@@ -56,8 +56,15 @@ enum EngineBootstrap {
         // moteur et garde JIT doivent précéder tout boot de VM.
         #endif
         #if LINUXRUNNER_LINKED
-        // LinuxRunner/iSH prépare son backend d'exécution au lancement
-        // (LRRuntimeBridge.prepareExecutionBackendAtLaunch).
+        // LinuxRunner : RIEN ici pour le backend d'exécution.
+        // prepareExecutionBackendAtLaunch ne doit PAS être appelé au
+        // lancement de l'app : dans l'app d'origine il se fait APRÈS
+        // beginBoot, au démarrage du runtime, avant le premier bloc
+        // guest (AppDelegate.startLinuxRuntime, Vendor/LinuxRunner/
+        // app/AppDelegate.m:528-533). Le rejouer là-bas, dans le
+        // chemin LinuxRunnerAdapter.start() — voir
+        // Docs/INTEGRATION_LINUXRUNNER.md, section « Séquence de
+        // boot à rejouer ».
         #endif
     }
 }
