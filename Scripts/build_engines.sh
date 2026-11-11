@@ -25,7 +25,13 @@ fi
 note "LinuxRunner : runtime iSH (Meson)"
 if [ -d Vendor/LinuxRunner ]; then
   command -v meson >/dev/null && command -v ninja >/dev/null || die "meson/ninja manquants : brew install meson ninja cmake pkg-config ld.lld"
-  ( cd Vendor/LinuxRunner && git submodule update --init --recursive --checkout -- deps/libapps deps/libarchive deps/glslang deps/spirv-cross ) || echo "  ! Sous-modules non initialisés (pas un clone git ?) — suivre Vendor/LinuxRunner/docs/BUILDING.md."
+  # Vendor/LinuxRunner est une copie de sources, pas un clone git :
+  # « git submodule update » ne peut rien y remplir (dossiers deps/*
+  # vides). Les sous-modules se peuplent avec
+  # Scripts/setup-linuxrunner-deps.sh, aux révisions épinglées dans
+  # SOURCE_ORIGIN.txt — on refuse de continuer avec des dossiers
+  # vides, sinon l'échec ne sortirait qu'au bootstrap, bien plus tard.
+  ./Scripts/setup-linuxrunner-deps.sh --check || die "Sous-modules LinuxRunner manquants ou à la mauvaise révision : lance ./Scripts/setup-linuxrunner-deps.sh puis relance build_engines.sh."
   echo "  Le cœur LinuxRunner se construit via leur meson.build + iSH.xcodeproj d'origine :"
   echo "  suivre Vendor/LinuxRunner/docs/BUILDING.md (variante interpréteur d'abord),"
   echo "  puis décommenter LINUXRUNNER_LINKED dans ce script une fois RuntimeBridge lié."
