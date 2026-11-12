@@ -1,0 +1,435 @@
+//
+//  TriOSAppDelegate.m — TriOS
+//
+//  Implémentation TriOS de la classe AppDelegate de LinuxRunner/iSH.
+//
+//  L'AppDelegate d'origine (Vendor/LinuxRunner/app/AppDelegate.m) est
+//  exclu du target TriOS : il construit la fenêtre et l'UI de l'app
+//  autonome. Mais RuntimeBridge et TerminalViewController y font
+//  référence (startLinuxRuntime, +bootError), et le runtime exige sa
+//  séquence de boot. Cette classe fournit donc la même interface
+//  (Vendor/LinuxRunner/app/AppDelegate.h) avec les méthodes du runtime
+//  reprises À L'IDENTIQUE des sources d'origine : -boot,
+//  -configureDns, -startLinuxRuntime, -exitApp et les gestionnaires
+//  ios_handle_exit / ios_handle_die. Aucune méthode de cycle de vie
+//  UI : TriOS reste une app SwiftUI, cette classe est branchée via
+//  @UIApplicationDelegateAdaptor et ne sert qu'au runtime Linux.
+//
+
+#include <resolv.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <mach/mach.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#import "app/AppDelegate.h"
+#import "app/AppGroup.h"
+#import "app/UnixSocketDirectory.h"
+#import "app/CurrentRoot.h"
+#import "app/ExceptionExfiltrator.h"
+#import "app/iOSFS.h"
+#import "app/PasteboardDevice.h"
+#import "app/LocationDevice.h"
+#import "app/BLESerial.h"
+#import "app/MIDISerial.h"
+#import "app/NSObject+SaneKVO.h"
+#import "app/Roots.h"
+#import "app/Terminal.h"
+#import "app/TerminalViewController.h"
+#import "app/UserPreferences.h"
+#import "app/UIApplication+OpenURL.h"
+#import "app/LinuxRunner/RuntimeBridge.h"
+#import "app/LinuxRunner/BootLog.h"
+#import "app/LinuxRunner/HostNameConfiguration.h"
+#include "kernel/init.h"
+#include "kernel/calls.h"
+#include "fs/dyndev.h"
+#include "fs/devices.h"
+#include "fs/path.h"
+#include "graphics/guest_gpu.h"
+#include "kernel/native_offload.h"
+#if defined(GUEST_ARM64)
+#include "app/DebugServer.h"
+#endif
+
+NSString *const ProcessExitedNotification = @"ProcessExitedNotification";
+
+static void logHostMemory(NSString *reason) {
+    task_vm_info_data_t info = {0};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        NSLog(@"HOST_MEMORY: %@ footprint=%llu resident=%llu", reason,
+              (unsigned long long)info.phys_footprint, (unsigned long long)info.resident_size);
+#ifdef LINUXRUNNER
+        [LRRuntimeBridge logCategory:@"MEMORY" event:[NSString stringWithFormat:@"host footprint=%llu resident=%llu",
+            (unsigned long long)info.phys_footprint, (unsigned long long)info.resident_size]];
+#endif
+    }
+}
+
+static void ios_handle_exit(struct task *task, int code) {
+    // we are interested in init and in children of init
+    // this is called with pids_lock as an implementation side effect, please do not cite as an example of good API design
+    if (task->parent != NULL && task->parent->parent != NULL)
+        return;
+    // pid should be saved now since task would be freed
+    pid_t pid = task->pid;
+#ifdef LINUXRUNNER
+    [LRRuntimeBridge logCategory:@"SIGNAL" event:[NSString stringWithFormat:@"pid=%d wait-status=%d", pid, code]];
+#endif
+    NSLog(@"guest process pid %d exited with code %d", pid, code);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:ProcessExitedNotification
+                                                            object:nil
+                                                          userInfo:@{@"pid": @(pid),
+                                                                     @"code": @(code)}];
+    });
+}
+
+static void ios_handle_die(const char *msg) {
+    NSString *message = [NSString stringWithFormat:@"%s: %s", __func__, msg];
+    iSHExceptionHandler([[NSException alloc] initWithName:NSGenericException reason:message userInfo:nil]);
+}
+
+static int bootError;
+
+@implementation AppDelegate
+
+- (int)boot {
+#if !ISH_LINUX
+#ifdef ISH_AOT_BOOTSTRAP
+#if !defined(ISH_JIT) || !defined(ISH_JIT_NO_EMIT)
+#error AOT bootstrap requires matching native/no-emitter definitions
+#endif
+    if (jit_aot_prepare_layout() != 0 || ish_app_native_fault_install() != 0)
+        return _EINVAL;
+    NSURL *identityURL = [NSBundle.mainBundle URLForResource:@"aot-build" withExtension:@"json"];
+    NSData *identityData = identityURL ? [NSData dataWithContentsOfURL:identityURL] : nil;
+    NSDictionary *identity = identityData ? [NSJSONSerialization JSONObjectWithData:identityData options:0 error:nil] : nil;
+    if (!identity || [identity[@"executionEnabled"] boolValue] != (ISH_AOT_IMAGE_EXECUTION != 0))
+        return _EINVAL;
+    NSLog(@"AOT_BUILD: version=%@ build=%@ revision=%@ images=%@ enabled=%d",
+          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
+          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"],
+          identity[@"sourceRevision"], identity[@"imageManifestSha256"], ISH_AOT_IMAGE_EXECUTION);
+    if (setenv("ISH_JIT", ISH_AOT_IMAGE_EXECUTION ? "1" : "0", 1) != 0 ||
+            setenv("ISH_AOT_FAMILY", "0", 1) != 0)
+        return _ENOMEM;
+#if ISH_AOT_IMAGE_EXECUTION
+    NSArray *modules = identity[@"modules"];
+    if ((modules.count != 3 && modules.count != 9 && modules.count != 10) || jit_aot_start((unsigned)modules.count) != 0)
+        return _EINVAL;
+    struct jit_layout expected;
+    jit_layout_read(&expected);
+    NSDictionary *contract = identity[@"contract"];
+    if ([contract[@"abi"] unsignedIntValue] != expected.abi ||
+            [contract[@"prologue_words"] unsignedIntValue] != expected.prologue_words ||
+            [contract[@"entry_off"] unsignedIntValue] != expected.entry_off ||
+            [contract[@"n_pinned"] unsignedIntValue] != expected.n_pinned)
+        return _EINVAL;
+#endif
+    char layout[2048];
+    jit_layout_describe(layout, sizeof(layout));
+    NSData *layoutData = [[NSString stringWithUTF8String:layout] dataUsingEncoding:NSUTF8StringEncoding];
+    NSURL *documents = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    NSError *layoutError = nil;
+    if (![layoutData writeToURL:[documents URLByAppendingPathComponent:@"aot-layout.json"] options:NSDataWritingAtomic error:&layoutError])
+        NSLog(@"AOT layout evidence write failed: %@", layoutError);
+    NSLog(@"AOT target layout: %s", layout);
+#endif
+#ifdef LINUXRUNNER
+    LRBootEvent("rootfs located: validating bundled resource");
+    NSURL *archiveURL = [NSBundle.mainBundle URLForResource:@"root" withExtension:@"tar.gz"];
+    if (!archiveURL || ![NSFileManager.defaultManager isReadableFileAtPath:archiveURL.path]) return _ENOENT;
+    LRBootEvent("environment metadata: loading root catalog and verified import if needed");
+    if (Roots.instance.initializationError || !Roots.instance.defaultRoot) return _EIO;
+#endif
+    NSURL *root = [Roots.instance rootUrl:Roots.instance.defaultRoot];
+#ifdef LINUXRUNNER
+    if (![NSFileManager.defaultManager fileExistsAtPath:[root URLByAppendingPathComponent:@"meta.db"].path] ||
+        ![NSFileManager.defaultManager fileExistsAtPath:[root URLByAppendingPathComponent:@"data"].path]) return _ENOENT;
+    LRBootEvent("runtime initialization started: mount_root");
+#endif
+
+    int err = mount_root(&fakefs, [root URLByAppendingPathComponent:@"data"].fileSystemRepresentation);
+    if (err < 0)
+        return err;
+
+#ifdef LINUXRUNNER
+    LRBootEvent("rootfs mounted; guest memory initialization and first process creation");
+#endif
+    fs_register(&iosfs);
+    fs_register(&iosfs_unsafe);
+
+    // need to do this first so that we can have a valid current for the generic_mknod calls
+    err = become_first_process();
+    if (err < 0)
+        return err;
+
+    err = prepare_guest_runtime_dirs();
+#ifdef LINUXRUNNER
+    [LRRuntimeBridge logCategory:@"FS" event:[NSString stringWithFormat:@"guest bootstrap /dev/shm mode=01777 host-page=%ld guest-page=%u result=%d", sysconf(_SC_PAGESIZE), (unsigned)PAGE_SIZE, err]];
+#endif
+    if (err < 0)
+        return err;
+
+#ifdef ISH_FFMPEG_TEST
+    // Register built-in native handlers (fake_ffmpeg) for the ffmpeg test target.
+    // This is NOT called in the standard iSH ARM64 target.
+    native_builtins_init();
+#endif
+
+#ifdef LINUXRUNNER
+    LRBootEvent("signal handlers installed; guest process created");
+#endif
+    FsInitialize();
+#ifdef LINUXRUNNER
+    err = [LRRuntimeBridge prepareExchange:Roots.instance.defaultRoot];
+    if (err < 0) return err;
+#endif
+
+    // create some device nodes
+    // this will do nothing if they already exist
+    generic_mknodat(AT_PWD, "/dev/tty1", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 1));
+    generic_mknodat(AT_PWD, "/dev/tty2", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 2));
+    generic_mknodat(AT_PWD, "/dev/tty3", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 3));
+    generic_mknodat(AT_PWD, "/dev/tty4", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 4));
+    generic_mknodat(AT_PWD, "/dev/tty5", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 5));
+    generic_mknodat(AT_PWD, "/dev/tty6", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 6));
+    generic_mknodat(AT_PWD, "/dev/tty7", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 7));
+
+    generic_mknodat(AT_PWD, "/dev/tty", S_IFCHR|0666, dev_make(TTY_ALTERNATE_MAJOR, DEV_TTY_MINOR));
+    generic_mknodat(AT_PWD, "/dev/console", S_IFCHR|0666, dev_make(TTY_ALTERNATE_MAJOR, DEV_CONSOLE_MINOR));
+    generic_mknodat(AT_PWD, "/dev/ptmx", S_IFCHR|0666, dev_make(TTY_ALTERNATE_MAJOR, DEV_PTMX_MINOR));
+
+    generic_mknodat(AT_PWD, "/dev/null", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_NULL_MINOR));
+    generic_mknodat(AT_PWD, "/dev/zero", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_ZERO_MINOR));
+    generic_mknodat(AT_PWD, "/dev/full", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_FULL_MINOR));
+    generic_mknodat(AT_PWD, "/dev/random", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_RANDOM_MINOR));
+    generic_mknodat(AT_PWD, "/dev/urandom", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_URANDOM_MINOR));
+    
+#ifdef LINUXRUNNER
+    // Guest Metal device (fs/gpu.c). Every open is an isolated, quota-limited
+    // context, like a Linux DRM render node, so ordinary desktop users need it:
+    // before this, only root-run launchers could create it and GPU modes failed
+    // or silently fell back for non-root desktop sessions. A node left 0600 by
+    // older launchers is repaired here.
+    generic_mknodat(AT_PWD, "/dev/linuxrunner-gpu", S_IFCHR|0666, dev_make(LR_GPU_MAJOR, 0));
+    generic_setattrat(AT_PWD, "/dev/linuxrunner-gpu", (struct attr) {.type = attr_mode, .mode = S_IFCHR|0666}, false);
+#endif
+
+    generic_mkdirat(AT_PWD, "/dev/pts", 0755);
+    generic_mkdirat(AT_PWD, "/mnt", 0755);
+    
+    // Permissions on / have been broken for a while, let's fix them
+    generic_setattrat(AT_PWD, "/", (struct attr) {.type = attr_mode, .mode = 0755}, false);
+    
+    // Register clipboard device driver and create device node for it
+    err = dyn_dev_register(&clipboard_dev, DEV_CHAR, DYN_DEV_MAJOR, DEV_CLIPBOARD_MINOR);
+    if (err != 0) {
+        return err;
+    }
+    generic_mknodat(AT_PWD, "/dev/clipboard", S_IFCHR|0666, dev_make(DYN_DEV_MAJOR, DEV_CLIPBOARD_MINOR));
+    
+    err = dyn_dev_register(&location_dev, DEV_CHAR, DYN_DEV_MAJOR, DEV_LOCATION_MINOR);
+    if (err != 0)
+        return err;
+    generic_mknodat(AT_PWD, "/dev/location", S_IFCHR|0666, dev_make(DYN_DEV_MAJOR, DEV_LOCATION_MINOR));
+
+    do_mount(&procfs, "proc", "/proc", "", 0);
+#ifdef LINUXRUNNER
+    // Software KMS device (fs/drm.c) and the sysfs entries describing it:
+    // CPU rendering only. Its /dev nodes exist only while a Hyprland desktop
+    // runs (session.sh), so other desktops see no DRM device.
+    setenv("ISH_SOFTWARE_DRM", "1", 0);
+    // Anonymous shared-buffer exports for the managed KWin virtual output.
+    // No device is exposed until the selected desktop prepares its nodes.
+    setenv("ISH_SOFTWARE_DMABUF", "1", 0);
+    do_mount(&sysfs, "sysfs", "/sys", "", 0);
+#endif
+    do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+
+#ifdef LINUXRUNNER
+    // Shared folders from Files (iCloud Drive, other providers) may hold items
+    // that are not downloaded yet ("dataless"). Let POSIX access from Linux
+    // programs download them instead of failing (public I/O policy).
+    LRSetDatalessMaterialization();
+#endif
+    iosfs_init(); // let it mount any filesystems from user defaults
+
+    [self configureDns];
+    
+    exit_hook = ios_handle_exit;
+    die_handler = ios_handle_die;
+#if !TARGET_OS_SIMULATOR
+    // Host backing paths for guest AF_UNIX sockets (X11, D-Bus, ...) must fit
+    // sun_path (104 bytes). The container temp dir is long; /var is the
+    // system's own link to /private/var, so use the shorter spelling, and a
+    // one-letter prefix (fs/sock.c appends at most 14 bytes). Without this,
+    // devices with 5-digit process IDs failed every bind: Xvfb "Cannot
+    // establish any listening sockets", D-Bus "File name too long".
+    NSString *tmp = NSTemporaryDirectory();
+    if ([tmp hasPrefix:@"/private/var/"]) tmp = [tmp substringFromIndex:@"/private".length];
+    NSString *sockTmp = [tmp stringByAppendingString:@"s"];
+    sock_tmp_prefix = strdup(sockTmp.UTF8String);
+    size_t worst = strlen(sock_tmp_prefix) + 14; // base-36 pid (<=6) "." id (<=7)
+    NSLog(@"[SOCKET] AF_UNIX host prefix length %zu, worst-case path %zu of 103", strlen(sock_tmp_prefix), worst);
+    if (worst > 103) [LRRuntimeBridge logCategory:@"SOCKET" event:[NSString stringWithFormat:@"AF_UNIX host path may exceed sun_path (%zu bytes); local sockets can fail with ENAMETOOLONG", worst]];
+#endif
+    
+    tty_drivers[TTY_CONSOLE_MAJOR] = &ios_console_driver;
+    LRBLESerialInstall();
+    LRMIDISerialInstall();
+    set_console_device(TTY_CONSOLE_MAJOR, 1);
+    err = create_stdio("/dev/console", TTY_CONSOLE_MAJOR, 1);
+    if (err < 0)
+        return err;
+
+#if defined(GUEST_ARM64)
+    debug_server_start(1234);
+#endif
+
+    NSArray<NSString *> *command;
+    command = UserPreferences.shared.bootCommand;
+#ifdef LINUXRUNNER
+    BOOL kali = [LRRuntimeBridge activeEnvironmentIsKali];
+    if (!kali && ([LRRuntimeBridge activeEnvironmentIsDebian] || [LRRuntimeBridge activeEnvironmentIsArch] || [LRRuntimeBridge activeEnvironmentIsSteamOS])) command = @[@"/bin/sh", @"/usr/lib/linuxrunner/init.sh"];
+    if ([LRRuntimeBridge activeEnvironmentIsFedora] || kali) {
+        // The official Fedora and Kali userspace images expect systemd init. Run
+        // only LinuxRunner's bundled first-start validator and a userspace PID 1.
+        // Do not copy host files into fakefs behind its metadata database.
+        NSURL *support = [NSBundle.mainBundle URLForResource:@"GUISupport" withExtension:@"bundle"];
+        NSString *initializer = support ? [NSString stringWithContentsOfURL:[support URLByAppendingPathComponent:kali ? @"initialize-kali.sh" : @"initialize-fedora.sh"] encoding:NSUTF8StringEncoding error:nil] : nil;
+        if (!initializer.length || initializer.length > 4000) {
+            LRBootEvent("Distribution initializer resource missing or invalid");
+            return _EINVAL;
+        }
+        NSString *script = [NSString stringWithFormat:@"mkdir -p /var/log || exit 1\n(\n%@\n) >>/var/log/linuxrunner-initialize.log 2>&1\nwhile :; do sleep 3600; done\n", initializer];
+        command = @[@"/bin/sh", @"-c", script];
+    }
+#endif
+    if (command.count == 0) {
+        NSLog(@"boot command is empty");
+        return _EINVAL;
+    }
+    NSLog(@"booting guest init with command: %@", [command componentsJoinedByString:@" "]);
+    char argv[4096];
+    [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
+    const char *envp =
+        "TERM=xterm-256color\0"
+        "HOME=/root\0"
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
+#if defined(GUEST_ARM64)
+        "PYTHONMALLOC=malloc\0"
+#endif
+        ;
+#ifdef LINUXRUNNER
+    LRBootEvent("guest init exec starting");
+#endif
+    err = do_execve(command[0].UTF8String, command.count, argv, envp);
+    if (err < 0)
+        return err;
+#ifdef LINUXRUNNER
+    LRBootEvent("Linux runtime initialized; scheduling guest init thread");
+#endif
+    err = task_start(current);
+    if (err < 0) {
+        task_discard_unstarted(current);
+        current = NULL;
+        return err;
+    }
+
+#else
+    // On first launch, this will trigger the import of the default root. Make sure to do this before entering the kernel, because it needs to run something on the main thread, and that would deadlock.
+    [Roots instance];
+    NSArray<NSString *> *args = @[];
+    actuate_kernel([args componentsJoinedByString:@" "].UTF8String);
+#endif
+    
+    return 0;
+}
+
+- (void)configureDns {
+#if !ISH_LINUX
+#ifdef LINUXRUNNER
+    // Reachability fires even in native-only mode. Never borrow a missing init.
+    lock(&pids_lock); BOOL hasInit = pid_get_task(1) != NULL; unlock(&pids_lock);
+    if (!hasInit) return;
+#endif
+    struct __res_state res;
+    BOOL resolverInitialized = EXIT_SUCCESS == res_ninit(&res);
+    if (!resolverInitialized) {
+        NSLog(@"[DNS] res_ninit failed, falling back to public resolver");
+    }
+    NSMutableString *resolvConf = [NSMutableString new];
+    if (resolverInitialized && res.dnsrch[0] != NULL) {
+        [resolvConf appendString:@"search"];
+        for (int i = 0; res.dnsrch[i] != NULL; i++) {
+            [resolvConf appendFormat:@" %s", res.dnsrch[i]];
+        }
+        [resolvConf appendString:@"\n"];
+    }
+    union res_sockaddr_union servers[NI_MAXSERV];
+    int serversFound = resolverInitialized && res.nscount > 0 ? res_getservers(&res, servers, NI_MAXSERV) : 0;
+    char address[NI_MAXHOST];
+    int nameserversWritten = 0;
+    for (int i = 0; i < serversFound; i ++) {
+        union res_sockaddr_union s = servers[i];
+        if (s.sin.sin_len == 0)
+            continue;
+        int err = getnameinfo((struct sockaddr *) &s.sin, s.sin.sin_len,
+                              address, sizeof(address),
+                              NULL, 0, NI_NUMERICHOST);
+        if (err != 0 || address[0] == '\0')
+            continue;
+        [resolvConf appendFormat:@"nameserver %s\n", address];
+        nameserversWritten++;
+    }
+    if (resolverInitialized)
+        res_nclose(&res);
+
+    if (nameserversWritten == 0) {
+        NSLog(@"[DNS] no system nameservers found, falling back to 1.1.1.1");
+        [resolvConf appendString:@"nameserver 1.1.1.1\n"];
+    }
+#ifdef LINUXRUNNER
+    [LRRuntimeBridge logCategory:@"NETWORK" event:[NSString stringWithFormat:@"DNS configured; system resolver count=%d", nameserversWritten]];
+#endif
+    
+    current = pid_get_task(1);
+#ifdef LINUXRUNNER
+    configureGuestHostAlias();
+#endif
+    struct fd *fd = generic_open("/etc/resolv.conf", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0666);
+    if (!IS_ERR(fd)) {
+        fd->ops->write(fd, resolvConf.UTF8String, [resolvConf lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+        fd_close(fd);
+    }
+#endif
+}
+
+- (int)startLinuxRuntime {
+    if (![LRRuntimeBridge beginBoot]) return bootError;
+    // Before the first guest block: the JIT starts only if iOS already allows it.
+    [LRRuntimeBridge prepareExecutionBackendAtLaunch];
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    bootError = [self boot];
+    if (bootError == 0) [LRRuntimeBridge applySharedFolderOwnership];
+    [LRRuntimeBridge recordBoot:Roots.instance.defaultRoot ?: @"default" error:bootError];
+    [LRRuntimeBridge logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot to task scheduling ms=%.1f", (CFAbsoluteTimeGetCurrent() - start) * 1000]];
+    return bootError;
+}
+
+- (void)exitApp {
+    NSLog(@"APP_SHUTDOWN: user-requested exit");
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Close LinuxRunner"
+        message:@"Close the app from the app switcher, then reopen it to start the selected environment. Files are preserved."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [currentTerminalViewController presentViewController:alert animated:YES completion:nil];
+}
+
++ (int)bootError {
+    return bootError;
+}
+
+@end

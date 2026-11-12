@@ -18,6 +18,16 @@ import SwiftUI
 struct TriOSApp: App {
     @StateObject private var kernel = OSKernel()
 
+    #if LINUXRUNNER_LINKED
+    // LinuxRunner/iSH pilote son runtime via l'UIApplicationDelegate :
+    // LRRuntimeBridge.startRuntime() appelle -[AppDelegate
+    // startLinuxRuntime]. TriOS fournit sa propre implémentation de
+    // cette classe (Modules/LinuxRunner/Native/TriOSAppDelegate.m,
+    // séquence de boot reprise de l'AppDelegate d'origine, sans son UI)
+    // et la branche ici ; SwiftUI continue de gérer les scènes.
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var linuxRunnerDelegate
+    #endif
+
     init() {
         // Dossiers de données séparés par application :
         // Documents/TriOS/Henge, Documents/TriOS/Kernarium,

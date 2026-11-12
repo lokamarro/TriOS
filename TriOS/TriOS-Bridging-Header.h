@@ -28,6 +28,9 @@
 #ifdef LINUXRUNNER_LINKED
 // Copié par Scripts/integrate.sh depuis Vendor/LinuxRunner/app/LinuxRunner/
 #import "RuntimeBridge.h"
+// L'AppDelegate d'origine (Vendor/LinuxRunner/app/) : TriOS en fournit
+// l'implémentation dans Modules/LinuxRunner/Native/TriOSAppDelegate.m.
+#import "app/AppDelegate.h"
 #endif
 
 #endif
