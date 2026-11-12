@@ -97,6 +97,27 @@ if [ "$manquants" -ne 0 ]; then
   exit 1
 fi
 
+# bootstrap-macos.sh contrôle les sous-modules via « git submodule status »
+# exécuté dans Vendor/LinuxRunner. Comme c'est une copie et non un clone,
+# git y remonte au dépôt parent et le contrôle échoue sur les pathspecs.
+# On crée donc un dépôt git local minimal : un .gitmodules décrivant les
+# quatre dépendances et des gitlinks pointant sur les dépôts déjà peuplés
+# aux révisions épinglées — le contrôle d'origine vérifie alors réellement
+# les révisions au lieu d'échouer sur la forme du dépôt.
+if [ ! -e "$LR/.git" ]; then
+  echo "Création d'un dépôt git local dans Vendor/LinuxRunner (contrôle bootstrap) :"
+  git -C "$LR" init -q
+  : > "$LR/.gitmodules"
+  for entree in "${DEPS[@]}"; do
+    IFS='|' read -r nom url sha <<< "$entree"
+    git -C "$LR" config -f .gitmodules "submodule.deps/$nom.path" "deps/$nom"
+    git -C "$LR" config -f .gitmodules "submodule.deps/$nom.url" "$url"
+    git -C "$LR" add "deps/$nom"
+  done
+  git -C "$LR" submodule init >/dev/null 2>&1 || true
+  git -C "$LR" submodule status --recursive -- deps/libapps deps/libarchive deps/glslang deps/spirv-cross | sed 's/^/  /'
+fi
+
 echo "Vérification des prérequis (bootstrap-macos.sh d'origine) :"
 if [ "$(uname -s)" = "Darwin" ]; then
   bash "$LR/scripts/bootstrap-macos.sh"
