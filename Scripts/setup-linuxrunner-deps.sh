@@ -115,6 +115,10 @@ if [ ! -e "$LR/.git" ]; then
     git -C "$LR" add "deps/$nom"
   done
   git -C "$LR" submodule init >/dev/null 2>&1 || true
+  # build-ipa.sh fait « git rev-parse HEAD » : il faut un premier commit,
+  # sinon HEAD est inconnu et le build meurt immédiatement (exit 128).
+  git -C "$LR" add .gitmodules
+  git -C "$LR" -c user.email="trios@localhost" -c user.name="TriOS" commit -q -m "Dépôt local TriOS : gitlinks des dépendances épinglées (contrôles bootstrap/build-ipa)"
   git -C "$LR" submodule status --recursive -- deps/libapps deps/libarchive deps/glslang deps/spirv-cross | sed 's/^/  /'
 fi
 
