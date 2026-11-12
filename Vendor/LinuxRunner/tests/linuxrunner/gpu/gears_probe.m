@@ -1,0 +1,15 @@
+#import <Foundation/Foundation.h>
+#import <ImageIO/ImageIO.h>
+#import "app/LinuxRunner/RFBClient.h"
+int main(int argc,char **argv){@autoreleasepool{
+ if(argc!=5)return 2;NSString *out=@(argv[3]);LRRFBClient *c=[[LRRFBClient alloc]initWithPort:atoi(argv[1]) password:[NSString stringWithContentsOfFile:@(argv[2]) encoding:NSASCIIStringEncoding error:nil]];
+ __block NSData *last=nil;__block unsigned w=0,h=0;__block BOOL ended=NO;c.frameHandler=^(NSData *d,uint16_t x,uint16_t y,uint64_t f,uint64_t b){last=d;w=x;h=y;};c.statusHandler=^(NSString *s){fprintf(stderr,"%s\n",s.UTF8String);if([s containsString:@"Display error:"])ended=YES;};[c start];NSDate *start=NSDate.date;
+ NSDictionary *session=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@"build/qt-tests/current-session.json"] options:0 error:nil];BOOL submitted=getenv("LR_GEARS_EXTERNAL_LAUNCH")!=NULL;
+
+ while(!ended&&-[start timeIntervalSinceNow]<40){
+ if(!submitted&&last&&-[start timeIntervalSinceNow]>6){NSString *requests=[session[@"path"] stringByAppendingPathComponent:@"requests"];[NSFileManager.defaultManager createDirectoryAtPath:requests withIntermediateDirectories:YES attributes:nil error:nil];NSString *command=@"#!/bin/sh\n/home/mobile/Downloads/gpu-resize-gears > /home/mobile/Downloads/gpu-resize.log 2>&1 &\nexec /bin/sh /home/mobile/Downloads/.linuxrunner/gui/gpu-gears.sh\n";[command writeToFile:[requests stringByAppendingPathComponent:@"launch-gears.sh"] atomically:YES encoding:NSUTF8StringEncoding error:nil];submitted=YES;}
+ [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.1]];}
+ if(last){CGColorSpaceRef sp=CGColorSpaceCreateDeviceRGB();CGDataProviderRef p=CGDataProviderCreateWithCFData((__bridge CFDataRef)last);CGImageRef img=CGImageCreate(w,h,8,32,w*4,sp,kCGBitmapByteOrder32Little|kCGImageAlphaNoneSkipFirst,p,NULL,NO,kCGRenderingIntentDefault);CGImageDestinationRef dst=CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:[out stringByAppendingPathComponent:@"macos-host-mesa-gears.png"]],CFSTR("public.png"),1,NULL);CGImageDestinationAddImage(dst,img,NULL);CGImageDestinationFinalize(dst);CFRelease(dst);CGImageRelease(img);CGDataProviderRelease(p);CGColorSpaceRelease(sp);}
+ [c pointerX:120 y:120 buttons:1];[c pointerX:120 y:120 buttons:0];[c key:0xff1b down:YES];[c key:0xff1b down:NO];NSDate *wait=NSDate.date;while(-[wait timeIntervalSinceNow]<3)[NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.1]];NSString *log=[NSString stringWithContentsOfFile:[session[@"path"] stringByAppendingPathComponent:@"application.log"] encoding:NSUTF8StringEncoding error:nil];BOOL rendered=[log containsString:@"GPU_EGL_SWAP"]&&[log containsString:@"size=420x320"]&&[log containsString:@"size=160x240"];
+ [[NSJSONSerialization dataWithJSONObject:@{@"environment":@"macOS host; not iPhone",@"Metal_window_swaps_and_resize":@(rendered)} options:NSJSONWritingPrettyPrinted error:nil]writeToFile:[out stringByAppendingPathComponent:@"gears-result.json"] atomically:YES];[c stop];return last&&rendered?0:1;
+}}
