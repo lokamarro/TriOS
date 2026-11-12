@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 18:58:20 +0900
+Subject: [PATCH] uml: hold the vhost-user socket from a request to its reply
+
+Only their order pairs a vhost-user reply with its request, so a
+frontend must not send another request before it has read the reply to
+the previous one. vhost_user_send() held sock_lock across a request and
+its acknowledgement, but a request whose reply carries data, such as
+GET_CONFIG or GET_FEATURES, dropped the lock after sending and read its
+reply unlocked. In-band notifications make every kick an acknowledged
+round trip, sent from any CPU, so a kick could go out while the reply
+to a configuration read was still on its way, and the two then read
+each other's replies: the kick found a reply of the wrong size and
+retired a healthy device as gone ("kick returned -71"), and the
+configuration read failed with -EPROTO as well. virtio-gpu lost its
+display this way when the host changed the display size several times
+while the guest was rendering.
+
+Read every reply in the same sock_lock section as its request, and
+reject a reply that names another request. GET_CONFIG now reads at most
+the payload it allocated room for; it allowed a payload as long as the
+whole message.
+---
+ arch/um/drivers/virtio_uml.c | 198 +++++++++++++++++++----------------
+ 1 file changed, 106 insertions(+), 92 deletions(-)
+
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index 186d3bab01d71da414c7f2bff4217fe1be488190..61c5ef5b7f2f9b8a2c30a45235331818c74ed613 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -286,21 +286,6 @@ static int vhost_user_recv_resp(struct virtio_uml_device *vu_dev,
+ 	return 0;
+ }
+ 
+-static int vhost_user_recv_u64(struct virtio_uml_device *vu_dev,
+-			       u64 *value)
+-{
+-	struct vhost_user_msg msg;
+-	int rc = vhost_user_recv_resp(vu_dev, &msg,
+-				      sizeof(msg.payload.integer));
+-
+-	if (rc)
+-		return rc;
+-	if (msg.header.size != sizeof(msg.payload.integer))
+-		return -EPROTO;
+-	*value = msg.payload.integer;
+-	return 0;
+-}
+-
+ static int vhost_user_recv_req(struct virtio_uml_device *vu_dev,
+ 			       struct vhost_user_msg *msg,
+ 			       size_t max_payload_size, int fds[2])
+@@ -356,30 +341,31 @@ static int vhost_user_recv_req(struct virtio_uml_device *vu_dev,
+ 	return rc;
+ }
+ 
+-static int vhost_user_send(struct virtio_uml_device *vu_dev,
+-			   bool need_response, struct vhost_user_msg *msg,
+-			   int *fds, size_t num_fds)
++/*
++ * Send @msg on the main socket and, unless @reply is NULL, read its reply
++ * into @reply, which may be @msg itself.
++ *
++ * Only their order pairs a reply with its request, so nothing else may be
++ * sent on the socket between the two: sock_lock covers the whole round trip.
++ * In-band notifications make every kick such a round trip, sent from any CPU
++ * and from atomic context, while another CPU may be reading the device's
++ * configuration. A reply read after sock_lock was dropped could be taken by
++ * that kick, which would then report a healthy backend as gone, and the
++ * reader would take the kick's acknowledgement in its place.
++ */
++static int vhost_user_round_trip(struct virtio_uml_device *vu_dev,
++				 struct vhost_user_msg *msg,
++				 int *fds, size_t num_fds,
++				 struct vhost_user_msg *reply,
++				 size_t max_payload_size)
+ {
+ 	size_t size = sizeof(msg->header) + msg->header.size;
++	u32 request = msg->header.request;
+ 	unsigned long flags;
+-	bool request_ack;
+ 	int rc;
+ 
+ 	msg->header.flags |= VHOST_USER_VERSION;
+ 
+-	/*
+-	 * The need_response flag indicates that we already need a response,
+-	 * e.g. to read the features. In these cases, don't request an ACK as
+-	 * it is meaningless. Also request an ACK only if supported.
+-	 */
+-	request_ack = !need_response;
+-	if (!(vu_dev->protocol_features &
+-			BIT_ULL(VHOST_USER_PROTOCOL_F_REPLY_ACK)))
+-		request_ack = false;
+-
+-	if (request_ack)
+-		msg->header.flags |= VHOST_USER_FLAG_NEED_REPLY;
+-
+ 	raw_spin_lock_irqsave(&vu_dev->sock_lock, flags);
+ 	rc = full_sendmsg_fds(vu_dev->sock, msg, size, fds, num_fds);
+ 	if (rc < 0) {
+@@ -391,18 +377,11 @@ static int vhost_user_send(struct virtio_uml_device *vu_dev,
+ 		goto out;
+ 	}
+ 
+-	if (request_ack) {
+-		uint64_t status;
+-
+-		rc = vhost_user_recv_u64(vu_dev, &status);
+-		if (rc)
+-			goto out;
+-
+-		if (status) {
+-			vu_err(vu_dev, "slave reports error: %llu\n", status);
+-			rc = -EIO;
+-			goto out;
+-		}
++	if (reply) {
++		rc = vhost_user_recv_resp(vu_dev, reply, max_payload_size);
++		/* A reply names the request it answers. */
++		if (!rc && reply->header.request != request)
++			rc = -EPROTO;
+ 	}
+ 
+ out:
+@@ -410,14 +389,72 @@ static int vhost_user_send(struct virtio_uml_device *vu_dev,
+ 	return rc;
+ }
+ 
++/* Send a request whose reply is at most an acknowledgement. */
++static int vhost_user_send(struct virtio_uml_device *vu_dev,
++			   struct vhost_user_msg *msg,
++			   int *fds, size_t num_fds)
++{
++	struct vhost_user_msg ack;
++	int rc;
++
++	/* Request an ACK only if supported. */
++	if (!(vu_dev->protocol_features &
++			BIT_ULL(VHOST_USER_PROTOCOL_F_REPLY_ACK)))
++		return vhost_user_round_trip(vu_dev, msg, fds, num_fds,
++					     NULL, 0);
++
++	msg->header.flags |= VHOST_USER_FLAG_NEED_REPLY;
++	rc = vhost_user_round_trip(vu_dev, msg, fds, num_fds, &ack,
++				   sizeof(ack.payload.integer));
++	if (rc)
++		return rc;
++	if (ack.header.size != sizeof(ack.payload.integer))
++		return -EPROTO;
++	if (ack.payload.integer) {
++		vu_err(vu_dev, "slave reports error: %llu\n",
++		       ack.payload.integer);
++		return -EIO;
++	}
++	return 0;
++}
++
++/*
++ * Send a request whose reply carries data, such as the features, and read
++ * that reply into @msg, which has room for @max_payload_size bytes of it.
++ */
++static int vhost_user_send_recv(struct virtio_uml_device *vu_dev,
++				struct vhost_user_msg *msg,
++				size_t max_payload_size)
++{
++	return vhost_user_round_trip(vu_dev, msg, NULL, 0, msg,
++				     max_payload_size);
++}
++
++static int vhost_user_send_recv_u64(struct virtio_uml_device *vu_dev,
++				    u32 request, u64 *value)
++{
++	struct vhost_user_msg msg = {
++		.header.request = request,
++	};
++	int rc = vhost_user_send_recv(vu_dev, &msg,
++				      sizeof(msg.payload.integer));
++
++	if (rc)
++		return rc;
++	if (msg.header.size != sizeof(msg.payload.integer))
++		return -EPROTO;
++	*value = msg.payload.integer;
++	return 0;
++}
++
+ static int vhost_user_send_no_payload(struct virtio_uml_device *vu_dev,
+-				      bool need_response, u32 request)
++				      u32 request)
+ {
+ 	struct vhost_user_msg msg = {
+ 		.header.request = request,
+ 	};
+ 
+-	return vhost_user_send(vu_dev, need_response, &msg, NULL, 0);
++	return vhost_user_send(vu_dev, &msg, NULL, 0);
+ }
+ 
+ static int vhost_user_send_no_payload_fd(struct virtio_uml_device *vu_dev,
+@@ -427,7 +464,7 @@ static int vhost_user_send_no_payload_fd(struct virtio_uml_device *vu_dev,
+ 		.header.request = request,
+ 	};
+ 
+-	return vhost_user_send(vu_dev, false, &msg, &fd, 1);
++	return vhost_user_send(vu_dev, &msg, &fd, 1);
+ }
+ 
+ static int vhost_user_send_u64(struct virtio_uml_device *vu_dev,
+@@ -439,23 +476,19 @@ static int vhost_user_send_u64(struct virtio_uml_device *vu_dev,
+ 		.payload.integer = value,
+ 	};
+ 
+-	return vhost_user_send(vu_dev, false, &msg, NULL, 0);
++	return vhost_user_send(vu_dev, &msg, NULL, 0);
+ }
+ 
+ static int vhost_user_set_owner(struct virtio_uml_device *vu_dev)
+ {
+-	return vhost_user_send_no_payload(vu_dev, false, VHOST_USER_SET_OWNER);
++	return vhost_user_send_no_payload(vu_dev, VHOST_USER_SET_OWNER);
+ }
+ 
+ static int vhost_user_get_features(struct virtio_uml_device *vu_dev,
+ 				   u64 *features)
+ {
+-	int rc = vhost_user_send_no_payload(vu_dev, true,
+-					    VHOST_USER_GET_FEATURES);
+-
+-	if (rc)
+-		return rc;
+-	return vhost_user_recv_u64(vu_dev, features);
++	return vhost_user_send_recv_u64(vu_dev, VHOST_USER_GET_FEATURES,
++					features);
+ }
+ 
+ static int vhost_user_set_features(struct virtio_uml_device *vu_dev,
+@@ -467,12 +500,9 @@ static int vhost_user_set_features(struct virtio_uml_device *vu_dev,
+ static int vhost_user_get_protocol_features(struct virtio_uml_device *vu_dev,
+ 					    u64 *protocol_features)
+ {
+-	int rc = vhost_user_send_no_payload(vu_dev, true,
+-			VHOST_USER_GET_PROTOCOL_FEATURES);
+-
+-	if (rc)
+-		return rc;
+-	return vhost_user_recv_u64(vu_dev, protocol_features);
++	return vhost_user_send_recv_u64(vu_dev,
++					VHOST_USER_GET_PROTOCOL_FEATURES,
++					protocol_features);
+ }
+ 
+ static int vhost_user_set_protocol_features(struct virtio_uml_device *vu_dev,
+@@ -485,33 +515,26 @@ static int vhost_user_set_protocol_features(struct virtio_uml_device *vu_dev,
+ static int vhost_user_get_queue_num(struct virtio_uml_device *vu_dev,
+ 				    u64 *queue_num)
+ {
+-	int rc = vhost_user_send_no_payload(vu_dev, true,
+-			VHOST_USER_GET_QUEUE_NUM);
+-
+-	if (rc)
+-		return rc;
+-	return vhost_user_recv_u64(vu_dev, queue_num);
++	return vhost_user_send_recv_u64(vu_dev, VHOST_USER_GET_QUEUE_NUM,
++					queue_num);
+ }
+ 
+ #ifdef UML_HOST_DARWIN
+ static int vhost_user_get_shmem_config(struct virtio_uml_device *vu_dev)
+ {
+-	struct vhost_user_msg msg;
++	struct vhost_user_msg msg = {
++		.header.request = VHOST_USER_GET_SHMEM_CONFIG,
++	};
+ 	unsigned long long phys;
+ 	unsigned long long size;
+ 	int rc;
+ 	int i;
+ 
+-	rc = vhost_user_send_no_payload(vu_dev, true,
+-					 VHOST_USER_GET_SHMEM_CONFIG);
+-	if (rc)
+-		return rc;
+-	rc = vhost_user_recv_resp(vu_dev, &msg,
++	rc = vhost_user_send_recv(vu_dev, &msg,
+ 				  sizeof(msg.payload.shmem_config));
+ 	if (rc)
+ 		return rc;
+-	if (msg.header.request != VHOST_USER_GET_SHMEM_CONFIG ||
+-	    msg.header.size != sizeof(msg.payload.shmem_config) ||
++	if (msg.header.size != sizeof(msg.payload.shmem_config) ||
+ 	    msg.payload.shmem_config.num_regions != 1 ||
+ 	    msg.payload.shmem_config.padding != 0 ||
+ 	    msg.payload.shmem_config.region_sizes[0] != 0)
+@@ -885,18 +908,9 @@ static void vhost_user_get_config(struct virtio_uml_device *vu_dev,
+ 	msg->payload.config.offset = 0;
+ 	msg->payload.config.size = cfg_size;
+ 
+-	rc = vhost_user_send(vu_dev, true, msg, NULL, 0);
+-	if (rc) {
+-		vu_err(vu_dev, "sending VHOST_USER_GET_CONFIG failed: %d\n",
+-		       rc);
+-		goto free;
+-	}
+-
+-	rc = vhost_user_recv_resp(vu_dev, msg, msg_size);
++	rc = vhost_user_send_recv(vu_dev, msg, payload_size);
+ 	if (rc) {
+-		vu_err(vu_dev,
+-		       "receiving VHOST_USER_GET_CONFIG response failed: %d\n",
+-		       rc);
++		vu_err(vu_dev, "VHOST_USER_GET_CONFIG failed: %d\n", rc);
+ 		goto free;
+ 	}
+ 
+@@ -936,7 +950,7 @@ static void vhost_user_set_config(struct virtio_uml_device *vu_dev,
+ 	msg->payload.config.size = len;
+ 	memcpy(msg->payload.config.payload, buf, len);
+ 
+-	rc = vhost_user_send(vu_dev, false, msg, NULL, 0);
++	rc = vhost_user_send(vu_dev, msg, NULL, 0);
+ 	if (rc)
+ 		vu_err(vu_dev, "sending VHOST_USER_SET_CONFIG failed: %d\n",
+ 		       rc);
+@@ -1019,7 +1033,7 @@ static int vhost_user_set_mem_table(struct virtio_uml_device *vu_dev)
+ 	if (rc < 0)
+ 		return rc;
+ 
+-	return vhost_user_send(vu_dev, false, &msg, fds,
++	return vhost_user_send(vu_dev, &msg, fds,
+ 			       msg.payload.mem_regions.num);
+ }
+ 
+@@ -1033,7 +1047,7 @@ static int vhost_user_set_vring_state(struct virtio_uml_device *vu_dev,
+ 		.payload.vring_state.num = num,
+ 	};
+ 
+-	return vhost_user_send(vu_dev, false, &msg, NULL, 0);
++	return vhost_user_send(vu_dev, &msg, NULL, 0);
+ }
+ 
+ static int vhost_user_set_vring_num(struct virtio_uml_device *vu_dev,
+@@ -1064,7 +1078,7 @@ static int vhost_user_set_vring_addr(struct virtio_uml_device *vu_dev,
+ 		.payload.vring_addr.log = log,
+ 	};
+ 
+-	return vhost_user_send(vu_dev, false, &msg, NULL, 0);
++	return vhost_user_send(vu_dev, &msg, NULL, 0);
+ }
+ 
+ static int vhost_user_set_vring_fd(struct virtio_uml_device *vu_dev,
+@@ -1080,9 +1094,9 @@ static int vhost_user_set_vring_fd(struct virtio_uml_device *vu_dev,
+ 		return -EINVAL;
+ 	if (fd < 0) {
+ 		msg.payload.integer |= VHOST_USER_VRING_POLL_MASK;
+-		return vhost_user_send(vu_dev, false, &msg, NULL, 0);
++		return vhost_user_send(vu_dev, &msg, NULL, 0);
+ 	}
+-	return vhost_user_send(vu_dev, false, &msg, &fd, 1);
++	return vhost_user_send(vu_dev, &msg, &fd, 1);
+ }
+ 
+ static int vhost_user_set_vring_call(struct virtio_uml_device *vu_dev,

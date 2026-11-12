@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 11:25:22 +0900
+Subject: [PATCH] v4l2: stage an input block that is smaller than the device's
+ buffers
+
+The decoder queues the dma-buf of every input block to the device as it is,
+and the device takes a dma-buf only if it is at least as large as the coded
+buffer size it negotiated (8 MiB; QBUF fails with EFAULT or EINVAL below
+it). The blocks the framework allocates for the component have the maximum
+input size, but a client of the block model allocates its own: CTS
+DecoderBlockModelTest uses blocks of 1 MiB, so the first QBUF failed, the
+decoder went into the error state and MediaCodec.stop() threw. Copy a
+block smaller than the maximum input size into a block of a pooled linear
+allocator, once per input, and queue the copy. A secure block is left alone.
+---
+ components/DecodeComponent.cpp                | 53 ++++++++++++++++++-
+ .../v4l2_codec2/components/DecodeComponent.h  |  4 ++
+ 2 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index a428ce80628236b58204302899967be38c4eb758..85db1e782a4e654af59138316a738a6ed399533c 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -11,6 +11,7 @@
+ #include <inttypes.h>
+ #include <linux/videodev2.h>
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include <memory>
+ 
+@@ -309,6 +310,7 @@ void DecodeComponent::releaseTask() {
+ 
+     mWeakThisFactory.InvalidateWeakPtrs();
+     mDecoder = nullptr;
++    mInputStagingPool.reset();
+ }
+ 
+ c2_status_t DecodeComponent::setListener_vb(const std::shared_ptr<C2Component::Listener>& listener,
+@@ -496,10 +498,59 @@ void DecodeComponent::processWork(const int32_t bitstreamId, const C2Work* work)
+     processWorkBuffer(bitstreamId, linearBlock);
+ }
+ 
++bool DecodeComponent::stageInput(const C2ConstLinearBlock& input, C2ConstLinearBlock* staged) {
++    ALOG_ASSERT(mDecoderTaskRunner->RunsTasksInCurrentSequence());
++
++    if (!mInputStagingPool) {
++        auto sharedThis = weak_from_this().lock();
++        if (sharedThis == nullptr) {
++            ALOGE("%s(): DecodeComponent instance is destroyed.", __func__);
++            return false;
++        }
++        c2_status_t status = CreateCodec2BlockPool(C2PlatformAllocatorStore::DMABUFHEAP,
++                                                   std::move(sharedThis), &mInputStagingPool);
++        if (status != C2_OK) {
++            ALOGE("Failed to create the pool for staging small input blocks: %d", status);
++            return false;
++        }
++    }
++
++    std::shared_ptr<C2LinearBlock> block;
++    c2_status_t status = mInputStagingPool->fetchLinearBlock(
++            mIntfImpl->getInputBufferSize(),
++            C2MemoryUsage(C2MemoryUsage::CPU_READ | C2MemoryUsage::CPU_WRITE), &block);
++    if (status != C2_OK) {
++        ALOGE("Failed to fetch a block for staging a small input block: %d", status);
++        return false;
++    }
++
++    C2WriteView writeView = block->map().get();
++    C2ReadView readView = input.map().get();
++    if (writeView.error() != C2_OK || readView.error() != C2_OK ||
++        writeView.capacity() < readView.capacity()) {
++        ALOGE("Failed to map the blocks for staging a small input block: %d, %d",
++              writeView.error(), readView.error());
++        return false;
++    }
++    memcpy(writeView.base(), readView.data(), readView.capacity());
++    *staged = block->share(0, readView.capacity(), C2Fence());
++    return true;
++}
++
+ void DecodeComponent::processWorkBuffer(const int32_t bitstreamId,
+                                         const C2ConstLinearBlock& linearBlock) {
++    // The device takes a coded buffer in a dma-buf as large as the buffers it negotiated, and the
++    // client of the block model may hand over a smaller block, which the device refuses. Such a
++    // block is staged in a pooled block of the negotiated size; the blocks the component
++    // allocates itself are that large and are queued as they are.
++    C2ConstLinearBlock input = linearBlock;
++    if (!mIsSecure && input.capacity() < mIntfImpl->getInputBufferSize() &&
++        !stageInput(linearBlock, &input)) {
++        reportError(C2_NO_MEMORY);
++        return;
++    }
+     std::unique_ptr<ConstBitstreamBuffer> buffer = std::make_unique<ConstBitstreamBuffer>(
+-            bitstreamId, linearBlock, linearBlock.offset(), linearBlock.size());
++            bitstreamId, input, input.offset(), input.size());
+     if (!buffer) {
+         reportError(C2_CORRUPTED);
+         return;
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index 23dd78cf4526a396ec80cfd662475d63892987a8..911128efd067e9930d5c4e3bb045a046eaf00911 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -69,6 +69,8 @@ protected:
+     void processCSDWork(const int32_t bitstreamId, const C2Work* work);
+     void processWork(const int32_t bitstreamId, const C2Work* work);
+     void processWorkBuffer(const int32_t bitstreamId, const C2ConstLinearBlock& linearBlock);
++    // Copy |input| into a block of the size the device takes, for a client's block that is smaller.
++    bool stageInput(const C2ConstLinearBlock& input, C2ConstLinearBlock* staged);
+ 
+     // Get the buffer pool.
+     std::unique_ptr<VideoFramePool> getVideoFramePool(const ui::Size& size,
+@@ -104,6 +106,8 @@ protected:
+     std::shared_ptr<Listener> mListener;
+ 
+     std::unique_ptr<VideoDecoder> mDecoder;
++    // The pool of the blocks a smaller input block of the client is staged in, created on first use.
++    std::shared_ptr<C2BlockPool> mInputStagingPool;
+     // The queue of works that haven't processed and sent to |mDecoder|.
+     std::queue<std::unique_ptr<C2Work>> mPendingWorks;
+     // The works whose input buffers are sent to |mDecoder|. The key is the

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:44:24 +0900
+Subject: [PATCH] Embedding: CPUID ends the dispatch after itself
+
+x86's protocol for code that another processor changes has the writer
+store the code and then a flag, and the processor that runs the code
+wait for the flag and execute a serializing instruction before it
+runs the new code. CPUID is the serializing instruction user code
+has besides IRET. An embedding host that keeps translations of guest
+code looks for code changes between dispatches, but embedded CPUID ran
+in line and the dispatch went on, so a thread whose only barrier was
+CPUID ran the translation it held from before the flag.
+
+Embedded CPUID now ends with a new EmbedderSerialize op, which leaves
+the dispatch at the next instruction with EMBEDDER_EXIT_SERIALIZE,
+the instruction retired, as SYSCALL leaves it for the host's kernel.
+It costs an exit per CPUID, which programs avoid on hot paths anyway.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp | 12 ++++++++++++
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp   |  9 +++++++++
+ FEXCore/Source/Interface/IR/IR.json                  |  8 ++++++++
+ FEXCore/include/FEXCore/Core/CoreState.h             |  5 +++++
+ 4 files changed, 34 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+index ab60009bf2554263bd2ef232baf0bfbb08762e9e..84b56744f93d5d3d20e589cc658be52c370d369f 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+@@ -199,6 +199,18 @@ DEF_OP(EmbedderRaiseGP) {
+   cbnz_OrRestart(ARMEmitter::Size::i32Bit, GetReg(Op->Value), Entry);
+ }
+ 
++DEF_OP(EmbedderSerialize) {
++  const auto Op = IROp->C<IR::IROp_EmbedderSerialize>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderSerialize outside embedding");
++  auto Site = fextl::make_unique<EmbedderBudgetSite>();
++  Site->GuestRIP = Op->NextRIP;
++  Site->ExitReason = Core::EMBEDDER_EXIT_SERIALIZE;
++  Site->Unretired = EmbedderUnretired(true);
++  auto* Entry = &Site->Entry;
++  EmbedderBudgetSites.push_back(std::move(Site));
++  b_OrRestart(Entry);
++}
++
+ void Arm64JITCore::EmbedderAtomic(ARMEmitter::Register Address, uint32_t Size, std::function<void(ARMEmitter::Register)> Op) {
+   const auto Host = EmbedderTranslate(Address, Size, Core::EMBEDDER_ACCESS_ATOMIC);
+   auto* Site = EmbedderColdSites.back().get();
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index cf5bf6d1a295874f3678263dfab08d71291635cb..bc25dd2d4c59db2429b4193c5e3a122ec09d6f06 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -1581,6 +1581,15 @@ void OpDispatchBuilder::CPUIDOp(OpcodeArgs) {
+   StoreGPRRegister(X86State::REG_RBX, RBX);
+   StoreGPRRegister(X86State::REG_RCX, RCX);
+   StoreGPRRegister(X86State::REG_RDX, RDX);
++
++  if (CTX->Embedded) {
++    // CPUID serializes: the code after it is the code other processors
++    // stored before it, which the host checks for between dispatches. The
++    // exit spills the static registers, so commit cached writes first.
++    CalculateDeferredFlags();
++    FlushRegisterCache();
++    _EmbedderSerialize(Op->PC + Op->InstSize);
++  }
+ }
+ 
+ uint32_t OpDispatchBuilder::GetConstantShift(X86Tables::DecodedOp Op, bool Is1Bit) {
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index fa4f6846f8085789ce6f35ebf7ae7a9b231f5611..9c4e3d1e15cace91069c89a67bf1b53b409a69b8 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -806,6 +806,14 @@
+         "HasSideEffects": true
+       },
+ 
++      "EmbedderSerialize u64:$NextRIP": {
++        "Desc": ["Embedded only: leaves the dispatch at NextRIP with EMBEDDER_EXIT_SERIALIZE, the",
++                 "instruction retired. Ends a serializing instruction, after which x86 runs the code",
++                 "another processor stored before it, so the host looks for code changes first."
++                ],
++        "HasSideEffects": true
++      },
++
+       "CacheLineClear GPR:$Addr, i1:$Serialize": {
+         "Desc": ["Does a 64 byte cacheline clear at the address specified",
+                  "Only clears the data cachelines. Doesn't do any zeroing",
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 617b47ffbf1f948da63ff6bff9f1cdb88f64db76..9cd4892e387e0631be032454172c31793fcf99df 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -385,6 +385,11 @@ enum EmbedderExitReason : uint32_t {
+   // An access the alignment check found misaligned while RFLAGS.AC is set:
+   // RIP names the instruction, which has done nothing, and x86 raises #AC.
+   EMBEDDER_EXIT_ALIGNMENT_FAULT = 12,
++  // A serializing instruction, CPUID, retired: RIP names the next
++  // instruction. x86 runs code another processor stored before the
++  // instruction from there on, so the host looks for code changes before it
++  // runs on.
++  EMBEDDER_EXIT_SERIALIZE = 13,
+ };
+ 
+ // Access info passed to the TLB-miss stub.

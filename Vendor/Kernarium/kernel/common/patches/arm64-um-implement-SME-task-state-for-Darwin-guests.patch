@@ -1,0 +1,1929 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:08:44 +0900
+Subject: [PATCH] arm64: um: implement SME task state for Darwin guests
+
+Bridge ABI 16 lets the Darwin host implement SME for a run. When it
+does, darwin_uml_guest_sme_vector_length() reports the host's streaming
+vector length (SVL), and the kernel now gives each task what
+arch/arm64/kernel/fpsimd.c gives it on a CPU whose only SME vector
+length is that SVL. When it reports zero, every new path is inactive
+and the kernel behaves as before.
+
+Every arm64 bridge tail grows from 528 to 552 bytes: the FP registers
+are followed by TPIDR2_EL0, a pointer to the task's SME storage and its
+length. The storage holds Z0-Z31, P0-P15, ZA and ZT0 and is allocated
+the first time the host reports an SME access (event 11) or the kernel
+needs it. PSTATE.SM and PSTATE.ZA live in the task's SVCR, which the
+host no longer forces to zero.
+
+The kernel duties follow native arm64:
+
+- A syscall from streaming mode leaves it first: SM and the vector
+  state are cleared and FPSR reads as the native SMSTOP leaves it,
+  while ZA is kept.
+- Signal frames carry sve_context with SVE_SIG_FLAG_SM, tpidr2_context,
+  za_context and, with SME2 and ZA on, zt_context, moving the tail
+  into extra_context when it does not fit. A handler starts with SM
+  and ZA off and TPIDR2 zero; sigreturn parses the frame as
+  parse_user_sigframe() does and rejects what native arm64 rejects.
+- ptrace gains NT_ARM_TLS, NT_ARM_SSVE, NT_ARM_ZA and NT_ARM_ZT in a
+  regset view that exists only with SME.
+- AT_MINSIGSTKSZ reports the largest frame, PR_SME_SET_VL and
+  PR_SME_GET_VL and abi.sme_default_vector_length accept and report
+  the one SVL.
+- clone() with CLONE_VM gives the child no ZA and a zero TPIDR2; a
+  fork copies both. exec and task release free the storage.
+
+asm/elf.h now includes the native asm/hwcap.h, which uapi/asm/ptrace.h
+also pulls in, and replaces its ELF_HWCAP, ELF_HWCAP2 and ELF_HWCAP3, so
+every file sees the Darwin guest's hwcaps and binfmt_elf still emits no
+AT_HWCAP3.
+
+The ABI 16 copies also rename the unused state_flags word of the guest
+registers to dispatch_flags and define its first flag, which nothing
+sets yet.
+
+The x86_64-userspace slice never enables the code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/um/Kconfig                       |   5 +
+ arch/arm64/um/Makefile                      |   1 +
+ arch/arm64/um/asm/elf.h                     |  22 +-
+ arch/arm64/um/asm/processor.h               |  21 +
+ arch/arm64/um/ptrace.c                      |  63 ++-
+ arch/arm64/um/registers.c                   |  13 +-
+ arch/arm64/um/shared/sysdep/sme.h           |  46 ++
+ arch/arm64/um/signal.c                      |  36 +-
+ arch/arm64/um/signal_frame.h                |  23 +
+ arch/arm64/um/sme.c                         | 520 ++++++++++++++++++
+ arch/arm64/um/sme.h                         |  85 +++
+ arch/arm64/um/sme_signal.c                  | 563 ++++++++++++++++++++
+ arch/um/kernel/exec.c                       |   4 +
+ arch/um/kernel/process.c                    |   8 +
+ arch/um/os-Darwin/skas/process.c            |  34 ++
+ arch/um/os-Darwin/uml_darwin_abi.h          |  59 +-
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |   4 +-
+ arch/um/os-Darwin/uml_darwin_cpu.h          |   3 +
+ 18 files changed, 1487 insertions(+), 23 deletions(-)
+ create mode 100644 arch/arm64/um/shared/sysdep/sme.h
+ create mode 100644 arch/arm64/um/signal_frame.h
+ create mode 100644 arch/arm64/um/sme.c
+ create mode 100644 arch/arm64/um/sme.h
+ create mode 100644 arch/arm64/um/sme_signal.c
+
+diff --git a/arch/arm64/um/Kconfig b/arch/arm64/um/Kconfig
+index 0c6de0263b94e36efac04e2a398a6ac50f9c959e..8b8b7d797c4dfc841eaa5c8f1b3ddc888fda9e1f 100644
+--- a/arch/arm64/um/Kconfig
++++ b/arch/arm64/um/Kconfig
+@@ -21,6 +21,11 @@ config UML_ARM64
+ 	select ARCH_USE_QUEUED_RWLOCKS
+ 	select UML_SUBARCH_SUPPORTS_SMP
+ 
++# Every arm64 task carries SME registers in its Darwin bridge tail, and gets
++# SME task state when the host implements SME for the run.
++config UML_ARM64_SME
++	def_bool y
++
+ config ARCH_MMAP_RND_BITS_MIN
+ 	int
+ 	default 18
+diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
+index b3bbae6cd5a149976a91c3df809f696e79d83ef0..8fb8cd5c5933244bf3a8889ff565b177da73d682 100644
+--- a/arch/arm64/um/Makefile
++++ b/arch/arm64/um/Makefile
+@@ -2,6 +2,7 @@
+ 
+ obj-y := bugs.o delay.o fault.o mem.o ptrace.o registers.o setjmp.o \
+ 	signal.o subarch.o syscall_table.o syscalls.o sysrq.o tls.o
++obj-$(CONFIG_UML_ARM64_SME) += sme.o sme_signal.o
+ 
+ $(obj)/user-offsets.s: c_flags = -Wp,-MD,$(depfile) $(USER_CFLAGS)
+ targets += user-offsets.s
+diff --git a/arch/arm64/um/asm/elf.h b/arch/arm64/um/asm/elf.h
+index baaa7c8c27de70be2f0513cc137f7bf645fa19ab..0a1ed25d8ee34401c84f359b868b25654df5ebc7 100644
+--- a/arch/arm64/um/asm/elf.h
++++ b/arch/arm64/um/asm/elf.h
+@@ -4,7 +4,12 @@
+ 
+ #include <asm/user.h>
+ #include <asm/ptrace.h>
+-#include <uapi/asm/hwcap.h>
++/*
++ * The native header, which uapi/asm/ptrace.h also includes, defines ELF_HWCAP
++ * and friends for the native CPU feature code; including it first lets the
++ * definitions below replace those in every file.
++ */
++#include <asm/hwcap.h>
+ #include <uapi/linux/elf.h>
+ 
+ #define CORE_DUMP_USE_REGSET
+@@ -30,6 +35,9 @@
+  * every path selected for that engine; it never copies an unchecked host mask
+  * into the guest auxiliary vector.
+  */
++#undef ELF_HWCAP
++#undef ELF_HWCAP2
++#undef ELF_HWCAP3
+ #ifdef UML_HOST_DARWIN
+ extern unsigned long darwin_uml_guest_hwcap(void);
+ extern unsigned long darwin_uml_guest_hwcap2(void);
+@@ -76,6 +84,18 @@ typedef struct uml_arm64_fpsimd_state elf_fpregset_t;
+ #define FIXADDR_USER_START 0
+ #define FIXADDR_USER_END 0
+ 
++#ifdef CONFIG_UML_ARM64_SME
++/*
++ * With SME, AT_MINSIGSTKSZ gives the stack the largest signal frame needs,
++ * as on native arm64; without it the vector stays as it was.
++ */
++extern unsigned long uml_arm64_minsigstksz;
++#define ARCH_DLINFO do { \
++	if (uml_arm64_minsigstksz) \
++		NEW_AUX_ENT(AT_MINSIGSTKSZ, uml_arm64_minsigstksz); \
++} while (0)
++#endif
++
+ #ifdef UML_HOST_DARWIN
+ /* Maps the page that holds the sigreturn trampoline (signal.c). */
+ #define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
+diff --git a/arch/arm64/um/asm/processor.h b/arch/arm64/um/asm/processor.h
+index 6fd6da6c5816a452cec29b2cc4fe7605845236ad..c2b6adefd7bb47d9d13846bc2fe51664c6e0f067 100644
+--- a/arch/arm64/um/asm/processor.h
++++ b/arch/arm64/um/asm/processor.h
+@@ -11,6 +11,10 @@ struct arch_thread {
+ 	unsigned long tpidr_el0;
+ 	void *darwin_task;
+ 	struct faultinfo faultinfo;
++#ifdef CONFIG_UML_ARM64_SME
++	/* PR_SME_VL_INHERIT, which survives exec. */
++	bool sme_vl_inherit;
++#endif
+ };
+ 
+ #define INIT_ARCH_THREAD { .tpidr_el0 = 0, .darwin_task = NULL, \
+@@ -25,8 +29,25 @@ static inline void arch_copy_thread(struct arch_thread *from,
+ 			    struct arch_thread *to)
+ {
+ 	to->tpidr_el0 = from->tpidr_el0;
++#ifdef CONFIG_UML_ARM64_SME
++	to->sme_vl_inherit = from->sme_vl_inherit;
++#endif
+ }
+ 
++#ifdef CONFIG_UML_ARM64_SME
++/* SME task state (arch/arm64/um/sme.c), hooked into the common UML task
++ * lifecycle and prctl(). */
++struct task_struct;
++extern void uml_arm64_sme_dup_task(struct task_struct *dst);
++extern int uml_arm64_sme_copy_thread(struct task_struct *p,
++				     unsigned long clone_flags);
++extern void uml_arm64_sme_flush_thread(void);
++extern int uml_arm64_sme_set_current_vl(unsigned long arg);
++extern int uml_arm64_sme_get_current_vl(void);
++#define SME_SET_VL(arg) uml_arm64_sme_set_current_vl(arg)
++#define SME_GET_VL() uml_arm64_sme_get_current_vl()
++#endif
++
+ #define current_sp() ({ void *sp; asm("mov %0, sp" : "=r"(sp)); sp; })
+ #define current_bp() ({ unsigned long fp; asm("mov %0, x29" : "=r"(fp)); fp; })
+ 
+diff --git a/arch/arm64/um/ptrace.c b/arch/arm64/um/ptrace.c
+index 52e976dc7f84880c40d4616989f8eea484a7c172..fb694dd05be0296ea9d65ed4c9b0c1c777acd44c 100644
+--- a/arch/arm64/um/ptrace.c
++++ b/arch/arm64/um/ptrace.c
+@@ -7,6 +7,11 @@
+ #include <linux/uaccess.h>
+ #include <asm/ptrace.h>
+ #include <asm/user.h>
++#ifdef CONFIG_UML_ARM64_SME
++#include <asm/sigcontext.h>
++#include <uapi/asm/ptrace.h>
++#include "sme.h"
++#endif
+ 
+ static int register_index(int regno)
+ {
+@@ -117,10 +122,12 @@ static int genregs_set(struct task_struct *target,
+ 	return 0;
+ }
+ 
++/* The FPSIMD registers only: the SME registers after them in the task's
++ * tail are not the tracer's to read or write. */
+ static int fpregs_get(struct task_struct *target,
+ 		      const struct user_regset *regset, struct membuf to)
+ {
+-	membuf_write(&to, target->thread.regs.regs.fp, host_fp_size);
++	membuf_write(&to, target->thread.regs.regs.fp, sizeof(elf_fpregset_t));
+ 	return 0;
+ }
+ 
+@@ -130,7 +137,7 @@ static int fpregs_set(struct task_struct *target,
+ 		      const void *kbuf, const void __user *ubuf)
+ {
+ 	return user_regset_copyin(&pos, &count, &kbuf, &ubuf,
+-		target->thread.regs.regs.fp, 0, host_fp_size);
++		target->thread.regs.regs.fp, 0, sizeof(elf_fpregset_t));
+ }
+ 
+ static const struct user_regset uml_arm64_regsets[] = {
+@@ -150,17 +157,69 @@ static const struct user_regset uml_arm64_regsets[] = {
+ 		.regset_get = fpregs_get,
+ 		.set = fpregs_set,
+ 	},
++#ifdef CONFIG_UML_ARM64_SME
++	/* Only the SME view below has these, as native arm64 with SME. */
++	{
++		USER_REGSET_NOTE_TYPE(ARM_TLS),
++		.n = 2,
++		.size = sizeof(void *),
++		.align = sizeof(void *),
++		.regset_get = uml_arm64_tls_get,
++		.set = uml_arm64_tls_set,
++	},
++	{
++		USER_REGSET_NOTE_TYPE(ARM_SSVE),
++		.n = DIV_ROUND_UP(SVE_PT_SIZE(UML_ARM64_SME_VQ_MAX,
++					      SVE_PT_REGS_SVE), SVE_VQ_BYTES),
++		.size = SVE_VQ_BYTES,
++		.align = SVE_VQ_BYTES,
++		.regset_get = uml_arm64_ssve_get,
++		.set = uml_arm64_ssve_set,
++	},
++	{
++		USER_REGSET_NOTE_TYPE(ARM_ZA),
++		/* ZA is one variably sized register, reported in SVE_VQ_BYTES
++		 * units as the regset core requires. */
++		.n = DIV_ROUND_UP(ZA_PT_SIZE(UML_ARM64_SME_VQ_MAX),
++				  SVE_VQ_BYTES),
++		.size = SVE_VQ_BYTES,
++		.align = SVE_VQ_BYTES,
++		.regset_get = uml_arm64_za_get,
++		.set = uml_arm64_za_set,
++	},
++	{
++		USER_REGSET_NOTE_TYPE(ARM_ZT),
++		.n = 1,
++		.size = ZT_SIG_REG_BYTES,
++		.align = sizeof(u64),
++		.regset_get = uml_arm64_zt_get,
++		.set = uml_arm64_zt_set,
++	},
++#endif
+ };
+ 
+ static const struct user_regset_view uml_arm64_view = {
++	.name = "aarch64",
++	.e_machine = EM_AARCH64,
++	.regsets = uml_arm64_regsets,
++	.n = REGSET_FP + 1,
++};
++
++#ifdef CONFIG_UML_ARM64_SME
++static const struct user_regset_view uml_arm64_sme_view = {
+ 	.name = "aarch64",
+ 	.e_machine = EM_AARCH64,
+ 	.regsets = uml_arm64_regsets,
+ 	.n = ARRAY_SIZE(uml_arm64_regsets),
+ };
++#endif
+ 
+ const struct user_regset_view *
+ task_user_regset_view(struct task_struct *task)
+ {
++#ifdef CONFIG_UML_ARM64_SME
++	if (uml_arm64_sme_vl)
++		return &uml_arm64_sme_view;
++#endif
+ 	return &uml_arm64_view;
+ }
+diff --git a/arch/arm64/um/registers.c b/arch/arm64/um/registers.c
+index 4b6212171d60f0591c3cfe525540e0d082fd6eea..44e138e7e5bc31175eddfcf186e245d8562c4b1c 100644
+--- a/arch/arm64/um/registers.c
++++ b/arch/arm64/um/registers.c
+@@ -4,12 +4,21 @@
+ #include <linux/string.h>
+ #include <longjmp.h>
+ #include <registers.h>
++#include <sysdep/sme.h>
+ 
+-unsigned long host_fp_size = sizeof(elf_fpregset_t);
++/* The register tail every task hands the Darwin host: an arm64 task's FP
++ * registers and SME registers. */
++#ifdef CONFIG_UML_ARM64_SME
++#define UML_ARM64_HOST_FP_SIZE UML_ARM64_TASK_TAIL_SIZE
++#else
++#define UML_ARM64_HOST_FP_SIZE sizeof(elf_fpregset_t)
++#endif
++
++unsigned long host_fp_size = UML_ARM64_HOST_FP_SIZE;
+ 
+ int arch_init_registers(int pid)
+ {
+-	host_fp_size = sizeof(elf_fpregset_t);
++	host_fp_size = UML_ARM64_HOST_FP_SIZE;
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/um/shared/sysdep/sme.h b/arch/arm64/um/shared/sysdep/sme.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3fa29f90482f77da5dff90423328b3b36bb45855
+--- /dev/null
++++ b/arch/arm64/um/shared/sysdep/sme.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _SYSDEP_UM_ARM64_SME_H
++#define _SYSDEP_UM_ARM64_SME_H
++
++/*
++ * Every arm64 task's Darwin bridge tail holds its SME registers right after
++ * its 528-byte FP registers, whether or not the host implements SME for the
++ * run (struct darwin_uml_guest_sme_registers).  The Darwin side checks this
++ * mirror against the bridge header, which the kernel side cannot include.
++ */
++struct uml_arm64_sme_registers {
++	unsigned long long tpidr2;
++	/* The task's SME storage, UML_ARM64_SME_STATE_SIZE(svl) bytes. */
++	unsigned long long state;
++	unsigned int svl;
++	unsigned int reserved;
++};
++
++#define UML_ARM64_FP_REGISTERS_SIZE 528
++#define UML_ARM64_TASK_TAIL_SIZE \
++	(UML_ARM64_FP_REGISTERS_SIZE + sizeof(struct uml_arm64_sme_registers))
++#define UML_ARM64_SME_REGISTERS(fp) ((struct uml_arm64_sme_registers *) \
++	((char *)(fp) + UML_ARM64_FP_REGISTERS_SIZE))
++
++/*
++ * The storage holds Z0-Z31, P0-P15, ZA as svl horizontal vectors, then ZT0,
++ * for a streaming vector length of svl bytes.  The low 16 bytes of each Z
++ * are a copy of the matching V in the FP registers, which own them.
++ */
++#define UML_ARM64_SME_Z_OFFSET(svl, n) ((n) * (svl))
++#define UML_ARM64_SME_P_OFFSET(svl, n) (32 * (svl) + (n) * ((svl) / 8))
++#define UML_ARM64_SME_ZA_OFFSET(svl, row) (34 * (svl) + (row) * (svl))
++#define UML_ARM64_SME_ZT0_OFFSET(svl) (34 * (svl) + (svl) * (svl))
++#define UML_ARM64_SME_ZT0_SIZE 64
++#define UML_ARM64_SME_STATE_SIZE(svl) \
++	(UML_ARM64_SME_ZT0_OFFSET(svl) + UML_ARM64_SME_ZT0_SIZE)
++
++/* uml_pt_regs.svcr: PSTATE.SM and PSTATE.ZA. */
++#define UML_ARM64_SVCR_SM 0x1UL
++#define UML_ARM64_SVCR_ZA 0x2UL
++
++/* Kernel entry points of the Darwin user-mode return path. */
++extern void uml_arm64_sme_syscall_enter(void);
++extern int uml_arm64_sme_access(void);
++
++#endif
+diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
+index 1b8d3a726ec4b17e88bbecb795b980a3bdb446d9..134007a2cbb6bf0b2c6c035d67d0f17681fb97d2 100644
+--- a/arch/arm64/um/signal.c
++++ b/arch/arm64/um/signal.c
+@@ -14,19 +14,8 @@
+ #include <asm/ptrace.h>
+ #include <asm/sigcontext.h>
+ #include <asm/ucontext.h>
+-
+-struct uml_arm64_rt_sigframe {
+-	struct siginfo info;
+-	struct ucontext uc;
+-};
+-
+-/* As on native arm64, a frame record above the signal frame links the
+- * handler's frame chain to the interrupted context.
+- */
+-struct uml_arm64_frame_record {
+-	u64 fp;
+-	u64 lr;
+-};
++#include "signal_frame.h"
++#include "sme.h"
+ 
+ #ifdef UML_HOST_DARWIN
+ /* A handler without SA_RESTORER returns here, in the final guest page above
+@@ -162,7 +151,11 @@ static int restore_mcontext(struct pt_regs *regs,
+ 	error |= get_user(PT_REGS_PSTATE(regs), &context->pstate);
+ 	if (!error && !uml_arm64_valid_user_pstate(&PT_REGS_PSTATE(regs)))
+ 		error = -EINVAL;
+-	if (!error)
++	if (!error && uml_arm64_sme_vl)
++		error = uml_arm64_sme_restore_sigframe(regs, (void __user *)
++			((char __user *)context -
++			 offsetof(struct uml_arm64_rt_sigframe, uc.uc_mcontext)));
++	else if (!error)
+ 		error = restore_fpsimd_context(regs, context);
+ 	PT_REGS_SYSCALL_NR(regs) = -1;
+ 	return error;
+@@ -173,11 +166,20 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
+ {
+ 	struct uml_arm64_frame_record __user *record;
+ 	struct uml_arm64_rt_sigframe __user *frame;
++	unsigned long frame_size = sizeof(*frame);
+ 	unsigned long restorer;
+ 	int error = 0;
+ 
++	if (uml_arm64_sme_vl) {
++		long size = uml_arm64_sme_sigframe_size();
++
++		if (size < 0)
++			return 1;
++		frame_size = size;
++	}
++
+ 	record = (void __user *)round_down(stack_top - sizeof(*record), 16);
+-	frame = (void __user *)round_down((unsigned long)record - sizeof(*frame),
++	frame = (void __user *)round_down((unsigned long)record - frame_size,
+ 					  16);
+ 	if (!access_ok(frame, (unsigned long)(record + 1) - (unsigned long)frame))
+ 		return 1;
+@@ -191,6 +193,8 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
+ 	error |= save_mcontext(&frame->uc.uc_mcontext, regs);
+ 	if (ksig->ka.sa.sa_flags & SA_SIGINFO)
+ 		error |= copy_siginfo_to_user(&frame->info, &ksig->info);
++	if (!error && uml_arm64_sme_vl)
++		error = uml_arm64_sme_save_sigframe(frame, regs);
+ 	if (error)
+ 		return error;
+ 
+@@ -210,6 +214,8 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
+ 	PT_REGS_LR(regs) = restorer;
+ 	PT_REGS_SP(regs) = (unsigned long)frame;
+ 	PT_REGS_IP(regs) = (unsigned long)ksig->ka.sa.sa_handler;
++	if (uml_arm64_sme_vl)
++		uml_arm64_sme_enter_handler();
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/um/signal_frame.h b/arch/arm64/um/signal_frame.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9dbf6930d4663fb0590d486adad3b2d6853d666b
+--- /dev/null
++++ b/arch/arm64/um/signal_frame.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _UM_ARM64_SIGNAL_FRAME_H
++#define _UM_ARM64_SIGNAL_FRAME_H
++
++#include <linux/signal.h>
++#include <linux/types.h>
++#include <asm/ucontext.h>
++
++/* Native arm64's struct rt_sigframe. */
++struct uml_arm64_rt_sigframe {
++	struct siginfo info;
++	struct ucontext uc;
++};
++
++/* As on native arm64, a frame record above the signal frame links the
++ * handler's frame chain to the interrupted context.
++ */
++struct uml_arm64_frame_record {
++	u64 fp;
++	u64 lr;
++};
++
++#endif
+diff --git a/arch/arm64/um/sme.c b/arch/arm64/um/sme.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..797ee012bf04d02fa63a8700f47d4f888a99f5ad
+--- /dev/null
++++ b/arch/arm64/um/sme.c
+@@ -0,0 +1,520 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SME task state for Darwin guests.
++ *
++ * When the Darwin host implements SME for the run,
++ * darwin_uml_guest_sme_vector_length() reports its streaming vector length
++ * (SVL), the only one a task can have, and the kernel gives each task what
++ * arch/arm64/kernel/fpsimd.c gives it on a CPU whose only supported SME
++ * vector length is that SVL.  Otherwise every function here leaves the task
++ * alone and the kernel behaves as one without SME.
++ *
++ * A task's PSTATE.SM and PSTATE.ZA are uml_pt_regs.svcr.  TPIDR2_EL0 and the
++ * task's SME storage live in the SME registers of its bridge tail.  The
++ * storage is allocated, zeroed, the first time an instruction or the kernel
++ * needs it, and an SVCR with either bit set implies that it exists.  The
++ * host loads and stores it around each entry, so the kernel may touch it
++ * only while the task is out of the guest.
++ */
++
++#include <linux/init.h>
++#include <linux/log2.h>
++#include <linux/prctl.h>
++#include <linux/regset.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/sysctl.h>
++#include <asm/elf.h>
++#include <asm/processor.h>
++#include <asm/sigcontext.h>
++#include <uapi/asm/ptrace.h>
++#include "sme.h"
++
++unsigned int uml_arm64_sme_vl __ro_after_init;
++bool uml_arm64_sme2 __ro_after_init;
++
++#ifdef UML_HOST_DARWIN
++extern unsigned long darwin_uml_guest_sme_vector_length(void);
++#define sme_host_vector_length() darwin_uml_guest_sme_vector_length()
++#define sme_host_hwcap2() darwin_uml_guest_hwcap2()
++#else
++#define sme_host_vector_length() 0UL
++#define sme_host_hwcap2() 0UL
++#endif
++
++static int __init uml_arm64_sme_init(void)
++{
++	unsigned long vl = sme_host_vector_length();
++
++	BUILD_BUG_ON(sizeof(elf_fpregset_t) != UML_ARM64_FP_REGISTERS_SIZE);
++	BUILD_BUG_ON(sizeof(struct uml_arm64_sme_registers) != 24);
++	if (!vl)
++		return 0;
++	/* An SME implementation's vector length is a power of two from 16 to
++	 * 256 bytes. */
++	if (WARN(!is_power_of_2(vl) || vl < 16 || vl > 256,
++		 "Darwin: invalid SME vector length %lu\n", vl))
++		return 0;
++	uml_arm64_sme_vl = vl;
++	uml_arm64_sme2 = sme_host_hwcap2() & HWCAP2_SME2;
++	return 0;
++}
++early_initcall(uml_arm64_sme_init);
++
++int uml_arm64_sme_alloc(struct task_struct *task)
++{
++	struct uml_arm64_sme_registers *sme = uml_arm64_sme_registers(task);
++	void *state;
++
++	if (sme->state)
++		return 0;
++	state = kzalloc(UML_ARM64_SME_STATE_SIZE(uml_arm64_sme_vl), GFP_KERNEL);
++	if (!state)
++		return -ENOMEM;
++	sme->state = (unsigned long)state;
++	sme->svl = uml_arm64_sme_vl;
++	return 0;
++}
++
++static void sme_free(struct task_struct *task)
++{
++	struct uml_arm64_sme_registers *sme = uml_arm64_sme_registers(task);
++
++	kfree(uml_arm64_sme_state(task));
++	sme->state = 0;
++	sme->svl = 0;
++}
++
++/*
++ * Native task_smstop_sm(): leaving streaming mode zeroes every vector
++ * register and sets FPSR as ResetSVEState() does.  Z and P become dead, so
++ * the storage keeps whatever it held.
++ */
++void uml_arm64_task_smstop_sm(struct task_struct *task)
++{
++	elf_fpregset_t *fp = uml_arm64_fp_registers(task);
++
++	if (!(*uml_arm64_svcr(task) & UML_ARM64_SVCR_SM))
++		return;
++	memset(fp->vregs, 0, sizeof(fp->vregs));
++	fp->fpsr = 0x0800009f;
++	*uml_arm64_svcr(task) &= ~UML_ARM64_SVCR_SM;
++}
++
++/*
++ * A system call leaves streaming mode and keeps ZA, as native
++ * fpsimd_syscall_enter() does, before a tracer's syscall-entry stop can
++ * look at the task.
++ */
++void uml_arm64_sme_syscall_enter(void)
++{
++	uml_arm64_task_smstop_sm(current);
++}
++
++/*
++ * DARWIN_UML_EVENT_SME_ACCESS: an instruction needs SME storage the task
++ * does not have yet; native do_sme_acc() allocates it, or kills the task.
++ * The host re-enters at the same instruction.
++ */
++int uml_arm64_sme_access(void)
++{
++	if (WARN_ON_ONCE(!uml_arm64_sme_vl))
++		return -EINVAL;
++	if (uml_arm64_sme_alloc(current)) {
++		force_sig(SIGKILL);
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++/*
++ * arch_dup_task_struct() copied the parent's tail; drop its storage pointer
++ * before anything can fail and free the child.
++ */
++void uml_arm64_sme_dup_task(struct task_struct *dst)
++{
++	struct uml_arm64_sme_registers *sme = uml_arm64_sme_registers(dst);
++
++	sme->state = 0;
++	sme->svl = 0;
++}
++
++/*
++ * copy_thread() for a user task, after it copied the parent's registers:
++ * the child starts outside streaming mode with ZA off, as native
++ * arch_dup_task_struct() leaves it.  A child with its own mm then inherits
++ * TPIDR2 and a copy of live ZA and ZT0, as copy_thread_za() gives it,
++ * because a lazily saved ZA may be dormant behind TPIDR2.  A child sharing
++ * the mm must not inherit TPIDR2, whose save block is on another task's
++ * stack.
++ */
++int uml_arm64_sme_copy_thread(struct task_struct *p, unsigned long clone_flags)
++{
++	struct uml_arm64_sme_registers *sme = uml_arm64_sme_registers(p);
++	void *state;
++
++	uml_arm64_sme_dup_task(p);
++	if (!uml_arm64_sme_vl)
++		return 0;
++	uml_arm64_task_smstop_sm(p);
++	*uml_arm64_svcr(p) &= ~UML_ARM64_SVCR_ZA;
++	if (clone_flags & CLONE_VM) {
++		sme->tpidr2 = 0;
++		return 0;
++	}
++	if (!(*uml_arm64_svcr(current) & UML_ARM64_SVCR_ZA) ||
++	    WARN_ON_ONCE(!uml_arm64_sme_state(current)))
++		return 0;
++	state = kmemdup(uml_arm64_sme_state(current),
++			UML_ARM64_SME_STATE_SIZE(uml_arm64_sme_vl), GFP_KERNEL);
++	if (!state)
++		return -ENOMEM;
++	sme->state = (unsigned long)state;
++	sme->svl = uml_arm64_sme_vl;
++	*uml_arm64_svcr(p) |= UML_ARM64_SVCR_ZA;
++	return 0;
++}
++
++/*
++ * exec, before flush_thread() clears the registers: native
++ * fpsimd_flush_thread() frees the storage and resets the vector length,
++ * which here is always the SVL; only the inherit flag survives.
++ */
++void uml_arm64_sme_flush_thread(void)
++{
++	if (uml_arm64_sme_vl)
++		sme_free(current);
++}
++
++void arch_release_task_struct(struct task_struct *task)
++{
++	if (uml_arm64_sme_vl)
++		sme_free(task);
++}
++
++/*
++ * vec_set_vector_length() for a CPU with one supported length: every valid
++ * length resolves to the SVL, as find_supported_vector_length() resolves
++ * it, so the live length never changes and an exec-time length always
++ * equals it.  What remains is the inherit flag.
++ */
++int uml_arm64_sme_set_vector_length(struct task_struct *task, unsigned long vl,
++				    unsigned long flags)
++{
++	if (flags & ~(unsigned long)(PR_SME_VL_INHERIT | PR_SME_SET_VL_ONEXEC))
++		return -EINVAL;
++	if (!sve_vl_valid(vl))
++		return -EINVAL;
++	task->thread.arch.sme_vl_inherit = !!(flags & PR_SME_VL_INHERIT);
++	return 0;
++}
++
++static int sme_prctl_status(void)
++{
++	int status = uml_arm64_sme_vl;
++
++	if (current->thread.arch.sme_vl_inherit)
++		status |= PR_SME_VL_INHERIT;
++	return status;
++}
++
++/* PR_SME_SET_VL */
++int uml_arm64_sme_set_current_vl(unsigned long arg)
++{
++	unsigned long vl = arg & PR_SME_VL_LEN_MASK;
++	int error;
++
++	if (!uml_arm64_sme_vl)
++		return -EINVAL;
++	error = uml_arm64_sme_set_vector_length(current, vl, arg & ~vl);
++	return error ?: sme_prctl_status();
++}
++
++/* PR_SME_GET_VL */
++int uml_arm64_sme_get_current_vl(void)
++{
++	return uml_arm64_sme_vl ? sme_prctl_status() : -EINVAL;
++}
++
++#ifdef CONFIG_SYSCTL
++/* /proc/sys/abi/sme_default_vector_length reads the SVL and accepts, with
++ * no effect, any valid length or -1, which natively select the SVL too. */
++static int sme_proc_do_default_vl(const struct ctl_table *table, int write,
++				  void *buffer, size_t *lenp, loff_t *ppos)
++{
++	int vl = uml_arm64_sme_vl;
++	struct ctl_table value = {
++		.data = &vl,
++		.maxlen = sizeof(vl),
++	};
++	int error = proc_dointvec(&value, write, buffer, lenp, ppos);
++
++	if (error || !write || vl == -1)
++		return error;
++	return sve_vl_valid(vl) ? 0 : -EINVAL;
++}
++
++static const struct ctl_table sme_default_vl_table[] = {
++	{
++		.procname = "sme_default_vector_length",
++		.mode = 0644,
++		.proc_handler = sme_proc_do_default_vl,
++	},
++};
++
++static int __init sme_sysctl_init(void)
++{
++	if (uml_arm64_sme_vl && !register_sysctl("abi", sme_default_vl_table))
++		return -EINVAL;
++	return 0;
++}
++core_initcall(sme_sysctl_init);
++#endif
++
++/*
++ * Regsets (native ptrace.c).  There is no NT_ARM_SVE: without non-streaming
++ * SVE the streaming registers are NT_ARM_SSVE, present while SM is set.
++ */
++
++/* NT_ARM_TLS: TPIDR_EL0, then TPIDR2_EL0. */
++int uml_arm64_tls_get(struct task_struct *target,
++		      const struct user_regset *regset, struct membuf to)
++{
++	membuf_store(&to, target->thread.arch.tpidr_el0);
++	return membuf_store(&to, uml_arm64_sme_registers(target)->tpidr2);
++}
++
++int uml_arm64_tls_set(struct task_struct *target,
++		      const struct user_regset *regset, unsigned int pos,
++		      unsigned int count, const void *kbuf,
++		      const void __user *ubuf)
++{
++	unsigned long tls[2] = {
++		target->thread.arch.tpidr_el0,
++		uml_arm64_sme_registers(target)->tpidr2,
++	};
++	int error;
++
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf, tls, 0,
++				   sizeof(tls));
++	if (error)
++		return error;
++	target->thread.arch.tpidr_el0 = tls[0];
++	uml_arm64_sme_registers(target)->tpidr2 = tls[1];
++	return 0;
++}
++
++static unsigned int sme_vq(void)
++{
++	return sve_vq_from_vl(uml_arm64_sme_vl);
++}
++
++/* NT_ARM_SSVE (native sve_get_common() for ARM64_VEC_SME). */
++int uml_arm64_ssve_get(struct task_struct *target,
++		       const struct user_regset *regset, struct membuf to)
++{
++	const elf_fpregset_t *fp = uml_arm64_fp_registers(target);
++	const u8 *state = uml_arm64_sme_state(target);
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sme_vq();
++	bool active = *uml_arm64_svcr(target) & UML_ARM64_SVCR_SM;
++	struct user_sve_header header = {
++		.vl = vl,
++		.max_vl = vl,
++		.flags = active ? SVE_PT_REGS_SVE : SVE_PT_REGS_FPSIMD,
++		.max_size = SVE_PT_SIZE(vq, SVE_PT_REGS_SVE),
++	};
++	int index;
++
++	if (target->thread.arch.sme_vl_inherit)
++		header.flags |= SVE_PT_VL_INHERIT;
++	header.size = active ? SVE_PT_SIZE(vq, header.flags) : sizeof(header);
++	membuf_write(&to, &header, sizeof(header));
++	if (!active)
++		return to.left;
++	/* Z with the FP registers' low 16 bytes, P, and a zero FFR. */
++	for (index = 0; index < 32; index++) {
++		membuf_write(&to, &fp->vregs[index], sizeof(fp->vregs[index]));
++		membuf_write(&to, state + UML_ARM64_SME_Z_OFFSET(vl, index) +
++			     sizeof(fp->vregs[index]),
++			     vl - sizeof(fp->vregs[index]));
++	}
++	membuf_write(&to, state + UML_ARM64_SME_P_OFFSET(vl, 0), 2 * vl);
++	membuf_zero(&to, SVE_PT_SVE_FPSR_OFFSET(vq) -
++		    SVE_PT_SVE_FFR_OFFSET(vq));
++	membuf_write(&to, &fp->fpsr, sizeof(fp->fpsr));
++	membuf_write(&to, &fp->fpcr, sizeof(fp->fpcr));
++	return membuf_zero(&to, ALIGN(header.size, SVE_VQ_BYTES) -
++			   (SVE_PT_SVE_FPCR_OFFSET(vq) + SVE_PT_SVE_FPCR_SIZE));
++}
++
++/*
++ * Native sve_set_common() for ARM64_VEC_SME: the task enters streaming mode
++ * with zeroed Z, P, V, FPSR and FPCR, then takes what the tracer supplies;
++ * ZA is kept.
++ */
++int uml_arm64_ssve_set(struct task_struct *target,
++		       const struct user_regset *regset, unsigned int pos,
++		       unsigned int count, const void *kbuf,
++		       const void __user *ubuf)
++{
++	elf_fpregset_t *fp = uml_arm64_fp_registers(target);
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sme_vq();
++	struct user_sve_header header;
++	u8 *state;
++	int index;
++	int error;
++
++	if (count < sizeof(header))
++		return -EINVAL;
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &header, 0,
++				   sizeof(header));
++	if (error)
++		return error;
++	/* Streaming registers exist only in SVE format. */
++	if ((header.flags & SVE_PT_REGS_MASK) == SVE_PT_REGS_FPSIMD)
++		return -EINVAL;
++	error = uml_arm64_sme_set_vector_length(target, header.vl,
++		((unsigned long)header.flags & ~SVE_PT_REGS_MASK) << 16);
++	if (error)
++		return error;
++	error = uml_arm64_sme_alloc(target);
++	if (error)
++		return error;
++	state = uml_arm64_sme_state(target);
++	memset(state, 0, UML_ARM64_SME_ZA_OFFSET(vl, 0));
++	*uml_arm64_svcr(target) |= UML_ARM64_SVCR_SM;
++	memset(fp, 0, sizeof(*fp));
++	if (count && vq != sve_vq_from_vl(header.vl))
++		return -EIO;
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf, state,
++				   SVE_PT_SVE_OFFSET, SVE_PT_SVE_FFR_OFFSET(vq));
++	if (!error) {
++		user_regset_copyin_ignore(&pos, &count, &kbuf, &ubuf,
++					  SVE_PT_SVE_FFR_OFFSET(vq),
++					  SVE_PT_SVE_FPSR_OFFSET(vq));
++		error = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++					   &fp->fpsr, SVE_PT_SVE_FPSR_OFFSET(vq),
++					   SVE_PT_SVE_FPCR_OFFSET(vq) +
++					   SVE_PT_SVE_FPCR_SIZE);
++	}
++	/* The FP registers own V, the low 16 bytes of each Z. */
++	for (index = 0; index < 32; index++)
++		memcpy(&fp->vregs[index],
++		       state + UML_ARM64_SME_Z_OFFSET(vl, index),
++		       sizeof(fp->vregs[index]));
++	return error;
++}
++
++/* NT_ARM_ZA (native za_get()). */
++int uml_arm64_za_get(struct task_struct *target,
++		     const struct user_regset *regset, struct membuf to)
++{
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sme_vq();
++	bool active = *uml_arm64_svcr(target) & UML_ARM64_SVCR_ZA;
++	struct user_za_header header = {
++		.vl = vl,
++		.max_vl = vl,
++		.max_size = ZA_PT_SIZE(vq),
++		.size = active ? ZA_PT_SIZE(vq) : ZA_PT_ZA_OFFSET,
++	};
++
++	if (target->thread.arch.sme_vl_inherit)
++		header.flags |= ZA_PT_VL_INHERIT;
++	membuf_write(&to, &header, sizeof(header));
++	if (active)
++		membuf_write(&to, uml_arm64_sme_state(target) +
++			     UML_ARM64_SME_ZA_OFFSET(vl, 0), ZA_PT_ZA_SIZE(vq));
++	return membuf_zero(&to, ALIGN(header.size, SVE_VQ_BYTES) - header.size);
++}
++
++/* ZA and ZT0 become zero whenever PSTATE.ZA turns on. */
++static void sme_zero_za(u8 *state)
++{
++	unsigned int vl = uml_arm64_sme_vl;
++
++	memset(state + UML_ARM64_SME_ZA_OFFSET(vl, 0), 0,
++	       UML_ARM64_SME_STATE_SIZE(vl) - UML_ARM64_SME_ZA_OFFSET(vl, 0));
++}
++
++/* NT_ARM_ZA (native za_set()): no data turns ZA off. */
++int uml_arm64_za_set(struct task_struct *target,
++		     const struct user_regset *regset, unsigned int pos,
++		     unsigned int count, const void *kbuf,
++		     const void __user *ubuf)
++{
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sme_vq();
++	struct user_za_header header;
++	int error;
++
++	if (count < sizeof(header))
++		return -EINVAL;
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &header, 0,
++				   sizeof(header));
++	if (error)
++		return error;
++	error = uml_arm64_sme_set_vector_length(target, header.vl,
++		(unsigned long)header.flags << 16);
++	if (error)
++		return error;
++	error = uml_arm64_sme_alloc(target);
++	if (error)
++		return error;
++	if (!(*uml_arm64_svcr(target) & UML_ARM64_SVCR_ZA))
++		sme_zero_za(uml_arm64_sme_state(target));
++	if (!count) {
++		*uml_arm64_svcr(target) &= ~UML_ARM64_SVCR_ZA;
++		return 0;
++	}
++	if (vq != sve_vq_from_vl(header.vl))
++		return -EIO;
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++				   uml_arm64_sme_state(target) +
++				   UML_ARM64_SME_ZA_OFFSET(vl, 0),
++				   ZA_PT_ZA_OFFSET, ZA_PT_SIZE(vq));
++	if (!error)
++		*uml_arm64_svcr(target) |= UML_ARM64_SVCR_ZA;
++	return error;
++}
++
++/* NT_ARM_ZT, with SME2: ZT0, which reads as zero while ZA is off. */
++int uml_arm64_zt_get(struct task_struct *target,
++		     const struct user_regset *regset, struct membuf to)
++{
++	if (!uml_arm64_sme2)
++		return -EINVAL;
++	if (*uml_arm64_svcr(target) & UML_ARM64_SVCR_ZA)
++		return membuf_write(&to, uml_arm64_sme_state(target) +
++				    UML_ARM64_SME_ZT0_OFFSET(uml_arm64_sme_vl),
++				    ZT_SIG_REG_BYTES);
++	return membuf_zero(&to, ZT_SIG_REG_BYTES);
++}
++
++/* Writing ZT0 turns ZA on, zeroing ZA if it was off. */
++int uml_arm64_zt_set(struct task_struct *target,
++		     const struct user_regset *regset, unsigned int pos,
++		     unsigned int count, const void *kbuf,
++		     const void __user *ubuf)
++{
++	int error;
++
++	if (!uml_arm64_sme2)
++		return -EINVAL;
++	error = uml_arm64_sme_alloc(target);
++	if (error)
++		return error;
++	if (!(*uml_arm64_svcr(target) & UML_ARM64_SVCR_ZA))
++		sme_zero_za(uml_arm64_sme_state(target));
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++				   uml_arm64_sme_state(target) +
++				   UML_ARM64_SME_ZT0_OFFSET(uml_arm64_sme_vl),
++				   0, ZT_SIG_REG_BYTES);
++	if (!error)
++		*uml_arm64_svcr(target) |= UML_ARM64_SVCR_ZA;
++	return error;
++}
+diff --git a/arch/arm64/um/sme.h b/arch/arm64/um/sme.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4afc2a47cac963ca6cffe77bdac399708c3a5dc4
+--- /dev/null
++++ b/arch/arm64/um/sme.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _UM_ARM64_SME_H
++#define _UM_ARM64_SME_H
++
++#include <linux/elf.h>
++#include <linux/sched.h>
++#include <sysdep/sme.h>
++
++/* The largest streaming vector length an SME CPU can have, in quadwords. */
++#define UML_ARM64_SME_VQ_MAX 16
++
++#ifdef CONFIG_UML_ARM64_SME
++/*
++ * The streaming vector length in bytes when the Darwin host implements SME
++ * for this run, the only one a task can have, else 0.  Every SME duty of the
++ * kernel is active only while it is non-zero.
++ */
++extern unsigned int uml_arm64_sme_vl;
++/* Whether the virtual CPU implements SME2, and with it ZT0. */
++extern bool uml_arm64_sme2;
++#else
++#define uml_arm64_sme_vl 0U
++#define uml_arm64_sme2 false
++#endif
++
++static inline elf_fpregset_t *uml_arm64_fp_registers(struct task_struct *task)
++{
++	return (elf_fpregset_t *)task->thread.regs.regs.fp;
++}
++
++static inline struct uml_arm64_sme_registers *
++uml_arm64_sme_registers(struct task_struct *task)
++{
++	return UML_ARM64_SME_REGISTERS(task->thread.regs.regs.fp);
++}
++
++/* The task's SME storage, or NULL while it has none. */
++static inline u8 *uml_arm64_sme_state(struct task_struct *task)
++{
++	return (u8 *)(unsigned long)uml_arm64_sme_registers(task)->state;
++}
++
++static inline unsigned long *uml_arm64_svcr(struct task_struct *task)
++{
++	return &task->thread.regs.regs.svcr;
++}
++
++struct membuf;
++struct pt_regs;
++struct uml_arm64_rt_sigframe;
++struct user_regset;
++
++int uml_arm64_sme_alloc(struct task_struct *task);
++void uml_arm64_task_smstop_sm(struct task_struct *task);
++int uml_arm64_sme_set_vector_length(struct task_struct *task, unsigned long vl,
++				    unsigned long flags);
++
++#define UML_ARM64_SME_REGSET_OPS(name) \
++int uml_arm64_##name##_get(struct task_struct *target, \
++			   const struct user_regset *regset, \
++			   struct membuf to); \
++int uml_arm64_##name##_set(struct task_struct *target, \
++			   const struct user_regset *regset, \
++			   unsigned int pos, unsigned int count, \
++			   const void *kbuf, const void __user *ubuf)
++UML_ARM64_SME_REGSET_OPS(tls);
++UML_ARM64_SME_REGSET_OPS(ssve);
++UML_ARM64_SME_REGSET_OPS(za);
++UML_ARM64_SME_REGSET_OPS(zt);
++#undef UML_ARM64_SME_REGSET_OPS
++
++/*
++ * Signal frames with SME records (sme_signal.c), for signal.c to call while
++ * uml_arm64_sme_vl is non-zero: the size of the current task's frame or a
++ * negative error, writing its SME records, sigreturn's parse and restore of
++ * every record, and the state a handler starts in.
++ */
++long uml_arm64_sme_sigframe_size(void);
++int uml_arm64_sme_save_sigframe(struct uml_arm64_rt_sigframe __user *frame,
++				struct pt_regs *regs);
++int uml_arm64_sme_restore_sigframe(struct pt_regs *regs,
++				   struct uml_arm64_rt_sigframe __user *frame);
++void uml_arm64_sme_enter_handler(void);
++
++#endif
+diff --git a/arch/arm64/um/sme_signal.c b/arch/arm64/um/sme_signal.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..885da55b1b255355e796e535529460093bb01ef3
+--- /dev/null
++++ b/arch/arm64/um/sme_signal.c
+@@ -0,0 +1,563 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SME records of Darwin guest signal frames (see sme.c).
++ */
++
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/signal.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <asm/elf.h>
++#include <asm/ptrace.h>
++#include <asm/sigcontext.h>
++#include "signal_frame.h"
++#include "sme.h"
++
++/*
++ * When the host implements SME, a signal frame takes native arm64's layout
++ * (arch/arm64/kernel/signal.c): records after fpsimd_context, which fill
++ * __reserved and continue behind an extra_context, then a terminator.  An
++ * SME frame holds sve_context, with the streaming registers while SM is set
++ * (there is no non-streaming SVE, so its VL is 0 otherwise), tpidr2_context,
++ * za_context, with ZA while it is live, and, with SME2, zt_context while ZA
++ * is live.  Like the FPSIMD-only frame it carries no esr_context.
++ */
++struct sme_sigframe_layout {
++	unsigned long size;
++	unsigned long limit;
++	unsigned long sve_offset;
++	unsigned long tpidr2_offset;
++	unsigned long za_offset;
++	unsigned long zt_offset;
++	unsigned long extra_offset;
++	unsigned long end_offset;
++};
++
++#define SME_TERMINATOR_SIZE round_up(sizeof(struct _aarch64_ctx), 16)
++#define SME_EXTRA_CONTEXT_SIZE round_up(sizeof(struct extra_context), 16)
++/* Native SIGFRAME_MAXSZ, the parser's bound on a frame. */
++#define SME_SIGFRAME_MAXSZ SZ_256K
++
++static void sme_init_layout(struct sme_sigframe_layout *user)
++{
++	memset(user, 0, sizeof(*user));
++	user->size = offsetof(struct uml_arm64_rt_sigframe,
++			      uc.uc_mcontext.__reserved);
++	user->limit = user->size +
++		sizeof(((struct sigcontext *)NULL)->__reserved) -
++		SME_TERMINATOR_SIZE - SME_EXTRA_CONTEXT_SIZE;
++}
++
++static unsigned long sme_sigframe_size(const struct sme_sigframe_layout *user)
++{
++	return round_up(max_t(unsigned long, user->size,
++			      sizeof(struct uml_arm64_rt_sigframe)), 16);
++}
++
++static int __sme_sigframe_alloc(struct sme_sigframe_layout *user,
++				unsigned long *offset, size_t size, bool extend)
++{
++	size_t padded_size = round_up(size, 16);
++
++	if (padded_size > user->limit - user->size && !user->extra_offset &&
++	    extend) {
++		int error;
++
++		user->limit += SME_EXTRA_CONTEXT_SIZE;
++		error = __sme_sigframe_alloc(user, &user->extra_offset,
++					     sizeof(struct extra_context), false);
++		if (error) {
++			user->limit -= SME_EXTRA_CONTEXT_SIZE;
++			return error;
++		}
++		/* The terminator of __reserved, then the extra space. */
++		user->size += SME_TERMINATOR_SIZE;
++		user->limit = SME_SIGFRAME_MAXSZ - SME_TERMINATOR_SIZE;
++	}
++	if (padded_size > user->limit - user->size)
++		return -ENOMEM;
++	*offset = user->size;
++	user->size += padded_size;
++	return 0;
++}
++
++static int sme_sigframe_alloc(struct sme_sigframe_layout *user,
++			      unsigned long *offset, size_t size)
++{
++	return __sme_sigframe_alloc(user, offset, size, true);
++}
++
++/*
++ * The layout of a frame for the current task, or with add_all the largest
++ * one any task can need (native setup_sigframe_layout(); unlike native,
++ * add_all includes ZA's data, so AT_MINSIGSTKSZ covers a frame with ZA
++ * live).
++ */
++static int sme_setup_layout(struct sme_sigframe_layout *user, bool add_all)
++{
++	unsigned long svcr = add_all ? 0 : *uml_arm64_svcr(current);
++	unsigned int vq = sve_vq_from_vl(uml_arm64_sme_vl);
++	unsigned long fpsimd_offset;
++	int error;
++
++	error = sme_sigframe_alloc(user, &fpsimd_offset,
++				   sizeof(struct fpsimd_context));
++	if (!error)
++		error = sme_sigframe_alloc(user, &user->sve_offset,
++			SVE_SIG_CONTEXT_SIZE(add_all ||
++				(svcr & UML_ARM64_SVCR_SM) ? vq : 0));
++	if (!error)
++		error = sme_sigframe_alloc(user, &user->tpidr2_offset,
++					   sizeof(struct tpidr2_context));
++	if (!error)
++		error = sme_sigframe_alloc(user, &user->za_offset,
++			ZA_SIG_CONTEXT_SIZE(add_all ||
++				(svcr & UML_ARM64_SVCR_ZA) ? vq : 0));
++	if (!error && uml_arm64_sme2 &&
++	    (add_all || (svcr & UML_ARM64_SVCR_ZA)))
++		error = sme_sigframe_alloc(user, &user->zt_offset,
++					   ZT_SIG_CONTEXT_SIZE(1));
++	if (error)
++		return error;
++	/* The terminator, and no allocation after it. */
++	user->limit += SME_TERMINATOR_SIZE;
++	error = sme_sigframe_alloc(user, &user->end_offset,
++				   sizeof(struct _aarch64_ctx));
++	user->limit = user->size;
++	return error;
++}
++
++/* Native signal_minsigstksz, the auxiliary vector's AT_MINSIGSTKSZ. */
++unsigned long uml_arm64_minsigstksz __ro_after_init;
++
++static int __init uml_arm64_minsigstksz_setup(void)
++{
++	struct sme_sigframe_layout user;
++
++	if (!uml_arm64_sme_vl)
++		return 0;
++	sme_init_layout(&user);
++	if (WARN_ON(sme_setup_layout(&user, true)))
++		return 0;
++	uml_arm64_minsigstksz = sme_sigframe_size(&user) +
++		round_up(sizeof(struct uml_arm64_frame_record), 16) +
++		16; /* the frame record's alignment */
++	return 0;
++}
++arch_initcall(uml_arm64_minsigstksz_setup);
++
++/* A record's head; its size is padded to 16 bytes, as native's is. */
++static int sme_put_head(struct _aarch64_ctx __user *head, u32 magic, u32 size)
++{
++	return put_user(magic, &head->magic) |
++		put_user(round_up(size, 16), &head->size);
++}
++
++/*
++ * The streaming Z and P registers in native sve_context layout, which is the
++ * storage's.  The FP registers own the low 16 bytes of each Z.  FFR does not
++ * exist in streaming mode without FA64 and reads as zero, as native
++ * sve_save_state() stores it.
++ */
++static int sme_save_streaming(char __user *data, const elf_fpregset_t *fp,
++			      const u8 *state)
++{
++	unsigned int vl = uml_arm64_sme_vl;
++	int index;
++
++	if (copy_to_user(data, state, UML_ARM64_SME_ZA_OFFSET(vl, 0)))
++		return -EFAULT;
++	for (index = 0; index < 32; index++)
++		if (copy_to_user(data + UML_ARM64_SME_Z_OFFSET(vl, index),
++				 &fp->vregs[index], sizeof(fp->vregs[index])))
++			return -EFAULT;
++	return clear_user(data + UML_ARM64_SME_ZA_OFFSET(vl, 0), vl / 8) ?
++		-EFAULT : 0;
++}
++
++static int sme_save_records(const struct sme_sigframe_layout *user,
++			    struct uml_arm64_rt_sigframe __user *frame,
++			    struct pt_regs *regs)
++{
++	char __user *base = (char __user *)frame;
++	const elf_fpregset_t *fp = (const void *)regs->regs.fp;
++	const u8 *state = uml_arm64_sme_state(current);
++	unsigned long svcr = *uml_arm64_svcr(current);
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sve_vq_from_vl(vl);
++	struct sve_context __user *sve = (void __user *)(base + user->sve_offset);
++	struct tpidr2_context __user *tpidr2 =
++		(void __user *)(base + user->tpidr2_offset);
++	struct za_context __user *za = (void __user *)(base + user->za_offset);
++	struct _aarch64_ctx __user *end =
++		(void __user *)(base + user->end_offset);
++	bool streaming = svcr & UML_ARM64_SVCR_SM;
++	bool za_live = svcr & UML_ARM64_SVCR_ZA;
++	int error;
++
++	error = sme_put_head(&sve->head, SVE_MAGIC,
++			     SVE_SIG_CONTEXT_SIZE(streaming ? vq : 0));
++	error |= put_user(streaming ? vl : 0, &sve->vl);
++	error |= put_user(streaming ? SVE_SIG_FLAG_SM : 0, &sve->flags);
++	error |= clear_user(sve->__reserved, sizeof(sve->__reserved)) ?
++		-EFAULT : 0;
++	if (!error && streaming)
++		error = sme_save_streaming((char __user *)sve +
++					   SVE_SIG_REGS_OFFSET, fp, state);
++
++	error |= sme_put_head(&tpidr2->head, TPIDR2_MAGIC, sizeof(*tpidr2));
++	error |= put_user(uml_arm64_sme_registers(current)->tpidr2,
++			  &tpidr2->tpidr2);
++
++	error |= sme_put_head(&za->head, ZA_MAGIC,
++			      ZA_SIG_CONTEXT_SIZE(za_live ? vq : 0));
++	error |= put_user(vl, &za->vl);
++	error |= clear_user(za->__reserved, sizeof(za->__reserved)) ?
++		-EFAULT : 0;
++	if (!error && za_live &&
++	    copy_to_user((char __user *)za + ZA_SIG_REGS_OFFSET,
++			 state + UML_ARM64_SME_ZA_OFFSET(vl, 0),
++			 ZA_SIG_REGS_SIZE(vq)))
++		error = -EFAULT;
++
++	if (!error && user->zt_offset) {
++		struct zt_context __user *zt =
++			(void __user *)(base + user->zt_offset);
++
++		error = sme_put_head(&zt->head, ZT_MAGIC,
++				     ZT_SIG_CONTEXT_SIZE(1));
++		error |= put_user(1, &zt->nregs);
++		error |= clear_user(zt->__reserved, sizeof(zt->__reserved)) ?
++			-EFAULT : 0;
++		if (!error && copy_to_user((char __user *)zt +
++					   ZT_SIG_REGS_OFFSET,
++					   state + UML_ARM64_SME_ZT0_OFFSET(vl),
++					   ZT_SIG_REGS_SIZE(1)))
++			error = -EFAULT;
++	}
++
++	if (!error && user->extra_offset) {
++		struct extra_context __user *extra =
++			(void __user *)(base + user->extra_offset);
++		struct _aarch64_ctx __user *terminator =
++			(void __user *)(base + user->extra_offset +
++					SME_EXTRA_CONTEXT_SIZE);
++		char __user *data = (char __user *)terminator +
++			SME_TERMINATOR_SIZE;
++
++		error = sme_put_head(&extra->head, EXTRA_MAGIC,
++				     SME_EXTRA_CONTEXT_SIZE);
++		error |= put_user((u64)(unsigned long)data, &extra->datap);
++		error |= put_user((u32)(base + round_up(user->size, 16) - data),
++				  &extra->size);
++		error |= sme_put_head(terminator, 0, 0);
++	}
++	if (!error)
++		error = sme_put_head(end, 0, 0);
++	return error;
++}
++
++/*
++ * Native setup_return(): a handler starts outside streaming mode, with ZA
++ * off and TPIDR2 zero.
++ */
++void uml_arm64_sme_enter_handler(void)
++{
++	uml_arm64_task_smstop_sm(current);
++	*uml_arm64_svcr(current) &= ~UML_ARM64_SVCR_ZA;
++	uml_arm64_sme_registers(current)->tpidr2 = 0;
++}
++
++struct sme_user_contexts {
++	struct fpsimd_context __user *fpsimd;
++	u32 fpsimd_size;
++	struct sve_context __user *sve;
++	u32 sve_size;
++	struct tpidr2_context __user *tpidr2;
++	u32 tpidr2_size;
++	struct za_context __user *za;
++	u32 za_size;
++	struct zt_context __user *zt;
++	u32 zt_size;
++};
++
++/* Native parse_user_sigframe(), for the records this kernel writes. */
++static int sme_parse_sigframe(struct sme_user_contexts *user,
++			      struct uml_arm64_rt_sigframe __user *frame)
++{
++	struct sigcontext __user *const context = &frame->uc.uc_mcontext;
++	char __user *base = (char __user *)&context->__reserved;
++	const char __user *const frame_base = (const char __user *)frame;
++	size_t limit = sizeof(context->__reserved);
++	bool have_extra_context = false;
++	size_t offset = 0;
++
++	memset(user, 0, sizeof(*user));
++	if (!IS_ALIGNED((unsigned long)base, 16))
++		return -EINVAL;
++
++	for (;;) {
++		struct _aarch64_ctx __user *head;
++		const char __user *userp;
++		struct extra_context __user *extra;
++		struct _aarch64_ctx __user *end;
++		u32 magic, size, end_magic, end_size, extra_size;
++		u64 extra_datap;
++
++		if (limit - offset < sizeof(*head) || !IS_ALIGNED(offset, 16))
++			return -EINVAL;
++		head = (struct _aarch64_ctx __user *)(base + offset);
++		if (get_user(magic, &head->magic) || get_user(size, &head->size))
++			return -EFAULT;
++		if (limit - offset < size)
++			return -EINVAL;
++
++		switch (magic) {
++		case 0:
++			return size ? -EINVAL : 0;
++		case FPSIMD_MAGIC:
++			if (user->fpsimd)
++				return -EINVAL;
++			user->fpsimd = (struct fpsimd_context __user *)head;
++			user->fpsimd_size = size;
++			break;
++		case ESR_MAGIC:
++			break;
++		case SVE_MAGIC:
++			if (user->sve)
++				return -EINVAL;
++			user->sve = (struct sve_context __user *)head;
++			user->sve_size = size;
++			break;
++		case TPIDR2_MAGIC:
++			if (user->tpidr2)
++				return -EINVAL;
++			user->tpidr2 = (struct tpidr2_context __user *)head;
++			user->tpidr2_size = size;
++			break;
++		case ZA_MAGIC:
++			if (user->za)
++				return -EINVAL;
++			user->za = (struct za_context __user *)head;
++			user->za_size = size;
++			break;
++		case ZT_MAGIC:
++			if (!uml_arm64_sme2 || user->zt)
++				return -EINVAL;
++			user->zt = (struct zt_context __user *)head;
++			user->zt_size = size;
++			break;
++		case EXTRA_MAGIC:
++			if (have_extra_context || size < sizeof(*extra))
++				return -EINVAL;
++			userp = (const char __user *)head;
++			extra = (struct extra_context __user *)head;
++			userp += size;
++			if (get_user(extra_datap, &extra->datap) ||
++			    get_user(extra_size, &extra->size))
++				return -EFAULT;
++			/* The terminator of __reserved follows it. */
++			if (limit - offset - size < SME_TERMINATOR_SIZE)
++				return -EINVAL;
++			end = (struct _aarch64_ctx __user *)userp;
++			userp += SME_TERMINATOR_SIZE;
++			if (get_user(end_magic, &end->magic) ||
++			    get_user(end_size, &end->size))
++				return -EFAULT;
++			if (end_magic || end_size)
++				return -EINVAL;
++			have_extra_context = true;
++			base = (char __user *)(unsigned long)extra_datap;
++			if (!IS_ALIGNED((unsigned long)base, 16) ||
++			    !IS_ALIGNED(extra_size, 16) || base != userp ||
++			    extra_size > frame_base + SME_SIGFRAME_MAXSZ - userp)
++				return -EINVAL;
++			offset = 0;
++			limit = extra_size;
++			if (!access_ok(base, limit))
++				return -EINVAL;
++			continue;
++		default:
++			/* POE, FPMR and GCS records, which this CPU has none
++			 * of, and anything unknown. */
++			return -EINVAL;
++		}
++		if (size < sizeof(*head) || limit - offset < size)
++			return -EINVAL;
++		offset += size;
++	}
++}
++
++static int sme_restore_fpsimd(struct pt_regs *regs,
++			      const struct sme_user_contexts *user)
++{
++	elf_fpregset_t *state = (void *)regs->regs.fp;
++	struct fpsimd_context fpsimd;
++
++	if (user->fpsimd_size != sizeof(fpsimd) ||
++	    copy_from_user(&fpsimd, user->fpsimd, sizeof(fpsimd)))
++		return -EINVAL;
++	memcpy(state->vregs, fpsimd.vregs, sizeof(state->vregs));
++	state->fpsr = fpsimd.fpsr;
++	state->fpcr = fpsimd.fpcr;
++	return 0;
++}
++
++/*
++ * Native restore_sve_fpsimd_context(): streaming registers, after which the
++ * FPSIMD record supplies V (the low 16 bytes of each Z), FPSR and FPCR.
++ */
++static int sme_restore_sve(struct pt_regs *regs,
++			   const struct sme_user_contexts *user)
++{
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sve_vq_from_vl(vl);
++	elf_fpregset_t *fp = (void *)regs->regs.fp;
++	u16 user_vl, flags;
++	u8 *state;
++	int index;
++	int error;
++
++	if (user->sve_size < sizeof(*user->sve))
++		return -EINVAL;
++	if (get_user(user_vl, &user->sve->vl) ||
++	    get_user(flags, &user->sve->flags))
++		return -EFAULT;
++	if (!(flags & SVE_SIG_FLAG_SM)) {
++		/* Without non-streaming SVE, only a bare header with VL 0. */
++		if (user_vl || user->sve_size != sizeof(*user->sve))
++			return -EINVAL;
++		*uml_arm64_svcr(current) &= ~UML_ARM64_SVCR_SM;
++		return sme_restore_fpsimd(regs, user);
++	}
++	if (user_vl != vl || user->sve_size < SVE_SIG_CONTEXT_SIZE(vq))
++		return -EINVAL;
++	error = uml_arm64_sme_alloc(current);
++	if (error)
++		return error;
++	state = uml_arm64_sme_state(current);
++	if (copy_from_user(state, (const char __user *)user->sve +
++			   SVE_SIG_REGS_OFFSET, UML_ARM64_SME_ZA_OFFSET(vl, 0)))
++		return -EFAULT;
++	*uml_arm64_svcr(current) |= UML_ARM64_SVCR_SM;
++	error = sme_restore_fpsimd(regs, user);
++	if (error)
++		return error;
++	for (index = 0; index < 32; index++)
++		memcpy(state + UML_ARM64_SME_Z_OFFSET(vl, index),
++		       &fp->vregs[index], sizeof(fp->vregs[index]));
++	return 0;
++}
++
++static int sme_restore_za(const struct sme_user_contexts *user)
++{
++	unsigned int vl = uml_arm64_sme_vl;
++	unsigned int vq = sve_vq_from_vl(vl);
++	u16 user_vl;
++	int error;
++
++	if (user->za_size < sizeof(*user->za))
++		return -EINVAL;
++	if (get_user(user_vl, &user->za->vl))
++		return -EFAULT;
++	if (user_vl != vl)
++		return -EINVAL;
++	if (user->za_size == sizeof(*user->za)) {
++		*uml_arm64_svcr(current) &= ~UML_ARM64_SVCR_ZA;
++		return 0;
++	}
++	if (user->za_size < ZA_SIG_CONTEXT_SIZE(vq))
++		return -EINVAL;
++	error = uml_arm64_sme_alloc(current);
++	if (error) {
++		*uml_arm64_svcr(current) &= ~UML_ARM64_SVCR_ZA;
++		return error;
++	}
++	if (copy_from_user(uml_arm64_sme_state(current) +
++			   UML_ARM64_SME_ZA_OFFSET(vl, 0),
++			   (const char __user *)user->za + ZA_SIG_REGS_OFFSET,
++			   ZA_SIG_REGS_SIZE(vq)))
++		return -EFAULT;
++	*uml_arm64_svcr(current) |= UML_ARM64_SVCR_ZA;
++	return 0;
++}
++
++static int sme_restore_zt(const struct sme_user_contexts *user)
++{
++	u16 nregs;
++
++	/* ZA is restored first, so this sees the frame's ZA. */
++	if (!(*uml_arm64_svcr(current) & UML_ARM64_SVCR_ZA) ||
++	    user->zt_size != ZT_SIG_CONTEXT_SIZE(1))
++		return -EINVAL;
++	if (get_user(nregs, &user->zt->nregs))
++		return -EFAULT;
++	if (nregs != 1)
++		return -EINVAL;
++	if (copy_from_user(uml_arm64_sme_state(current) +
++			   UML_ARM64_SME_ZT0_OFFSET(uml_arm64_sme_vl),
++			   (const char __user *)user->zt + ZT_SIG_REGS_OFFSET,
++			   ZT_SIG_REGS_SIZE(1)))
++		return -EFAULT;
++	return 0;
++}
++
++/* Native restore_sigframe()'s records, in its order. */
++int uml_arm64_sme_restore_sigframe(struct pt_regs *regs,
++				   struct uml_arm64_rt_sigframe __user *frame)
++{
++	struct sme_user_contexts user;
++	u64 tpidr2;
++	int error;
++
++	error = sme_parse_sigframe(&user, frame);
++	if (error)
++		return error;
++	if (!user.fpsimd)
++		return -EINVAL;
++	if (user.sve) {
++		error = sme_restore_sve(regs, &user);
++	} else {
++		*uml_arm64_svcr(current) &= ~UML_ARM64_SVCR_SM;
++		error = sme_restore_fpsimd(regs, &user);
++	}
++	if (!error && user.tpidr2) {
++		if (user.tpidr2_size != sizeof(*user.tpidr2))
++			return -EINVAL;
++		if (get_user(tpidr2, &user.tpidr2->tpidr2))
++			return -EFAULT;
++		uml_arm64_sme_registers(current)->tpidr2 = tpidr2;
++	}
++	if (!error && user.za)
++		error = sme_restore_za(&user);
++	if (!error && user.zt)
++		error = sme_restore_zt(&user);
++	return error;
++}
++
++long uml_arm64_sme_sigframe_size(void)
++{
++	struct sme_sigframe_layout user;
++
++	sme_init_layout(&user);
++	if (sme_setup_layout(&user, false))
++		return -ENOMEM;
++	return sme_sigframe_size(&user);
++}
++
++/* The records after the FPSIMD one, which save_mcontext() wrote, in the
++ * frame uml_arm64_sme_sigframe_size() sized. */
++int uml_arm64_sme_save_sigframe(struct uml_arm64_rt_sigframe __user *frame,
++				struct pt_regs *regs)
++{
++	struct sme_sigframe_layout user;
++
++	sme_init_layout(&user);
++	if (sme_setup_layout(&user, false))
++		return -ENOMEM;
++	return sme_save_records(&user, frame, regs);
++}
+diff --git a/arch/um/kernel/exec.c b/arch/um/kernel/exec.c
+index 3ebfd69039436852e72bb82bbc3245888de7f758..99689df74a6165ed4b4ae07580fb1c406fa72bb1 100644
+--- a/arch/um/kernel/exec.c
++++ b/arch/um/kernel/exec.c
+@@ -22,6 +22,10 @@
+ 
+ void flush_thread(void)
+ {
++#ifdef CONFIG_UML_ARM64_SME
++	/* Before the registers below, which hold the storage pointer. */
++	uml_arm64_sme_flush_thread();
++#endif
+ 	arch_flush_thread(&current->thread.arch);
+ 
+ 	get_safe_registers(current_pt_regs()->regs.gp,
+diff --git a/arch/um/kernel/process.c b/arch/um/kernel/process.c
+index 9489651287b3d7fbe264d32eaeeb8977954a5a95..e04b03437b9a89c2f8e9edd02af04953a5e4d255 100644
+--- a/arch/um/kernel/process.c
++++ b/arch/um/kernel/process.c
+@@ -182,6 +182,11 @@ int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)
+ 		 */
+ 		memcpy(p->thread.regs.regs.fp,
+ 		       current_pt_regs()->regs.fp, host_fp_size);
++#ifdef CONFIG_UML_ARM64_SME
++		ret = uml_arm64_sme_copy_thread(p, clone_flags);
++		if (ret)
++			return ret;
++#endif
+ 		PT_REGS_SET_SYSCALL_RETURN(&p->thread.regs, 0);
+ 		if (sp != 0)
+ 			REGS_SP(p->thread.regs.regs.gp) = sp;
+@@ -227,6 +232,9 @@ int arch_dup_task_struct(struct task_struct *dst,
+ 	} else {
+ 		memcpy(dst, src, arch_task_struct_size);
+ 	}
++#ifdef CONFIG_UML_ARM64_SME
++	uml_arm64_sme_dup_task(dst);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 176920b9e90363d7f48a7b74910f6972ec4d96f1..e7937d6b99c6068a258b8c1c1a33e9a6a83aed65 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -15,6 +15,7 @@
+ #include <smp.h>
+ #include <sys/mman.h>
+ #include <sysdep/ptrace.h>
++#include <sysdep/sme.h>
+ #include "../bridge.h"
+ #include "../internal.h"
+ 
+@@ -48,6 +49,26 @@ _Static_assert(UML_ARM64_FAULT_EXECUTE == DARWIN_UML_FAULT_EXECUTE,
+ 	       "fault execute bit drift");
+ _Static_assert(UML_ARM64_FAULT_PAGE == DARWIN_UML_FAULT_PAGE,
+ 	       "fault page trap drift");
++/* The kernel side reads an arm64 task's SME registers through its mirror. */
++_Static_assert(UML_ARM64_FP_REGISTERS_SIZE ==
++	       DARWIN_UML_ABI_GUEST_SME_REGISTERS_OFFSET,
++	       "SME registers offset drift");
++_Static_assert(UML_ARM64_TASK_TAIL_SIZE == DARWIN_UML_ABI_GUEST_ARM64_TAIL_SIZE,
++	       "arm64 task tail size drift");
++_Static_assert(offsetof(struct uml_arm64_sme_registers, state) ==
++	       offsetof(struct darwin_uml_guest_sme_registers, state) &&
++	       offsetof(struct uml_arm64_sme_registers, svl) ==
++	       offsetof(struct darwin_uml_guest_sme_registers, svl),
++	       "SME registers layout drift");
++_Static_assert(UML_ARM64_SME_P_OFFSET(64, 3) ==
++	       DARWIN_UML_GUEST_SME_P_OFFSET(64, 3) &&
++	       UML_ARM64_SME_ZA_OFFSET(32, 5) ==
++	       DARWIN_UML_GUEST_SME_ZA_OFFSET(32, 5) &&
++	       UML_ARM64_SME_STATE_SIZE(16) ==
++	       DARWIN_UML_GUEST_SME_STATE_SIZE(16) &&
++	       UML_ARM64_SME_STATE_SIZE(256) ==
++	       DARWIN_UML_GUEST_SME_STATE_SIZE(256),
++	       "SME storage layout drift");
+ 
+ /* relay_signal consumes Linux signal numbers, not Darwin SIGBUS (10). */
+ #define DARWIN_GUEST_SIGBUS 7
+@@ -414,6 +435,10 @@ void userspace(struct uml_pt_regs *registers)
+ 		UPT_SYSCALL_NR(registers) = -1;
+ 		switch (event) {
+ 		case DARWIN_UML_EVENT_SYSCALL:
++#ifdef CONFIG_UML_ARM64_SME
++			if (registers->svcr & UML_ARM64_SVCR_SM)
++				uml_arm64_sme_syscall_enter();
++#endif
+ 			registers->orig_x0 = UPT_X(registers, 0);
+ 			handle_syscall(registers);
+ 			/* copy_mm() records the parent's COW protection changes in
+@@ -472,6 +497,15 @@ void userspace(struct uml_pt_regs *registers)
+ 		}
+ 		case DARWIN_UML_EVENT_INTERRUPT:
+ 			break;
++#ifdef CONFIG_UML_ARM64_SME
++		case DARWIN_UML_EVENT_SME_ACCESS:
++			/* Storage for the instruction, which the host retries;
++			 * a failed allocation has already killed the task. */
++			if (uml_arm64_sme_access() == -EINVAL)
++				fatal_userspace(registers, "SME access without SME",
++						-EINVAL);
++			break;
++#endif
+ 		case DARWIN_UML_EVENT_FLOATING_POINT_TRAP:
+ 		{
+ 			siginfo_t signal_info = { 0 };
+diff --git a/arch/um/os-Darwin/uml_darwin_abi.h b/arch/um/os-Darwin/uml_darwin_abi.h
+index 38192336884c5922ef6db1ce80afa607cda3c431..56c60588026ee5326a037d9a7e55cca5a5f39c28 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi.h
++++ b/arch/um/os-Darwin/uml_darwin_abi.h
+@@ -46,9 +46,24 @@ enum darwin_uml_guest_event {
+ 	DARWIN_UML_EVENT_PC_ALIGNMENT = 8,
+ 	DARWIN_UML_EVENT_STOP = 9,
+ 	DARWIN_UML_EVENT_DATA_ALIGNMENT = 10,
++	/* The task has no SME storage and an instruction needs it: allocate
++	 * DARWIN_UML_GUEST_SME_STATE_SIZE(svl) zeroed bytes for the bridge's
++	 * streaming vector length, publish them in the task's
++	 * struct darwin_uml_guest_sme_registers and re-enter at the same PC,
++	 * which retired nothing. */
++	DARWIN_UML_EVENT_SME_ACCESS = 11,
+ 	DARWIN_UML_EVENT_FATAL = -1,
+ };
+ 
++/* darwin_uml_guest_registers.dispatch_flags: facts about the task that hold
++ * for one entry. The kernel sets them before it enters the guest and clears
++ * them on return, so they never become part of the task's saved PSTATE. */
++enum {
++	/* clone(CLONE_VM) without CLONE_VFORK has shared the task's mm with
++	 * another task since the mm was created. */
++	DARWIN_UML_DISPATCH_MM_SHARED = 1U << 0,
++};
++
+ enum {
+ 	DARWIN_UML_FAULT_WRITE = 2,
+ 	DARWIN_UML_FAULT_EXECUTE = 16,
+@@ -90,13 +105,15 @@ struct darwin_uml_guest_registers {
+ 	darwin_uml_abi_u64 sp;
+ 	darwin_uml_abi_u64 pc;
+ 	darwin_uml_abi_u32 pstate;
+-	darwin_uml_abi_u32 state_flags;
++	darwin_uml_abi_u32 dispatch_flags;
+ 	darwin_uml_abi_u64 original_x0;
+ 	struct darwin_uml_faultinfo fault;
+ 	long long syscall;
+ 	darwin_uml_abi_s32 is_user;
+ 	darwin_uml_abi_s32 padding;
+ 	darwin_uml_abi_u64 fpmr;
++	/* An arm64 task's PSTATE.SM in bit 0 and PSTATE.ZA in bit 1; the other
++	 * bits stay zero. */
+ 	darwin_uml_abi_u64 svcr;
+ 	/* The i386 TLS descriptors of an x86_64-userspace kernel's compat
+ 	 * task, one struct user_desc each; zero for every other task. */
+@@ -110,8 +127,33 @@ struct darwin_uml_guest_fp_registers {
+ 	darwin_uml_abi_u32 reserved[2];
+ };
+ 
++/* Every arm64 task's register tail holds this immediately after its
++ * struct darwin_uml_guest_fp_registers, whether or not the run implements
++ * SME; an x86_64-userspace task's tail ends after the FP registers. */
++struct darwin_uml_guest_sme_registers {
++	darwin_uml_abi_u64 tpidr2;   /* TPIDR2_EL0; 0 without SME */
++	darwin_uml_abi_u64 state;    /* address of the task's SME storage, or 0 */
++	darwin_uml_abi_u32 svl;      /* bytes per vector the storage holds, or 0 */
++	darwin_uml_abi_u32 reserved; /* 0 */
++};
++
++/* A task's SME storage, DARWIN_UML_GUEST_SME_STATE_SIZE(svl) bytes for a
++ * streaming vector length of svl bytes: Z0-Z31 of svl bytes, P0-P15 of
++ * svl / 8 bytes, ZA as its svl horizontal vectors of svl bytes, then the
++ * 64-byte ZT0, each part at a multiple of svl. Bytes 0-15 of each stored Z
++ * are a copy of the matching V in struct darwin_uml_guest_fp_registers,
++ * which owns them: the host ignores them on entry and writes them on exit. */
++#define DARWIN_UML_GUEST_SME_Z_OFFSET(svl, n) ((n) * (svl))
++#define DARWIN_UML_GUEST_SME_P_OFFSET(svl, n) (32 * (svl) + (n) * ((svl) / 8))
++#define DARWIN_UML_GUEST_SME_ZA_OFFSET(svl, row) (34 * (svl) + (row) * (svl))
++#define DARWIN_UML_GUEST_SME_ZT0_OFFSET(svl) (34 * (svl) + (svl) * (svl))
++#define DARWIN_UML_GUEST_SME_ZT0_SIZE 64
++#define DARWIN_UML_GUEST_SME_STATE_SIZE(svl) \
++	(DARWIN_UML_GUEST_SME_ZT0_OFFSET(svl) + DARWIN_UML_GUEST_SME_ZT0_SIZE)
++
+ /* Layout constants make the native and kernel-side checks independent of a
+  * compiler's spelling of the corresponding structures. */
++#define DARWIN_UML_ABI_GUEST_REGISTERS_DISPATCH_FLAGS_OFFSET 268U
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_ORIGINAL_X0_OFFSET 272U
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_FAULT_OFFSET 280U
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_SYSCALL_OFFSET 304U
+@@ -119,6 +161,10 @@ struct darwin_uml_guest_fp_registers {
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_COMPAT_TLS_OFFSET 336U
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_SIZE 384U
+ #define DARWIN_UML_ABI_GUEST_FP_REGISTERS_SIZE 528U
++#define DARWIN_UML_ABI_GUEST_SME_REGISTERS_OFFSET 528U
++#define DARWIN_UML_ABI_GUEST_SME_REGISTERS_SIZE 24U
++/* The fp_size an arm64 task passes to darwin_uml_enter_guest(). */
++#define DARWIN_UML_ABI_GUEST_ARM64_TAIL_SIZE 552U
+ 
+ #if defined(__cplusplus)
+ #include <stddef.h>
+@@ -126,10 +172,13 @@ static_assert(DARWIN_UML_EVENT_FLOATING_POINT_TRAP == 7);
+ static_assert(DARWIN_UML_EVENT_PC_ALIGNMENT == 8);
+ static_assert(DARWIN_UML_EVENT_STOP == 9);
+ static_assert(DARWIN_UML_EVENT_DATA_ALIGNMENT == 10);
++static_assert(DARWIN_UML_EVENT_SME_ACCESS == 11);
+ static_assert(DARWIN_UML_FLOATING_POINT_SYNDROME_BASE == 0xb2800000U);
+ static_assert(DARWIN_UML_GUEST_PAGE_SIZE ==
+ 		(1ULL << DARWIN_UML_GUEST_PAGE_SHIFT));
+ static_assert(DARWIN_UML_GUEST_PAGE_SIZE == 4096);
++static_assert(offsetof(struct darwin_uml_guest_registers, dispatch_flags) ==
++		DARWIN_UML_ABI_GUEST_REGISTERS_DISPATCH_FLAGS_OFFSET);
+ static_assert(offsetof(struct darwin_uml_guest_registers, original_x0) ==
+ 		DARWIN_UML_ABI_GUEST_REGISTERS_ORIGINAL_X0_OFFSET);
+ static_assert(offsetof(struct darwin_uml_guest_registers, fault) ==
+@@ -145,6 +194,14 @@ static_assert(sizeof(struct darwin_uml_guest_registers) ==
+ static_assert(sizeof(struct darwin_uml_faultinfo) == 24U);
+ static_assert(sizeof(struct darwin_uml_guest_fp_registers) ==
+ 		DARWIN_UML_ABI_GUEST_FP_REGISTERS_SIZE);
++static_assert(sizeof(struct darwin_uml_guest_sme_registers) ==
++		DARWIN_UML_ABI_GUEST_SME_REGISTERS_SIZE);
++static_assert(DARWIN_UML_ABI_GUEST_SME_REGISTERS_OFFSET ==
++		DARWIN_UML_ABI_GUEST_FP_REGISTERS_SIZE);
++static_assert(DARWIN_UML_ABI_GUEST_ARM64_TAIL_SIZE ==
++		DARWIN_UML_ABI_GUEST_SME_REGISTERS_OFFSET +
++		DARWIN_UML_ABI_GUEST_SME_REGISTERS_SIZE);
++static_assert(DARWIN_UML_GUEST_SME_STATE_SIZE(64) == 6336);
+ #endif
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index 38855e4935929907bb5a23c20c4567b9b5259e31..1a6c06c5487bd02096727a82626324a924994cef 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 15U
+-#define DARWIN_UML_ABI_FINGERPRINT 0xb4c4fd7b247daffeULL
++#define DARWIN_UML_ABI_VERSION 16U
++#define DARWIN_UML_ABI_FINGERPRINT 0x63aeb83b60564512ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_cpu.h b/arch/um/os-Darwin/uml_darwin_cpu.h
+index 0138c26228f00aab8e7ddb1ccc2d19b6e7081494..307ea43de86400be7c3fc0e140a41d6a0558cb08 100644
+--- a/arch/um/os-Darwin/uml_darwin_cpu.h
++++ b/arch/um/os-Darwin/uml_darwin_cpu.h
+@@ -13,6 +13,9 @@ int darwin_uml_enter_guest(void *registers, void *fp_registers,
+ 			   unsigned long *tls);
+ unsigned long darwin_uml_guest_hwcap(void);
+ unsigned long darwin_uml_guest_hwcap2(void);
++/* The streaming vector length in bytes when the virtual CPU implements SME
++ * for this run, else 0. Fixed for the life of the process. */
++unsigned long darwin_uml_guest_sme_vector_length(void);
+ /* The virtual CPU's model name, for /proc/cpuinfo. Static storage owned by
+  * the emulator, valid for the lifetime of the process, and identical for
+  * every guest architecture the host presents. */

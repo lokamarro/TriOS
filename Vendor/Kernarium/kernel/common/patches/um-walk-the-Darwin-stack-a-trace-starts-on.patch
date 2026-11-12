@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 05:25:56 +0900
+Subject: [PATCH] um: walk the Darwin stack a trace starts on
+
+dump_trace() bounded its scan of the current task by the top of the
+carrier pthread's native stack. A Darwin vCPU carrier runs each Linux
+task on that task's own stack in guest memory, so the stack pointer
+never lay below that bound and every WARN and BUG printed an empty Call
+Trace.
+
+Walk the stack that holds the starting stack pointer: the task's own
+stack or, on the current thread, the carrier's native stack or the
+signal stack its interrupts run on. An interrupt taken on the signal
+stack continues on the task stack it interrupted, through the registers
+do_IRQ() published with set_irq_regs(). A kernel fault starts at the
+faulting instruction. A task blocked in the scheduler is walked from
+the context it saved when it switched away; one running on another CPU
+still reports nothing.
+
+The walk follows AArch64 frame records, so every entry is reliable, and
+a Darwin kernel without CONFIG_FRAME_POINTER fails to build instead of
+printing guesses. The arm64 port gains PT_REGS_BP, which the shared
+stack-trace header uses with frame pointers. A saved trace now honours
+its skip count.
+---
+ arch/arm64/um/asm/ptrace.h       |   2 +
+ arch/um/include/asm/stacktrace.h |   8 +-
+ arch/um/include/shared/os.h      |   3 +-
+ arch/um/kernel/stacktrace.c      | 122 ++++++++++++++++++++++++++++---
+ arch/um/os-Darwin/util.c         |  24 +++++-
+ 5 files changed, 144 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm64/um/asm/ptrace.h b/arch/arm64/um/asm/ptrace.h
+index 06ae614ff420b1b811457fa8e2f3a5f67b088ee0..e25a782dc897099cd0224b6f3c2db3e46a3b5e88 100644
+--- a/arch/arm64/um/asm/ptrace.h
++++ b/arch/arm64/um/asm/ptrace.h
+@@ -15,6 +15,8 @@ enum {
+ 
+ #define PT_REGS_X(state, n) UPT_X(&(state)->regs, n)
+ #define PT_REGS_FP(state) UPT_FP(&(state)->regs)
++/* UML's shared stack walker names the frame pointer BP, as on x86. */
++#define PT_REGS_BP(state) PT_REGS_FP(state)
+ #define PT_REGS_LR(state) UPT_LR(&(state)->regs)
+ #define PT_REGS_PSTATE(state) UPT_PSTATE(&(state)->regs)
+ #define PT_REGS_ORIG_SYSCALL(state) PT_REGS_X(state, 8)
+diff --git a/arch/um/include/asm/stacktrace.h b/arch/um/include/asm/stacktrace.h
+index 1bdad33f906f5739c0559ac40e22bbf16e25057a..a1c6fd8c126fb07c2fe99f719b89187c8762934a 100644
+--- a/arch/um/include/asm/stacktrace.h
++++ b/arch/um/include/asm/stacktrace.h
+@@ -24,7 +24,9 @@ get_frame_pointer(struct task_struct *task, struct pt_regs *segv_regs)
+ 	 * KSTK_EBP() reports the task's userspace frame pointer.  Following it
+ 	 * would walk guest memory as if it held kernel frames, and on hosts
+ 	 * that do not keep an idle task's userspace mapped it faults the
+-	 * kernel outright.  A blocked task has no frame pointer worth reading.
++	 * kernel outright.  Those saved registers hold no kernel frame; the
++	 * Darwin dump_trace() starts another task's trace from the context it
++	 * saved when it switched away instead.
+ 	 */
+ 	return 0;
+ }
+@@ -44,8 +46,8 @@ static inline unsigned long
+ 	/*
+ 	 * KSTK_ESP() likewise reports the task's userspace stack pointer, which
+ 	 * never addresses kernel memory.  Report no stack rather than a guest
+-	 * one: both walkers stop on NULL, so a dump of another task loses
+-	 * nothing that was ever meaningful.
++	 * one, so show_stack() prints no raw stack words for another task; its
++	 * call trace still comes from dump_trace().
+ 	 */
+ 	return NULL;
+ }
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 1abe4b56b3ba15b32dbea0577976d1efe8a38ca6..6c022aa9698cec9b1ef5fe4f60e6a7a04c700274 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -272,7 +272,8 @@ extern void mark_sigio_pending(void);
+ /* util.c */
+ extern void stack_protections(unsigned long address);
+ #ifdef UML_HOST_DARWIN
+-extern unsigned long os_current_thread_stack_top(void);
++extern int os_host_stack_bounds(unsigned long sp, unsigned long *low,
++				unsigned long *high);
+ extern int darwin_uml_vm_activate(unsigned long generation);
+ extern int darwin_uml_vm_batch_begin(unsigned long generation);
+ extern int darwin_uml_vm_batch_end(void);
+diff --git a/arch/um/kernel/stacktrace.c b/arch/um/kernel/stacktrace.c
+index f6a76717b89a519f6a69c7b6daec1221b35921e4..e2a27cbfa2586c5434ebeef497ffb0e73dde57a7 100644
+--- a/arch/um/kernel/stacktrace.c
++++ b/arch/um/kernel/stacktrace.c
+@@ -13,16 +13,122 @@
+ #include <linux/uaccess.h>
+ #include <asm/stacktrace.h>
+ #ifdef UML_HOST_DARWIN
++#include <linux/sched/task_stack.h>
++#include <asm/irq_regs.h>
+ #include <os.h>
++
++/*
++ * A Darwin vCPU carrier thread runs each Linux task on that task's own stack
++ * in guest memory, takes host signals, and so interrupts, on its signal stack,
++ * and runs early boot on its native stack.  Walk the frame records on the
++ * stack that holds the starting stack pointer; an interrupt continues on the
++ * task stack it interrupted, found through the registers the interrupt saved.
++ */
++#ifndef CONFIG_FRAME_POINTER
++#error "the Darwin stack walker follows frame records and needs CONFIG_FRAME_POINTER"
+ #endif
+ 
++struct darwin_stack {
++	unsigned long low;
++	unsigned long high;
++};
++
++static bool darwin_task_stack(struct task_struct *tsk, unsigned long sp,
++			      struct darwin_stack *stack)
++{
++	unsigned long base = (unsigned long)task_stack_page(tsk);
++
++	if (!base || sp < base || sp >= base + THREAD_SIZE)
++		return false;
++	stack->low = base;
++	stack->high = base + THREAD_SIZE;
++	return true;
++}
++
++static void darwin_report(const struct stacktrace_ops *ops, void *data,
++			  unsigned long addr, int reliable)
++{
++	if (__kernel_text_address(addr))
++		ops->address(data, addr, reliable);
++}
++
++static void darwin_walk(unsigned long sp, unsigned long fp,
++			const struct darwin_stack *stack,
++			const struct stacktrace_ops *ops, void *data)
++{
++	const struct stack_frame *frame;
++	unsigned long next;
++
++	sp &= ~(sizeof(long) - 1);
++	/*
++	 * An AArch64 frame record holds the caller's record and the return
++	 * address, and each record lies above the one it follows.
++	 */
++	while (fp >= sp && fp <= stack->high - sizeof(*frame) &&
++	       IS_ALIGNED(fp, sizeof(long))) {
++		frame = (const struct stack_frame *)fp;
++		darwin_report(ops, data,
++			      READ_ONCE_NOCHECK(frame->return_address), 1);
++		next = (unsigned long)READ_ONCE_NOCHECK(frame->next_frame);
++		if (next <= fp)
++			break;
++		fp = next;
++	}
++}
++
++void dump_trace(struct task_struct *tsk,
++		const struct stacktrace_ops *ops,
++		void *data)
++{
++	struct pt_regs *segv_regs = tsk->thread.segv_regs;
++	struct darwin_stack stack;
++	struct pt_regs *regs;
++	unsigned long sp, fp;
++
++	if (tsk != current) {
++		/*
++		 * A task blocked in the scheduler saved its kernel context when
++		 * it switched away.  One running on another CPU has none that
++		 * holds still, so report nothing for it.
++		 */
++		if (task_curr(tsk))
++			return;
++		sp = tsk->thread.switch_buf[0].sp;
++		if (!darwin_task_stack(tsk, sp, &stack))
++			return;
++		darwin_report(ops, data, tsk->thread.switch_buf[0].pc, 1);
++		darwin_walk(sp, tsk->thread.switch_buf[0].fp, &stack, ops, data);
++		return;
++	}
++	if (segv_regs) {
++		/* A kernel fault walks from the instruction that faulted. */
++		sp = PT_REGS_SP(segv_regs);
++		fp = PT_REGS_FP(segv_regs);
++		darwin_report(ops, data, PT_REGS_IP(segv_regs), 1);
++	} else {
++		sp = (unsigned long)current_sp();
++		fp = current_bp();
++	}
++	if (darwin_task_stack(tsk, sp, &stack)) {
++		darwin_walk(sp, fp, &stack, ops, data);
++		return;
++	}
++	if (os_host_stack_bounds(sp, &stack.low, &stack.high))
++		return;
++	darwin_walk(sp, fp, &stack, ops, data);
++	regs = get_irq_regs();
++	if (!regs || !darwin_task_stack(tsk, PT_REGS_SP(regs), &stack))
++		return;
++	darwin_report(ops, data, PT_REGS_IP(regs), 1);
++	darwin_walk(PT_REGS_SP(regs), PT_REGS_FP(regs), &stack, ops, data);
++}
++#else
+ void dump_trace(struct task_struct *tsk,
+ 		const struct stacktrace_ops *ops,
+ 		void *data)
+ {
+ 	int reliable = 0;
+ 	unsigned long *sp, bp, addr;
+-	unsigned long stack_top;
+ 	struct pt_regs *segv_regs = tsk->thread.segv_regs;
+ 	struct stack_frame *frame;
+ 
+@@ -30,14 +136,7 @@ void dump_trace(struct task_struct *tsk,
+ 	sp = get_stack_pointer(tsk, segv_regs);
+ 
+ 	frame = (struct stack_frame *)bp;
+-#ifdef UML_HOST_DARWIN
+-	if ((!tsk || tsk == current) && !segv_regs)
+-		stack_top = os_current_thread_stack_top();
+-	else
+-#endif
+-		stack_top = ((unsigned long)sp + THREAD_SIZE - 1) &
+-			~(THREAD_SIZE - 1);
+-	while ((unsigned long)sp < stack_top) {
++	while (((long) sp & (THREAD_SIZE-1)) != 0) {
+ 		addr = READ_ONCE_NOCHECK(*sp);
+ 		if (__kernel_text_address(addr)) {
+ 			reliable = 0;
+@@ -51,6 +150,7 @@ void dump_trace(struct task_struct *tsk,
+ 		sp++;
+ 	}
+ }
++#endif
+ 
+ static void save_addr(void *data, unsigned long address, int reliable)
+ {
+@@ -58,6 +158,10 @@ static void save_addr(void *data, unsigned long address, int reliable)
+ 
+ 	if (!reliable)
+ 		return;
++	if (trace->skip > 0) {
++		trace->skip--;
++		return;
++	}
+ 	if (trace->nr_entries >= trace->max_entries)
+ 		return;
+ 
+diff --git a/arch/um/os-Darwin/util.c b/arch/um/os-Darwin/util.c
+index e12528a48f14503a7e36dbaf112ba9c15f0c45b1..b5c2d191e6c859a25efb43c25f6f30f915cb0fa1 100644
+--- a/arch/um/os-Darwin/util.c
++++ b/arch/um/os-Darwin/util.c
+@@ -24,9 +24,29 @@ void stack_protections(unsigned long address)
+ 		panic("protecting stack failed, errno = %d", errno);
+ }
+ 
+-unsigned long os_current_thread_stack_top(void)
++/* Find the host stack holding sp on this thread: its native pthread stack or
++ * its signal stack.  A Linux task stack is guest memory, never a host stack.
++ */
++int os_host_stack_bounds(unsigned long sp, unsigned long *low,
++			 unsigned long *high)
+ {
+-	return (unsigned long)pthread_get_stackaddr_np(pthread_self());
++	pthread_t self = pthread_self();
++	unsigned long top = (unsigned long)pthread_get_stackaddr_np(self);
++	unsigned long bottom = top - pthread_get_stacksize_np(self);
++	stack_t signal_stack;
++
++	if (sp < bottom || sp >= top) {
++		if (sigaltstack(NULL, &signal_stack) < 0 ||
++		    (signal_stack.ss_flags & SS_DISABLE))
++			return -1;
++		bottom = (unsigned long)signal_stack.ss_sp;
++		top = bottom + signal_stack.ss_size;
++		if (sp < bottom || sp >= top)
++			return -1;
++	}
++	*low = bottom;
++	*high = top;
++	return 0;
+ }
+ 
+ /*

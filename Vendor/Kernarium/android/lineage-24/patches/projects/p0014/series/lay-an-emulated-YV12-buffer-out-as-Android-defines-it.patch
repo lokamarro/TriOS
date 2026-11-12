@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:10:39 +0900
+Subject: [PATCH] lay an emulated YV12 buffer out as Android defines it
+
+Android defines where the planes of a YV12 buffer lie from its luma stride
+alone: the V plane follows the Y plane, the U plane follows the V plane, and the
+chroma stride is the luma stride halved (<system/graphics.h>). The media
+framework, the Image API and the NDK all compute them that way. A YV12 buffer
+that the driver creates as an R8 image instead gave both chroma planes the
+luma stride, each a full image row wide, so the U plane lay 115200 bytes
+further than a 640x360 frame says, a reader got Cb from the wrong bytes, and a
+Vulkan import of the same buffer was refused because a half-width plane had
+the pitch of a full-width one.
+
+Keep the driver's own native layout for the emulated one. A chroma row is
+then half the width of the R8 image, so two of them fill one image row and the
+image needs no more rows than a bi-planar buffer: 1920x1080 is a 1920x1620
+image, not 1920x2160. The luma stride is a multiple of 32, which makes the
+half of it a multiple of 16 as Android requires.
+
+A rectangle of a chroma plane is then the rectangle in the left half of the
+rows that start an image row and the rectangle in the right half of those that
+end one, so the transfers for a locked rectangle are the luma box and up to
+two boxes for each chroma plane. They cover exactly the bytes of the
+rectangle: a lock of a part of the frame flushes and invalidates what it
+covers and nothing else.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ virtgpu_virgl.c | 113 ++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 80 insertions(+), 33 deletions(-)
+
+diff --git a/virtgpu_virgl.c b/virtgpu_virgl.c
+index aba55fe89e28d41c4c8511e82ba90b7380576f1e..5a1cbf944416f5c5a5c39175a75932571c5c89ea 100644
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -163,7 +163,7 @@ static bool virgl_bitmask_supports_format(struct virgl_supported_format_mask *su
+ // difficult to compute the transfers needed for example when the middle 2x2 region of the
+ // image is locked and needs to be flushed/invalidated.
+ //
+-// Emulated multi-plane buffers instead have a layout of:
++// Emulated bi-planar buffers instead have a layout of:
+ //
+ // | Y | Y | Y | Y | Y | Y |
+ // | Y | Y | Y | Y | Y | Y |
+@@ -171,19 +171,30 @@ static bool virgl_bitmask_supports_format(struct virgl_supported_format_mask *su
+ // | Y | Y | Y | Y | Y | Y |
+ // | Y | Y | Y | Y | Y | Y |
+ // | Y | Y | Y | Y | Y | Y |
+-// | U | U | U |   |   |   |
+-// | U | U | U |   |   |   |
+-// | U | U | U |   |   |   |
+-// | V | V | V |   |   |   |
+-// | V | V | V |   |   |   |
+-// | V | V | V |   |   |   |
++// | C | C | C | C | C | C |
++// | C | C | C | C | C | C |
++// | C | C | C | C | C | C |
+ //
+-// where each plane is placed as a sub-image (albeit with a very large stride) in order to
+-// simplify transfers into 3 sub-image transfers for the above example.
++// where each plane is placed as a sub-image in order to simplify transfers into 2 sub-image
++// transfers for the above example.
+ //
+-// Additional note: the V-plane is not placed to the right of the U-plane due to some
+-// observed failures in media framework code which assumes the V-plane is not
+-// "row-interlaced" with the U-plane.
++// A tri-planar YV12 buffer keeps the layout Android defines for it, because the media framework
++// computes where its planes are from the luma stride alone: the V plane follows the Y plane, the
++// U plane follows the V plane, and the chroma stride is half the luma stride. A chroma row is
++// therefore half as wide as the R8 image the host creates, and two of them fill one image row:
++//
++// | Y | Y | Y | Y | Y | Y |
++// | Y | Y | Y | Y | Y | Y |
++// | Y | Y | Y | Y | Y | Y |
++// | Y | Y | Y | Y | Y | Y |
++// | Y | Y | Y | Y | Y | Y |
++// | Y | Y | Y | Y | Y | Y |
++// | V | V | V | V | V | V |
++// | V | V | V | U | U | U |
++// | U | U | U | U | U | U |
++//
++// A sub-image of one chroma plane is then two sub-images of the host image, one for the chroma
++// rows that start an image row and one for those that end it.
+ static void virgl_get_emulated_metadata(const struct bo *bo, struct bo_metadata *metadata)
+ {
+ 	uint32_t y_plane_height;
+@@ -224,23 +235,26 @@ static void virgl_get_emulated_metadata(const struct bo *bo, struct bo_metadata
+ 		y_plane_height = original_height;
+ 		c_plane_height = DIV_ROUND_UP(original_height, 2);
+ 
++		// Android requires a 16 byte aligned luma stride and a chroma stride of half of
++		// it, rounded up to 16 bytes (<system/graphics.h>), so a luma stride of 32 bytes
++		// makes the chroma stride exactly half of the image row.
+ 		metadata->width = ALIGN(original_width, 32);
+-		metadata->height = y_plane_height + (2 * c_plane_height);
++		metadata->height = y_plane_height + c_plane_height;
+ 
+ 		// Y-plane (full resolution)
+ 		metadata->strides[0] = metadata->width;
+ 		metadata->offsets[0] = 0;
+-		metadata->sizes[0] = metadata->width * original_height;
++		metadata->sizes[0] = metadata->width * y_plane_height;
+ 
+-		// Cb-plane (half resolution, placed below Y-plane)
+-		metadata->strides[1] = metadata->width;
++		// Cr-plane (half resolution, placed below Y-plane)
++		metadata->strides[1] = metadata->width / 2;
+ 		metadata->offsets[1] = metadata->offsets[0] + metadata->sizes[0];
+-		metadata->sizes[1] = metadata->width * c_plane_height;
++		metadata->sizes[1] = metadata->strides[1] * c_plane_height;
+ 
+-		// Cr-plane (half resolution, placed below Cb-plane)
+-		metadata->strides[2] = metadata->width;
++		// Cb-plane (half resolution, placed below Cr-plane)
++		metadata->strides[2] = metadata->width / 2;
+ 		metadata->offsets[2] = metadata->offsets[1] + metadata->sizes[1];
+-		metadata->sizes[2] = metadata->width * c_plane_height;
++		metadata->sizes[2] = metadata->strides[2] * c_plane_height;
+ 
+ 		metadata->total_size = metadata->width * metadata->height;
+ 		break;
+@@ -249,11 +263,40 @@ static void virgl_get_emulated_metadata(const struct bo *bo, struct bo_metadata
+ 	}
+ }
+ 
++// A luma sub-image, and two for each of the two chroma planes of an emulated YV12 buffer.
++#define VIRGL_MAX_TRANSFERS 5
++
+ struct virtio_transfers_params {
+ 	size_t xfers_needed;
+-	struct rectangle xfer_boxes[DRV_MAX_PLANES];
++	struct rectangle xfer_boxes[VIRGL_MAX_TRANSFERS];
+ };
+ 
++// Add the sub-images of a rectangle of one chroma plane of an emulated YV12 buffer. A chroma row
++// is half as wide as the host image, so the rows of the plane alternate between its left and its
++// right half, and a rectangle of the plane is the rectangle of the rows in each half. First
++// is the number of the half row at which the plane starts.
++static void virgl_add_yvu420_chroma_transfers(struct virtio_transfers_params *xfer_params,
++					      uint32_t chroma_stride, uint32_t first,
++					      const struct rectangle *chroma_box)
++{
++	uint32_t begin = first + chroma_box->y;
++	uint32_t end = begin + chroma_box->height;
++
++	for (uint32_t half = 0; half < 2; half++) {
++		uint32_t row_begin = begin + ((begin & 1) != half);
++		if (row_begin >= end)
++			continue;
++
++		uint32_t row_end = (end - 1) - (((end - 1) & 1) != half);
++		struct rectangle *box = &xfer_params->xfer_boxes[xfer_params->xfers_needed++];
++
++		box->x = half * chroma_stride + chroma_box->x;
++		box->y = row_begin / 2;
++		box->width = chroma_box->width;
++		box->height = row_end / 2 - row_begin / 2 + 1;
++	}
++}
++
+ static void virgl_get_emulated_transfers_params(const struct bo *bo,
+ 						const struct rectangle *transfer_box,
+ 						struct virtio_transfers_params *xfer_params)
+@@ -306,7 +349,7 @@ static void virgl_get_emulated_transfers_params(const struct bo *bo,
+ 	case DRM_FORMAT_YVU420:
+ 	case DRM_FORMAT_YVU420_ANDROID:
+ 		// Tri-planar
+-		xfer_params->xfers_needed = 3;
++		xfer_params->xfers_needed = 1;
+ 
+ 		y_plane_height = bo->meta.height;
+ 		c_plane_height = DIV_ROUND_UP(bo->meta.height, 2);
+@@ -317,17 +360,21 @@ static void virgl_get_emulated_transfers_params(const struct bo *bo,
+ 		xfer_params->xfer_boxes[0].width = transfer_box->width;
+ 		xfer_params->xfer_boxes[0].height = transfer_box->height;
+ 
+-		// Cb-plane (half resolution, placed below Y-plane)
+-		xfer_params->xfer_boxes[1].x = transfer_box->x;
+-		xfer_params->xfer_boxes[1].y = transfer_box->y + y_plane_height;
+-		xfer_params->xfer_boxes[1].width = DIV_ROUND_UP(transfer_box->width, 2);
+-		xfer_params->xfer_boxes[1].height = DIV_ROUND_UP(transfer_box->height, 2);
+-
+-		// Cr-plane (half resolution, placed below Cb-plane)
+-		xfer_params->xfer_boxes[2].x = transfer_box->x;
+-		xfer_params->xfer_boxes[2].y = transfer_box->y + y_plane_height + c_plane_height;
+-		xfer_params->xfer_boxes[2].width = DIV_ROUND_UP(transfer_box->width, 2);
+-		xfer_params->xfer_boxes[2].height = DIV_ROUND_UP(transfer_box->height, 2);
++		// Cr-plane and Cb-plane (half resolution, one after the other below Y-plane)
++		struct rectangle chroma_box = {
++			.x = transfer_box->x / 2,
++			.y = transfer_box->y / 2,
++			.width = DIV_ROUND_UP(transfer_box->x + transfer_box->width, 2) -
++				 transfer_box->x / 2,
++			.height = DIV_ROUND_UP(transfer_box->y + transfer_box->height, 2) -
++				  transfer_box->y / 2,
++		};
++		uint32_t chroma_stride = ALIGN(bo->meta.width, 32) / 2;
++		virgl_add_yvu420_chroma_transfers(xfer_params, chroma_stride, 2 * y_plane_height,
++						  &chroma_box);
++		virgl_add_yvu420_chroma_transfers(xfer_params, chroma_stride,
++						  2 * y_plane_height + c_plane_height,
++						  &chroma_box);
+ 
+ 		break;
+ 	}

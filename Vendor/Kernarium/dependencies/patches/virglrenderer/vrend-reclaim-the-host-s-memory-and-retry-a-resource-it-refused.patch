@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:39:54 +0900
+Subject: [PATCH] vrend: reclaim the host's memory and retry a resource it
+ refused
+
+The host grants the GPU a fixed budget, and its Vulkan driver refuses
+a heap that would take the process past it. A refused texture or
+buffer reaches the guest as GL_OUT_OF_MEMORY, which makes Chrome lose
+every WebGL context and block the site until it restarts. A refusal
+that falls a few megabytes short is often not a full budget but one
+that still holds memory for work that has finished: textures the guest
+released while a batch that used them is not yet reset, deletes
+glthread and the threaded context still queue, shared-memory segments
+waiting behind a fence, command storage a device caches, buffers a
+driver keeps for reuse. The pool's own hook frees only the last of
+these, and it runs inside the driver on the refused thread, where it
+cannot flush or trim a context.
+
+vrend_renderer_resource_create now retries once, after giving back
+what the renderer can reach from outside the driver. Every GL context
+of every vrend context, the renderer's own context 0 included, is
+flushed, then finished so that completed work no longer holds its
+storage, then trimmed (EGL_MESA_context_trim). The shared-memory
+segments that waited behind a fence are freed, the host driver is
+asked to free what it caches (eglReleaseCachedMemoryMESA), and the
+host to release what other drivers cache, through the new optional
+reclaim_begin and reclaim_end callbacks, which the renderer wires to
+KosmicKrisp's command allocators. The contexts are visited through a
+list of all vrend contexts, and the context that was current is
+current again afterwards, so the reclaim also works for a resource a
+guest makes from inside its command stream. The creation runs again
+from nothing, so the failed try leaves nothing to undo, and a resource
+that still does not fit is refused as before.
+
+What a reclaim frees leaves Metal's allocation counter at once but the
+graphics ledger the pool also counts a moment later, and the pool takes
+the larger of the two: a retry made at once is still refused. When the
+reclaim freed device memory, reclaim_end waits, for 300 ms at most, for
+the pool to show the room the thread was refused, and a reclaim that
+freed nothing does not wait.
+
+A reclaim that did not help rules out another until a resource has
+been destroyed or a quarter of a second has passed: a budget that is
+really full gains nothing from it, and a guest that keeps asking would
+otherwise pay a finish of every context for each refusal.
+
+This builds on the topic "vrend: trim a context the host found idle",
+whose per-context trim and EGL entry point it reuses, and leaves that
+topic as it is.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/virglrenderer.c          |  35 ++++++++
+ src/vrend/vrend_renderer.c   | 167 ++++++++++++++++++++++++++++++++++-
+ src/vrend/vrend_renderer.h   |   9 ++
+ src/vrend/vrend_winsys_egl.c |  20 +++++
+ src/vrend/vrend_winsys_egl.h |   1 +
+ 5 files changed, 228 insertions(+), 4 deletions(-)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 0f5e0e951f2e242b1c614ee994a20f5f8360a551..b98aaf7a98bd46580f61c6a863e02811537ecb4d 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -791,6 +791,39 @@ static int make_current_surfaceless(virgl_renderer_gl_context ctx)
+    return 0;
+ }
+ 
++#ifdef ENABLE_VENUS
++/* The device memory the host's Vulkan devices had freed when a reclaim began,
++ * and how little freed since is not worth waiting for. */
++static uint64_t reclaim_freed_mark;
++#define RECLAIM_SETTLE_MIN_FREED (1ull << 20)
++/* The host's graphics ledger lags the allocation counter by a periodic sweep
++ * of a quarter of a second at most. */
++#define RECLAIM_SETTLE_MS 300
++#endif
++
++static void reclaim_begin(void)
++{
++#ifdef ENABLE_VENUS
++   reclaim_freed_mark = vkr_renderer_get_freed_memory();
++#endif
++}
++
++/* The command storage the host's Vulkan devices cache for reuse counts
++ * against the same device memory budget as a resource's storage, and no
++ * context of the renderer holds it.  What the reclaim freed leaves Metal's
++ * allocation counter at once and the ledger a moment later, and the budget
++ * counts the larger, so the retry waits for the room to show when the reclaim
++ * freed something worth waiting for. */
++static void reclaim_end(void)
++{
++#ifdef ENABLE_VENUS
++   vkr_renderer_release_cached_memory();
++   const uint64_t freed = vkr_renderer_get_freed_memory() - reclaim_freed_mark;
++   vkr_renderer_wait_for_pool_headroom(freed >= RECLAIM_SETTLE_MIN_FREED ?
++                                       RECLAIM_SETTLE_MS : 0);
++#endif
++}
++
+ static const struct vrend_if_cbs vrend_cbs = {
+    ctx0_fence_retire,
+    create_gl_context,
+@@ -800,6 +833,8 @@ static const struct vrend_if_cbs vrend_cbs = {
+    create_gl_context_surfaceless,
+    destroy_gl_context_surfaceless,
+    make_current_surfaceless,
++   reclaim_begin,
++   reclaim_end,
+ };
+ #endif
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a814b33b5 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -31,6 +31,7 @@
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <sys/mman.h>
++#include <time.h>
+ #include "pipe/p_shader_tokens.h"
+ 
+ #include "pipe/p_defines.h"
+@@ -359,6 +360,16 @@ struct global_renderer_state {
+    struct vrend_context *current_ctx;
+    struct vrend_context *current_hw_ctx;
+ 
++   /* every vrend context, the renderer's own context 0 included */
++   struct list_head contexts;
++   /* resources destroyed so far, and the count and time (CLOCK_MONOTONIC,
++    * nanoseconds) of the last time the renderer gave back the host's memory
++    * for a refused resource without that helping; zero time if it helped or
++    * has not been tried */
++   uint64_t resources_destroyed;
++   uint64_t reclaim_futile_destroyed;
++   uint64_t reclaim_futile_ns;
++
+    struct list_head waiting_query_list;
+    struct list_head fence_list;
+    struct list_head fence_wait_list;
+@@ -891,6 +902,8 @@ struct vrend_untyped_resource {
+ struct vrend_context {
+    char debug_name[64];
+ 
++   /* in global_renderer_state.contexts while the context exists */
++   struct list_head all_head;
+    struct list_head sub_ctxs;
+    struct list_head vrend_resources;
+ 
+@@ -945,6 +958,8 @@ struct vrend_context {
+ };
+ 
+ static int get_glsl_version(void);
++static bool vrend_reclaim_host_memory(void);
++static void vrend_note_reclaim_result(bool recovered);
+ static void vrend_pause_render_condition(struct vrend_context *ctx, bool pause);
+ static void vrend_update_viewport_state(struct vrend_sub_context *sub_ctx);
+ static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx);
+@@ -8250,6 +8265,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+    list_inithead(&vrend_state.fence_list);
+    list_inithead(&vrend_state.fence_wait_list);
+    list_inithead(&vrend_state.waiting_query_list);
++   list_inithead(&vrend_state.contexts);
++   vrend_state.reclaim_futile_ns = 0;
+    atomic_store(&vrend_state.has_waiting_queries, false);
+ 
+    /* create 0 context */
+@@ -8568,6 +8585,9 @@ void vrend_destroy_context(struct vrend_context *ctx)
+ {
+    bool switch_0 = (ctx == vrend_state.current_ctx);
+    struct vrend_context *cur = vrend_state.current_ctx;
++
++   list_delinit(&ctx->all_head);
++
+    if (switch_0) {
+       vrend_state.current_ctx = NULL;
+       vrend_state.current_hw_ctx = NULL;
+@@ -8641,6 +8661,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+ 
+    grctx->ctx_id = id;
+ 
++   list_inithead(&grctx->all_head);
+    list_inithead(&grctx->sub_ctxs);
+    list_inithead(&grctx->vrend_resources);
+ 
+@@ -8681,6 +8702,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+       return NULL;
+    }
+    vrend_renderer_set_sub_ctx(grctx, 0);
++   list_addtail(&grctx->all_head, &vrend_state.contexts);
+ 
+    int glver = get_glsl_version();
+    if (glver < 0) {
+@@ -9697,10 +9719,10 @@ static void vrend_resource_zero_texture(struct vrend_resource *gr)
+    }
+ }
+ 
+-struct pipe_resource *
+-vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args *args,
+-                               void *image_oes,
+-                               int *error)
++static struct pipe_resource *
++vrend_renderer_resource_create_once(const struct vrend_renderer_resource_create_args *args,
++                                    void *image_oes,
++                                    int *error)
+ {
+    struct vrend_resource *gr;
+    int ret;
+@@ -9757,6 +9779,39 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    return &gr->base;
+ }
+ 
++/* A host driver with no room for a resource's storage may only be holding the
++ * room for work that has finished.  The renderer then gives back what its own
++ * contexts and the process's other drivers keep for completed work, and makes
++ * the resource once more: the creation starts from nothing, so the try that
++ * failed leaves no state to undo.  A resource that still does not fit is
++ * refused as before, and the reclaim is not repeated for the next refusals
++ * until something has been destroyed or a while has passed, since a budget
++ * that is really full gains nothing from it and a guest that keeps asking
++ * would otherwise pay for it each time.
++ *
++ * Context 0, the renderer's own, and every guest context are visited whoever
++ * asked, so the reclaim also works from inside a guest's command stream: the
++ * context that was current is current again when it returns. */
++struct pipe_resource *
++vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args *args,
++                               void *image_oes,
++                               int *error)
++{
++   int refusal = EINVAL;
++   struct pipe_resource *res;
++
++   if (!error)
++      error = &refusal;
++
++   res = vrend_renderer_resource_create_once(args, image_oes, error);
++   if (res || *error != ENOMEM || !vrend_reclaim_host_memory())
++      return res;
++
++   res = vrend_renderer_resource_create_once(args, image_oes, error);
++   vrend_note_reclaim_result(res != NULL);
++   return res;
++}
++
+ /* The R8 texture of a planes-only packed YUV image is the 1x1 texture that
+  * gives the image a name; the planes hold its pixels. */
+ static int vrend_packed_yuv_alloc_name(struct vrend_resource *gr)
+@@ -10179,6 +10234,7 @@ void vrend_resource_sync_shm_import(struct vrend_resource *res)
+ 
+ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ {
++   vrend_state.resources_destroyed++;
+    if (res->packed_yuv) {
+       for (unsigned i = 0; i < ARRAY_SIZE(res->packed_yuv->plane); i++)
+          vrend_resource_reference(&res->packed_yuv->plane[i], NULL);
+@@ -13331,6 +13387,109 @@ void vrend_renderer_host_context_trim(void)
+    vrend_renderer_context_trim(vrend_state.ctx0);
+ }
+ 
++/* How long a reclaim that did not help rules out another, if no resource has
++ * been destroyed since. */
++#define VREND_RECLAIM_HOLD_OFF_NS (250ull * 1000 * 1000)
++
++static uint64_t vrend_monotonic_ns(void)
++{
++   struct timespec now;
++   clock_gettime(CLOCK_MONOTONIC, &now);
++   return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
++}
++
++/* Runs `fn` once for each GL context of every vrend context, with that GL
++ * context current, and leaves current what was current when it was called.
++ * A context in error has no GL context to use and is skipped. */
++static void vrend_for_each_gl_context(void (*fn)(void))
++{
++   struct vrend_context *current = vrend_state.current_ctx;
++
++   list_for_each_entry(struct vrend_context, ctx, &vrend_state.contexts, all_head) {
++      if (!ctx->sub || (ctx->ctx_id != 0 && ctx->in_error))
++         continue;
++
++      struct vrend_sub_context *selected = ctx->sub;
++      list_for_each_entry(struct vrend_sub_context, sub, &ctx->sub_ctxs, head) {
++         if (vrend_hw_switch_context_with_sub(ctx, sub->sub_ctx_id))
++            fn();
++      }
++      vrend_hw_switch_context_with_sub(ctx, selected->sub_ctx_id);
++   }
++
++   if (!vrend_hw_switch_context(current ? current : vrend_state.ctx0, true))
++      vrend_hw_switch_context(vrend_state.ctx0, true);
++}
++
++static void vrend_reclaim_flush(void)
++{
++   glFlush();
++}
++
++/* A refused resource is the one time the renderer waits for the GPU on a
++ * trim's behalf: the work of a flushed context still holds the storage it
++ * used until it completes, and a trim releases only what has completed. */
++static void vrend_reclaim_finish(void)
++{
++   glFinish();
++}
++
++static void vrend_reclaim_trim(void)
++{
++#ifdef HAVE_EPOXY_EGL_H
++   virgl_egl_trim_context(egl);
++#endif
++}
++
++/* Gives back everything the renderer can reach that holds storage for work
++ * that has completed or is about to: it flushes every GL context so that what
++ * glthread and the threaded context still queue (the deletes of resources the
++ * guest has released among it) reaches the driver, waits for the GPU to
++ * finish that work, trims every context so the driver drops the references
++ * its completed batches kept, frees the shared-memory segments that were
++ * waiting behind a fence (the GPU is idle now, as that drain requires), and
++ * then asks the host drivers to free what they cache for reuse.  Returns
++ * false when a reclaim a moment ago did not help and nothing has been
++ * destroyed since: there is nothing new to give back.  The host then waits,
++ * for a moment at most, for what was freed to count in its budget. */
++static bool vrend_reclaim_host_memory(void)
++{
++   if (vrend_state.reclaim_futile_ns &&
++       vrend_state.resources_destroyed == vrend_state.reclaim_futile_destroyed &&
++       vrend_monotonic_ns() < vrend_state.reclaim_futile_ns + VREND_RECLAIM_HOLD_OFF_NS)
++      return false;
++
++   if (vrend_clicbs->reclaim_begin)
++      vrend_clicbs->reclaim_begin();
++   vrend_for_each_gl_context(vrend_reclaim_flush);
++   vrend_for_each_gl_context(vrend_reclaim_finish);
++   vrend_for_each_gl_context(vrend_reclaim_trim);
++   vrend_drain_retired_shm(true);
++#ifdef HAVE_EPOXY_EGL_H
++   virgl_egl_release_cached_memory(egl);
++#endif
++   if (vrend_clicbs->reclaim_end)
++      vrend_clicbs->reclaim_end();
++   return true;
++}
++
++static void vrend_note_reclaim_result(bool recovered)
++{
++   static bool reported;
++
++   if (recovered) {
++      vrend_state.reclaim_futile_ns = 0;
++      if (!reported) {
++         reported = true;
++         virgl_warn("a resource the host driver had no room for was made "
++                    "after the renderer gave back the memory it held\n");
++      }
++   } else {
++      vrend_state.reclaim_futile_ns = vrend_monotonic_ns();
++      vrend_state.reclaim_futile_destroyed = vrend_state.resources_destroyed;
++   }
++}
++
+ static void vrend_finish_context_switch(struct vrend_context *ctx)
+ {
+    if (ctx->ctx_switch_pending == false)
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index b3b7ee7501169b405c1add95d915d8a644d6ae6d..133569a3b0c733d625226afc6f803c89a5a4daa5 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -254,6 +254,15 @@ struct vrend_if_cbs {
+    virgl_gl_context (*create_gl_context_surfaceless)(int scanout, struct virgl_gl_ctx_param *params);
+    void (*destroy_gl_context_surfaceless)(virgl_gl_context ctx);
+    int (*make_current_surfaceless)(virgl_gl_context ctx);
++
++   /* Optional, as a pair.  The host driver refused a resource's storage and
++    * the renderer is about to give back what its own contexts hold.
++    * reclaim_end is called when it has: release what the process's other
++    * drivers cache for reuse, which counts against the same budget, and wait
++    * briefly for the memory that was freed to count in the host's budget.
++    * Both run with no driver lock held by the renderer. */
++   void (*reclaim_begin)(void);
++   void (*reclaim_end)(void);
+ };
+ 
+ #define VREND_USE_THREAD_SYNC (1 << 0)
+diff --git a/src/vrend/vrend_winsys_egl.c b/src/vrend/vrend_winsys_egl.c
+index eaaba2840b343f4a6624a2003f290f24aa585ff1..de533ced0543f0719594425e5c381e47c885c81e 100644
+--- a/src/vrend/vrend_winsys_egl.c
++++ b/src/vrend/vrend_winsys_egl.c
+@@ -956,6 +956,26 @@ bool virgl_egl_trim_context(struct virgl_egl *egl)
+    return trim_context && trim_context();
+ }
+ 
++/* eglReleaseCachedMemoryMESA, from the same extension: free what every screen
++ * of the process caches for reuse and nothing uses, and say how many cached
++ * allocations that released.  It takes no display and needs no current
++ * context, so it can be asked from anywhere in the renderer. */
++unsigned virgl_egl_release_cached_memory(struct virgl_egl *egl)
++{
++   typedef EGLint (*release_cached_memory_proc)(void);
++   static release_cached_memory_proc release_cached_memory;
++
++   if (!egl || !has_bit(egl->extension_bits, EGL_MESA_CONTEXT_TRIM))
++      return 0;
++   if (!release_cached_memory)
++      release_cached_memory =
++         (release_cached_memory_proc)eglGetProcAddress("eglReleaseCachedMemoryMESA");
++   if (!release_cached_memory)
++      return 0;
++   const EGLint released = release_cached_memory();
++   return released > 0 ? (unsigned)released : 0;
++}
++
+ bool virgl_egl_supports_host_pointer_image(struct virgl_egl *egl)
+ {
+    return has_bit(egl->extension_bits, EGL_MESA_IMAGE_HOST_POINTER);
+diff --git a/src/vrend/vrend_winsys_egl.h b/src/vrend/vrend_winsys_egl.h
+index 1d5ef95f99008216aadc31b8686ce4314798cf2e..f155198abb4c8a55c6ac9d2b8c2dd27f70c47857 100644
+--- a/src/vrend/vrend_winsys_egl.h
++++ b/src/vrend/vrend_winsys_egl.h
+@@ -87,6 +87,7 @@ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo
+ #endif
+ 
+ bool virgl_egl_trim_context(struct virgl_egl *egl);
++unsigned virgl_egl_release_cached_memory(struct virgl_egl *egl);
+ bool virgl_egl_supports_host_pointer_image(struct virgl_egl *egl);
+ void *virgl_egl_image_from_host_pointer(struct virgl_egl *egl,
+                                         void *pointer,

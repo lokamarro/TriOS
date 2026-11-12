@@ -1,0 +1,358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:57:06 +0900
+Subject: [PATCH] ext4: keep the allocator state of a group with inode
+ preallocations in memory
+
+Evicting a cached ext4 inode that still holds an inode preallocation
+allocates memory from reclaim. ext4_clear_inode() calls
+ext4_discard_preallocations(), which loads the group's buddy with
+GFP_NOFS | __GFP_NOFAIL, and when the group's bitmap and buddy folios in
+s_buddy_cache are no longer cached (drop_caches, or earlier reclaim),
+__filemap_get_folio() has to allocate them. The inode shrinker runs
+under PF_MEMALLOC, and since 903edea6c53f the page allocator warns about
+a __GFP_NOFAIL request there whenever it misses the fast path:
+
+  WARNING: mm/page_alloc.c:4763 __alloc_pages_slowpath
+   __filemap_get_folio
+   ext4_mb_load_buddy_gfp
+   ext4_discard_preallocations
+   ext4_clear_inode
+   ext4_evict_inode
+   evict
+   prune_icache_sb
+   super_cache_scan
+   shrink_slab
+   balance_pgdat
+   kswapd
+
+The release also reads the group's block bitmap buffer, which is a
+__GFP_NOFAIL allocation (__getblk_slow()) once the buffer is gone. The
+flags cannot be dropped: a failure there would abort the filesystem.
+
+Closed inodes hold preallocations more often than it seems. Enabling
+fs-verity writes the Merkle tree past EOF without delayed allocation, so
+the preallocation outlives the file's last close and only eviction
+discards it.
+
+Make the release not allocate. While a block group holds at least one
+inode preallocation, it holds references to the group's in-core bitmap
+folio, its buddy folio and its on-disk block bitmap buffer, kept in
+struct ext4_group_info under the group lock together with a count of the
+inode preallocations on bb_prealloc_list.
+
+- The folios are taken when the count goes from 0 to 1 in
+  ext4_mb_new_inode_pa(), where the allocation already holds both, so
+  the references neither sleep nor fail.
+- The buffer is taken by the first ext4_mb_mark_context() of the group
+  while the count is non-zero, which is the call that marks the blocks
+  of the same allocation. Until then the inode is in use by the
+  allocating task and cannot be evicted.
+- Every place an inode preallocation leaves bb_prealloc_list
+  (ext4_mb_put_pa(), ext4_mb_discard_group_preallocations(),
+  ext4_discard_preallocations() and ext4_mb_cleanup_pa() at unmount)
+  decrements the count, and when it reaches zero detaches the references
+  under the group lock and puts them after unlocking. ext4_mb_release()
+  drops all of them before it puts the buddy cache inode.
+
+The release then finds all three objects in memory:
+ext4_mb_load_buddy_gfp() takes its lock-free path and
+ext4_read_block_bitmap() finds the buffer. A referenced folio is neither
+dropped from the cache nor re-initialised by ext4_mb_init_cache(), which
+skips an initialised group, so online resize and block sizes below the
+page size (several groups share a folio) are unaffected. Locality group
+preallocations are not counted, because eviction never releases them.
+
+The cost is at most three 4 KiB pages per group that holds an inode
+preallocation, 96 KiB per GiB of filesystem in the worst case, 32 bytes
+per group in struct ext4_group_info, and the pinned pages cannot be
+reclaimed or migrated while the preallocation lives. If the bitmap read
+of the allocation fails, the group keeps no buffer reference and its
+release falls back to reading the bitmap, as before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ fs/ext4/ext4.h    |  12 ++++
+ fs/ext4/mballoc.c | 140 +++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 149 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index dae7fb8bc598e32311f4c64524709923805d94d1..1c1ccadc49a130baae9356448116e8869e1ea34c 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3542,6 +3542,18 @@ struct ext4_group_info {
+ 	ext4_grpblk_t	bb_largest_free_order;/* order of largest frag in BG */
+ 	ext4_group_t	bb_group;	/* Group number */
+ 	struct          list_head bb_prealloc_list;
++	/*
++	 * While bb_prealloc_list holds inode preallocations, the group keeps
++	 * its allocator state in memory: references to its in-core bitmap and
++	 * buddy folios in s_buddy_cache and to its on-disk block bitmap
++	 * buffer, so that releasing an inode preallocation never allocates
++	 * (see ext4_mb_pa_refs_get() in mballoc.c).  All of this is protected
++	 * by the group lock.
++	 */
++	unsigned int	bb_inode_pa_count;	/* inode PAs on bb_prealloc_list */
++	struct folio	*bb_pa_bitmap_folio;
++	struct folio	*bb_pa_buddy_folio;
++	struct buffer_head *bb_pa_bitmap_bh;
+ #ifdef DOUBLE_CHECK
+ 	void            *bb_bitmap;
+ #endif
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 71b8b47e213ab1775219fb49b142fa9d67556219..bef6cbb7ef74f5eabaaecd412e9efc05897f2262 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -3864,8 +3864,116 @@ int ext4_mb_init(struct super_block *sb)
+ 	return ret;
+ }
+ 
+-/* need to called with the ext4 group lock held */
+-static int ext4_mb_cleanup_pa(struct ext4_group_info *grp)
++/*
++ * Releasing an inode preallocation must not allocate memory.  The inode
++ * shrinker releases one when it evicts a cached inode, and then it runs under
++ * PF_MEMALLOC, where the page allocator warns about the __GFP_NOFAIL request
++ * that ext4_discard_preallocations() makes for a buddy folio that is no
++ * longer cached, and a failing request would have to abort the filesystem.
++ *
++ * So while a group holds at least one inode preallocation, it also holds
++ * references to the three objects the release needs: the group's in-core
++ * bitmap folio and buddy folio in s_buddy_cache, and its on-disk block bitmap
++ * buffer.  The release then finds all of them in memory.  A referenced folio
++ * is neither dropped from the cache nor replaced by ext4_mb_init_cache(), and
++ * a referenced buffer is not freed.  The references are taken and dropped
++ * where an inode preallocation joins and leaves bb_prealloc_list, under the
++ * group lock for the pointers and outside it for the puts.
++ *
++ * The folios are taken from the allocation that creates the first
++ * preallocation, which already holds them.  The buffer is taken by the first
++ * ext4_mb_mark_context() of the group after that, which is the one that marks
++ * the blocks of the same allocation.  Until then the inode is in use by the
++ * allocating task, so it cannot be evicted.
++ *
++ * Locality group preallocations are not counted: nothing releases them from
++ * eviction.
++ */
++struct ext4_pa_refs {
++	struct folio *bitmap_folio;
++	struct folio *buddy_folio;
++	struct buffer_head *bitmap_bh;
++};
++
++/* Called with the group lock held when an inode PA joins bb_prealloc_list. */
++static void ext4_mb_pa_refs_get(struct ext4_group_info *grp,
++				struct ext4_allocation_context *ac)
++{
++	lockdep_assert_held(ext4_group_lock_ptr(ac->ac_sb,
++						ac->ac_b_ex.fe_group));
++	if (grp->bb_inode_pa_count++)
++		return;
++	WARN_ON_ONCE(grp->bb_pa_bitmap_folio || grp->bb_pa_buddy_folio ||
++		     grp->bb_pa_bitmap_bh);
++	/*
++	 * The allocation holds both folios until ext4_mb_release_context(), so
++	 * taking another reference neither sleeps nor fails.
++	 */
++	grp->bb_pa_bitmap_folio = ac->ac_bitmap_folio;
++	folio_get(grp->bb_pa_bitmap_folio);
++	grp->bb_pa_buddy_folio = ac->ac_buddy_folio;
++	folio_get(grp->bb_pa_buddy_folio);
++}
++
++/* Called with the group lock held, after the group's bitmap buffer is read. */
++static void ext4_mb_pa_refs_get_bitmap(struct ext4_group_info *grp,
++				       struct buffer_head *bitmap_bh)
++{
++	if (!grp->bb_inode_pa_count || grp->bb_pa_bitmap_bh)
++		return;
++	get_bh(bitmap_bh);
++	grp->bb_pa_bitmap_bh = bitmap_bh;
++}
++
++/* Move all of the group's references to @refs; the group lock is held. */
++static void ext4_mb_pa_refs_take(struct ext4_group_info *grp,
++				 struct ext4_pa_refs *refs)
++{
++	WARN_ON_ONCE(refs->bitmap_folio || refs->buddy_folio ||
++		     refs->bitmap_bh);
++	refs->bitmap_folio = grp->bb_pa_bitmap_folio;
++	refs->buddy_folio = grp->bb_pa_buddy_folio;
++	refs->bitmap_bh = grp->bb_pa_bitmap_bh;
++	grp->bb_pa_bitmap_folio = NULL;
++	grp->bb_pa_buddy_folio = NULL;
++	grp->bb_pa_bitmap_bh = NULL;
++}
++
++/*
++ * Called with the group lock held after @pa left bb_prealloc_list.  When the
++ * last inode PA left, the group's references move to @refs, which the caller
++ * puts with ext4_mb_pa_refs_put() after dropping the lock.
++ */
++static void ext4_mb_pa_refs_detach(struct ext4_group_info *grp,
++				   struct ext4_prealloc_space *pa,
++				   struct ext4_pa_refs *refs)
++{
++	if (pa->pa_type != MB_INODE_PA)
++		return;
++	if (WARN_ON_ONCE(!grp->bb_inode_pa_count))
++		return;
++	if (--grp->bb_inode_pa_count)
++		return;
++	ext4_mb_pa_refs_take(grp, refs);
++}
++
++static void ext4_mb_pa_refs_put(struct ext4_pa_refs *refs)
++{
++	if (refs->bitmap_folio)
++		folio_put(refs->bitmap_folio);
++	if (refs->buddy_folio)
++		folio_put(refs->buddy_folio);
++	if (refs->bitmap_bh)
++		brelse(refs->bitmap_bh);
++	memset(refs, 0, sizeof(*refs));
++}
++
++/*
++ * need to called with the ext4 group lock held; the group's references move
++ * to @refs, which the caller puts after dropping the lock.
++ */
++static int ext4_mb_cleanup_pa(struct ext4_group_info *grp,
++			      struct ext4_pa_refs *refs)
+ {
+ 	struct ext4_prealloc_space *pa;
+ 	struct list_head *cur, *tmp;
+@@ -3877,6 +3985,8 @@ static int ext4_mb_cleanup_pa(struct ext4_group_info *grp)
+ 		count++;
+ 		kmem_cache_free(ext4_pspace_cachep, pa);
+ 	}
++	grp->bb_inode_pa_count = 0;
++	ext4_mb_pa_refs_take(grp, refs);
+ 	return count;
+ }
+ 
+@@ -3888,6 +3998,7 @@ void ext4_mb_release(struct super_block *sb)
+ 	struct ext4_group_info *grinfo, ***group_info;
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	struct kmem_cache *cachep = get_groupinfo_cache(sb->s_blocksize_bits);
++	struct ext4_pa_refs refs = {};
+ 	int count;
+ 
+ 	/*
+@@ -3905,11 +4016,13 @@ void ext4_mb_release(struct super_block *sb)
+ 				continue;
+ 			mb_group_bb_bitmap_free(grinfo);
+ 			ext4_lock_group(sb, i);
+-			count = ext4_mb_cleanup_pa(grinfo);
++			count = ext4_mb_cleanup_pa(grinfo, &refs);
+ 			if (count)
+ 				mb_debug(sb, "mballoc: %d PAs left\n",
+ 					 count);
+ 			ext4_unlock_group(sb, i);
++			/* before iput(s_buddy_cache) below */
++			ext4_mb_pa_refs_put(&refs);
+ 			kmem_cache_free(cachep, grinfo);
+ 		}
+ 		num_meta_group_infos = (ngroups +
+@@ -4092,6 +4205,7 @@ ext4_mb_mark_context(handle_t *handle, struct super_block *sb, bool state,
+ 	struct buffer_head *gdp_bh;
+ 	int err;
+ 	unsigned int i, already, changed = len;
++	struct ext4_group_info *grp;
+ 
+ 	KUNIT_STATIC_STUB_REDIRECT(ext4_mb_mark_context,
+ 				   handle, sb, state, group, blkoff, len,
+@@ -4124,7 +4238,11 @@ ext4_mb_mark_context(handle_t *handle, struct super_block *sb, bool state,
+ 			goto out_err;
+ 	}
+ 
++	grp = ext4_get_group_info(sb, group);
+ 	ext4_lock_group(sb, group);
++	/* Keep the buffer an inode preallocation's release will read. */
++	if (grp)
++		ext4_mb_pa_refs_get_bitmap(grp, bitmap_bh);
+ 	if (ext4_has_group_desc_csum(sb) &&
+ 	    (gdp->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))) {
+ 		gdp->bg_flags &= cpu_to_le16(~EXT4_BG_BLOCK_UNINIT);
+@@ -5166,6 +5284,8 @@ static void ext4_mb_put_pa(struct ext4_allocation_context *ac,
+ 	ext4_group_t grp;
+ 	ext4_fsblk_t grp_blk;
+ 	struct ext4_inode_info *ei = EXT4_I(ac->ac_inode);
++	struct ext4_group_info *gi;
++	struct ext4_pa_refs refs = {};
+ 
+ 	/* in this short window concurrent discard can set pa_deleted */
+ 	spin_lock(&pa->pa_lock);
+@@ -5206,9 +5326,13 @@ static void ext4_mb_put_pa(struct ext4_allocation_context *ac,
+ 	 * we make "copy" and "mark all PAs" atomic and serialize "drop PA"
+ 	 * against that pair
+ 	 */
++	gi = ext4_get_group_info(sb, grp);
+ 	ext4_lock_group(sb, grp);
+ 	list_del(&pa->pa_group_list);
++	if (gi)
++		ext4_mb_pa_refs_detach(gi, pa, &refs);
+ 	ext4_unlock_group(sb, grp);
++	ext4_mb_pa_refs_put(&refs);
+ 
+ 	if (pa->pa_type == MB_INODE_PA) {
+ 		write_lock(pa->pa_node_lock.inode_lock);
+@@ -5341,6 +5465,7 @@ ext4_mb_new_inode_pa(struct ext4_allocation_context *ac)
+ 	pa->pa_inode = ac->ac_inode;
+ 
+ 	list_add(&pa->pa_group_list, &grp->bb_prealloc_list);
++	ext4_mb_pa_refs_get(grp, ac);
+ 
+ 	write_lock(pa->pa_node_lock.inode_lock);
+ 	ext4_mb_pa_rb_insert(&ei->i_prealloc_node, &pa->pa_node.inode_node);
+@@ -5509,6 +5634,7 @@ ext4_mb_discard_group_preallocations(struct super_block *sb,
+ 	LIST_HEAD(list);
+ 	struct ext4_buddy e4b;
+ 	struct ext4_inode_info *ei;
++	struct ext4_pa_refs refs = {};
+ 	int err;
+ 	int free = 0;
+ 
+@@ -5561,6 +5687,7 @@ ext4_mb_discard_group_preallocations(struct super_block *sb,
+ 		spin_unlock(&pa->pa_lock);
+ 
+ 		list_del(&pa->pa_group_list);
++		ext4_mb_pa_refs_detach(grp, pa, &refs);
+ 		list_add(&pa->u.pa_tmp_list, &list);
+ 	}
+ 
+@@ -5593,6 +5720,7 @@ ext4_mb_discard_group_preallocations(struct super_block *sb,
+ 	ext4_unlock_group(sb, group);
+ 	ext4_mb_unload_buddy(&e4b);
+ 	put_bh(bitmap_bh);
++	ext4_mb_pa_refs_put(&refs);
+ out_dbg:
+ 	mb_debug(sb, "discarded (%d) blocks preallocated for group %u bb_free (%d)\n",
+ 		 free, group, grp->bb_free);
+@@ -5617,6 +5745,8 @@ void ext4_discard_preallocations(struct inode *inode)
+ 	ext4_group_t group = 0;
+ 	LIST_HEAD(list);
+ 	struct ext4_buddy e4b;
++	struct ext4_group_info *grp;
++	struct ext4_pa_refs refs = {};
+ 	struct rb_node *iter;
+ 	int err;
+ 
+@@ -5703,13 +5833,17 @@ void ext4_discard_preallocations(struct inode *inode)
+ 			continue;
+ 		}
+ 
++		grp = ext4_get_group_info(sb, group);
+ 		ext4_lock_group(sb, group);
+ 		list_del(&pa->pa_group_list);
++		if (grp)
++			ext4_mb_pa_refs_detach(grp, pa, &refs);
+ 		ext4_mb_release_inode_pa(&e4b, bitmap_bh, pa);
+ 		ext4_unlock_group(sb, group);
+ 
+ 		ext4_mb_unload_buddy(&e4b);
+ 		put_bh(bitmap_bh);
++		ext4_mb_pa_refs_put(&refs);
+ 
+ 		list_del(&pa->u.pa_tmp_list);
+ 		ext4_mb_pa_free(pa);

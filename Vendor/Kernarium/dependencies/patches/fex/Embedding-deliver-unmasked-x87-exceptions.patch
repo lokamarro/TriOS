@@ -1,0 +1,696 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 09:36:33 +0900
+Subject: [PATCH] Embedding: deliver unmasked x87 exceptions
+
+x86 raises #MF at the next waiting x87 or MMX instruction after an x87
+instruction raises an exception the control word unmasks, and the
+raising instruction commits less than its masked form: after invalid
+operation, a denormal operand or division by zero nothing but the
+status word, and a store beside an overflow or underflow writes
+nothing. An embedding host that runs x86 programs exactly needs both.
+
+The floating-point mode an embedder sets now also says whether the x87
+control word unmasks an exception, and FLDCW, FLDENV, FRSTOR and FNINIT
+-- so FNSAVE -- leave a context whose mode they change. In that mode:
+
+- every waiting instruction starts with an EmbedderX87Wait op, which
+  leaves with EMBEDDER_EXIT_X87_FAULT while ES shows an exception
+  pending, before the instruction does anything;
+- the helpers, the inline exception paths, the stack faults and the
+  comparisons record the unmasked exceptions the running instruction
+  raised, and EmbedderX87Commit ops after each lowered operation, before
+  a store and before a comparison's pop leave with
+  EMBEDDER_EXIT_X87_EXCEPTION, the instruction retired with only its
+  status word changed; a comparison sets its condition codes first, as
+  an Intel host does, and a load completes beside a denormal operand;
+- FLDCW makes ES and B show whether the new control word unmasks a flag
+  already set.
+
+Embedded, FLDENV, FRSTOR, FXRSTOR and XRSTOR set ES and B from the
+flags and the control word they load. A helper that follows an
+unmasked invalid operation, denormal operand or division by zero of
+its instruction raises none of a result's exceptions, and a store
+conversion beside an unmasked overflow or underflow raises no
+precision.
+---
+ FEXCore/Source/Interface/Context/Context.h    |  7 ++
+ FEXCore/Source/Interface/Core/Core.cpp        | 31 ++++++++
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  |  4 +
+ .../Core/Interpreter/Fallbacks/F80Fallbacks.h | 24 +++++-
+ .../Interface/Core/JIT/EmbedderFloat.cpp      | 44 ++++++++++-
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |  3 +
+ .../Source/Interface/Core/OpcodeDispatcher.h  | 10 +++
+ .../Interface/Core/OpcodeDispatcher/X87.cpp   | 79 ++++++++++++++++---
+ FEXCore/Source/Interface/IR/IR.json           | 17 ++++
+ FEXCore/Source/Interface/IR/PassManager.cpp   |  3 +-
+ FEXCore/Source/Interface/IR/Passes.h          |  4 +-
+ .../IR/Passes/x87StackOptimizationPass.cpp    | 66 +++++++++++++++-
+ FEXCore/include/FEXCore/Core/CoreState.h      | 16 ++++
+ 13 files changed, 288 insertions(+), 20 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index e536fb6aae987fc222fe792f6f0da71255ca7017..b12c41017663c752b7881707405c7ba5121d03b0 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -37,6 +37,11 @@ namespace Core {
+   struct InternalThreadState;
+ } // namespace Core
+ 
++namespace X86Tables {
++  struct X86InstInfo;
++  struct DecodedInst;
++} // namespace X86Tables
++
+ namespace CPU {
+   class Dispatcher;
+ } // namespace CPU
+@@ -156,6 +161,8 @@ public:
+ 
+   bool IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) override;
+   bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) override;
++  // Embedded x87 checks: whether the instruction is a waiting one.
++  static bool WaitsForX87(const FEXCore::X86Tables::X86InstInfo* TableInfo, const FEXCore::X86Tables::DecodedInst* DecodedInfo);
+   uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 0833ed57f6685475d527e7e6e81e061cb494a8da..5ec8123ba8e8b284fe3d4664d94f8f89a5e6a3a5 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -688,6 +688,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ 
+         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
+           auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;
++          if (Embedded && (EmbedderFPMode & FEXCore::Core::EMBEDDER_FP_MODE_X87) != 0 && WaitsForX87(TableInfo, DecodedInfo)) {
++            Thread->OpDispatcher->_EmbedderX87Wait(DecodedInfo->PC + DecodedInfo->InstSize);
++          }
+           Thread->OpDispatcher->ResetHandledLock();
+           Thread->OpDispatcher->ResetDecodeFailure();
+           IR::ForceTSOMode ForceTSO = IR::ForceTSOMode::NoOverride;
+@@ -1057,6 +1060,34 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   return (uintptr_t)CodePtr;
+ }
+ 
++// Whether x86 raises #MF before the instruction while an unmasked x87
++// exception is pending: FWAIT, EMMS, FEMMS, an instruction with an MMX
++// register operand, and every x87 instruction but FNINIT, FNCLEX, FNSTSW,
++// FNSTCW, FNSTENV, FNSAVE and the FNENI, FNDISI and FNSETPM no-ops.
++bool ContextImpl::WaitsForX87(const FEXCore::X86Tables::X86InstInfo* TableInfo, const FEXCore::X86Tables::DecodedInst* DecodedInfo) {
++  using namespace FEXCore::X86Tables;
++  if (TableInfo >= X87F80Ops.data() && TableInfo < X87F80Ops.data() + X87F80Ops.size()) {
++    // OP is the escape less D8, then the ModRM byte.
++    const uint8_t ModRM = DecodedInfo->ModRM;
++    const bool Register = (ModRM >> 6) == 3;
++    const uint8_t Reg = (ModRM >> 3) & 7;
++    switch (0xD8 + (DecodedInfo->OP >> 8)) {
++    case 0xD9: return Register || (Reg != 6 && Reg != 7);
++    case 0xDB: return !(ModRM >= 0xE0 && ModRM <= 0xE4);
++    case 0xDD: return Register || (Reg != 6 && Reg != 7);
++    case 0xDF: return ModRM != 0xE0;
++    default: return true;
++    }
++  }
++  if (TableInfo == &BaseOps[0x9B] || TableInfo == &SecondBaseOps[0x77] || TableInfo == &SecondBaseOps[0x0E]) {
++    return true;
++  }
++  const auto MMX = [](const DecodedOperand& Operand) {
++    return Operand.IsGPR() && Operand.Data.GPR.GPR >= FEXCore::X86State::REG_MM_0 && Operand.Data.GPR.GPR <= FEXCore::X86State::REG_MM_7;
++  };
++  return MMX(DecodedInfo->Dest) || MMX(DecodedInfo->Src[0]) || MMX(DecodedInfo->Src[1]) || MMX(DecodedInfo->Src[2]);
++}
++
+ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+   FEXCORE_PROFILE_SCOPED("CompileSingleStep");
+   auto Thread = Frame->Thread;
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index f4915a2230e289521f98ae09598d0ac5d53ce871..fbaa9f42ca4ae891c4e6def9222a466558f495a7 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -868,6 +868,10 @@ void Dispatcher::EmitX87Exception(uint32_t Bit) {
+   mov(ARMEmitter::Size::i32Bit, TMP1, 1);
+   strb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_ES_LOC);
+   strb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_B_LOC);
++  // For an embedding host's commit checks.
++  ldr(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.X87Raised));
++  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, 1U << Bit);
++  str(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.X87Raised));
+   (void)Bind(&Masked);
+ }
+ 
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+index 43acaf1a7a160e4d49b736a37953a2a437cb41c1..57b7522125e59aad0ffc9c9840f6140e15ed037a 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+@@ -42,8 +42,9 @@ constexpr uint_fast8_t X87DenormalFlag = 0x20;
+ 
+ // Accumulates the exceptions an operation raised into the status word's
+ // sticky flags, and sets ES and B while one the control word unmasks is
+-// pending.
+-FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state& State, uint16_t FCW, FEXCore::Core::CpuStateFrame* Frame) {
++// pending. Store is a conversion to the format of a memory destination.
++FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state& State, uint16_t FCW, FEXCore::Core::CpuStateFrame* Frame,
++                                                         bool Store) {
+   uint16_t Raised = 0;
+   if (State.exceptionFlags & softfloat_flag_invalid) {
+     Raised |= 1U << 0;
+@@ -66,6 +67,17 @@ FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state&
+   if (Raised == 0) {
+     return;
+   }
++  // After an unmasked invalid operation, denormal operand or division by
++  // zero, this operation's or one an earlier operation of its instruction
++  // raised, x86 computes no result and raises none of a result's
++  // exceptions. A store beside an unmasked overflow or underflow stores
++  // nothing, and raises no precision.
++  const uint16_t Unmasked = Raised & ~FCW & 0x3fU;
++  if (((Unmasked | Frame->Embedder.X87Raised) & 0x07U) != 0) {
++    Raised &= 0x07U;
++  } else if (Store && (Unmasked & 0x18U) != 0) {
++    Raised &= ~(1U << 5);
++  }
+   for (unsigned Bit = 0; Bit < 6; ++Bit) {
+     if (Raised & (1U << Bit)) {
+       Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC + Bit] = 1;
+@@ -74,6 +86,8 @@ FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state&
+   if (Raised & ~FCW & 0x3fU) {
+     Frame->State.flags[FEXCore::X86State::X87FLAG_ES_LOC] = 1;
+     Frame->State.flags[FEXCore::X86State::X87FLAG_B_LOC] = 1;
++    // For an embedding host's commit checks.
++    Frame->Embedder.X87Raised |= Raised & ~FCW & 0x3fU;
+   }
+ }
+ 
+@@ -86,7 +100,7 @@ public:
+     , Frame(Frame) {}
+ 
+   FEXCORE_PRESERVE_ALL_ATTR ~ScopedSoftFloatState() {
+-    HandleX87Exception(State, FCW, Frame);
++    HandleX87Exception(State, FCW, Frame, Store);
+   }
+ 
+   // Disable copy and move to ensure RAII semantics
+@@ -109,6 +123,8 @@ public:
+ 
+   softfloat_state State;
+   uint16_t FCW;
++  // A conversion for a store to memory.
++  bool Store {};
+ 
+ private:
+   FEXCore::Core::CpuStateFrame* Frame;
+@@ -161,12 +177,14 @@ struct OpHandlers<IR::OP_F80CVT> {
+   FEXCORE_PRESERVE_ALL_ATTR static float handle4(uint16_t FCW, VectorRegType src, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame};
++    State.Store = true;
+     return X80SoftFloat(src).ToF32(&State.State);
+   }
+ 
+   FEXCORE_PRESERVE_ALL_ATTR static double handle8(uint16_t FCW, VectorRegType src, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame};
++    State.Store = true;
+     return X80SoftFloat(src).ToF64(&State.State);
+   }
+ };
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
+index 113312b3b1d500755ae370dbcb04cd81603f024f..3ee847f4e46d1d111ae0a0748496a7317fc31956 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
+@@ -542,8 +542,17 @@ DEF_OP(EmbedderFPModeCheck) {
+   orr(i32, TMP2, TMP2, TMP3);
+   ubfx(i32, TMP3, TMP1, 15, 1);
+   orr(i32, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 1);
+-  const auto Expected = CTX->EmbedderFPMode & (Core::EMBEDDER_FP_MODE_DAZ | Core::EMBEDDER_FP_MODE_FTZ |
+-                                               Core::EMBEDDER_FP_MODE_CHECK_SPECIAL | Core::EMBEDDER_FP_MODE_CHECK_ALL);
++  // X87, unless the x87 control word masks all six exceptions: TMP3 is the
++  // unmasked set, at most 63, whose negation has bit 31 set when it is not
++  // empty.
++  ldrh(TMP3.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.FCW));
++  mvn(i32, TMP3, TMP3);
++  and_(i32, TMP3, TMP3, 0x3f);
++  neg(i32, TMP3, TMP3);
++  lsr(i32, TMP3, TMP3, 31);
++  orr(i32, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 4);
++  const auto Expected = CTX->EmbedderFPMode & (Core::EMBEDDER_FP_MODE_DAZ | Core::EMBEDDER_FP_MODE_FTZ | Core::EMBEDDER_FP_MODE_CHECK_SPECIAL |
++                                               Core::EMBEDDER_FP_MODE_CHECK_ALL | Core::EMBEDDER_FP_MODE_X87);
+   if (Expected != 0) {
+     eor(ARMEmitter::Size::i32Bit, TMP2, TMP2, Expected);
+   }
+@@ -551,6 +560,37 @@ DEF_OP(EmbedderFPModeCheck) {
+   EmbedderBudgetSites.push_back(std::move(Site));
+ }
+ 
++DEF_OP(EmbedderX87Wait) {
++  const auto Op = IROp->C<IR::IROp_EmbedderX87Wait>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderX87Wait outside embedding");
++  EmbedderX87NextRIP = Op->NextRIP;
++  // #MF while an unmasked exception is pending, before the instruction does
++  // anything. No NZCV writes: guest flags are live.
++  auto Site = fextl::make_unique<EmbedderBudgetSite>();
++  Site->GuestRIP = EmbedderCurrentRIP;
++  Site->ExitReason = Core::EMBEDDER_EXIT_X87_FAULT;
++  Site->Unretired = EmbedderUnretired(false);
++  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_ES_LOC);
++  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, &Site->Entry);
++  str(ARMEmitter::WReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.X87Raised));
++  EmbedderBudgetSites.push_back(std::move(Site));
++}
++
++DEF_OP(EmbedderX87Commit) {
++  const auto Op = IROp->C<IR::IROp_EmbedderX87Commit>();
++  LOGMAN_THROW_A_FMT(Embedded() && EmbedderX87NextRIP != 0, "EmbedderX87Commit without EmbedderX87Wait");
++  // The instruction retires with the status word its exception set, and
++  // nothing else. No NZCV writes.
++  auto Site = fextl::make_unique<EmbedderBudgetSite>();
++  Site->GuestRIP = EmbedderX87NextRIP;
++  Site->ExitReason = Core::EMBEDDER_EXIT_X87_EXCEPTION;
++  Site->Unretired = EmbedderUnretired(true);
++  ldr(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.X87Raised));
++  and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, Op->Mask);
++  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, &Site->Entry);
++  EmbedderBudgetSites.push_back(std::move(Site));
++}
++
+ void Arm64JITCore::EmitEmbedderFPSites() {
+   const auto Scratch = offsetof(FEXCore::Core::CpuStateFrame, Embedder.FPScratch);
+   for (auto& Site : EmbedderFPSites) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 18c1bf602fd4cc0a93cddaf20616dcc20fd5eafa..e25ba3bbec86673de076de92d38f0c41ac052b4d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -197,6 +197,9 @@ private:
+   void EmbedderFPInputTest(const EmbedderFPSite& Site, uint32_t Kind, uint32_t ElementBytes, uint32_t Bytes, uint32_t Flags, bool Above,
+                            ARMEmitter::ForwardLabel* Target);
+   uint64_t EmbedderCurrentRIP {};
++  // The next instruction's RIP, from the running instruction's
++  // EmbedderX87Wait, where its EmbedderX87Commit ops leave.
++  uint64_t EmbedderX87NextRIP {};
+   // The instructions the unit runs from its entry to its end, which its entry
+   // charges the budget for, and their offsets from the entry in order.
+   uint32_t EmbedderBlockInstructions {};
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 631cc1a4ab1f686cab37907918615345db203b66..ab6c86226698aef204e4a1d3d2cea450c8bbc5d1 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1517,6 +1517,16 @@ private:
+   // reads them.
+   void EmbedderFPExceptions(Core::EmbedderFPKind Kind, IR::OpSize ElementSize, uint32_t Lanes, Ref Source1, Ref Source2 = nullptr,
+                             uint32_t Imm = 0, uint32_t Flags = 0);
++  // Embedded, while the x87 control word unmasks an exception: x87 checks.
++  bool EmbedderX87Checks() const;
++  // With x87 checks, EmbedderX87Commit(Mask).
++  void EmbedderX87Commit(uint32_t Mask);
++  static constexpr uint32_t EmbedderX87PrecomputationExceptions = 0x07;
++  static constexpr uint32_t EmbedderX87StoreExceptions = 0x1f;
++  // Raises invalid operation where Unordered, 0 or 1, is set.
++  void X87InvalidForNaN(Ref Unordered);
++  // Sets ES and B to whether FSW holds a flag FCW unmasks.
++  void X87UpdatePending(Ref FSW, Ref FCW);
+   // Whether this context's checks settle exceptions MXCSR unmasks.
+   bool EmbedderFPChecksExceptions() const;
+   fextl::vector<IR::IROp_EmbedderFPCheck*> EmbedderFPInstructionChecks;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 762280e820b311846888525902e1c620f3449ee6..41a7d584103898432fd2019f3f7cf63e585acac9 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -83,6 +83,7 @@ void OpDispatchBuilder::FBLD(OpcodeArgs) {
+ 
+ void OpDispatchBuilder::FBSTP(OpcodeArgs) {
+   Ref converted = _F80BCDStore(_ReadStackValue(0));
++  EmbedderX87Commit(EmbedderX87StoreExceptions);
+   StoreResultFPR_WithOpSize(Op, Op->Dest, converted, OpSize::f80Bit, OpSize::i8Bit);
+   _PopStackDestroy();
+ }
+@@ -154,6 +155,7 @@ void OpDispatchBuilder::FIST(OpcodeArgs, bool Truncate) {
+   // The conversion helper raises IE for a NaN, an infinity or a value out
+   // of the destination's range, the 16-bit one included.
+   Data = _F80CVTInt(Size, Data, Truncate);
++  EmbedderX87Commit(EmbedderX87StoreExceptions);
+ 
+   StoreResultGPR_WithOpSize(Op, Op->Dest, Data, Size, OpSize::i8Bit,
+                             CTX->IsVectorAtomicTSOEnabled() ? MemoryAccessType::DEFAULT : MemoryAccessType::NONTSO);
+@@ -436,6 +438,10 @@ Ref OpDispatchBuilder::ReconstructX87StateFromFSW_Helper(Ref FSW) {
+     SetRFLAG(_Bfe(OpSize::i32Bit, 1, Bit, FSW), FEXCore::X86State::X87FLAG_IE_LOC + Bit);
+   }
+   SetRFLAG<FEXCore::X86State::X87FLAG_B_LOC>(_Bfe(OpSize::i32Bit, 1, 15, FSW));
++  if (CTX->Embedded) {
++    // Callers store the control word first.
++    X87UpdatePending(FSW, _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW)));
++  }
+   return Top;
+ }
+ 
+@@ -462,6 +468,7 @@ void OpDispatchBuilder::X87LDENV(OpcodeArgs) {
+     Ref MemLocation = Add(OpSize::i64Bit, Mem, IR::OpSizeToSize(Size) * 2);
+     SetX87FTW(_LoadMemGPR(Size, MemLocation, Size));
+   }
++  EmbedderFPModeCheck(Op);
+ }
+ 
+ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
+@@ -607,6 +614,7 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
+     Reg = _F80CVT(OpSize::i64Bit, Reg); // Convert to double precision
+   }
+   _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
++  EmbedderFPModeCheck(Op);
+ }
+ 
+ // Load / Store Control Word
+@@ -622,6 +630,16 @@ void OpDispatchBuilder::X87FLDCW(OpcodeArgs) {
+   _StackForceSlow();
+   Ref NewFCW = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
++  if (EmbedderX87Checks()) {
++    // A context without the x87 checks leaves when the new control word
++    // unmasks an exception, and the host makes ES show a pending one.
++    Ref Flags = Constant(0);
++    for (unsigned Bit = 0; Bit < 6; ++Bit) {
++      Flags = _Orlshl(OpSize::i32Bit, Flags, GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC + Bit), Bit);
++    }
++    X87UpdatePending(Flags, NewFCW);
++  }
++  EmbedderFPModeCheck(Op);
+ }
+ 
+ void OpDispatchBuilder::FXCH(OpcodeArgs) {
+@@ -672,6 +690,16 @@ void OpDispatchBuilder::FCOMI(OpcodeArgs, IR::OpSize Width, bool Integer, OpDisp
+   HostFlag_CF = _Or(OpSize::i32Bit, HostFlag_CF, HostFlag_Unordered);
+   HostFlag_ZF = _Or(OpSize::i32Bit, HostFlag_ZF, HostFlag_Unordered);
+ 
++  // The compare helper raises IE for a signaling NaN. FCOM, FCOMI and
++  // FICOM signal for any NaN; FUCOM, FUCOMP, FUCOMPP, FUCOMI and FUCOMIP,
++  // whose register forms these are, do not. IE is sticky. An Intel host sets
++  // the condition codes beside an unmasked exception, but does not pop.
++  const uint16_t Form = Op->OP & ~7U;
++  const bool Quiet = Form == 0x5E0 || Form == 0x5E8 || Op->OP == 0x2E9 || Form == 0x3E8 || Form == 0x7E8;
++  if (!Quiet) {
++    X87InvalidForNaN(HostFlag_Unordered);
++  }
++
+   if (WhichFlags == FCOMIFlags::FLAGS_X87) {
+     SetRFLAG<FEXCore::X86State::X87FLAG_C0_LOC>(HostFlag_CF);
+     SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Constant(0));
+@@ -693,15 +721,9 @@ void OpDispatchBuilder::FCOMI(OpcodeArgs, IR::OpSize Width, bool Integer, OpDisp
+     SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
+   }
+ 
+-  // The compare helper raises IE for a signaling NaN. FCOM, FCOMI and
+-  // FICOM signal for any NaN; FUCOM, FUCOMP, FUCOMPP, FUCOMI and FUCOMIP,
+-  // whose register forms these are, do not. IE is sticky.
+-  const uint16_t Form = Op->OP & ~7U;
+-  const bool Quiet = Form == 0x5E0 || Form == 0x5E8 || Op->OP == 0x2E9 || Form == 0x3E8 || Form == 0x7E8;
+-  if (!Quiet) {
+-    SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC), HostFlag_Unordered));
++  if (PopTwice || (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) != 0) {
++    EmbedderX87Commit(EmbedderX87PrecomputationExceptions);
+   }
+-
+   if (PopTwice) {
+     _PopStackDestroy();
+     _PopStackDestroy();
+@@ -719,13 +741,48 @@ void OpDispatchBuilder::FTST(OpcodeArgs) {
+   HostFlag_CF = _Or(OpSize::i32Bit, HostFlag_CF, HostFlag_Unordered);
+   HostFlag_ZF = _Or(OpSize::i32Bit, HostFlag_ZF, HostFlag_Unordered);
+ 
++  // FTST signals for any NaN; IE is sticky.
++  X87InvalidForNaN(HostFlag_Unordered);
++
+   SetRFLAG<FEXCore::X86State::X87FLAG_C0_LOC>(HostFlag_CF);
+   SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Constant(0));
+   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(HostFlag_Unordered);
+   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(HostFlag_ZF);
++}
+ 
+-  // FTST signals for any NaN; IE is sticky.
+-  SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC), HostFlag_Unordered));
++void OpDispatchBuilder::X87InvalidForNaN(Ref Unordered) {
++  SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC), Unordered));
++  if (!EmbedderX87Checks()) {
++    return;
++  }
++  // Unmasked, it is pending for the next waiting instruction.
++  Ref FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
++  Ref Unmasked = _Andn(OpSize::i32Bit, Unordered, FCW);
++  SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_ES_LOC), Unmasked));
++  SetRFLAG<FEXCore::X86State::X87FLAG_B_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_B_LOC), Unmasked));
++  constexpr auto Raised = offsetof(FEXCore::Core::CpuStateFrame, Embedder.X87Raised);
++  _StoreContextGPR(OpSize::i32Bit, _Or(OpSize::i32Bit, _LoadContextGPR(OpSize::i32Bit, Raised), Unmasked), Raised);
++}
++
++bool OpDispatchBuilder::EmbedderX87Checks() const {
++  return CTX->Embedded && (CTX->EmbedderFPMode & Core::EMBEDDER_FP_MODE_X87) != 0;
++}
++
++void OpDispatchBuilder::EmbedderX87Commit(uint32_t Mask) {
++  if (EmbedderX87Checks()) {
++    _EmbedderX87Commit(Mask);
++  }
++}
++
++// x87 reports an exception the control word unmasks, ES, at the next waiting
++// instruction. Whatever loads the control word or the status word makes ES
++// and B show whether one is pending.
++void OpDispatchBuilder::X87UpdatePending(Ref FSW, Ref FCW) {
++  // The unmasked flags, at most 63: plus 63, bit 6 is whether any is set.
++  Ref Unmasked = _And(OpSize::i32Bit, _Andn(OpSize::i32Bit, FSW, FCW), Constant(0x3f));
++  Ref Pending = _Lshr(OpSize::i32Bit, Add(OpSize::i32Bit, Unmasked, 63), Constant(6));
++  SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(Pending);
++  SetRFLAG<FEXCore::X86State::X87FLAG_B_LOC>(Pending);
+ }
+ 
+ void OpDispatchBuilder::X87OpHelper(OpcodeArgs, FEXCore::IR::IROps IROp, bool ZeroC2) {
+@@ -836,6 +893,8 @@ void OpDispatchBuilder::FNINIT(OpcodeArgs) {
+     SetRFLAG(Zero, FEXCore::X86State::X87FLAG_IE_LOC + Bit);
+   }
+   SetRFLAG<FEXCore::X86State::X87FLAG_B_LOC>(Zero);
++  // FNINIT and FNSAVE mask every exception.
++  EmbedderFPModeCheck(Op);
+ }
+ 
+ void OpDispatchBuilder::X87FFREE(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index e6f3c6b01d473d73a16b3db1d44d271e9554b80c..a3bcbff046f35edc41c388259c5df37afef5803e 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -719,6 +719,23 @@
+         "HasSideEffects": true
+       },
+ 
++      "EmbedderX87Wait u64:$NextRIP": {
++        "Desc": ["Embedded, while the context's mode has EMBEDDER_FP_MODE_X87: starts a waiting x87 or",
++                 "MMX instruction, whose next instruction is at NextRIP. Leaves the dispatch with",
++                 "EMBEDDER_EXIT_X87_FAULT while the status word's ES shows an unmasked exception pending,",
++                 "and clears Embedder.X87Raised."
++                ],
++        "HasSideEffects": true
++      },
++      "EmbedderX87Commit u32:$Mask": {
++        "Desc": ["Embedded, while the context's mode has EMBEDDER_FP_MODE_X87: leaves the dispatch at",
++                 "the next instruction with EMBEDDER_EXIT_X87_EXCEPTION when the running x87 instruction",
++                 "raised an unmasked exception in Mask (Embedder.X87Raised), before it commits anything",
++                 "past this point."
++                ],
++        "HasSideEffects": true
++      },
++
+       "EmbedderProbe GPR:$Addr, u32:$Size": {
+         "Desc": ["Embedded only: faults as a load of the Size bytes at Addr would, without loading.",
+                  "An instruction that loads its operand in parts, such as FXRSTOR, probes the whole",
+diff --git a/FEXCore/Source/Interface/IR/PassManager.cpp b/FEXCore/Source/Interface/IR/PassManager.cpp
+index 7d18ebf66a42455d525ef358ac10bb208e367381..142d53cc8dbffe156c2d0ef448d296ac40ac8299 100644
+--- a/FEXCore/Source/Interface/IR/PassManager.cpp
++++ b/FEXCore/Source/Interface/IR/PassManager.cpp
+@@ -73,7 +73,8 @@ void PassManager::AddDefaultPasses(Context::ContextImpl* ctx) {
+   // We only specifically disable optimization passes if desired, as IR output should
+   // still be well-formed regardless of the modifications made to it.
+   if (!DisablePasses()) {
+-    InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit, ctx->Embedded));
++    InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit, ctx->Embedded,
++                                              &ctx->EmbedderFPMode));
+     InsertPass(CreateDeadFlagCalculationEliminination(ctx->Embedded));
+   }
+ 
+diff --git a/FEXCore/Source/Interface/IR/Passes.h b/FEXCore/Source/Interface/IR/Passes.h
+index 51a9b26490bd1768e047e23131626557ff21a204..b8624c0c8bb7a64e12d3a0daec7e16e6f92ca187 100644
+--- a/FEXCore/Source/Interface/IR/Passes.h
++++ b/FEXCore/Source/Interface/IR/Passes.h
+@@ -14,7 +14,9 @@ class Pass;
+ fextl::unique_ptr<Pass> CreateDeadFlagCalculationEliminination(bool Embedded = false);
+ fextl::unique_ptr<Pass> CreateEmbedderReadsForWritePass();
+ fextl::unique_ptr<Pass> CreateRegisterAllocationPass(const CPUIDEmu* CPUID, bool Embedded);
+-fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures&, OpSize GPROpSize, bool Embedded = false);
++// EmbedderFPMode, embedded, is the context's Core::EMBEDDER_FP_MODE_* bits.
++fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures&, OpSize GPROpSize, bool Embedded = false,
++                                                       const uint32_t* EmbedderFPMode = nullptr);
+ 
+ namespace Validation {
+   fextl::unique_ptr<Pass> CreateIRValidation();
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index 88d575a98cbadcefbc03f63f4325805001c2230a..86ea92c7c3b846e96560bb7875e568d16373b496 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -151,8 +151,9 @@ private:
+ 
+ class X87StackOptimization final : public Pass {
+ public:
+-  void SetEmbedded(bool Value) {
++  void SetEmbedded(bool Value, const uint32_t* FPMode) {
+     Embedded = Value;
++    EmbedderFPMode = FPMode;
+   }
+   X87StackOptimization(const FEXCore::HostFeatures& Features, OpSize GPROpSize)
+     : Features(Features)
+@@ -216,11 +217,19 @@ private:
+     case OpSize::i32Bit:
+     case OpSize::i64Bit: {
+       StackNode = IREmit->_F80CVT(Op->StoreSize, StackNode);
++      if (X87Checks()) {
++        // An unmasked exception, an overflow or underflow included, leaves
++        // memory alone.
++        IREmit->_EmbedderX87Commit(X87StoreExceptions);
++      }
+       IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+       break;
+     }
+ 
+     case OpSize::f80Bit: {
++      if (X87Checks()) {
++        IREmit->_EmbedderX87Commit(X87StoreExceptions);
++      }
+       Store80BitToMem(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+       break;
+     }
+@@ -376,6 +385,18 @@ private:
+   // one: the slow path is taken throughout and addresses the stack slots as
+   // CPU state.
+   bool Embedded = false;
++  // The embedding context's floating-point mode, which may change between
++  // translations.
++  const uint32_t* EmbedderFPMode = nullptr;
++  // Whether the x87 control word unmasks an exception, so that an
++  // instruction that raises an unmasked one before it computes its result
++  // commits only the status word (EmbedderX87Commit).
++  bool X87Checks() const {
++    return Embedded && EmbedderFPMode && (*EmbedderFPMode & Core::EMBEDDER_FP_MODE_X87) != 0;
++  }
++  // A store commits nothing beside an unmasked invalid operation, denormal
++  // operand, division by zero, overflow or underflow.
++  static constexpr uint32_t X87StoreExceptions = 0x1f;
+ 
+   // Keeping IREmitter not to pass arguments around
+   IREmitter* IREmit = nullptr;
+@@ -383,6 +404,34 @@ private:
+ 
+ inline const X87StackOptimization::StackMemberInfo X87StackOptimization::StackMemberInfo::Invalid {nullptr};
+ 
++// The unmasked exceptions after which an Intel host commits nothing more of
++// a lowered operation's instruction than the status word: none for one that
++// raises none or is checked elsewhere, invalid operation for a load, which
++// x86 completes beside a denormal operand, and else invalid operation, a
++// denormal operand and division by zero.
++static uint32_t X87CommitMask(IROps Op) {
++  switch (Op) {
++  case OP_INITSTACK:
++  case OP_INVALIDATESTACK:
++  case OP_STACKVALIDTAG:
++  case OP_POPSTACKDESTROY:
++  case OP_SYNCSTACKTOSLOW:
++  case OP_STACKFORCESLOW:
++  case OP_INCSTACKTOP:
++  case OP_DECSTACKTOP:
++  // Checked before its store.
++  case OP_STORESTACKMEM:
++  // A comparison sets its condition codes regardless, and the dispatcher
++  // checks before it pops.
++  case OP_F80CMPSTACK:
++  case OP_F80CMPVALUE:
++  case OP_F80STACKTEST: return 0;
++  case OP_PUSHSTACK:
++  case OP_COPYPUSHSTACK: return 0x01;
++  default: return 0x07;
++  }
++}
++
+ inline void X87StackOptimization::InvalidateCaches() {
+   InvalidateCachedRegs();
+   ConstantPool.fill(nullptr);
+@@ -533,6 +582,11 @@ inline Ref X87StackOptimization::X87StackFault(Ref Value, Ref Fault, bool Overfl
+   Ref Unmasked = IREmit->_Andn(OpSize::i32Bit, Fault, FCW);
+   X87FlagOr(FEXCore::X86State::X87FLAG_ES_LOC, Unmasked);
+   X87FlagOr(FEXCore::X86State::X87FLAG_B_LOC, Unmasked);
++  if (X87Checks()) {
++    // Invalid operation is bit 0 of the raised set.
++    constexpr auto Raised = offsetof(FEXCore::Core::CpuStateFrame, Embedder.X87Raised);
++    IREmit->_StoreContextGPR(OpSize::i32Bit, IREmit->_Or(OpSize::i32Bit, IREmit->_LoadContextGPR(OpSize::i32Bit, Raised), Unmasked), Raised);
++  }
+ 
+   Ref Indefinite = IREmit->_VCastFromGPR(OpSize::i128Bit, OpSize::i64Bit, IREmit->_Constant(0xC000'0000'0000'0000ULL));
+   Indefinite = IREmit->_VInsGPR(OpSize::i128Bit, OpSize::i64Bit, 1, Indefinite, IREmit->_Constant(0xFFFF));
+@@ -1327,6 +1381,12 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+       default: LOGMAN_THROW_A_FMT(false, "IROp was expected to be lowered");
+       }
+       if (Embedded) {
++        // An unmasked invalid operation, denormal operand or division by
++        // zero leaves the registers and the stack alone, and with them every
++        // operation after this one of its instruction.
++        if (const auto Mask = X87CommitMask(IROp->Op); X87Checks() && Mask != 0) {
++          IREmit->_EmbedderX87Commit(Mask);
++        }
+         // The embedding host leaves a block in the middle, at a system call,
+         // a fault or a TLB miss it cannot satisfy, so commit every pending
+         // stack write before the next operation can exit.
+@@ -1345,9 +1405,9 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+   }
+ }
+ 
+-fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures& Features, OpSize GPROpSize, bool Embedded) {
++fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures& Features, OpSize GPROpSize, bool Embedded, const uint32_t* EmbedderFPMode) {
+   auto Pass = fextl::make_unique<X87StackOptimization>(Features, GPROpSize);
+-  Pass->SetEmbedded(Embedded);
++  Pass->SetEmbedded(Embedded, EmbedderFPMode);
+   return Pass;
+ }
+ } // namespace FEXCore::IR
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index bc937cb33f766a8a14e82c8e54ddbe9679cd5463..10d3172eb0226b5021dc1b4530e20578c1bd0d29 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -372,6 +372,15 @@ enum EmbedderExitReason : uint32_t {
+   // which has changed nothing and runs again as a unit of its own in a
+   // floating-point mode whose checks settle them all.
+   EMBEDDER_EXIT_FP_RETRY = 9,
++  // A waiting x87 or MMX instruction found an exception the x87 control word
++  // unmasks pending (ES): RIP names the instruction, which has done nothing,
++  // and x86 raises #MF there.
++  EMBEDDER_EXIT_X87_FAULT = 10,
++  // An x87 instruction raised an exception the control word unmasks before
++  // it computed its result, or an overflow or underflow of a store: it
++  // retired having changed only the status word, as x86 does, and RIP names
++  // the next instruction.
++  EMBEDDER_EXIT_X87_EXCEPTION = 11,
+ };
+ 
+ // Access info passed to the TLB-miss stub.
+@@ -416,6 +425,10 @@ constexpr uint32_t EMBEDDER_FP_MODE_CHECK_SPECIAL = 1U << 2;
+ // MXCSR unmasks a denormal operand, underflow or precision, which no value
+ // shows: every check goes to the host's helper.
+ constexpr uint32_t EMBEDDER_FP_MODE_CHECK_ALL = 1U << 3;
++// The x87 control word unmasks an exception: a waiting x87 or MMX
++// instruction starts with EmbedderX87Wait, and an x87 instruction that
++// raises an unmasked exception commits only what x86 commits.
++constexpr uint32_t EMBEDDER_FP_MODE_X87 = 1U << 4;
+ // The x86 operation an EmbedderFPCheck op checks, of the instruction (or
+ // 128-bit part of one) whose result it takes.
+ enum EmbedderFPKind : uint8_t {
+@@ -684,6 +697,9 @@ struct CpuStateFrame {
+     // instruction's low part for its high part to settle, which then goes
+     // to the helper whatever its values.
+     uint32_t FPPending {};
++    // The x87 exceptions the running instruction raised that the control
++    // word unmasks: bits 0 to 5 as in the status word.
++    uint32_t X87Raised {};
+   } Embedder;
+ 
+   // Pointers that the JIT needs to load to remove relocations

@@ -1,0 +1,853 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 14:57:25 +0900
+Subject: [PATCH] kosmickrisp: satisfy the Zink OpenGL 2.1 profile
+
+---
+ src/kosmickrisp/libkk/kk_geometry.cl          |  37 +++
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  12 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 135 +++++++++--
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |   3 +
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  |  42 +++-
+ .../vulkan/kk_nir_lower_descriptors.c         |  50 ++++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   9 +-
+ src/kosmickrisp/vulkan/kk_sampler.c           |  10 +-
+ src/kosmickrisp/vulkan/kk_sampler.h           |   1 +
+ src/kosmickrisp/vulkan/kk_shader.c            | 225 +++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |   1 +
+ 11 files changed, 496 insertions(+), 29 deletions(-)
+
+diff --git a/src/kosmickrisp/libkk/kk_geometry.cl b/src/kosmickrisp/libkk/kk_geometry.cl
+index 8b7d61657f05ecebb1566ac59bd81642ab1a2480..1e540ef4252f94ba601138881713ee6398c27410 100644
+--- a/src/kosmickrisp/libkk/kk_geometry.cl
++++ b/src/kosmickrisp/libkk/kk_geometry.cl
+@@ -49,6 +49,43 @@ libkk_polygon_point_setup_indirect(
+    out_draw[3] = in_draw[index_size_B ? 4 : 3];
+ }
+ 
++KERNEL(1)
++libkk_rectangular_line_setup_indirect(
++   global struct poly_heap *heap, global struct poly_vertex_params *vp,
++   constant uint32_t *in_draw, global uint32_t *out_draw,
++   uint64_t index_buffer, uint32_t index_buffer_range_el,
++   uint32_t index_size_B, uint64_t vertex_outputs, uint32_t mode)
++{
++   uint32_t count = in_draw[0];
++   uint32_t instance_count = in_draw[1];
++   uint32_t output_size =
++      poly_tcs_in_size(count * instance_count, vertex_outputs);
++
++   vp->output_buffer = (uintptr_t)poly_heap_alloc(heap, output_size);
++   vp->outputs = vertex_outputs;
++   vp->verts_per_instance = count;
++
++   vp->grid[0] = count;
++   vp->grid[1] = instance_count;
++   vp->grid[2] = 1;
++   vp->grid[3] = 64;
++   vp->grid[4] = 1;
++   vp->grid[5] = 1;
++
++   if (index_size_B) {
++      uint32_t first_index = in_draw[2];
++      vp->index_buffer = index_buffer + (first_index * index_size_B);
++      vp->index_buffer_range_el =
++         poly_index_buffer_range_el(index_buffer_range_el, first_index);
++   }
++
++   /* Each logical line becomes two filled triangles. */
++   out_draw[0] = u_decomposed_prims_for_vertices(mode, count) * 6;
++   out_draw[1] = instance_count;
++   out_draw[2] = 0;
++   out_draw[3] = in_draw[index_size_B ? 4 : 3];
++}
++
+ KERNEL(1024)
+ libkk_prefix_sum_tess(global struct poly_tess_params *p)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 55dadb9d30201e89ba70b4ed01ec1a0304753a7a..080f7a7d52d66e797242dce305ba02fd9c0ca4c5 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -89,6 +89,18 @@ struct kk_per_draw_data {
+    uint32_t polygon_point_front_face;
+    uint32_t polygon_point_topology;
+    uint32_t polygon_point_provoking_last;
++
++   /* Dynamic state consumed by rectangular-line vertex expansion. */
++   uint32_t rectangular_line_topology;
++   uint32_t rectangular_line_provoking_last;
++   float rectangular_line_half_width;
++   uint32_t rectangular_line_pad;
++   struct {
++      float half_width;
++      float half_height;
++      float inv_half_width;
++      float inv_half_height;
++   } rectangular_line_viewports[KK_MAX_VIEWPORTS];
+ };
+ 
+ struct kk_attachment {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index cdb8b61b952a68484a1803cc2462c9d820c635ff..783c5e30d13860a6e518f89b9b54d7c6be0a7eb1 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1196,6 +1196,9 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    struct kk_descriptor_state *desc = &gfx->descriptors;
+    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+    mtl_render_encoder *enc = cs_get_render(cmd);
++   struct kk_shader *vertex = cmd->state.shaders[MESA_SHADER_VERTEX];
++   const bool rectangular_lines =
++      vertex && vertex->info.vs.rectangular_line_emulation;
+ 
+    if (IS_DIRTY(VI_BINDING_STRIDES)) {
+       u_foreach_bit(ndx, dyn->vi->bindings_valid) {
+@@ -1213,24 +1216,33 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       }
+    }
+ 
+-   if (IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY)) {
+-      /* Only disable rendering if primitive type is culled. */
+-      gfx->is_cull_front_and_back =
+-         dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK &&
+-         is_primitive_culled(dyn->ia.primitive_topology);
+-      if (gfx->is_cull_front_and_back) {
+-         set_empty_scissor(enc);
+-      } else {
+-         mtl_set_cull_mode(enc,
+-                           vk_front_face_to_mtl_cull_mode(dyn->rs.cull_mode));
+-         /* Enforce setting the correct scissors */
++   if (IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
++       IS_SHADER_DIRTY(VERTEX)) {
++      if (rectangular_lines) {
++         /* Vulkan cull mode does not apply to line primitives.  The generated
++          * raster primitive is a triangle only as an implementation detail. */
++         gfx->is_cull_front_and_back = false;
++         mtl_set_cull_mode(enc, MTL_CULL_MODE_NONE);
+          BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORT_COUNT);
++      } else {
++         /* Only disable rendering if primitive type is culled. */
++         gfx->is_cull_front_and_back =
++            dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK &&
++            is_primitive_culled(dyn->ia.primitive_topology);
++         if (gfx->is_cull_front_and_back) {
++            set_empty_scissor(enc);
++         } else {
++            mtl_set_cull_mode(
++               enc, vk_front_face_to_mtl_cull_mode(dyn->rs.cull_mode));
++            /* Enforce setting the correct scissors */
++            BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORT_COUNT);
++         }
+       }
+    }
+ 
+-   if (IS_DIRTY(RS_POLYGON_MODE)) {
++   if (IS_DIRTY(RS_POLYGON_MODE) || IS_SHADER_DIRTY(VERTEX)) {
+       enum mtl_triangle_fill_mode fill_mode =
+-         dyn->rs.polygon_mode == VK_POLYGON_MODE_LINE
++         !rectangular_lines && dyn->rs.polygon_mode == VK_POLYGON_MODE_LINE
+             ? MTL_TRIANGLE_FILL_MODE_LINES
+             : MTL_TRIANGLE_FILL_MODE_FILL;
+       mtl_set_triangle_fill_mode(enc, fill_mode);
+@@ -1518,7 +1530,8 @@ build_per_draw_upload_mask(struct kk_cmd_buffer *cmd)
+ 
+    struct kk_shader *vertex = cmd->state.shaders[MESA_SHADER_VERTEX];
+    if (vertex && (vertex->info.uses_per_draw_data ||
+-                  vertex->info.vs.polygon_point_emulation)) {
++                  vertex->info.vs.polygon_point_emulation ||
++                  vertex->info.vs.rectangular_line_emulation)) {
+       mask |= BITFIELD_BIT(MESA_SHADER_VERTEX);
+    }
+ 
+@@ -1754,10 +1767,11 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
+    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+    bool tess = upload_mask & BITFIELD_BIT(MESA_SHADER_TESS_EVAL);
+    bool polygon_points = vs && vs->info.vs.polygon_point_emulation;
++   bool rectangular_lines = vs && vs->info.vs.rectangular_line_emulation;
+ 
+    /* Prepare the software vertex stage used by tessellation and culled
+     * polygon-point draws. */
+-   if (tess || polygon_points) {
++   if (tess || polygon_points || rectangular_lines) {
+       gfx->per_draw_data.index_size = draw->index.el_size_B;
+       gfx->per_draw_data.base_vertex_addr = upload_base_vertex(cmd, draw);
+       gfx->per_draw_data.base_instance_addr = upload_base_instance(cmd, draw);
+@@ -1785,6 +1799,32 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
+          VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+    }
+ 
++   if (rectangular_lines) {
++      const struct vk_dynamic_graphics_state *dyn =
++         &cmd->vk.dynamic_graphics_state;
++      gfx->per_draw_data.rectangular_line_topology = prim;
++      gfx->per_draw_data.rectangular_line_provoking_last =
++         dyn->rs.provoking_vertex ==
++         VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
++      gfx->per_draw_data.rectangular_line_half_width =
++         dyn->rs.line.width * 0.5f;
++
++      for (uint32_t i = 0; i < KK_MAX_VIEWPORTS; ++i) {
++         const VkViewport *viewport =
++            i < dyn->vp.viewport_count ? &dyn->vp.viewports[i] : NULL;
++         float half_width = viewport ? viewport->width * 0.5f : 0.0f;
++         float half_height = viewport ? viewport->height * 0.5f : 0.0f;
++         gfx->per_draw_data.rectangular_line_viewports[i].half_width =
++            half_width;
++         gfx->per_draw_data.rectangular_line_viewports[i].half_height =
++            half_height;
++         gfx->per_draw_data.rectangular_line_viewports[i].inv_half_width =
++            half_width != 0.0f ? 1.0f / half_width : 0.0f;
++         gfx->per_draw_data.rectangular_line_viewports[i].inv_half_height =
++            half_height != 0.0f ? 1.0f / half_height : 0.0f;
++      }
++   }
++
+    struct kk_ptr shader_data_gpu =
+       kk_pool_upload(cmd, &gfx->per_draw_data, sizeof(gfx->per_draw_data), 8u);
+    if (unlikely(!shader_data_gpu.gpu))
+@@ -1955,6 +1995,66 @@ kk_launch_polygon_points(struct kk_cmd_buffer *cmd, struct kk_draw_data draw,
+    return draw;
+ }
+ 
++static struct kk_draw_data
++kk_launch_rectangular_lines(struct kk_cmd_buffer *cmd,
++                            struct kk_draw_data draw, enum mesa_prim prim)
++{
++   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++   bool indirect = kk_grid_is_indirect(draw.grid);
++
++   if (indirect) {
++      struct kk_ptr out_draw =
++         kk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4);
++      if (unlikely(!out_draw.gpu))
++         return (struct kk_draw_data){.grid = kk_grid_1d(0)};
++
++      struct libkk_rectangular_line_setup_indirect_args args = {
++         .heap = kk_heap(cmd),
++         .vp = gfx->per_draw_data.vertex_params,
++         .in_draw = draw.grid.addr,
++         .out_draw = out_draw.gpu,
++         .index_buffer = draw.index.gpu.addr,
++         .index_buffer_range_el =
++            draw.index.el_size_B
++               ? draw.index.gpu.range / draw.index.el_size_B
++               : 0,
++         .index_size_B = draw.index.el_size_B,
++         .vertex_outputs = vs->info.vs.outputs_written,
++         .mode = prim,
++      };
++
++      libkk_rectangular_line_setup_indirect_struct(cmd, kk_grid_1d(1), true,
++                                                   args);
++      draw.grid = kk_grid_indirect(out_draw.gpu);
++   }
++
++   mtl_compute_encoder *enc = cs_get_compute(cmd, true);
++   mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
++   struct mtl_size local_size = {64, 1, 1};
++
++   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
++                                    MTL_STAGE_DISPATCH);
++   mtl_compute_set_pipeline_state(enc, pipeline);
++   if (indirect) {
++      uint64_t grid_addr =
++         gfx->per_draw_data.vertex_params +
++         offsetof(struct poly_vertex_params, grid);
++      mtl_dispatch_threads_with_indirect_buffer(enc, grid_addr);
++   } else {
++      kk_dispatch_compute(enc, kk_grid_2d(draw.grid.size.x, draw.grid.size.y),
++                          local_size);
++      draw.grid.size.x =
++         u_decomposed_prims_for_vertices(prim, draw.grid.size.x) * 6;
++   }
++
++   draw.index.gpu = (struct kk_addr_range){0};
++   draw.index.el_size_B = 0;
++   draw.vertex_offset = 0;
++   draw.primitive_type = MTL_PRIMITIVE_TYPE_TRIANGLE;
++   return draw;
++}
++
+ /* Get modifiable per draw data. */
+ static struct kk_draw_data
+ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+@@ -2012,6 +2112,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+    const bool emulate_polygon_points =
+       !tess && polygon_as_points && vs->info.vs.polygon_point_emulation;
++   const bool emulate_rectangular_lines =
++      !tess && vs->info.vs.rectangular_line_emulation;
+ 
+    /* Unroll geometry. Skip draw if we fail. No need to unroll if tessellation
+     * is present since it also handles unrolling. */
+@@ -2037,6 +2139,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+          draw_data = kk_launch_tess(cmd, draw_data);
+       else if (emulate_polygon_points)
+          draw_data = kk_launch_polygon_points(cmd, draw_data, data->prim);
++      else if (emulate_rectangular_lines)
++         draw_data =
++            kk_launch_rectangular_lines(cmd, draw_data, data->prim);
+ 
+       const enum mesa_prim raster_prim = tess ? cmd->state.gfx.tess.prim
+                                                : data->prim;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index df5a21d42cfd861cab2da0b9fd114a29926bda4e..62dd80260bfeef318a8ccd18d9832760d293cfb8 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -78,6 +78,8 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+             desc[plane].image_gpu_resource_id =
+                view->planes[plane].sampled_gpu_resource_id;
+          }
++         desc[plane].image_swizzle =
++            kk_pack_component_mapping(view->vk.swizzle);
+       }
+    }
+ 
+@@ -101,6 +103,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+          desc[plane].lod_bias_fp16 = sampler->lod_bias_fp16;
+          desc[plane].lod_min_fp16 = sampler->lod_min_fp16;
+          desc[plane].lod_max_fp16 = sampler->lod_max_fp16;
++         desc[plane].sampler_swizzle = sampler->border_swizzle;
+       }
+ 
+       if (sampler->has_border) {
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 8cd9f485f258d52cd8d57e3ae50b52b6eaebd156..0dee65bc71a37905d5fb2baadf89380533066fe4 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -21,14 +21,52 @@ struct kk_sampled_image_descriptor {
+     * high bits carry the sampler's compare operation, which a depth-compare
+     * sample needs in order to evaluate the emulated border itself. */
+    int32_t clamp_0_sampler_index_or_negative;
+-   uint32_t pad_to_64_bits;
++   /* Packed VkComponentMapping from the sampled image view.  Each component
++    * occupies three bits and has already had IDENTITY resolved. */
++   uint32_t image_swizzle;
+    uint32_t border[4];
+-   uint64_t pad_to_power_2[3];
++   /* Packed VkComponentMapping supplied with the sampler.  Bit 31 indicates
++    * that the mapping was explicit; otherwise image_swizzle is used. */
++   uint32_t sampler_swizzle;
++   uint32_t pad_to_power_2[5];
+ };
+ 
+ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
+               "kk_sampled_image_descriptor has no holes");
+ 
++#define KK_COMPONENT_SWIZZLE_BITS 3u
++#define KK_COMPONENT_SWIZZLE_MASK ((1u << KK_COMPONENT_SWIZZLE_BITS) - 1u)
++#define KK_COMPONENT_SWIZZLE_EXPLICIT BITFIELD_BIT(31)
++
++static inline uint32_t
++kk_pack_component_mapping(VkComponentMapping mapping)
++{
++   const VkComponentSwizzle components[4] = {
++      mapping.r,
++      mapping.g,
++      mapping.b,
++      mapping.a,
++   };
++   const VkComponentSwizzle identity[4] = {
++      VK_COMPONENT_SWIZZLE_R,
++      VK_COMPONENT_SWIZZLE_G,
++      VK_COMPONENT_SWIZZLE_B,
++      VK_COMPONENT_SWIZZLE_A,
++   };
++   uint32_t packed = 0;
++
++   for (unsigned i = 0; i < ARRAY_SIZE(components); ++i) {
++      VkComponentSwizzle component = components[i];
++      if (component == VK_COMPONENT_SWIZZLE_IDENTITY)
++         component = identity[i];
++
++      assert(component <= VK_COMPONENT_SWIZZLE_A);
++      packed |= component << (i * KK_COMPONENT_SWIZZLE_BITS);
++   }
++
++   return packed;
++}
++
+ struct kk_storage_image_descriptor {
+    uint64_t image_gpu_resource_id;
+ };
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 79ba814a6ab9c639a965c4d0f4dde7920f951d41..2a78510347829bd4e05061187204f7711d1a2fc3 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -550,6 +550,56 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+       nir_alu_type T = nir_alu_type_get_base_type(tex->dest_type);
+       border = nir_convert_to_bit_size(b, border, T, tex->def.bit_size);
+ 
++      unsigned sampler_swizzle_offs =
++         offsetof(struct kk_sampled_image_descriptor, sampler_swizzle);
++      nir_def *sampler_swizzle = load_resource_deref_desc(
++         b, 1, 32, nir_src_as_deref(nir_src_for_ssa(sampler)),
++         plane_offset_B + sampler_swizzle_offs, ctx);
++
++      unsigned image_swizzle_offs =
++         offsetof(struct kk_sampled_image_descriptor, image_swizzle);
++      nir_def *image_swizzle = load_resource_deref_desc(
++         b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)),
++         plane_offset_B + image_swizzle_offs, ctx);
++
++      nir_def *explicit = nir_ine_imm(
++         b, nir_iand_imm(b, sampler_swizzle,
++                         KK_COMPONENT_SWIZZLE_EXPLICIT),
++         0);
++      nir_def *swizzle =
++         nir_bcsel(b, explicit, sampler_swizzle, image_swizzle);
++      nir_def *zero = T == nir_type_float
++                         ? nir_imm_floatN_t(b, 0.0, border->bit_size)
++                         : nir_imm_intN_t(b, 0, border->bit_size);
++      nir_def *one = T == nir_type_float
++                        ? nir_imm_floatN_t(b, 1.0, border->bit_size)
++                        : nir_imm_intN_t(b, 1, border->bit_size);
++      nir_def *components[4];
++
++      for (unsigned i = 0; i < ARRAY_SIZE(components); ++i) {
++         nir_def *component = nir_iand_imm(
++            b, nir_ushr_imm(b, swizzle, i * KK_COMPONENT_SWIZZLE_BITS),
++            KK_COMPONENT_SWIZZLE_MASK);
++         nir_def *value = zero;
++         value = nir_bcsel(
++            b, nir_ieq_imm(b, component, VK_COMPONENT_SWIZZLE_ONE), one,
++            value);
++         value = nir_bcsel(
++            b, nir_ieq_imm(b, component, VK_COMPONENT_SWIZZLE_R),
++            nir_channel(b, border, 0), value);
++         value = nir_bcsel(
++            b, nir_ieq_imm(b, component, VK_COMPONENT_SWIZZLE_G),
++            nir_channel(b, border, 1), value);
++         value = nir_bcsel(
++            b, nir_ieq_imm(b, component, VK_COMPONENT_SWIZZLE_B),
++            nir_channel(b, border, 2), value);
++         value = nir_bcsel(
++            b, nir_ieq_imm(b, component, VK_COMPONENT_SWIZZLE_A),
++            nir_channel(b, border, 3), value);
++         components[i] = value;
++      }
++      border = nir_vec(b, components, ARRAY_SIZE(components));
++
+       nir_def_replace(&tex->def, border);
+       return true;
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 1a15d747bf228d12ecd2f1662efd0646d0c71d63..298b0aa81a8a2de3c471c9ecf6a73895d2f1cc56 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -160,6 +160,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_attachment_feedback_loop_layout = true,
+       .EXT_attachment_feedback_loop_dynamic_state = true,
+       .EXT_blend_operation_advanced = true,
++      .EXT_border_color_swizzle = true,
+       .EXT_calibrated_timestamps = true,
+       .EXT_conditional_rendering = true,
+       .EXT_custom_border_color = true,
+@@ -330,6 +331,7 @@ kk_get_device_features(
+       .vulkanMemoryModelDeviceScope = true,
+ 
+       /* Vulkan 1.4 */
++      .rectangularLines = true,
+       .bresenhamLines = true,
+       .dynamicRenderingLocalRead = true,
+       .globalPriorityQuery = true,
+@@ -410,6 +412,10 @@ kk_get_device_features(
+       /* VK_EXT_blend_operation_advanced */
+       .advancedBlendCoherentOperations = true,
+ 
++      /* VK_EXT_border_color_swizzle */
++      .borderColorSwizzle = true,
++      .borderColorSwizzleFromImage = true,
++
+       /* VK_EXT_conditional_rendering */
+       .conditionalRendering = true,
+       .inheritedConditionalRendering = true,
+@@ -427,7 +433,8 @@ kk_get_device_features(
+       /* VK_EXT_extended_dynamic_state3 */
+       .extendedDynamicState3DepthClampEnable = true,
+       .extendedDynamicState3DepthClipNegativeOneToOne = true,
+-      .extendedDynamicState3LineRasterizationMode = true,
++      /* Rectangular-line expansion is selected at pipeline compile time. */
++      .extendedDynamicState3LineRasterizationMode = false,
+       .extendedDynamicState3SampleLocationsEnable = true,
+       .extendedDynamicState3TessellationDomainOrigin = true,
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_sampler.c b/src/kosmickrisp/vulkan/kk_sampler.c
+index 28dbe4ecff769b7088b3dfcdd69807d509378dd3..40bc4d65a5988e9bead5a05b6f6e69be8c5409c8 100644
+--- a/src/kosmickrisp/vulkan/kk_sampler.c
++++ b/src/kosmickrisp/vulkan/kk_sampler.c
+@@ -7,6 +7,7 @@
+ 
+ #include "kk_sampler.h"
+ 
++#include "kk_descriptor_types.h"
+ #include "kk_entrypoints.h"
+ #include "kk_physical_device.h"
+ 
+@@ -224,7 +225,7 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+        * If there is a border colour component mapping, we need to swizzle with
+        * it. Otherwise, we can assume there's nothing to do.
+        */
+-      VkClearColorValue bc = sampler->vk.border_color_value;
++      sampler->custom_border = sampler->vk.border_color_value;
+ 
+       const VkSamplerBorderColorComponentMappingCreateInfoEXT *swiz_info =
+          vk_find_struct_const(
+@@ -232,11 +233,10 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+             SAMPLER_BORDER_COLOR_COMPONENT_MAPPING_CREATE_INFO_EXT);
+ 
+       if (swiz_info) {
+-         const bool is_int = vk_border_color_is_int(pCreateInfo->borderColor);
+-         bc = vk_swizzle_color_value(bc, swiz_info->components, is_int);
++         sampler->border_swizzle =
++            kk_pack_component_mapping(swiz_info->components) |
++            KK_COMPONENT_SWIZZLE_EXPLICIT;
+       }
+-
+-      sampler->custom_border = bc;
+    }
+ 
+    *pSampler = kk_sampler_to_handle(sampler);
+diff --git a/src/kosmickrisp/vulkan/kk_sampler.h b/src/kosmickrisp/vulkan/kk_sampler.h
+index 610f5e6cb389a33a14c086390082cddce2a6680c..35cd7e77cd515eb4efa52c5967deaf648478b0af 100644
+--- a/src/kosmickrisp/vulkan/kk_sampler.h
++++ b/src/kosmickrisp/vulkan/kk_sampler.h
+@@ -22,6 +22,7 @@
+ struct kk_sampler {
+    struct vk_sampler vk;
+    VkClearColorValue custom_border;
++   uint32_t border_swizzle;
+    bool has_border;
+    /* Depth-compare samples evaluate the emulated border themselves. */
+    VkCompareOp border_compare_op;
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 567530c14de14102639b6d07eb565ba3b1e8b4a9..481905828b72494579e34ae322ead4860cab74f6 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -114,6 +114,7 @@ has_static_depth_stencil_state(const struct vk_graphics_pipeline_state *state)
+ struct kk_vs_key {
+    bool is_points;
+    bool polygon_point_emulation;
++   bool rectangular_line_emulation;
+    struct vk_vertex_input_state vi;
+ };
+ 
+@@ -124,6 +125,12 @@ kk_vk_prim_is_triangles(VkPrimitiveTopology topology)
+           MESA_PRIM_TRIANGLES;
+ }
+ 
++static bool
++kk_vk_prim_is_lines(VkPrimitiveTopology topology)
++{
++   return u_reduced_prim(vk_topology_to_mesa(topology)) == MESA_PRIM_LINES;
++}
++
+ static bool
+ kk_needs_polygon_point_emulation(
+    const struct vk_graphics_pipeline_state *state)
+@@ -136,6 +143,14 @@ kk_needs_polygon_point_emulation(
+           state->rs->cull_mode != VK_CULL_MODE_NONE;
+ }
+ 
++static bool
++kk_needs_rectangular_line_emulation(
++   const struct vk_graphics_pipeline_state *state)
++{
++   return state->rs->line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR &&
++          kk_vk_prim_is_lines(state->ia->primitive_topology);
++}
++
+ static void
+ kk_populate_vs_key(struct kk_vs_key *key,
+                    const struct vk_graphics_pipeline_state *state)
+@@ -146,6 +161,8 @@ kk_populate_vs_key(struct kk_vs_key *key,
+       (state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
+        kk_vk_prim_is_triangles(state->ia->primitive_topology));
+    key->polygon_point_emulation = kk_needs_polygon_point_emulation(state);
++   key->rectangular_line_emulation =
++      kk_needs_rectangular_line_emulation(state);
+    key->vi = *state->vi;
+ }
+ 
+@@ -1214,6 +1231,178 @@ kk_create_polygon_point_raster_shader(const nir_shader *vs,
+    return nir;
+ }
+ 
++static nir_def *
++kk_load_rectangular_line_viewport(nir_builder *b, nir_def *viewport)
++{
++   nir_def *per_draw = nir_load_per_draw_ptr_kk(b, 1, 64);
++   nir_def *byte_offset = nir_imul_imm(
++      b, viewport,
++      sizeof(((struct kk_per_draw_data *)0)->rectangular_line_viewports[0]));
++   nir_def *addr = nir_iadd(
++      b, per_draw,
++      nir_u2u64(b, byte_offset));
++   addr = nir_iadd_imm(
++      b, addr,
++      offsetof(struct kk_per_draw_data, rectangular_line_viewports));
++
++   return nir_load_global_constant(b, 4, 32, addr, .align_mul = 4,
++                                   .align_offset = 0);
++}
++
++/* Metal's native line primitive follows its relaxed line rules.  Expand only
++ * pipelines that explicitly request Vulkan rectangular lines into filled
++ * triangles.  The application VS remains a compute stage, so this generated
++ * hardware VS can assemble the two endpoint records without CPU readback. */
++static nir_shader *
++kk_create_rectangular_line_raster_shader(const nir_shader *vs,
++                                         const nir_shader *fs)
++{
++   struct kk_polygon_point_output outputs[NUM_TOTAL_VARYING_SLOTS] = {0};
++   nir_shader_intrinsics_pass((nir_shader *)vs,
++                              kk_collect_polygon_point_output,
++                              nir_metadata_all, outputs);
++
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_VERTEX, vs->options, "rectangular_line_raster");
++   nir_shader *nir = b.shader;
++   nir->info.outputs_written = vs->info.outputs_written;
++   nir->info.clip_distance_array_size = vs->info.clip_distance_array_size;
++   nir->info.cull_distance_array_size = vs->info.cull_distance_array_size;
++
++   nir_def *vertex_params = kk_load_polygon_point_per_draw(
++      &b, offsetof(struct kk_per_draw_data, vertex_params), 64);
++   nir_def *topology = kk_load_polygon_point_per_draw(
++      &b, offsetof(struct kk_per_draw_data, rectangular_line_topology), 32);
++   nir_def *provoking_last = kk_load_polygon_point_per_draw(
++      &b, offsetof(struct kk_per_draw_data,
++                   rectangular_line_provoking_last),
++      32);
++   nir_def *line_half_width = kk_load_polygon_point_per_draw(
++      &b, offsetof(struct kk_per_draw_data, rectangular_line_half_width), 32);
++
++   nir_def *raw_vertex = nir_load_vertex_id(&b);
++   nir_def *primitive = nir_udiv_imm(&b, raw_vertex, 6);
++   nir_def *corner = nir_umod_imm(&b, raw_vertex, 6);
++
++   /* Triangle list: (A+, A-, B+), (B+, A-, B-). */
++   nir_def *endpoint = nir_ior(
++      &b, nir_ior(&b, nir_ieq_imm(&b, corner, 2),
++                  nir_ieq_imm(&b, corner, 3)),
++      nir_ieq_imm(&b, corner, 5));
++   endpoint = nir_b2i32(&b, endpoint);
++   nir_def *negative_side = nir_ior(
++      &b, nir_ior(&b, nir_ieq_imm(&b, corner, 1),
++                  nir_ieq_imm(&b, corner, 4)),
++      nir_ieq_imm(&b, corner, 5));
++   nir_def *side = nir_bcsel(&b, negative_side, nir_imm_float(&b, -1.0f),
++                             nir_imm_float(&b, 1.0f));
++
++   nir_def *vertices_per_instance = poly_input_vertices(&b, vertex_params);
++   nir_def *instance = nir_load_instance_id(&b);
++   nir_def *instance_base = nir_imul(&b, instance, vertices_per_instance);
++
++   nir_def *line_vertices[2];
++   nir_def *positions[2];
++   for (unsigned v = 0; v < ARRAY_SIZE(line_vertices); ++v) {
++      line_vertices[v] = poly_vertex_id_for_line_class(
++         &b, topology, primitive, nir_imm_int(&b, v),
++         vertices_per_instance);
++      line_vertices[v] = nir_iadd(&b, instance_base, line_vertices[v]);
++
++      nir_def *components[4];
++      for (unsigned c = 0; c < ARRAY_SIZE(components); ++c) {
++         components[c] = kk_load_polygon_point_output(
++            &b, vertex_params, vs->info.outputs_written, line_vertices[v],
++            VARYING_SLOT_POS, c, 32);
++      }
++      positions[v] = nir_vec(&b, components, ARRAY_SIZE(components));
++   }
++
++   nir_def *viewport = nir_imm_int(&b, 0);
++   if (vs->info.outputs_written & VARYING_BIT_VIEWPORT) {
++      viewport = kk_load_polygon_point_output(
++         &b, vertex_params, vs->info.outputs_written, line_vertices[0],
++         VARYING_SLOT_VIEWPORT, 0, 32);
++      viewport = nir_umin_imm(&b, viewport, KK_MAX_VIEWPORTS - 1);
++   }
++   nir_def *viewport_data =
++      kk_load_rectangular_line_viewport(&b, viewport);
++   nir_def *half_extent = nir_trim_vector(&b, viewport_data, 2);
++   nir_def *inv_half_extent = nir_channels(&b, viewport_data, 0xc);
++
++   nir_def *ndc[2];
++   for (unsigned v = 0; v < ARRAY_SIZE(ndc); ++v) {
++      ndc[v] = nir_fmul(
++         &b, nir_trim_vector(&b, positions[v], 2),
++         nir_frcp(&b, nir_channel(&b, positions[v], 3)));
++   }
++   nir_def *framebuffer_delta =
++      nir_fmul(&b, nir_fsub(&b, ndc[1], ndc[0]), half_extent);
++   nir_def *perpendicular = nir_vec2(
++      &b, nir_fneg(&b, nir_channel(&b, framebuffer_delta, 1)),
++      nir_channel(&b, framebuffer_delta, 0));
++   nir_def *length_sq = nir_fdot(&b, framebuffer_delta, framebuffer_delta);
++   nir_def *inv_length = nir_bcsel(
++      &b, nir_fgt_imm(&b, length_sq, 0.0f), nir_frsq(&b, length_sq),
++      nir_imm_float(&b, 0.0f));
++   nir_def *ndc_offset = nir_fmul(
++      &b, nir_fmul(&b, perpendicular,
++                   nir_fmul(&b, inv_length, line_half_width)),
++      inv_half_extent);
++
++   nir_def *source_endpoint = endpoint;
++   nir_def *source_vertex = nir_bcsel(
++      &b, nir_ieq_imm(&b, source_endpoint, 0), line_vertices[0],
++      line_vertices[1]);
++   nir_def *provoking_vertex = nir_bcsel(
++      &b, nir_ieq_imm(&b, provoking_last, 0), line_vertices[0],
++      line_vertices[1]);
++   nir_def *source_position = nir_bcsel(
++      &b, nir_ieq_imm(&b, source_endpoint, 0), positions[0], positions[1]);
++   nir_def *clip_offset = nir_fmul(
++      &b, nir_fmul(&b, ndc_offset, side),
++      nir_channel(&b, source_position, 3));
++   nir_def *expanded_xy = nir_fadd(
++      &b, nir_trim_vector(&b, source_position, 2), clip_offset);
++
++   uint64_t flat_outputs =
++      fs->info.inputs_read &
++      ~(fs->info.linear_varyings | fs->info.perspective_varyings);
++   nir_def *zero = nir_imm_int(&b, 0);
++   u_foreach_bit64(location, vs->info.outputs_written) {
++      const struct kk_polygon_point_output *output = &outputs[location];
++      assert(output->type != nir_type_invalid);
++      unsigned bit_size = nir_alu_type_get_type_size(output->type);
++      nir_def *varying_vertex =
++         (flat_outputs & BITFIELD64_BIT(location)) ? provoking_vertex
++                                                  : source_vertex;
++
++      u_foreach_bit(component, output->component_mask) {
++         nir_def *value;
++         if (location == VARYING_SLOT_POS && component < 2) {
++            value = nir_channel(&b, expanded_xy, component);
++         } else if (location == VARYING_SLOT_POS) {
++            value = nir_channel(&b, source_position, component);
++         } else {
++            value = kk_load_polygon_point_output(
++               &b, vertex_params, vs->info.outputs_written, varying_vertex,
++               location, component, bit_size);
++         }
++
++         nir_store_output(
++            &b, value, zero, .base = 0, .range = 1, .write_mask = 1,
++            .component = component, .src_type = output->type,
++            .io_semantics = (nir_io_semantics){
++               .location = location,
++               .num_slots = 1,
++            });
++      }
++   }
++
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++   return nir;
++}
++
+ static nir_shader *
+ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
+               const struct vk_graphics_pipeline_state *state)
+@@ -1466,6 +1655,9 @@ gather_graphics_pipeline_create_info(
+           MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE)
+       topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+ 
++   if (info->vs.rectangular_line_emulation)
++      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
+    info->vs.topology =
+       vk_primitive_topology_to_mtl_primitive_topology_class(topology);
+ }
+@@ -1602,6 +1794,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+    const bool polygon_point_emulation =
+       state && !tess && kk_needs_polygon_point_emulation(state);
++   const bool rectangular_line_emulation =
++      state && !tess && kk_needs_rectangular_line_emulation(state);
+ 
+    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
+     * optimization. */
+@@ -1614,7 +1808,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       bool emulated_stage =
+          (tess && (nir->info.stage == MESA_SHADER_VERTEX ||
+                    nir->info.stage == MESA_SHADER_TESS_CTRL)) ||
+-         (polygon_point_emulation && nir->info.stage == MESA_SHADER_VERTEX);
++         ((polygon_point_emulation || rectangular_line_emulation) &&
++          nir->info.stage == MESA_SHADER_VERTEX);
+ 
+       msl_preprocess_nir_workarounds(nir, dev->disabled_workarounds);
+       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+@@ -1645,6 +1840,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                          UINT32_MAX, nir_opts, NULL);
+ 
+    uint32_t polygon_point_shader = UINT32_MAX;
++   uint32_t rectangular_line_shader = UINT32_MAX;
+    if (polygon_point_emulation) {
+       assert(nir_shaders[0]->info.stage == MESA_SHADER_VERTEX);
+       assert(nir_shaders[total_shaders - 1]->info.stage ==
+@@ -1658,13 +1854,28 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+       polygon_point_shader = total_shaders;
+       nir_shaders[total_shaders++] = point;
++   } else if (rectangular_line_emulation) {
++      assert(nir_shaders[0]->info.stage == MESA_SHADER_VERTEX);
++      assert(nir_shaders[total_shaders - 1]->info.stage ==
++             MESA_SHADER_FRAGMENT);
++
++      nir_shader *line = kk_create_rectangular_line_raster_shader(
++         nir_shaders[0], nir_shaders[total_shaders - 1]);
++      msl_preprocess_nir_workarounds(line, dev->disabled_workarounds);
++      kk_lower_nir(dev, line, false, infos[0].robustness,
++                   infos[0].set_layout_count, infos[0].set_layouts, state);
++
++      rectangular_line_shader = total_shaders;
++      nir_shaders[total_shaders++] = line;
+    }
+ 
+    for (uint32_t i = 0; i < total_shaders; i++) {
+       struct kk_shader *prev_stage =
+-         i == polygon_point_shader ? shaders[0]
+-                                   : (i > 0 ? shaders[i - 1] : NULL);
+-      bool force_sw_vs = polygon_point_emulation && i == 0;
++         (i == polygon_point_shader || i == rectangular_line_shader)
++            ? shaders[0]
++            : (i > 0 ? shaders[i - 1] : NULL);
++      bool force_sw_vs =
++         (polygon_point_emulation || rectangular_line_emulation) && i == 0;
+       result =
+          kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
+                            state, force_sw_vs, pAllocator, &shaders[i]);
+@@ -1686,8 +1897,10 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+       if (i == 0 && polygon_point_emulation)
+          shaders[i]->info.vs.polygon_point_emulation = true;
++      if (i == 0 && rectangular_line_emulation)
++         shaders[i]->info.vs.rectangular_line_emulation = true;
+ 
+-      if (i == polygon_point_shader) {
++      if (i == polygon_point_shader || i == rectangular_line_shader) {
+          shaders[i]->msl_data[MESA_SHADER_GEOMETRY] =
+             shaders[i]->msl_data[MESA_SHADER_VERTEX];
+          memset(&shaders[i]->msl_data[MESA_SHADER_VERTEX], 0,
+@@ -1713,7 +1926,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       gather_graphics_pipeline_create_info(state, shaders, total_shaders);
+       result = kk_compile_graphics_pipeline(dev, shaders[0]);
+ 
+-      /* Free generated fragment and polygon-point shaders. Their MSL was
++      /* Free generated fragment and raster-emulation shaders. Their MSL was
+        * copied into the vertex shader that owns the complete pipeline. */
+       for (uint32_t i = shader_count; i < total_shaders; ++i)
+          kk_shader_destroy(&dev->vk, shaders[i], pAllocator);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 1855d68866a862f0f0cf1ba72b81961869a21434..dac4b88aad55053e662224d540d5add8d90667db 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -70,6 +70,7 @@ struct kk_shader_info {
+          uint32_t sample_count;
+          uint64_t outputs_written;
+          bool polygon_point_emulation;
++         bool rectangular_line_emulation;
+ 
+          /* Data needed for serialization. */
+          enum mtl_primitive_topology_class topology;

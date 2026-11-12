@@ -1,0 +1,799 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:20:06 +0900
+Subject: [PATCH] util/disk_cache: claim a temporary entry with O_EXCL, not a
+ lock
+
+disk_cache_write_item_to_disk opened <entry>.tmp, took LOCK_EX on it
+(flock, or an F_SETLK write lock where flock is missing) and held that
+lock until it had renamed the file into place and closed it, and
+disk_cache_recompute_size took the same lock on a temporary file older
+than an hour before it removed it. A writer holds its lock for as long
+as its thread is in the middle of a write, and the disk cache's threads
+run in processes the system may suspend at any moment. iOS ends a
+suspended process that holds a file lock (exception 0xdead10cc), so a
+shader cache write in flight at the wrong moment took the whole
+application with it.
+
+Create the temporary file with O_CREAT | O_EXCL instead. Whoever
+creates it owns the write of the entry, and EEXIST means another thread
+or process is writing it, so the job is skipped, which is the outcome
+of a failed flock. Nothing takes a lock any more, and the exclusion
+between processes is the same, because O_EXCL is atomic on the file
+system as well. Every path after the claim already ends with the file
+renamed or unlinked, so a writer that finishes leaves nothing behind.
+
+A writer that dies leaves its file, and a lock no longer reveals that
+it is dead; only age does. A temporary file older than an hour is
+removed without being opened, by the size recomputation and by the next
+writer of the same entry, which replaces it. The second is needed
+because the first runs only when a cache is created with an invalid
+index or an eviction finds nothing to remove, so without it a dead
+writer would block its entry for much longer than an hour. A live
+writer is done in a moment.
+
+The test stops a writer at its rename, with the temporary file complete
+and still open, and probes the file with flock and F_OFD_GETLK from a
+fresh open file description. It also checks that a second writer
+leaves the entry to the first without waiting for it, that concurrent
+puts of one key from several instances leave one valid entry and a size
+that matches the disk, and that stale temporary files go by age alone,
+even while a lock is held on one.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/util/disk_cache_os.c               |  94 +++--
+ src/util/meson.build                   |  15 +
+ src/util/tests/disk_cache_tmp_rename.c |  32 ++
+ src/util/tests/disk_cache_tmp_rename.h |  20 +
+ src/util/tests/disk_cache_tmp_test.cpp | 505 +++++++++++++++++++++++++
+ 5 files changed, 618 insertions(+), 48 deletions(-)
+ create mode 100644 src/util/tests/disk_cache_tmp_rename.c
+ create mode 100644 src/util/tests/disk_cache_tmp_rename.h
+ create mode 100644 src/util/tests/disk_cache_tmp_test.cpp
+
+diff --git a/src/util/disk_cache_os.c b/src/util/disk_cache_os.c
+index 15b6a819b6866a74c4e64738fecc297a224811e1..2eb95f88824b46d724b58bda560559fba37dbc2b 100644
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -550,6 +550,13 @@ disk_cache_size_is_valid(struct disk_cache *cache)
+    return true;
+ }
+ 
++/* A writer claims its entry by creating the temporary file exclusively
++ * (see disk_cache_open_tmp_file) and holds no lock on it, so only the age
++ * of the file says whether a writer is still behind it.  A writer that died
++ * leaves the file, which keeps its entry from being written until the file
++ * is this old and is removed, by the next writer of that entry or by a size
++ * recomputation.
++ */
+ #define DISK_CACHE_STALE_TMP_AGE (60 * 60)
+ 
+ void
+@@ -578,25 +585,8 @@ disk_cache_recompute_size(struct disk_cache *cache)
+ 
+          size_t len = strlen(dir_ent->d_name);
+          if (len >= 4 && strcmp(&dir_ent->d_name[len - 4], ".tmp") == 0) {
+-            if (now - sb.st_mtime > DISK_CACHE_STALE_TMP_AGE) {
+-               int fd = openat(dir_fd, dir_ent->d_name, O_WRONLY | O_CLOEXEC);
+-               if (fd != -1) {
+-#ifdef HAVE_FLOCK
+-                  int err = flock(fd, LOCK_EX | LOCK_NB);
+-#else
+-                  struct flock lock = {
+-                     .l_start = 0,
+-                     .l_len = 0,
+-                     .l_type = F_WRLCK,
+-                     .l_whence = SEEK_SET
+-                  };
+-                  int err = fcntl(fd, F_SETLK, &lock);
+-#endif
+-                  if (err == 0)
+-                     unlinkat(dir_fd, dir_ent->d_name, 0);
+-                  close(fd);
+-               }
+-            }
++            if (now - sb.st_mtime > DISK_CACHE_STALE_TMP_AGE)
++               unlinkat(dir_fd, dir_ent->d_name, 0);
+             continue;
+          }
+ 
+@@ -845,6 +835,28 @@ create_cache_item_header_and_blob(struct disk_cache_put_job *dc_job,
+    return false;
+ }
+ 
++/* Create the temporary file of an entry for writing. Fails with EEXIST
++ * while another writer has it. A file old enough to be a dead writer's is
++ * removed first, so that it blocks its entry only for a while.
++ */
++static int
++disk_cache_open_tmp_file(const char *filename_tmp)
++{
++   const int flags = O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL;
++   int fd = open(filename_tmp, flags, 0644);
++
++   if (fd == -1 && errno == EEXIST) {
++      struct stat sb;
++      if (stat(filename_tmp, &sb) == 0 &&
++          time(NULL) - sb.st_mtime > DISK_CACHE_STALE_TMP_AGE) {
++         unlink(filename_tmp);
++         fd = open(filename_tmp, flags, 0644);
++      }
++   }
++
++   return fd;
++}
++
+ void
+ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+                               char *filename)
+@@ -861,7 +873,15 @@ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+    if (asprintf(&filename_tmp, "%s.tmp", filename) == -1)
+       goto done;
+ 
+-   fd = open(filename_tmp, O_WRONLY | O_CLOEXEC | O_CREAT, 0644);
++   /* Whoever creates the temporary file owns the write of this entry. If
++    * it already exists, another thread or process is writing the entry, so
++    * just let that file be responsible for writing the file. The claim is
++    * the exclusive creation, not a lock on the open file, so that a writer
++    * that is stopped or killed halfway holds nothing but its own entry,
++    * and every path below ends with the temporary file renamed or
++    * unlinked.
++    */
++   fd = disk_cache_open_tmp_file(filename_tmp);
+ 
+    /* Make the two-character subdirectory within the cache as needed. */
+    if (fd == -1) {
+@@ -870,35 +890,16 @@ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+ 
+       make_cache_file_directory(dc_job->cache, dc_job->key);
+ 
+-      fd = open(filename_tmp, O_WRONLY | O_CLOEXEC | O_CREAT, 0644);
++      fd = disk_cache_open_tmp_file(filename_tmp);
+       if (fd == -1)
+          goto done;
+    }
+ 
+-   /* With the temporary file open, we take an exclusive flock on
+-    * it. If the flock fails, then another process still has the file
+-    * open with the flock held. So just let that file be responsible
+-    * for writing the file.
+-    */
+-#ifdef HAVE_FLOCK
+-   int err = flock(fd, LOCK_EX | LOCK_NB);
+-#else
+-   struct flock lock = {
+-      .l_start = 0,
+-      .l_len = 0, /* entire file */
+-      .l_type = F_WRLCK,
+-      .l_whence = SEEK_SET
+-   };
+-   int err = fcntl(fd, F_SETLK, &lock);
+-#endif
+-   if (err == -1)
+-      goto done;
+-
+-   /* Now that we have the lock on the open temporary file, we can
+-    * check to see if the destination file already exists. If so,
+-    * another process won the race between when we saw that the file
+-    * didn't exist and now. In this case, we don't do anything more,
+-    * (to ensure the size accounting of the cache doesn't get off).
++   /* Now that we own the temporary file, we can check to see if the
++    * destination file already exists. If so, another process won the
++    * race between when we saw that the file didn't exist and now. In this
++    * case, we don't do anything more, (to ensure the size accounting of
++    * the cache doesn't get off).
+     */
+    fd_final = open(filename, O_RDONLY | O_CLOEXEC);
+    if (fd_final != -1) {
+@@ -943,9 +944,6 @@ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+  done:
+    if (fd_final != -1)
+       close(fd_final);
+-   /* This close finally releases the flock, (now that the final file
+-    * has been renamed into place and the size has been added).
+-    */
+    if (fd != -1)
+       close(fd);
+    free(filename_tmp);
+diff --git a/src/util/meson.build b/src/util/meson.build
+index 03b45b41fc089e120e4464d82e44423063e65a5d..61578d372ae18998608510fabc3d6d9091c8efef 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -514,6 +514,21 @@ if with_tests
+     files_util_tests += files(
+       'tests/cache_test.cpp',
+     )
++
++    if host_machine.system() != 'windows'
++      test(
++        'disk_cache_tmp',
++        executable(
++          'disk_cache_tmp_test',
++          files('tests/disk_cache_tmp_test.cpp', 'tests/disk_cache_tmp_rename.c'),
++          dependencies : [idep_mesautil, idep_gtest],
++        ),
++        suite : ['util'],
++        protocol : 'gtest',
++        is_parallel : false,
++        timeout : 180,
++      )
++    endif
+   endif
+ 
+   test(
+diff --git a/src/util/tests/disk_cache_tmp_rename.c b/src/util/tests/disk_cache_tmp_rename.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..efdb1f6aa12c34707c5a0e3a5df71234e6c7b435
+--- /dev/null
++++ b/src/util/tests/disk_cache_tmp_rename.c
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: MIT */
++
++/* The disk cache publishes an entry by renaming its temporary file onto the
++ * final name. Linked into disk_cache_tmp_test, this definition takes the
++ * place of the C library's for the cache code, so that the test can stop a
++ * writer there: its temporary file is complete and still open, the last
++ * moment at which anything the writer held on it is still held. */
++
++#include <fcntl.h>
++#include <stdio.h>
++
++#include "disk_cache_tmp_rename.h"
++
++static disk_cache_test_rename_hook rename_hook;
++
++void
++disk_cache_test_set_rename_hook(disk_cache_test_rename_hook hook)
++{
++   __atomic_store_n(&rename_hook, hook, __ATOMIC_SEQ_CST);
++}
++
++int
++rename(const char *from, const char *to)
++{
++   disk_cache_test_rename_hook hook =
++      __atomic_load_n(&rename_hook, __ATOMIC_SEQ_CST);
++
++   if (hook)
++      hook(from, to);
++
++   return renameat(AT_FDCWD, from, AT_FDCWD, to);
++}
+diff --git a/src/util/tests/disk_cache_tmp_rename.h b/src/util/tests/disk_cache_tmp_rename.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..71331bcfeaf976d194367dab8f8230d21b977d97
+--- /dev/null
++++ b/src/util/tests/disk_cache_tmp_rename.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef DISK_CACHE_TMP_RENAME_H
++#define DISK_CACHE_TMP_RENAME_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Called before every rename the process makes. Null removes the hook. */
++typedef void (*disk_cache_test_rename_hook)(const char *from, const char *to);
++
++void
++disk_cache_test_set_rename_hook(disk_cache_test_rename_hook hook);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* DISK_CACHE_TMP_RENAME_H */
+diff --git a/src/util/tests/disk_cache_tmp_test.cpp b/src/util/tests/disk_cache_tmp_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ee42a28c38dc3dc710edaa511cf75adee45e6d6
+--- /dev/null
++++ b/src/util/tests/disk_cache_tmp_test.cpp
+@@ -0,0 +1,505 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A multi-file disk cache writer claims an entry by creating its temporary
++ * file exclusively. It holds no lock on the file, so nothing a writer owns
++ * outlives it when it is stopped or killed, and a second writer of the same
++ * entry finds the temporary file and leaves the entry to the first. A
++ * temporary file that no writer will finish is removed by age alone. */
++
++#include <gtest/gtest.h>
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "util/disk_cache.h"
++#include "util/disk_cache_os.h"
++#include "util/u_atomic.h"
++
++#include "disk_cache_tmp_rename.h"
++
++#ifdef ENABLE_SHADER_CACHE
++
++namespace fs = std::filesystem;
++
++namespace {
++
++constexpr auto timeout = std::chrono::seconds(30);
++
++/* Stops the thread that renames a temporary file onto its entry. */
++struct Gate {
++   std::mutex mutex;
++   std::condition_variable changed;
++   bool armed = false;
++   bool reached = false;
++   bool open = false;
++   unsigned renames = 0;
++   std::string held;
++};
++
++Gate gate;
++
++void
++rename_hook(const char *from, const char *)
++{
++   const size_t len = strlen(from);
++   if (len < 4 || strcmp(from + len - 4, ".tmp") != 0)
++      return;
++
++   std::unique_lock<std::mutex> lock(gate.mutex);
++   gate.renames++;
++   if (!gate.armed)
++      return;
++
++   gate.armed = false;
++   gate.held = from;
++   gate.reached = true;
++   gate.changed.notify_all();
++   gate.changed.wait_for(lock, timeout, [] { return gate.open; });
++}
++
++struct CacheDeleter {
++   void operator()(struct disk_cache *cache) const { disk_cache_destroy(cache); }
++};
++using CachePtr = std::unique_ptr<struct disk_cache, CacheDeleter>;
++
++/* What a process that wants to own the file meets: a flock, or an open file
++ * description lock, held by someone else. */
++struct Probe {
++   bool flock_free = false;
++   bool ofd_free = false;
++   bool ok = false;
++};
++
++Probe
++probe_locks(const std::string &path)
++{
++   Probe probe;
++
++   int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
++   if (fd == -1)
++      return probe;
++
++#ifdef F_OFD_GETLK
++   struct flock query = {};
++   query.l_type = F_WRLCK;
++   query.l_whence = SEEK_SET;
++   probe.ofd_free = fcntl(fd, F_OFD_GETLK, &query) == 0 &&
++                    query.l_type == F_UNLCK;
++#else
++   probe.ofd_free = true;
++#endif
++
++   if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
++      probe.flock_free = true;
++      flock(fd, LOCK_UN);
++   }
++
++   close(fd);
++   probe.ok = true;
++   return probe;
++}
++
++std::vector<uint8_t>
++make_data(unsigned seed, size_t size)
++{
++   std::vector<uint8_t> data(size);
++   uint64_t state = 0x9e3779b97f4a7c15ull * (seed + 1);
++   for (uint8_t &byte : data) {
++      state ^= state << 13;
++      state ^= state >> 7;
++      state ^= state << 17;
++      byte = (uint8_t)(state >> 24);
++   }
++   return data;
++}
++
++void
++make_key(struct disk_cache *cache, unsigned id, cache_key key)
++{
++   disk_cache_compute_key(cache, &id, sizeof(id), key);
++}
++
++std::string
++entry_path(struct disk_cache *cache, const cache_key key)
++{
++   char *name = disk_cache_get_cache_filename(cache, key);
++   std::string path = name ? name : "";
++   free(name);
++   return path;
++}
++
++bool
++exists(const std::string &path)
++{
++   struct stat sb;
++   return stat(path.c_str(), &sb) == 0;
++}
++
++void
++age(const std::string &path, int seconds)
++{
++   struct timespec times[2];
++   clock_gettime(CLOCK_REALTIME, &times[0]);
++   times[0].tv_sec -= seconds;
++   times[1] = times[0];
++   ASSERT_EQ(utimensat(AT_FDCWD, path.c_str(), times, 0), 0) << path;
++}
++
++void
++write_file(const std::string &path, const char *content)
++{
++   fs::create_directories(fs::path(path).parent_path());
++   FILE *file = fopen(path.c_str(), "w");
++   ASSERT_NE(file, nullptr) << path;
++   fputs(content, file);
++   fclose(file);
++}
++
++struct Entries {
++   unsigned entries = 0;
++   unsigned temporaries = 0;
++   uint64_t bytes = 0;
++};
++
++/* The files of the two-character directories, as the cache counts them. */
++Entries
++list_entries(struct disk_cache *cache)
++{
++   Entries found;
++   for (const fs::directory_entry &dir : fs::directory_iterator(cache->path)) {
++      if (!dir.is_directory() || dir.path().filename().string().size() != 2)
++         continue;
++      for (const fs::directory_entry &file : fs::directory_iterator(dir)) {
++         if (file.path().extension() == ".tmp") {
++            found.temporaries++;
++            continue;
++         }
++         struct stat sb;
++         if (stat(file.path().c_str(), &sb) != 0)
++            continue;
++         found.entries++;
++         found.bytes += (uint64_t)sb.st_blocks * 512;
++      }
++   }
++   return found;
++}
++
++bool
++holds(struct disk_cache *cache, const cache_key key,
++      const std::vector<uint8_t> &data)
++{
++   size_t size = 0;
++   void *got = disk_cache_get(cache, key, &size);
++   const bool same = got && size == data.size() &&
++                     memcmp(got, data.data(), size) == 0;
++   free(got);
++   return same;
++}
++
++class DiskCacheTmp : public ::testing::Test {
++protected:
++   std::string dir;
++
++   void SetUp() override
++   {
++      const char *base = getenv("TMPDIR");
++      std::string pattern =
++         std::string(base && *base ? base : "/tmp") + "/disk-cache-tmp.XXXXXX";
++      std::vector<char> name(pattern.begin(), pattern.end());
++      name.push_back('\0');
++      ASSERT_NE(mkdtemp(name.data()), nullptr) << pattern;
++      dir = name.data();
++
++      setenv("MESA_SHADER_CACHE_DIR", dir.c_str(), 1);
++      setenv("MESA_SHADER_CACHE_DISABLE", "false", 1);
++      setenv("MESA_DISK_CACHE_MULTI_FILE", "true", 1);
++      unsetenv("MESA_DISK_CACHE_SINGLE_FILE");
++      unsetenv("MESA_DISK_CACHE_DATABASE");
++      unsetenv("MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ");
++
++      {
++         std::lock_guard<std::mutex> lock(gate.mutex);
++         gate.armed = gate.reached = gate.open = false;
++         gate.renames = 0;
++         gate.held.clear();
++      }
++      disk_cache_test_set_rename_hook(rename_hook);
++   }
++
++   void TearDown() override
++   {
++      open_gate();
++      caches.clear();
++      disk_cache_test_set_rename_hook(nullptr);
++      std::error_code ignored;
++      fs::remove_all(dir, ignored);
++   }
++
++   std::vector<CachePtr> caches;
++
++   /* Another instance over the same directory is another process as far as
++    * the cache can tell. */
++   struct disk_cache *make_cache()
++   {
++      caches.emplace_back(disk_cache_create("test", "make_check", 0));
++      struct disk_cache *cache = caches.back().get();
++      EXPECT_NE(cache, nullptr);
++      if (cache)
++         EXPECT_EQ(cache->type, DISK_CACHE_MULTI_FILE);
++      return cache;
++   }
++
++   void arm_gate()
++   {
++      std::lock_guard<std::mutex> lock(gate.mutex);
++      gate.armed = true;
++      gate.reached = false;
++      gate.open = false;
++   }
++
++   bool wait_for_writer()
++   {
++      std::unique_lock<std::mutex> lock(gate.mutex);
++      return gate.changed.wait_for(lock, timeout, [] { return gate.reached; });
++   }
++
++   void open_gate()
++   {
++      std::lock_guard<std::mutex> lock(gate.mutex);
++      gate.open = true;
++      gate.changed.notify_all();
++   }
++
++   unsigned renames()
++   {
++      std::lock_guard<std::mutex> lock(gate.mutex);
++      return gate.renames;
++   }
++};
++
++/* The writer's temporary file is complete and still open when it is renamed.
++ * Nothing is locked on it at that point, or at any other: a probe on a fresh
++ * open file description finds neither a flock nor an open file description
++ * lock. */
++TEST_F(DiskCacheTmp, WriterHoldsNoLock)
++{
++   struct disk_cache *cache = make_cache();
++   ASSERT_NE(cache, nullptr);
++
++   const std::vector<uint8_t> data = make_data(1, 40000);
++   cache_key key;
++   make_key(cache, 1, key);
++
++   arm_gate();
++   disk_cache_put(cache, key, data.data(), data.size(), NULL);
++   ASSERT_TRUE(wait_for_writer()) << "the writer never reached its rename";
++
++   std::string tmp;
++   {
++      std::lock_guard<std::mutex> lock(gate.mutex);
++      tmp = gate.held;
++   }
++   EXPECT_EQ(tmp, entry_path(cache, key) + ".tmp");
++
++   struct stat sb;
++   ASSERT_EQ(stat(tmp.c_str(), &sb), 0) << tmp;
++   EXPECT_GT(sb.st_size, 0) << "the temporary file is complete";
++   EXPECT_FALSE(exists(entry_path(cache, key)));
++
++   const Probe probe = probe_locks(tmp);
++   ASSERT_TRUE(probe.ok);
++   EXPECT_TRUE(probe.flock_free) << "the writer holds a flock";
++   EXPECT_TRUE(probe.ofd_free) << "the writer holds a file lock";
++
++   open_gate();
++   disk_cache_wait_for_idle(cache);
++
++   EXPECT_TRUE(holds(cache, key, data));
++   EXPECT_FALSE(exists(tmp));
++   const Entries found = list_entries(cache);
++   EXPECT_EQ(found.entries, 1u);
++   EXPECT_EQ(found.temporaries, 0u);
++}
++
++/* A second writer of an entry finds the first one's temporary file, leaves
++ * the entry to it, and does not wait for it. */
++TEST_F(DiskCacheTmp, SecondWriterLeavesTheEntryToTheFirst)
++{
++   struct disk_cache *first = make_cache();
++   struct disk_cache *second = make_cache();
++   ASSERT_NE(first, nullptr);
++   ASSERT_NE(second, nullptr);
++
++   const std::vector<uint8_t> data = make_data(2, 30000);
++   cache_key key;
++   make_key(first, 2, key);
++
++   arm_gate();
++   disk_cache_put(first, key, data.data(), data.size(), NULL);
++   ASSERT_TRUE(wait_for_writer()) << "the writer never reached its rename";
++
++   disk_cache_put(second, key, data.data(), data.size(), NULL);
++   disk_cache_wait_for_idle(second);
++   EXPECT_EQ(renames(), 1u) << "the second writer wrote the entry too";
++   EXPECT_FALSE(exists(entry_path(second, key)));
++
++   open_gate();
++   disk_cache_wait_for_idle(first);
++
++   EXPECT_EQ(renames(), 1u);
++   EXPECT_TRUE(holds(first, key, data));
++   EXPECT_TRUE(holds(second, key, data));
++   const Entries found = list_entries(first);
++   EXPECT_EQ(found.entries, 1u);
++   EXPECT_EQ(found.temporaries, 0u);
++   EXPECT_EQ(p_atomic_read(&first->size->value), found.bytes);
++}
++
++/* Several instances put the same keys at once. Each key ends as one valid
++ * entry, no temporary file is left, and the size the instances share is the
++ * size of what is on disk. */
++TEST_F(DiskCacheTmp, ConcurrentPutsOfOneKeyLeaveOneValidEntry)
++{
++   constexpr unsigned instances = 6;
++   constexpr unsigned keys = 48;
++
++   std::vector<struct disk_cache *> cache;
++   for (unsigned i = 0; i < instances; i++) {
++      cache.push_back(make_cache());
++      ASSERT_NE(cache.back(), nullptr);
++   }
++
++   std::vector<std::vector<uint8_t>> data;
++   std::vector<std::vector<uint8_t>> key_bytes;
++   for (unsigned k = 0; k < keys; k++) {
++      data.push_back(make_data(100 + k, 2000 + 1500 * k));
++      key_bytes.emplace_back(sizeof(cache_key));
++      make_key(cache[0], 100 + k, key_bytes.back().data());
++   }
++
++   std::atomic<bool> go{false};
++   std::vector<std::thread> threads;
++   for (unsigned i = 0; i < instances; i++) {
++      threads.emplace_back([&, i] {
++         while (!go.load())
++            std::this_thread::yield();
++         for (unsigned k = 0; k < keys; k++)
++            disk_cache_put(cache[i], key_bytes[k].data(), data[k].data(),
++                           data[k].size(), NULL);
++      });
++   }
++   go = true;
++   for (std::thread &thread : threads)
++      thread.join();
++   for (struct disk_cache *c : cache)
++      disk_cache_wait_for_idle(c);
++
++   for (unsigned k = 0; k < keys; k++)
++      for (struct disk_cache *c : cache)
++         EXPECT_TRUE(holds(c, key_bytes[k].data(), data[k])) << "key " << k;
++
++   const Entries found = list_entries(cache[0]);
++   EXPECT_EQ(found.entries, keys);
++   EXPECT_EQ(found.temporaries, 0u);
++   EXPECT_EQ(p_atomic_read(&cache[0]->size->value), found.bytes);
++}
++
++/* A temporary file a writer is still behind blocks the entry's other
++ * writers. One that is old enough is a dead writer's: the next writer of the
++ * entry replaces it. */
++TEST_F(DiskCacheTmp, StaleTemporaryFileIsReplacedByTheNextWriter)
++{
++   struct disk_cache *cache = make_cache();
++   ASSERT_NE(cache, nullptr);
++
++   const std::vector<uint8_t> data = make_data(3, 20000);
++   cache_key key;
++   make_key(cache, 3, key);
++   const std::string entry = entry_path(cache, key);
++   const std::string tmp = entry + ".tmp";
++   write_file(tmp, "a writer that has not finished");
++
++   disk_cache_put(cache, key, data.data(), data.size(), NULL);
++   disk_cache_wait_for_idle(cache);
++   EXPECT_FALSE(exists(entry)) << "a writer took over a live temporary file";
++   EXPECT_TRUE(exists(tmp));
++   EXPECT_FALSE(holds(cache, key, data));
++
++   age(tmp, 2 * 60 * 60);
++   disk_cache_put(cache, key, data.data(), data.size(), NULL);
++   disk_cache_wait_for_idle(cache);
++   EXPECT_TRUE(holds(cache, key, data));
++   EXPECT_FALSE(exists(tmp));
++   const Entries found = list_entries(cache);
++   EXPECT_EQ(found.entries, 1u);
++   EXPECT_EQ(found.temporaries, 0u);
++   EXPECT_EQ(p_atomic_read(&cache->size->value), found.bytes);
++}
++
++/* Recomputing the cache's size removes the temporary files that are old
++ * enough, whatever holds them open or locked, and keeps the others. */
++TEST_F(DiskCacheTmp, SizeRecomputationRemovesStaleTemporaryFilesByAge)
++{
++   struct disk_cache *cache = make_cache();
++   ASSERT_NE(cache, nullptr);
++
++   const std::vector<uint8_t> data = make_data(4, 10000);
++   cache_key key;
++   make_key(cache, 4, key);
++   disk_cache_put(cache, key, data.data(), data.size(), NULL);
++   disk_cache_wait_for_idle(cache);
++   ASSERT_TRUE(holds(cache, key, data));
++
++   cache_key stale_key, fresh_key;
++   make_key(cache, 5, stale_key);
++   make_key(cache, 6, fresh_key);
++   const std::string stale = entry_path(cache, stale_key) + ".tmp";
++   const std::string fresh = entry_path(cache, fresh_key) + ".tmp";
++   write_file(stale, "a writer that died");
++   write_file(fresh, "a writer that is running");
++   age(stale, 2 * 60 * 60);
++
++   /* A holder of the old kind keeps its lock on the stale file. */
++   const int holder = open(stale.c_str(), O_RDWR | O_CLOEXEC);
++   ASSERT_NE(holder, -1);
++   ASSERT_EQ(flock(holder, LOCK_EX | LOCK_NB), 0);
++
++   disk_cache_recompute_size(cache);
++   close(holder);
++
++   EXPECT_FALSE(exists(stale));
++   EXPECT_TRUE(exists(fresh));
++   const Entries found = list_entries(cache);
++   EXPECT_EQ(found.entries, 1u);
++   EXPECT_EQ(found.temporaries, 1u);
++   EXPECT_EQ(p_atomic_read(&cache->size->value), found.bytes);
++}
++
++} /* namespace */
++
++#else
++
++TEST(DiskCacheTmp, Disabled)
++{
++   GTEST_SKIP() << "ENABLE_SHADER_CACHE not defined.";
++}
++
++#endif /* ENABLE_SHADER_CACHE */

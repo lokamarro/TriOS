@@ -1,0 +1,480 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:49:48 +0900
+Subject: [PATCH] virt_wifi: let a supplicant listen and send on any channel
+
+Android's Easy Connect (DPP) starts from a URI that names the channels a
+peer listens on, and wpa_supplicant's dpp_channel_intersect() keeps those
+the driver lists as usable. virt_wifi listed one channel per band, 2432
+and 5240 MHz, so a URI naming 2412 and 5200 left none: the supplicant
+refused to start ("No available channels for initiating DPP
+Authentication"), the HAL call failed, and the framework reported
+EASY_CONNECT_EVENT_FAILURE_GENERIC at once. A real radio, or mac80211_hwsim,
+starts, finds nobody, and the framework's 40 s timer reports
+EASY_CONNECT_EVENT_FAILURE_TIMEOUT, which is what the CTS expects.
+
+Given a channel, the supplicant would fail next at the first
+off-channel step: virt_wifi has no remain-on-channel and no management
+frame transmit, and cfg80211 refuses both.
+
+Give the radio what a station needs for that, with no peer on any
+channel:
+
+- 2.4 GHz channels 1 to 13 and 5 GHz channels 36 to 48 and 149 to 165.
+  The regulatory domain is the world one, so 2412 MHz allows initiating
+  radiation and the 5 GHz channels do not, and a URI meets 2412. The
+  access point stays on 5240 MHz, so scans and the association are
+  unchanged.
+- remain_on_channel and cancel_remain_on_channel: one request at a time,
+  reported ready at once and expired when the time asked for (at most
+  5 s) has gone, or when it is cancelled or the interface stops.
+- mgmt_tx and mgmt_tx_cancel_wait for Action frames, reported as not
+  acknowledged, because nobody is there to acknowledge them. The frame is
+  copied and its status sent from a work item, as a driver does after the
+  air time.
+- Action frame transmit and receive and Probe Request receive for the
+  station, WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL and WIPHY_FLAG_OFFCHAN_TX, so
+  that a supplicant sends frames off channel without asking for a
+  channel first, and a 5 s maximum remain-on-channel time.
+
+The works are cancelled, and the frames not yet reported dropped, when
+the interface stops or its link is deleted. Only the Android configuration
+builds virt_wifi.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/virtual/virt_wifi.c | 331 ++++++++++++++++++++++-
+ 1 file changed, 316 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/virtual/virt_wifi.c b/drivers/net/wireless/virtual/virt_wifi.c
+index 16d1d3cedd981c42df8b0b08f162ae2a24a9896b..d5497a551659a4f4dd4e4631115d577682d048c2 100644
+--- a/drivers/net/wireless/virtual/virt_wifi.c
++++ b/drivers/net/wireless/virtual/virt_wifi.c
+@@ -23,11 +23,40 @@ struct virt_wifi_wiphy_priv {
+ 	bool being_deleted;
+ };
+ 
+-static struct ieee80211_channel channel_2ghz = {
+-	.band = NL80211_BAND_2GHZ,
+-	.center_freq = 2432,
+-	.hw_value = 2432,
+-	.max_power = 20,
++#define VIRT_WIFI_CHANNEL_2GHZ(freq) {			\
++	.band = NL80211_BAND_2GHZ,			\
++	.center_freq = (freq),				\
++	.hw_value = (freq),				\
++	.max_power = 20,				\
++}
++
++#define VIRT_WIFI_CHANNEL_5GHZ(freq) {			\
++	.band = NL80211_BAND_5GHZ,			\
++	.center_freq = (freq),				\
++	.hw_value = (freq),				\
++	.max_power = 20,				\
++}
++
++/*
++ * The radio lists the channels of a phone's Wi-Fi chip, so that a supplicant
++ * finds a channel its peer was told to use (an Easy Connect URI names 2.4 GHz
++ * channel 1 and 5 GHz channel 40). Only the access point is fake, and it
++ * stays on 5240 MHz.
++ */
++static struct ieee80211_channel channels_2ghz[] = {
++	VIRT_WIFI_CHANNEL_2GHZ(2412),
++	VIRT_WIFI_CHANNEL_2GHZ(2417),
++	VIRT_WIFI_CHANNEL_2GHZ(2422),
++	VIRT_WIFI_CHANNEL_2GHZ(2427),
++	VIRT_WIFI_CHANNEL_2GHZ(2432),
++	VIRT_WIFI_CHANNEL_2GHZ(2437),
++	VIRT_WIFI_CHANNEL_2GHZ(2442),
++	VIRT_WIFI_CHANNEL_2GHZ(2447),
++	VIRT_WIFI_CHANNEL_2GHZ(2452),
++	VIRT_WIFI_CHANNEL_2GHZ(2457),
++	VIRT_WIFI_CHANNEL_2GHZ(2462),
++	VIRT_WIFI_CHANNEL_2GHZ(2467),
++	VIRT_WIFI_CHANNEL_2GHZ(2472),
+ };
+ 
+ static struct ieee80211_rate bitrates_2ghz[] = {
+@@ -41,10 +70,10 @@ static struct ieee80211_rate bitrates_2ghz[] = {
+ };
+ 
+ static struct ieee80211_supported_band band_2ghz = {
+-	.channels = &channel_2ghz,
++	.channels = channels_2ghz,
+ 	.bitrates = bitrates_2ghz,
+ 	.band = NL80211_BAND_2GHZ,
+-	.n_channels = 1,
++	.n_channels = ARRAY_SIZE(channels_2ghz),
+ 	.n_bitrates = ARRAY_SIZE(bitrates_2ghz),
+ 	.ht_cap = {
+ 		.ht_supported = true,
+@@ -62,13 +91,21 @@ static struct ieee80211_supported_band band_2ghz = {
+ 	},
+ };
+ 
+-static struct ieee80211_channel channel_5ghz = {
+-	.band = NL80211_BAND_5GHZ,
+-	.center_freq = 5240,
+-	.hw_value = 5240,
+-	.max_power = 20,
++static struct ieee80211_channel channels_5ghz[] = {
++	VIRT_WIFI_CHANNEL_5GHZ(5180),
++	VIRT_WIFI_CHANNEL_5GHZ(5200),
++	VIRT_WIFI_CHANNEL_5GHZ(5220),
++	VIRT_WIFI_CHANNEL_5GHZ(5240),
++	VIRT_WIFI_CHANNEL_5GHZ(5745),
++	VIRT_WIFI_CHANNEL_5GHZ(5765),
++	VIRT_WIFI_CHANNEL_5GHZ(5785),
++	VIRT_WIFI_CHANNEL_5GHZ(5805),
++	VIRT_WIFI_CHANNEL_5GHZ(5825),
+ };
+ 
++/* The access point's channel: 5240 MHz, the fourth 5 GHz entry. */
++#define VIRT_WIFI_BSS_CHANNEL	(&channels_5ghz[3])
++
+ static struct ieee80211_rate bitrates_5ghz[] = {
+ 	{ .bitrate = 60 },
+ 	{ .bitrate = 120 },
+@@ -94,10 +131,10 @@ static struct ieee80211_rate bitrates_5ghz[] = {
+ 		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 14)
+ 
+ static struct ieee80211_supported_band band_5ghz = {
+-	.channels = &channel_5ghz,
++	.channels = channels_5ghz,
+ 	.bitrates = bitrates_5ghz,
+ 	.band = NL80211_BAND_5GHZ,
+-	.n_channels = 1,
++	.n_channels = ARRAY_SIZE(channels_5ghz),
+ 	.n_bitrates = ARRAY_SIZE(bitrates_5ghz),
+ 	.ht_cap = {
+ 		.ht_supported = true,
+@@ -153,7 +190,7 @@ static void virt_wifi_inform_bss(struct wiphy *wiphy)
+ 		.ssid = VIRT_WIFI_SSID,
+ 	};
+ 
+-	informed_bss = cfg80211_inform_bss(wiphy, &channel_5ghz,
++	informed_bss = cfg80211_inform_bss(wiphy, VIRT_WIFI_BSS_CHANNEL,
+ 					   CFG80211_BSS_FTYPE_PRESP,
+ 					   fake_router_bssid, tsf,
+ 					   WLAN_CAPABILITY_ESS, 0,
+@@ -210,6 +247,23 @@ static void virt_wifi_cancel_scan(struct wiphy *wiphy)
+ 	}
+ }
+ 
++/* The longest time one remain-on-channel request may ask for. */
++#define VIRT_WIFI_MAX_ROC_MS	5000
++
++enum virt_wifi_roc_state {
++	VIRT_WIFI_ROC_IDLE,
++	VIRT_WIFI_ROC_STARTING,	/* requested, not yet reported ready */
++	VIRT_WIFI_ROC_ACTIVE,	/* ready; ends when the work runs again */
++};
++
++/* A management frame whose transmit status is still to be reported. */
++struct virt_wifi_tx_status {
++	struct list_head list;
++	u64 cookie;
++	size_t len;
++	u8 buf[];
++};
++
+ struct virt_wifi_netdev_priv {
+ 	struct delayed_work connect;
+ 	struct net_device *lowerdev;
+@@ -222,6 +276,22 @@ struct virt_wifi_netdev_priv {
+ 	bool is_up;
+ 	bool is_connected;
+ 	bool being_deleted;
++
++	/*
++	 * Off-channel operation. There is no peer on any channel: a frame
++	 * sent is never acknowledged, and a channel one listens on stays
++	 * quiet until the time asked for has gone. offchan_lock guards the
++	 * fields below it.
++	 */
++	spinlock_t offchan_lock;
++	struct delayed_work roc;
++	struct work_struct tx_status;
++	struct list_head tx_pending;
++	struct ieee80211_channel *roc_chan;
++	unsigned int roc_duration;
++	u64 roc_cookie;
++	u64 last_cookie;
++	enum virt_wifi_roc_state roc_state;
+ };
+ 
+ /* Called with the rtnl lock held. */
+@@ -359,6 +429,217 @@ static int virt_wifi_dump_station(struct wiphy *wiphy, struct net_device *dev,
+ 	return virt_wifi_get_station(wiphy, dev, fake_router_bssid, sinfo);
+ }
+ 
++static struct virt_wifi_netdev_priv *virt_wifi_wdev_priv(struct wireless_dev *wdev)
++{
++	return wdev->netdev ? netdev_priv(wdev->netdev) : NULL;
++}
++
++/*
++ * Reports the channel ready, then expired. Acquires and releases no cfg80211
++ * lock: both events are only sent.
++ */
++static void virt_wifi_roc_work(struct work_struct *work)
++{
++	struct virt_wifi_netdev_priv *priv =
++		container_of(work, struct virt_wifi_netdev_priv, roc.work);
++	struct wireless_dev *wdev = priv->upperdev->ieee80211_ptr;
++	struct ieee80211_channel *chan;
++	unsigned int duration;
++	u64 cookie;
++
++	spin_lock_bh(&priv->offchan_lock);
++	chan = priv->roc_chan;
++	duration = priv->roc_duration;
++	cookie = priv->roc_cookie;
++	switch (priv->roc_state) {
++	case VIRT_WIFI_ROC_STARTING:
++		priv->roc_state = VIRT_WIFI_ROC_ACTIVE;
++		spin_unlock_bh(&priv->offchan_lock);
++		cfg80211_ready_on_channel(wdev, cookie, chan, duration,
++					  GFP_KERNEL);
++		schedule_delayed_work(&priv->roc, msecs_to_jiffies(duration));
++		break;
++	case VIRT_WIFI_ROC_ACTIVE:
++		priv->roc_state = VIRT_WIFI_ROC_IDLE;
++		priv->roc_chan = NULL;
++		spin_unlock_bh(&priv->offchan_lock);
++		cfg80211_remain_on_channel_expired(wdev, cookie, chan,
++						   GFP_KERNEL);
++		break;
++	default:
++		spin_unlock_bh(&priv->offchan_lock);
++	}
++}
++
++/*
++ * Ends the remain-on-channel request, only the one with this cookie unless it
++ * is zero, and reports it expired, as the cancellation of a request does.
++ * Acquires and releases no cfg80211 lock.
++ */
++static int virt_wifi_cancel_roc(struct virt_wifi_netdev_priv *priv, u64 cookie)
++{
++	struct ieee80211_channel *chan;
++
++	spin_lock_bh(&priv->offchan_lock);
++	if (priv->roc_state == VIRT_WIFI_ROC_IDLE ||
++	    (cookie && priv->roc_cookie != cookie)) {
++		spin_unlock_bh(&priv->offchan_lock);
++		return -ENOENT;
++	}
++	cookie = priv->roc_cookie;
++	chan = priv->roc_chan;
++	priv->roc_state = VIRT_WIFI_ROC_IDLE;
++	priv->roc_chan = NULL;
++	spin_unlock_bh(&priv->offchan_lock);
++
++	cancel_delayed_work_sync(&priv->roc);
++	cfg80211_remain_on_channel_expired(priv->upperdev->ieee80211_ptr,
++					   cookie, chan, GFP_KERNEL);
++	return 0;
++}
++
++/* Reports every queued frame as not acknowledged: nobody is listening. */
++static void virt_wifi_tx_status_work(struct work_struct *work)
++{
++	struct virt_wifi_netdev_priv *priv =
++		container_of(work, struct virt_wifi_netdev_priv, tx_status);
++	struct virt_wifi_tx_status *status;
++
++	for (;;) {
++		spin_lock_bh(&priv->offchan_lock);
++		status = list_first_entry_or_null(&priv->tx_pending,
++						  struct virt_wifi_tx_status,
++						  list);
++		if (status)
++			list_del(&status->list);
++		spin_unlock_bh(&priv->offchan_lock);
++		if (!status)
++			return;
++
++		cfg80211_mgmt_tx_status(priv->upperdev->ieee80211_ptr,
++					status->cookie, status->buf,
++					status->len, false, GFP_KERNEL);
++		kfree(status);
++	}
++}
++
++/*
++ * Ends the remain-on-channel request and drops the frames not yet reported.
++ * The interface is down or going away, and no new request can start.
++ */
++static void virt_wifi_cancel_offchannel(struct net_device *netdev)
++{
++	struct virt_wifi_netdev_priv *priv = netdev_priv(netdev);
++	struct virt_wifi_tx_status *status, *next;
++	LIST_HEAD(dropped);
++
++	virt_wifi_cancel_roc(priv, 0);
++	cancel_work_sync(&priv->tx_status);
++
++	spin_lock_bh(&priv->offchan_lock);
++	list_splice_init(&priv->tx_pending, &dropped);
++	spin_unlock_bh(&priv->offchan_lock);
++	list_for_each_entry_safe(status, next, &dropped, list)
++		kfree(status);
++}
++
++/* Called with the rtnl lock held. */
++static int virt_wifi_remain_on_channel(struct wiphy *wiphy,
++				       struct wireless_dev *wdev,
++				       struct ieee80211_channel *chan,
++				       unsigned int duration, u64 *cookie)
++{
++	struct virt_wifi_netdev_priv *priv = virt_wifi_wdev_priv(wdev);
++
++	wiphy_debug(wiphy, "remain_on_channel %u MHz %u ms\n",
++		    chan->center_freq, duration);
++
++	if (!priv || priv->being_deleted || !priv->is_up)
++		return -ENETDOWN;
++
++	spin_lock_bh(&priv->offchan_lock);
++	if (priv->roc_state != VIRT_WIFI_ROC_IDLE) {
++		spin_unlock_bh(&priv->offchan_lock);
++		return -EBUSY;
++	}
++	priv->roc_state = VIRT_WIFI_ROC_STARTING;
++	priv->roc_chan = chan;
++	priv->roc_duration = duration;
++	priv->roc_cookie = ++priv->last_cookie;
++	*cookie = priv->roc_cookie;
++	spin_unlock_bh(&priv->offchan_lock);
++
++	/* The channel is ready once the request has returned its cookie. */
++	schedule_delayed_work(&priv->roc, 0);
++	return 0;
++}
++
++/* Called with the rtnl lock held. */
++static int virt_wifi_cancel_remain_on_channel(struct wiphy *wiphy,
++					      struct wireless_dev *wdev,
++					      u64 cookie)
++{
++	struct virt_wifi_netdev_priv *priv = virt_wifi_wdev_priv(wdev);
++
++	wiphy_debug(wiphy, "cancel_remain_on_channel\n");
++
++	if (!priv || !cookie)
++		return -ENOENT;
++	return virt_wifi_cancel_roc(priv, cookie);
++}
++
++/* Called with the rtnl lock held. */
++static int virt_wifi_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
++			     struct cfg80211_mgmt_tx_params *params,
++			     u64 *cookie)
++{
++	struct virt_wifi_netdev_priv *priv = virt_wifi_wdev_priv(wdev);
++	struct virt_wifi_tx_status *status = NULL;
++
++	wiphy_debug(wiphy, "mgmt_tx %zu bytes\n", params->len);
++
++	if (!priv || priv->being_deleted || !priv->is_up)
++		return -ENETDOWN;
++
++	if (!params->dont_wait_for_ack) {
++		status = kmalloc(struct_size(status, buf, params->len),
++				 GFP_KERNEL);
++		if (!status)
++			return -ENOMEM;
++		status->len = params->len;
++		memcpy(status->buf, params->buf, params->len);
++	}
++
++	spin_lock_bh(&priv->offchan_lock);
++	*cookie = ++priv->last_cookie;
++	if (status) {
++		status->cookie = *cookie;
++		list_add_tail(&status->list, &priv->tx_pending);
++	}
++	spin_unlock_bh(&priv->offchan_lock);
++
++	if (status)
++		schedule_work(&priv->tx_status);
++	return 0;
++}
++
++/* Called with the rtnl lock held. */
++static int virt_wifi_mgmt_tx_cancel_wait(struct wiphy *wiphy,
++					 struct wireless_dev *wdev, u64 cookie)
++{
++	/* The radio never stays on a channel to wait for an answer. */
++	return 0;
++}
++
++static const struct ieee80211_txrx_stypes
++virt_wifi_mgmt_stypes[NUM_NL80211_IFTYPES] = {
++	[NL80211_IFTYPE_STATION] = {
++		.tx = BIT(IEEE80211_STYPE_ACTION >> 4),
++		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
++		      BIT(IEEE80211_STYPE_PROBE_REQ >> 4),
++	},
++};
++
+ static const struct cfg80211_ops virt_wifi_cfg80211_ops = {
+ 	.scan = virt_wifi_scan,
+ 
+@@ -367,6 +648,11 @@ static const struct cfg80211_ops virt_wifi_cfg80211_ops = {
+ 
+ 	.get_station = virt_wifi_get_station,
+ 	.dump_station = virt_wifi_dump_station,
++
++	.remain_on_channel = virt_wifi_remain_on_channel,
++	.cancel_remain_on_channel = virt_wifi_cancel_remain_on_channel,
++	.mgmt_tx = virt_wifi_mgmt_tx,
++	.mgmt_tx_cancel_wait = virt_wifi_mgmt_tx_cancel_wait,
+ };
+ 
+ /* Acquires and releases the rtnl lock. */
+@@ -391,6 +677,14 @@ static struct wiphy *virt_wifi_make_wiphy(void)
+ 
+ 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+ 
++	/*
++	 * A supplicant listens on, and sends frames on, channels other than
++	 * the one it is connected to (Easy Connect, ANQP). Nobody answers.
++	 */
++	wiphy->flags |= WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL | WIPHY_FLAG_OFFCHAN_TX;
++	wiphy->max_remain_on_channel_duration = VIRT_WIFI_MAX_ROC_MS;
++	wiphy->mgmt_stypes = virt_wifi_mgmt_stypes;
++
+ 	priv = wiphy_priv(wiphy);
+ 	priv->being_deleted = false;
+ 	priv->scan_request = NULL;
+@@ -461,6 +755,7 @@ static int virt_wifi_net_device_stop(struct net_device *dev)
+ 
+ 	virt_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
+ 	virt_wifi_cancel_connect(dev);
++	virt_wifi_cancel_offchannel(dev);
+ 	netif_carrier_off(dev);
+ 
+ 	return 0;
+@@ -537,6 +832,10 @@ static int virt_wifi_newlink(struct net_device *dev,
+ 	netif_carrier_off(dev);
+ 
+ 	priv->upperdev = dev;
++	spin_lock_init(&priv->offchan_lock);
++	INIT_DELAYED_WORK(&priv->roc, virt_wifi_roc_work);
++	INIT_WORK(&priv->tx_status, virt_wifi_tx_status_work);
++	INIT_LIST_HEAD(&priv->tx_pending);
+ 	priv->lowerdev = __dev_get_by_index(link_net,
+ 					    nla_get_u32(tb[IFLA_LINK]));
+ 
+@@ -613,6 +912,8 @@ static void virt_wifi_dellink(struct net_device *dev,
+ 
+ 	priv->being_deleted = true;
+ 	virt_wifi_cancel_connect(dev);
++	if (dev->ieee80211_ptr)
++		virt_wifi_cancel_offchannel(dev);
+ 	netif_carrier_off(dev);
+ 
+ 	netdev_rx_handler_unregister(priv->lowerdev);

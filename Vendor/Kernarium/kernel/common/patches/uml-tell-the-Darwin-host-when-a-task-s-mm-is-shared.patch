@@ -1,0 +1,549 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:08:45 +0900
+Subject: [PATCH] uml: tell the Darwin host when a task's mm is shared
+
+The Darwin host's x86 JIT may relax memory ordering while no other agent
+can observe an address space, and must keep x86's total store order
+while one can. Each guest entry carries a dispatch flag,
+DARWIN_UML_DISPATCH_MM_SHARED, for that, and bridge ABI 19 gives it the
+meaning below, which a host may rely on.
+
+Another agent can observe an mm while any of three conditions holds,
+which current_mm_shared() works out afresh for every guest entry:
+
+- Another task may run on it: mm_users counts more than the entering
+  task. A vfork child does not count its parent, which cannot run until
+  the child leaves the mm (current->vfork_done is set until then).
+- It maps memory that another mm may map too: any VM_MAYSHARE vma.
+  That covers shared anonymous memory, shared file mappings, SysV shm,
+  memfd, and the io_uring and AIO rings that the kernel fills from
+  other CPUs. A read-only shared mapping counts, since its loads must
+  keep their order as much as a writer's stores. mmap_region() sets the
+  mm's mark through an arch_mmap_shared() hook. When
+  vms_complete_munmap_vmas() has removed such a vma (munmap, mremap,
+  shmdt, a MAP_FIXED replacement), arch_munmap_shared() walks the vmas
+  under mmap_lock and clears the mark if none is left. A fork child has
+  the mark only if a shared vma came with it.
+- io_uring keeps a ring in the task's own memory (IORING_SETUP_NO_MMAP
+  or a provided-buffer ring), which a completion on another CPU or
+  another process's IORING_OP_MSG_RING writes. The pinned region
+  records its mm, and arch_ring_pin() and arch_ring_unpin() count the
+  mm's pinned regions. The unpin, possibly from a work item, comes
+  after the ring's last writer.
+
+Once none holds, the next entry lacks the flag, and every store another
+agent made before is visible to it: the entering task reads mm_users
+and the pin count with acquire loads, which pair with mmput()'s fully
+ordered decrement and the unpin's release, and a shared vma is gone
+from the page tables before its mark clears. A new sharer always comes
+from a system call of a task on the mm (clone() raises mm_users before
+the child runs; mmap() and the pin set the mark before they return), so
+no entry can miss it. A temporary mm_users reference (procfs, ptrace)
+marks entries only while it lasts. The flag describes one entry and is
+cleared after it returns, as PSTATE.SS is.
+
+Only the x86-64 JIT reads the flag, and x86-64 tasks exist only in the
+x86-64 userspace slice, so all of this is under UML_DARWIN_MM_SHARED,
+which that slice selects. It selects ARCH_HAS_MM_SHARED_HOOKS, which
+makes io_uring record the pinning mm and lets the arch define the hooks.
+The arm64 kernels build none of it: their entries, mmaps, munmaps,
+forks and ring pins do no mm-shared work, and the flag stays clear
+there, where the arm64 host does not read it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/Kconfig                             |   9 ++
+ arch/um/include/asm/mm_hooks.h              |  16 +++
+ arch/um/include/asm/mmu.h                   |  10 ++
+ arch/um/include/shared/skas/skas.h          |   3 +
+ arch/um/kernel/skas/mmu_darwin.c            | 103 ++++++++++++++++++++
+ arch/um/os-Darwin/skas/process.c            |  35 +++++++
+ arch/um/os-Darwin/uml_darwin_abi.h          |  13 ++-
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |   2 +-
+ include/linux/io_uring_types.h              |   4 +
+ include/linux/mmu_context.h                 |  34 +++++++
+ io_uring/memmap.c                           |  18 ++++
+ mm/Kconfig                                  |   7 ++
+ mm/vma.c                                    |   9 +-
+ 13 files changed, 259 insertions(+), 4 deletions(-)
+
+diff --git a/arch/um/Kconfig b/arch/um/Kconfig
+index cc7f5ddb404cbc3fda7ae2d8c6cd847f8941137e..8818e790d811f0446137a780ab0f04c238522bfa 100644
+--- a/arch/um/Kconfig
++++ b/arch/um/Kconfig
+@@ -91,6 +91,15 @@ config HZ
+ config UML_SUBARCH_SUPPORTS_SMP
+ 	bool
+ 
++# Whether every guest entry tells the Darwin host if an agent other than the
++# task can observe the memory of its mm (DARWIN_UML_DISPATCH_MM_SHARED), for a
++# host that relaxes x86's memory order while none can.  Only the x86-64 JIT
++# reads the flag, so only the x86-64 userspace slice selects this; elsewhere
++# the flag stays clear and no mm path does this work.
++config UML_DARWIN_MM_SHARED
++	bool
++	select ARCH_HAS_MM_SHARED_HOOKS
++
+ config SMP
+ 	bool "Symmetric multi-processing support"
+ 	default y
+diff --git a/arch/um/include/asm/mm_hooks.h b/arch/um/include/asm/mm_hooks.h
+index 0d33f7fd17a9cb58998978aa56eb469fb773a607..2427d23ff06b608042a4b2eec8c8b4438a19a56a 100644
+--- a/arch/um/include/asm/mm_hooks.h
++++ b/arch/um/include/asm/mm_hooks.h
+@@ -6,14 +6,30 @@
+ struct mm_struct;
+ struct vm_area_struct;
+ 
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm);
++#else
+ static inline int arch_dup_mmap(struct mm_struct *oldmm,
+ 				struct mm_struct *mm)
+ {
+ 	return 0;
+ }
++#endif
+ 
+ void arch_exit_mmap(struct mm_struct *mm);
+ 
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++/* See linux/mmu_context.h. */
++void arch_mmap_shared(struct mm_struct *mm);
++#define arch_mmap_shared arch_mmap_shared
++void arch_munmap_shared(struct mm_struct *mm);
++#define arch_munmap_shared arch_munmap_shared
++void arch_ring_pin(struct mm_struct *mm);
++#define arch_ring_pin arch_ring_pin
++void arch_ring_unpin(struct mm_struct *mm);
++#define arch_ring_unpin arch_ring_unpin
++#endif
++
+ static inline bool arch_vma_access_permitted(struct vm_area_struct *vma,
+ 		bool write, bool execute, bool foreign)
+ {
+diff --git a/arch/um/include/asm/mmu.h b/arch/um/include/asm/mmu.h
+index 65bf0b3375992a9c1a3127e4215b1be127fa81f7..498f7a55d9ab3ebfe76a017357039de196b08bdf 100644
+--- a/arch/um/include/asm/mmu.h
++++ b/arch/um/include/asm/mmu.h
+@@ -17,6 +17,16 @@
+ 
+ typedef struct mm_context {
+ 	struct mm_id id;
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++	/*
++	 * What lets an agent other than the mm's own tasks see its memory,
++	 * besides a second user, which current_mm_shared() reads at every
++	 * guest entry: whether the mm maps a VM_MAYSHARE vma (written under
++	 * mmap_lock), and how many io_uring regions hold pinned pages of it.
++	 */
++	int darwin_maps_shared;
++	atomic_t darwin_ring_pins;
++#endif
+ 	struct mutex turnstile;
+ 
+ 	struct list_head list;
+diff --git a/arch/um/include/shared/skas/skas.h b/arch/um/include/shared/skas/skas.h
+index 16a9b0f8f228fc0b0bac09d5b77aff057fb1a310..4d671e0632111ef1d0da38142c276613b79ec794 100644
+--- a/arch/um/include/shared/skas/skas.h
++++ b/arch/um/include/shared/skas/skas.h
+@@ -14,6 +14,9 @@ extern void new_thread_handler(void);
+ extern void handle_syscall(struct uml_pt_regs *regs);
+ extern unsigned long current_stub_stack(void);
+ extern struct mm_id *current_mm_id(void);
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++extern int current_mm_shared(void);
++#endif
+ extern unsigned long current_tls(void);
+ extern void current_set_tls(unsigned long tls);
+ extern void current_mm_sync(void);
+diff --git a/arch/um/kernel/skas/mmu_darwin.c b/arch/um/kernel/skas/mmu_darwin.c
+index e770c638bc22feef6238890837e6d3f50bae46f4..7a70e528b66dd95c7102ff2f8bc335907c18c985 100644
+--- a/arch/um/kernel/skas/mmu_darwin.c
++++ b/arch/um/kernel/skas/mmu_darwin.c
+@@ -8,6 +8,7 @@
+ #include <asm/mm_hooks.h>
+ #include <kern_util.h>
+ #include <os.h>
++#include <skas.h>
+ 
+ static atomic_t darwin_mm_generation = ATOMIC_INIT(1);
+ 
+@@ -24,6 +25,104 @@ void arch_exit_mmap(struct mm_struct *mm)
+ 		      mm->context.id.darwin_generation);
+ }
+ 
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++/*
++ * Whether another agent may observe the memory of current's mm, read at every
++ * entry of the task into its guest code (DARWIN_UML_DISPATCH_MM_SHARED); the
++ * Darwin host keeps x86's memory order for that entry while it holds.  The
++ * mm is shared while
++ *
++ * - another task may run on it: mm_users counts every task from copy_mm(),
++ *   before a CLONE_VM child can run, to the mmput() after its last write to
++ *   the mm.  A vfork child does not count the parent waiting for it, which
++ *   runs no user code until the child leaves the mm.  A temporary reference,
++ *   from /proc or ptrace, only keeps the mm shared while it lasts;
++ * - it maps a VM_MAYSHARE vma, which another mm may map too (MAP_SHARED of
++ *   any kind, read-only ones included, SysV shm, memfd, and the io_uring and
++ *   AIO rings the kernel fills from other CPUs); or
++ * - io_uring keeps a ring in pinned pages of it, which a completion or
++ *   another ring's IORING_OP_MSG_RING writes from other CPUs.
++ *
++ * Only a task on the mm can make an unshared mm shared, inside one of its own
++ * system calls, so the new sharer's first instruction and the task's next one
++ * run ordered.  The conditions are read with acquire semantics: the last
++ * other user's mmput() is a fully ordered decrement, and the unpin a release,
++ * so every store an agent made before it is visible once this task runs
++ * unordered.
++ */
++int current_mm_shared(void)
++{
++	struct mm_struct *mm = current->mm;
++	int users;
++
++	if (mm == NULL)
++		return 0;
++	users = atomic_read_acquire(&mm->mm_users);
++	if (READ_ONCE(current->vfork_done) != NULL)
++		users--;
++	return users > 1 || READ_ONCE(mm->context.darwin_maps_shared) ||
++	       atomic_read_acquire(&mm->context.darwin_ring_pins) != 0;
++}
++
++/* Whether @mm maps a VM_MAYSHARE vma; the caller holds its mmap_lock. */
++static bool maps_shared(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	VMA_ITERATOR(vmi, mm, 0);
++
++	for_each_vma(vmi, vma)
++		if (vma->vm_flags & VM_MAYSHARE)
++			return true;
++	return false;
++}
++
++/* mmap_region() mapped a VM_MAYSHARE vma, holding mmap_lock for writing. */
++void arch_mmap_shared(struct mm_struct *mm)
++{
++	WRITE_ONCE(mm->context.darwin_maps_shared, 1);
++}
++
++/*
++ * The munmap path removed a VM_MAYSHARE vma, holding mmap_lock for reading
++ * at least.  Every vma that may remain is in the tree, the moved copy of an
++ * mremap() or the new vma of a MAP_FIXED mmap() included, and a new shared
++ * mapping needs the lock for writing, so the walk's answer stands until the
++ * lock is dropped.
++ */
++void arch_munmap_shared(struct mm_struct *mm)
++{
++	if (!maps_shared(mm))
++		WRITE_ONCE(mm->context.darwin_maps_shared, 0);
++}
++
++/*
++ * io_uring pinned user pages of @mm for a ring, or unpinned them, possibly
++ * from a work item after the ring's last reference went: the release orders
++ * every write to the ring before the count's fall.
++ */
++void arch_ring_pin(struct mm_struct *mm)
++{
++	atomic_inc(&mm->context.darwin_ring_pins);
++}
++
++void arch_ring_unpin(struct mm_struct *mm)
++{
++	atomic_dec_return_release(&mm->context.darwin_ring_pins);
++}
++
++/*
++ * A fork child gets the shared vmas its parent may not keep to itself
++ * (MADV_DONTFORK); both mmap_locks are held for writing.  Its pages that
++ * io_uring pins were copied for it, so it starts with no pinned ring.
++ */
++int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm)
++{
++	if (READ_ONCE(oldmm->context.darwin_maps_shared) && maps_shared(mm))
++		WRITE_ONCE(mm->context.darwin_maps_shared, 1);
++	return 0;
++}
++#endif
++
+ int arch_unmap_one(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		   unsigned long addr, pte_t orig_pte)
+ {
+@@ -49,6 +148,10 @@ int init_new_context(struct task_struct *task, struct mm_struct *mm)
+ 	id->pid = atomic_inc_return(&darwin_mm_generation);
+ 	id->darwin_generation = id->pid;
+ 	id->darwin_context = NULL;
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++	mm->context.darwin_maps_shared = 0;
++	atomic_set(&mm->context.darwin_ring_pins, 0);
++#endif
+ 	id->stack = 0;
+ 	id->sock = -1;
+ 	id->syscall_data_len = 0;
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 6927080a90261b5201163b0c728830728855a01f..cdf178045d08ff70e525b3e7c6e1f9e3463d46e0 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -106,6 +106,38 @@ static void end_guest_step(struct uml_pt_regs *regs, int stepping)
+ 		UPT_PSTATE(regs) &= ~DARWIN_GUEST_PSTATE_SS;
+ }
+ 
++/*
++ * The dispatch flags of the guest registers hold facts about the task for
++ * one entry (enum DARWIN_UML_DISPATCH_*).  They are set just before it and
++ * cleared right after, so no saved, traced or signal-frame register ever
++ * carries them.  The kernel works each one out afresh for every entry, after
++ * whatever ended the last one.  Returns the flags set for this entry.
++ */
++static unsigned int begin_guest_dispatch(struct uml_pt_regs *regs,
++					 struct mm_id *mm_id)
++{
++	unsigned int *flags = (unsigned int *)((char *)regs +
++		DARWIN_UML_ABI_GUEST_REGISTERS_DISPATCH_FLAGS_OFFSET);
++	unsigned int set = 0;
++
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
++	if (mm_id != NULL && current_mm_shared())
++		set |= DARWIN_UML_DISPATCH_MM_SHARED;
++#endif
++	if (set)
++		*flags |= set;
++	return set;
++}
++
++static void end_guest_dispatch(struct uml_pt_regs *regs, unsigned int set)
++{
++	unsigned int *flags = (unsigned int *)((char *)regs +
++		DARWIN_UML_ABI_GUEST_REGISTERS_DISPATCH_FLAGS_OFFSET);
++
++	if (set)
++		*flags &= ~set;
++}
++
+ static pthread_mutex_t shutdown_lock = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t shutdown_condition = PTHREAD_COND_INITIALIZER;
+ static int shutdown_mode = -1;
+@@ -323,6 +355,7 @@ void userspace(struct uml_pt_regs *registers)
+ 		unsigned long guest_tls;
+ 		const unsigned int *guest_ipi_sequence;
+ 		unsigned int guest_ipi_snapshot;
++		unsigned int dispatch;
+ 		int event;
+ 		int stepping;
+ 
+@@ -368,12 +401,14 @@ void userspace(struct uml_pt_regs *registers)
+ 			guest_ipi_sequence, guest_ipi_snapshot) < 0)
+ 			fatal_userspace(registers, "interrupt registration", -1);
+ 		stepping = begin_guest_step(registers);
++		dispatch = begin_guest_dispatch(registers, mm_id);
+ 		darwin_ipi_guest_begin();
+ 		event = darwin_uml_enter_guest(registers, registers->fp,
+ 				host_fp_size,
+ 				mm_id == NULL ? 0 : mm_id->darwin_generation,
+ 				&guest_tls);
+ 		darwin_ipi_guest_end();
++		end_guest_dispatch(registers, dispatch);
+ 		end_guest_step(registers, stepping);
+ 		if (event == DARWIN_UML_EVENT_STOP)
+ 			darwin_host_stop();
+diff --git a/arch/um/os-Darwin/uml_darwin_abi.h b/arch/um/os-Darwin/uml_darwin_abi.h
+index 56c60588026ee5326a037d9a7e55cca5a5f39c28..b2404aba46536a37f38fa9626b3ebce398da7a93 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi.h
++++ b/arch/um/os-Darwin/uml_darwin_abi.h
+@@ -59,8 +59,17 @@ enum darwin_uml_guest_event {
+  * for one entry. The kernel sets them before it enters the guest and clears
+  * them on return, so they never become part of the task's saved PSTATE. */
+ enum {
+-	/* clone(CLONE_VM) without CLONE_VFORK has shared the task's mm with
+-	 * another task since the mm was created. */
++	/* Another agent may observe the memory of the task's mm during this
++	 * entry: another task may run on the mm (a vfork child does not count
++	 * its waiting parent), the mm maps memory that another mm may map too
++	 * (MAP_SHARED of any kind or SysV shm), or io_uring holds pinned
++	 * memory of the mm for a ring. The kernel works it out for each entry,
++	 * so it clears again once none of these holds. Every store made by
++	 * another agent before the condition ended is visible to the entry
++	 * that first lacks the flag. A host may rely on this meaning from
++	 * bridge ABI 19 in a kernel of the x86-64 userspace slice, the only
++	 * one that sets the flag; the arm64 kernels never set it, and the
++	 * arm64 host does not read it. */
+ 	DARWIN_UML_DISPATCH_MM_SHARED = 1U << 0,
+ };
+ 
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index fc13ce83dcf8fbd119e4915d4a904089cd677c8e..da7d5a81db003f8572aafbaccc580c29f24ce2a8 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 17U
++#define DARWIN_UML_ABI_VERSION 19U
+ #define DARWIN_UML_ABI_FINGERPRINT 0x75b16149a5953494ULL
+ 
+ #endif
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index bdfc3cf7d989d01076870117081947112f646af5..b46b7c20704b89ef67da23ca7f680588c81e6d49 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -91,6 +91,10 @@ struct io_mapped_region {
+ 	void			*ptr;
+ 	unsigned		nr_pages;
+ 	unsigned		flags;
++#ifdef CONFIG_ARCH_HAS_MM_SHARED_HOOKS
++	/* the mm whose pages a user-provided region pins */
++	struct mm_struct	*mm;
++#endif
+ };
+ 
+ /*
+diff --git a/include/linux/mmu_context.h b/include/linux/mmu_context.h
+index ac01dc4eb2cecd71ed39bbb65df912b4734e9169..cadd9b1de926b15238d58a8b0619da001a167f83 100644
+--- a/include/linux/mmu_context.h
++++ b/include/linux/mmu_context.h
+@@ -36,6 +36,40 @@ static inline unsigned long mm_untag_mask(struct mm_struct *mm)
+ }
+ #endif
+ 
++/*
++ * Memory of @mm that an agent other than the mm's own tasks can reach comes
++ * and goes.  mmap_region() calls arch_mmap_shared() once it has mapped a
++ * VM_MAYSHARE vma, which another mm may map too, and the munmap path calls
++ * arch_munmap_shared() once it has removed one, both with mmap_lock held.
++ * io_uring calls arch_ring_pin() when it pins user memory of @mm to keep a
++ * ring in, which other CPUs fill, and arch_ring_unpin() when it unpins it,
++ * possibly from another task.  An architecture that must know selects
++ * ARCH_HAS_MM_SHARED_HOOKS and defines them.
++ */
++#ifndef arch_mmap_shared
++static inline void arch_mmap_shared(struct mm_struct *mm)
++{
++}
++#endif
++
++#ifndef arch_munmap_shared
++static inline void arch_munmap_shared(struct mm_struct *mm)
++{
++}
++#endif
++
++#ifndef arch_ring_pin
++static inline void arch_ring_pin(struct mm_struct *mm)
++{
++}
++#endif
++
++#ifndef arch_ring_unpin
++static inline void arch_ring_unpin(struct mm_struct *mm)
++{
++}
++#endif
++
+ #ifndef arch_pgtable_dma_compat
+ static inline bool arch_pgtable_dma_compat(struct mm_struct *mm)
+ {
+diff --git a/io_uring/memmap.c b/io_uring/memmap.c
+index 3855452f48e2972611ef67429a709df9164388ed..4cc1529fd0b88f36654d460f6b6e77fe2649f878 100644
+--- a/io_uring/memmap.c
++++ b/io_uring/memmap.c
+@@ -8,6 +8,8 @@
+ #include <linux/vmalloc.h>
+ #include <linux/io_uring.h>
+ #include <linux/io_uring_types.h>
++#include <linux/mmu_context.h>
++#include <linux/sched/mm.h>
+ #include <asm/shmparam.h>
+ 
+ #include "memmap.h"
+@@ -103,6 +105,13 @@ void io_free_region(struct user_struct *user, struct io_mapped_region *mr)
+ 
+ 		kvfree(mr->pages);
+ 	}
++#ifdef CONFIG_ARCH_HAS_MM_SHARED_HOOKS
++	if (mr->mm) {
++		/* Nothing writes the ring any more. */
++		arch_ring_unpin(mr->mm);
++		mmdrop(mr->mm);
++	}
++#endif
+ 	if ((mr->flags & IO_REGION_F_VMAP) && mr->ptr)
+ 		vunmap(mr->ptr);
+ 	if (mr->nr_pages && user)
+@@ -144,6 +153,15 @@ static int io_region_pin_pages(struct io_mapped_region *mr,
+ 	if (WARN_ON_ONCE(nr_pages != mr->nr_pages))
+ 		return -EFAULT;
+ 
++#ifdef CONFIG_ARCH_HAS_MM_SHARED_HOOKS
++	/*
++	 * The ring now lives in the task's own memory, which other CPUs fill
++	 * or read: a completion, or another ring's IORING_OP_MSG_RING.
++	 */
++	mr->mm = current->mm;
++	mmgrab(mr->mm);
++	arch_ring_pin(mr->mm);
++#endif
+ 	mr->pages = pages;
+ 	mr->flags |= IO_REGION_F_USER_PROVIDED;
+ 	return 0;
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 76001e9ba04f1c116c92b3b76f43d45464a00f36..909561b73db0ee6d391c6e9a965bcd751e83127b 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1097,6 +1097,13 @@ config IDLE_PAGE_TRACKING
+ 	  See Documentation/admin-guide/mm/idle_page_tracking.rst for
+ 	  more details.
+ 
++# The architecture defines arch_mmap_shared(), arch_munmap_shared(),
++# arch_ring_pin() and arch_ring_unpin() (linux/mmu_context.h) to learn when
++# memory of an mm becomes reachable by an agent other than its own tasks, and
++# io_uring records the mm whose pages a ring pins for it.
++config ARCH_HAS_MM_SHARED_HOOKS
++	bool
++
+ # Architectures which implement cpu_dcache_is_aliasing() to query
+ # whether the data caches are aliased (VIVT or VIPT with dcache
+ # aliasing) need to select this.
+diff --git a/mm/vma.c b/mm/vma.c
+index d1627a8ef32b128af71db3450f94af919c7c2cef..f8b709c027c6fe957d090554faf1d194e4ce8abf 100644
+--- a/mm/vma.c
++++ b/mm/vma.c
+@@ -1306,6 +1306,7 @@ static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
+ {
+ 	struct vm_area_struct *vma;
+ 	struct mm_struct *mm;
++	bool shared = false;
+ 
+ 	mm = current->mm;
+ 	mm->map_count -= vms->vma_count;
+@@ -1331,10 +1332,14 @@ static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
+ 
+ 	/* Remove and clean up vmas */
+ 	mas_set(mas_detach, 0);
+-	mas_for_each(mas_detach, vma, ULONG_MAX)
++	mas_for_each(mas_detach, vma, ULONG_MAX) {
++		shared |= !!(vma->vm_flags & VM_MAYSHARE);
+ 		remove_vma(vma);
++	}
+ 
+ 	vm_unacct_memory(vms->nr_accounted);
++	if (shared)
++		arch_munmap_shared(mm);
+ 	validate_mm(mm);
+ 	if (vms->unlock)
+ 		mmap_read_unlock(mm);
+@@ -2808,6 +2813,8 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 	}
+ 
+ 	ret = __mmap_region(file, addr, len, vm_flags, pgoff, uf);
++	if ((vm_flags & VM_MAYSHARE) && !IS_ERR_VALUE(ret))
++		arch_mmap_shared(current->mm);
+ 
+ 	/* Clear our write mapping regardless of error. */
+ 	if (writable_file_mapping)

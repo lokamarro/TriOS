@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 16:29:46 +0900
+Subject: [PATCH] zink: publish a batch's id before clearing its unflushed flag
+
+A buffer read map waits for the batch that last wrote the buffer, and it
+decides whether there is anything to wait for with zink_batch_usage_exists(),
+which answers yes when the usage carries either a batch id or the unflushed
+flag. The submit thread turns one into the other: it assigns the batch id,
+stores it into the usage, and then clears the flag. The reader loaded the id
+first and the flag second, so a reader whose first load lands before the id is
+stored and whose second load lands after the flag is cleared sees neither, and
+concludes the buffer is idle. It then maps and returns the buffer's previous
+contents while the batch that fills it is still on its way to the queue.
+
+The window is the gap between those two stores, and on a weakly ordered host
+it is the gap between their becoming visible, which is far wider than the two
+instructions suggest. A transform-feedback capture read back immediately after
+its draw hit it about once in six thousand captures: the map returned a few
+microseconds before the batch was submitted, and the captured vertices appeared
+in memory while that batch ran, so the test saw the buffer's undefined pre-draw
+contents. The guest driver inherits the same race whenever it runs on this
+zink over Venus, because the guest's own submit thread publishes a batch the
+same way.
+
+Publish in the order the reader can trust instead: store the id, then clear
+the flag with release ordering, and have the reader acquire the flag before it
+looks at the id. A cleared flag then guarantees a visible id, and a batch in
+the middle of submission always reports usage.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_batch.c |  5 +++--
+ src/gallium/drivers/zink/zink_batch.h | 15 +++++++++++++--
+ 2 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index ea099054ee425bb1fe66edd7448637e72dac16ed..f1e6258b9957145fef0c9bc927c690fb8c6528df 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -649,7 +649,8 @@ submit_queue(void *data, void *gdata, int thread_index)
+       bs->fence.batch_id = (uint32_t)p_atomic_inc_return(&screen->curr_batch);
+    bs->usage.usage = bs->fence.batch_id;
+    assert(bs->usage.usage);
+-   bs->usage.unflushed = false;
++   /* Release the id before clearing the flag: readers check the flag first. */
++   p_atomic_set(&bs->usage.unflushed, false);
+ 
+    uint64_t batch_id = bs->fence.batch_id;
+    /* first submit is just for acquire waits since they have a separate array */
+@@ -1235,7 +1236,7 @@ zink_batch_usage_unflushed_wait(struct zink_context *ctx, struct zink_batch_usag
+          mtx_unlock(&u->mtx);
+       }
+    }
+-   return !u->unflushed;
++   return !p_atomic_read(&u->unflushed);
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/zink/zink_batch.h b/src/gallium/drivers/zink/zink_batch.h
+index d582d29470e1983ce34d33ab845575ae21fcb68f..027536d6873a057e01f4603cedbff01e91d1700e 100644
+--- a/src/gallium/drivers/zink/zink_batch.h
++++ b/src/gallium/drivers/zink/zink_batch.h
+@@ -28,6 +28,7 @@
+ #include "zink_types.h"
+ 
+ #include "util/list.h"
++#include "util/u_atomic.h"
+ #include "util/set.h"
+ #include "util/u_dynarray.h"
+ 
+@@ -86,7 +87,7 @@ debug_describe_zink_batch_state(char *buf, const struct zink_batch_state *ptr);
+ static ALWAYS_INLINE bool
+ zink_batch_usage_is_unflushed(const struct zink_batch_usage *u)
+ {
+-   return u && u->unflushed;
++   return u && p_atomic_read(&u->unflushed);
+ }
+ 
+ static ALWAYS_INLINE void
+@@ -110,7 +111,17 @@ zink_batch_usage_matches(const struct zink_batch_usage *u, const struct zink_bat
+ static ALWAYS_INLINE bool
+ zink_batch_usage_exists(const struct zink_batch_usage *u)
+ {
+-   return u && (u->usage || u->unflushed);
++   if (!u)
++      return false;
++   /* Read the flag before the id. The submit thread publishes the id and only
++    * then clears this flag, so a cleared flag guarantees a visible id. Reading
++    * them the other way round lets a mapping thread load the id before it is
++    * published and the flag after it is cleared, and a batch on its way to the
++    * queue then looks like it carries no usage at all.
++    */
++   if (p_atomic_read(&u->unflushed))
++      return true;
++   return u->usage != 0;
+ }
+ 
+ static ALWAYS_INLINE unsigned

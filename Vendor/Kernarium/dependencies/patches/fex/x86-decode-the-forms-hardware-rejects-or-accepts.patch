@@ -1,0 +1,637 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:25:45 +0900
+Subject: [PATCH] x86: decode the forms hardware rejects or accepts
+
+Several encodings decoded differently from hardware:
+
+- LEA, MOVHPS's store, MOVNTQ, and FXSAVE, FXRSTOR and XSAVE take a
+  memory operand only; their register forms are undefined.
+- BT, by register or by immediate, and CMP only read their operand
+  and cannot be locked; LOCK BT and LOCK CMP are undefined.
+- MOV to CS, or to a segment register past GS, is undefined before
+  the source is read.
+- SYSEXIT outside ring 0 raises #GP, not #UD.
+- BSF and BSR ignore an F2 prefix.
+---
+ .../Interface/Core/OpcodeDispatcher.cpp       | 82 ++++++++++++----
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  4 +
+ .../OpcodeDispatcher/SecondaryGroupTables.h   |  9 ++
+ .../OpcodeDispatcher/SecondaryModRMTables.h   |  3 +-
+ .../Core/OpcodeDispatcher/SecondaryTables.h   | 13 ++-
+ .../Core/X86Tables/PrimaryGroupTables.cpp     |  6 +-
+ .../Core/X86Tables/SecondaryGroupTables.cpp   | 94 +++++++++----------
+ .../Core/X86Tables/SecondaryModRMTables.cpp   |  2 +-
+ .../Core/X86Tables/SecondaryTables.cpp        | 19 ++--
+ .../Interface/Core/X86Tables/X87Tables.cpp    | 24 ++---
+ 10 files changed, 166 insertions(+), 90 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 4ace8e89c8d355c4ac9d3ec025a0c71584ca7f47..1949b300522c0e51b5698b7b3c9d738ac4c7841c 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -1388,6 +1388,26 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+   // The loads here also load the selector, NOT the base
+ 
+   if (ToSeg) {
++    // CPL3 can't write to CS, and the encodings past GS name no register:
++    // both are undefined before the source is read.
++    switch (Op->Dest.Data.GPR.GPR) {
++    case FEXCore::X86State::REG_RCX: // CS
++    case FEXCore::X86State::REG_R9:  // CS
++      UnimplementedOp(Op);
++      return;
++    case FEXCore::X86State::REG_RAX:
++    case FEXCore::X86State::REG_R8:
++    case FEXCore::X86State::REG_RBX:
++    case FEXCore::X86State::REG_R11:
++    case FEXCore::X86State::REG_RDX:
++    case FEXCore::X86State::REG_R10:
++    case FEXCore::X86State::REG_RBP:
++    case FEXCore::X86State::REG_R13:
++    case FEXCore::X86State::REG_RSP:
++    case FEXCore::X86State::REG_R12: break;
++    default: UnimplementedOp(Op); return;
++    }
++
+     Ref Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], OpSize::i16Bit, Op->Flags);
+ 
+     switch (Op->Dest.Data.GPR.GPR) {
+@@ -1401,16 +1421,6 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, ds_idx));
+       UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+       break;
+-    case FEXCore::X86State::REG_RCX: // CS
+-    case FEXCore::X86State::REG_R9:  // CS
+-      // CPL3 can't write to this
+-      Break(FEXCore::IR::BreakDefinition {
+-        .ErrorRegister = 0,
+-        .Signal = SIGILL,
+-        .TrapNumber = 0,
+-        .si_code = 0,
+-      });
+-      break;
+     case FEXCore::X86State::REG_RDX: // SS
+     case FEXCore::X86State::REG_R10: // SS
+       _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, ss_idx));
+@@ -1548,6 +1558,12 @@ uint32_t OpDispatchBuilder::GetConstantShift(X86Tables::DecodedOp Op, bool Is1Bi
+ }
+ 
+ void OpDispatchBuilder::XGetBVOp(OpcodeArgs) {
++  // XGETBV and XSETBV take no 66, F2 or F3 prefix.
++  if (Op->Flags & (X86Tables::DecodeFlags::FLAG_OPERAND_SIZE | X86Tables::DecodeFlags::FLAG_REP_PREFIX |
++                   X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) {
++    UnimplementedOp(Op);
++    return;
++  }
+   Ref Function = LoadGPRRegister(X86State::REG_RCX);
+ 
+   auto RAX = _AllocateGPR(false);
+@@ -5292,9 +5308,9 @@ void OpDispatchBuilder::CLFLUSHOPT(OpcodeArgs) {
+   _CacheLineClear(DestMem, false);
+ }
+ 
++// A register form of each is the fence, whatever its rm field.
+ void OpDispatchBuilder::LoadFenceOrXRSTOR(OpcodeArgs) {
+-  // 0xE8 signifies LFENCE
+-  if (Op->ModRM == 0xE8) {
++  if (!DestIsMem(Op)) {
+     _Fence(FenceType::Load);
+   } else {
+     XRstorOpImpl(Op);
+@@ -5302,8 +5318,8 @@ void OpDispatchBuilder::LoadFenceOrXRSTOR(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::MemFenceOrXSAVEOPT(OpcodeArgs) {
+-  if (Op->ModRM == 0xF0) {
+-    // 0xF0 is MFENCE
++  if (!DestIsMem(Op)) {
++    // MFENCE
+     _Fence(FenceType::LoadStore);
+   } else {
+     XSaveOp(Op);
+@@ -5311,8 +5327,8 @@ void OpDispatchBuilder::MemFenceOrXSAVEOPT(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::StoreFenceOrCLFlush(OpcodeArgs) {
+-  if (Op->ModRM == 0xF8) {
+-    // 0xF8 is SFENCE
++  if (!DestIsMem(Op)) {
++    // SFENCE
+     _Fence(FenceType::Store);
+   } else {
+     // This is a CLFlush
+@@ -5476,6 +5492,40 @@ void OpDispatchBuilder::UnimplementedOp(OpcodeArgs) {
+               });
+ }
+ 
++void OpDispatchBuilder::XSetBVOp(OpcodeArgs) {
++  if (Op->Flags & (X86Tables::DecodeFlags::FLAG_OPERAND_SIZE | X86Tables::DecodeFlags::FLAG_REP_PREFIX |
++                   X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) {
++    UnimplementedOp(Op);
++  } else {
++    PermissionRestrictedOp(Op);
++  }
++}
++
++// SWAPGS and SYSRET raise #GP outside ring 0 in 64-bit mode and are
++// undefined in compatibility mode.
++void OpDispatchBuilder::SWAPGSOp(OpcodeArgs) {
++  if (Is64BitMode) {
++    PermissionRestrictedOp(Op);
++  } else {
++    UnimplementedOp(Op);
++  }
++}
++
++void OpDispatchBuilder::SYSRETOp(OpcodeArgs) {
++  SWAPGSOp(Op);
++}
++
++// MOV to or from CR1, CR5, CR6, CR7 or CR9 to CR15 is undefined, which x86
++// checks before the privilege a move with CR0, CR2, CR3, CR4 or CR8 needs.
++void OpDispatchBuilder::MOVControlRegisterOp(OpcodeArgs) {
++  const uint8_t Register = ((Op->ModRM >> 3) & 7) | ((Op->Flags & X86Tables::DecodeFlags::FLAG_REX_XGPR_R) ? 8 : 0);
++  if (Register == 0 || Register == 2 || Register == 3 || Register == 4 || Register == 8) {
++    PermissionRestrictedOp(Op);
++  } else {
++    UnimplementedOp(Op);
++  }
++}
++
+ void OpDispatchBuilder::PermissionRestrictedOp(OpcodeArgs) {
+   BreakOp(Op, FEXCore::IR::BreakDefinition {
+                 .ErrorRegister = 0,
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 1e4a22f1cbab383f80d3a644cea90a0a0717b15f..a8c8bf8a5e7f4d14766e4c324aa2f88f2cb22b4a 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -422,6 +422,10 @@ public:
+   void CMOVOp(OpcodeArgs);
+   void CPUIDOp(OpcodeArgs);
+   void XGetBVOp(OpcodeArgs);
++  void XSetBVOp(OpcodeArgs);
++  void SWAPGSOp(OpcodeArgs);
++  void SYSRETOp(OpcodeArgs);
++  void MOVControlRegisterOp(OpcodeArgs);
+   uint32_t GetConstantShift(X86Tables::DecodedOp Op, bool Is1Bit);
+   void SHLOp(OpcodeArgs);
+   void SHLImmediateOp(OpcodeArgs, bool SHL1Bit);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
+index 2e8ad544ae5624c5ddd9177a5a3926cb7cb2c2d2..369b7f6c4a4604a5e60b04da5e347042ec95e0ca 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
+@@ -10,6 +10,10 @@ constexpr uint16_t PF_66 = 2;
+ constexpr uint16_t PF_F2 = 3;
+ constexpr DispatchTableEntry OpDispatch_SecondaryGroupTables[] = {
+   // GROUP 6
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F2, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+@@ -26,6 +30,11 @@ constexpr DispatchTableEntry OpDispatch_SecondaryGroupTables[] = {
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_66, 1), 1, &OpDispatchBuilder::SIDTOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_F2, 1), 1, &OpDispatchBuilder::SIDTOp},
+ 
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_NONE, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_F3, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_66, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_F2, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_NONE, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_F3, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_7, PF_66, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
+index 73868476913637c590413e02fbb77f7a2b330b9f..ac0a38f9f5a921236b4b514cb960e1bfe9c477f8 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
+@@ -10,12 +10,13 @@ constexpr DispatchTableEntry OpDispatch_SecondaryModRMTables[] = {
+ 
+   // REG /2
+   {((1 << 3) | 0), 1, &OpDispatchBuilder::XGetBVOp},
++  {((1 << 3) | 1), 1, &OpDispatchBuilder::XSetBVOp},
+ 
+   // REG /3
+   {((2 << 3) | 7), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+ 
+   // REG /7
+-  {((3 << 3) | 0), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {((3 << 3) | 0), 1, &OpDispatchBuilder::SWAPGSOp},
+   {((3 << 3) | 1), 1, &OpDispatchBuilder::RDTSCPOp},
+   {((3 << 3) | 4), 1, &OpDispatchBuilder::CLZeroOp},
+ };
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
+index c2affd4e159f7408b68618d0f1f3790558cd520a..f3ee6a18a43dbb223f914844221e0da1b181b09a 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
+@@ -6,18 +6,25 @@ namespace FEXCore::IR {
+ constexpr DispatchTableEntry OpDispatch_TwoByteOpTable[] = {
+   // Instructions
+   {0x03, 1, &OpDispatchBuilder::LSLOp},
+-  {0x06, 4, &OpDispatchBuilder::PermissionRestrictedOp},
++  {0x06, 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {0x07, 1, &OpDispatchBuilder::SYSRETOp},
++  {0x08, 2, &OpDispatchBuilder::PermissionRestrictedOp},
+   {0x0B, 1, &OpDispatchBuilder::INTOp},
+   {0x0E, 1, &OpDispatchBuilder::X87EMMS},
+ 
+   {0x19, 7, &OpDispatchBuilder::NOPOp}, // NOP with ModRM
+ 
+-  {0x20, 4, &OpDispatchBuilder::PermissionRestrictedOp},
++  {0x20, 1, &OpDispatchBuilder::MOVControlRegisterOp},
++  {0x21, 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {0x22, 1, &OpDispatchBuilder::MOVControlRegisterOp},
++  {0x23, 1, &OpDispatchBuilder::PermissionRestrictedOp},
+ 
+   {0x30, 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {0x31, 1, &OpDispatchBuilder::RDTSCOp},
+   {0x32, 2, &OpDispatchBuilder::PermissionRestrictedOp},
+-  {0x34, 3, &OpDispatchBuilder::UnimplementedOp},
++  {0x34, 1, &OpDispatchBuilder::UnimplementedOp},
++  {0x35, 1, &OpDispatchBuilder::PermissionRestrictedOp}, // SYSEXIT outside ring 0
++  {0x36, 1, &OpDispatchBuilder::UnimplementedOp},
+ 
+   {0x40, 16, &OpDispatchBuilder::CMOVOp},
+   {0x6E, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVBetweenGPR_FPR, OpDispatchBuilder::VectorOpType::MMX>},
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/PrimaryGroupTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/PrimaryGroupTables.cpp
+index cab98f95daebd80e4ff1c6a4f0f608b6ce1a75eb..e5ec4801f076f014860550869476638b78627349 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/PrimaryGroupTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/PrimaryGroupTables.cpp
+@@ -73,7 +73,7 @@ constexpr std::array<X86InstInfo, MAX_INST_GROUP_TABLE_SIZE> PrimaryInstGroupOps
+     {OPD(TYPE_GROUP_1, OpToIndex(0x80), 4), 1, X86InstInfo{"AND",  TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                      1}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x80), 5), 1, X86InstInfo{"SUB",  TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                      1}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x80), 6), 1, X86InstInfo{"XOR",  TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                      1}},
+-    {OPD(TYPE_GROUP_1, OpToIndex(0x80), 7), 1, X86InstInfo{"CMP",  TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                      1}},
++    {OPD(TYPE_GROUP_1, OpToIndex(0x80), 7), 1, X86InstInfo{"CMP",  TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST,                                                           1}},
+ 
+     {OPD(TYPE_GROUP_1, OpToIndex(0x81), 0), 1, X86InstInfo{"ADD",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_SUPPORTS_LOCK | FLAGS_LITERAL_PATCHABLE,                          4}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x81), 1), 1, X86InstInfo{"OR",   TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_SUPPORTS_LOCK | FLAGS_LITERAL_PATCHABLE,                          4}},
+@@ -82,7 +82,7 @@ constexpr std::array<X86InstInfo, MAX_INST_GROUP_TABLE_SIZE> PrimaryInstGroupOps
+     {OPD(TYPE_GROUP_1, OpToIndex(0x81), 4), 1, X86InstInfo{"AND",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_SUPPORTS_LOCK | FLAGS_LITERAL_PATCHABLE,                          4}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x81), 5), 1, X86InstInfo{"SUB",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_SUPPORTS_LOCK | FLAGS_LITERAL_PATCHABLE,                          4}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x81), 6), 1, X86InstInfo{"XOR",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_SUPPORTS_LOCK | FLAGS_LITERAL_PATCHABLE,                          4}},
+-    {OPD(TYPE_GROUP_1, OpToIndex(0x81), 7), 1, X86InstInfo{"CMP",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_SUPPORTS_LOCK | FLAGS_LITERAL_PATCHABLE,                          4}},
++    {OPD(TYPE_GROUP_1, OpToIndex(0x81), 7), 1, X86InstInfo{"CMP",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SRC_SEXT64BIT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_LITERAL_PATCHABLE,                          4}},
+ 
+     // Duplicates the 0x80 opcode group
+     {OPD(TYPE_GROUP_1, OpToIndex(0x82), 0), 1, X86InstInfo{"",  TYPE_ARCH_DISPATCHER, FLAGS_NONE, 0, { .Indirect = PrimaryGroup_ArchSelect_LUT[ENTRY_1_82_0] }}},
+@@ -101,7 +101,7 @@ constexpr std::array<X86InstInfo, MAX_INST_GROUP_TABLE_SIZE> PrimaryInstGroupOps
+     {OPD(TYPE_GROUP_1, OpToIndex(0x83), 4), 1, X86InstInfo{"AND",  TYPE_INST, FLAGS_SRC_SEXT | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                     1}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x83), 5), 1, X86InstInfo{"SUB",  TYPE_INST, FLAGS_SRC_SEXT | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                     1}},
+     {OPD(TYPE_GROUP_1, OpToIndex(0x83), 6), 1, X86InstInfo{"XOR",  TYPE_INST, FLAGS_SRC_SEXT | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                     1}},
+-    {OPD(TYPE_GROUP_1, OpToIndex(0x83), 7), 1, X86InstInfo{"CMP",  TYPE_INST, FLAGS_SRC_SEXT | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,                                     1}},
++    {OPD(TYPE_GROUP_1, OpToIndex(0x83), 7), 1, X86InstInfo{"CMP",  TYPE_INST, FLAGS_SRC_SEXT | FLAGS_MODRM | FLAGS_SF_MOD_DST,                                                          1}},
+ 
+     // GROUP 2
+     {OPD(TYPE_GROUP_2, OpToIndex(0xC0), 0), 1, X86InstInfo{"ROL",  TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST,                                      1}},
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
+index fdfaf50de704fabf6e270deb84d459ac9f115cb6..580fc5fb4eee7e2ee0f8b9aa9a60bf62062f7213 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
+@@ -63,7 +63,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     // GROUP 6
+     {OPD(TYPE_GROUP_6, PF_NONE, 0), 1, X86InstInfo{"SLDT",  TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 1), 1, X86InstInfo{"STR",   TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+-    {OPD(TYPE_GROUP_6, PF_NONE, 2), 1, X86InstInfo{"LLDT",  TYPE_PRIV, FLAGS_NONE,       0}},
++    {OPD(TYPE_GROUP_6, PF_NONE, 2), 1, X86InstInfo{"LLDT",  TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 3), 1, X86InstInfo{"LTR",   TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 4), 1, X86InstInfo{"VERR",  TYPE_UNDEC, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 5), 1, X86InstInfo{"VERW",  TYPE_UNDEC, FLAGS_MODRM, 0}},
+@@ -72,7 +72,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+ 
+     {OPD(TYPE_GROUP_6, PF_F3, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+-    {OPD(TYPE_GROUP_6, PF_F3, 2), 1, X86InstInfo{"LLDT",    TYPE_PRIV, FLAGS_NONE,       0}},
++    {OPD(TYPE_GROUP_6, PF_F3, 2), 1, X86InstInfo{"LLDT",    TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 4), 1, X86InstInfo{"VERR",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 5), 1, X86InstInfo{"VERW",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+@@ -81,7 +81,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+ 
+     {OPD(TYPE_GROUP_6, PF_66, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_66, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+-    {OPD(TYPE_GROUP_6, PF_66, 2), 1, X86InstInfo{"LLDT",    TYPE_PRIV, FLAGS_NONE,       0}},
++    {OPD(TYPE_GROUP_6, PF_66, 2), 1, X86InstInfo{"LLDT",    TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_66, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_66, 4), 1, X86InstInfo{"VERR",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_66, 5), 1, X86InstInfo{"VERW",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+@@ -90,7 +90,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+ 
+     {OPD(TYPE_GROUP_6, PF_F2, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+-    {OPD(TYPE_GROUP_6, PF_F2, 2), 1, X86InstInfo{"LLDT",    TYPE_PRIV, FLAGS_NONE,       0}},
++    {OPD(TYPE_GROUP_6, PF_F2, 2), 1, X86InstInfo{"LLDT",    TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 4), 1, X86InstInfo{"VERR",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 5), 1, X86InstInfo{"VERW",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+@@ -139,7 +139,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_8, PF_NONE, 1), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,   0}},
+     {OPD(TYPE_GROUP_8, PF_NONE, 2), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,   0}},
+     {OPD(TYPE_GROUP_8, PF_NONE, 3), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,   0}},
+-    {OPD(TYPE_GROUP_8, PF_NONE, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK, 1}},
++    {OPD(TYPE_GROUP_8, PF_NONE, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,                       1}},
+     {OPD(TYPE_GROUP_8, PF_NONE, 5), 1, X86InstInfo{"BTS", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK, 1}},
+     {OPD(TYPE_GROUP_8, PF_NONE, 6), 1, X86InstInfo{"BTR", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK, 1}},
+     {OPD(TYPE_GROUP_8, PF_NONE, 7), 1, X86InstInfo{"BTC", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK, 1}},
+@@ -148,7 +148,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_8, PF_F3, 1), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+     {OPD(TYPE_GROUP_8, PF_F3, 2), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+     {OPD(TYPE_GROUP_8, PF_F3, 3), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+-    {OPD(TYPE_GROUP_8, PF_F3, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
++    {OPD(TYPE_GROUP_8, PF_F3, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,                         1}},
+     {OPD(TYPE_GROUP_8, PF_F3, 5), 1, X86InstInfo{"BTS", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+     {OPD(TYPE_GROUP_8, PF_F3, 6), 1, X86InstInfo{"BTR", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+     {OPD(TYPE_GROUP_8, PF_F3, 7), 1, X86InstInfo{"BTC", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+@@ -157,7 +157,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_8, PF_66, 1), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+     {OPD(TYPE_GROUP_8, PF_66, 2), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+     {OPD(TYPE_GROUP_8, PF_66, 3), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+-    {OPD(TYPE_GROUP_8, PF_66, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
++    {OPD(TYPE_GROUP_8, PF_66, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,                         1}},
+     {OPD(TYPE_GROUP_8, PF_66, 5), 1, X86InstInfo{"BTS", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+     {OPD(TYPE_GROUP_8, PF_66, 6), 1, X86InstInfo{"BTR", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+     {OPD(TYPE_GROUP_8, PF_66, 7), 1, X86InstInfo{"BTC", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+@@ -166,7 +166,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_8, PF_F2, 1), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+     {OPD(TYPE_GROUP_8, PF_F2, 2), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+     {OPD(TYPE_GROUP_8, PF_F2, 3), 1, X86InstInfo{"",    TYPE_INVALID, FLAGS_NONE,     0}},
+-    {OPD(TYPE_GROUP_8, PF_F2, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
++    {OPD(TYPE_GROUP_8, PF_F2, 4), 1, X86InstInfo{"BT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,                         1}},
+     {OPD(TYPE_GROUP_8, PF_F2, 5), 1, X86InstInfo{"BTS", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+     {OPD(TYPE_GROUP_8, PF_F2, 6), 1, X86InstInfo{"BTR", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+     {OPD(TYPE_GROUP_8, PF_F2, 7), 1, X86InstInfo{"BTC", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SUPPORTS_LOCK,   1}},
+@@ -363,11 +363,11 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_14, PF_F2, 7), 1, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE,                                             0}},
+ 
+     // GROUP 15
+-    {OPD(TYPE_GROUP_15, PF_NONE, 0), 1, X86InstInfo{"FXSAVE",          TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,       0}}, // MMX/x87
+-    {OPD(TYPE_GROUP_15, PF_NONE, 1), 1, X86InstInfo{"FXRSTOR",         TYPE_INST, FLAGS_MODRM,       0}}, // MMX/x87
++    {OPD(TYPE_GROUP_15, PF_NONE, 0), 1, X86InstInfo{"FXSAVE",          TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_MOD_MEM_ONLY,       0}}, // MMX/x87
++    {OPD(TYPE_GROUP_15, PF_NONE, 1), 1, X86InstInfo{"FXRSTOR",         TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,       0}}, // MMX/x87
+     {OPD(TYPE_GROUP_15, PF_NONE, 2), 1, X86InstInfo{"LDMXCSR",         TYPE_INST, GenFlagsSameSize(SIZE_32BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_MOD_MEM_ONLY, 0}},
+     {OPD(TYPE_GROUP_15, PF_NONE, 3), 1, X86InstInfo{"STMXCSR",         TYPE_INST, GenFlagsSameSize(SIZE_32BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_15, PF_NONE, 4), 1, X86InstInfo{"XSAVE",           TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,      0}},
++    {OPD(TYPE_GROUP_15, PF_NONE, 4), 1, X86InstInfo{"XSAVE",           TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_MOD_MEM_ONLY,      0}},
+     {OPD(TYPE_GROUP_15, PF_NONE, 5), 1, X86InstInfo{"LFENCE/XRSTOR",   TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,      0}},
+     {OPD(TYPE_GROUP_15, PF_NONE, 6), 1, X86InstInfo{"MFENCE/XSAVEOPT", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,      0}},
+     {OPD(TYPE_GROUP_15, PF_NONE, 7), 1, X86InstInfo{"SFENCE/CLFLUSH",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,      0}},
+@@ -388,7 +388,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_15, PF_66, 4), 1, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE,                    0}},
+     {OPD(TYPE_GROUP_15, PF_66, 5), 1, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE,                    0}},
+     {OPD(TYPE_GROUP_15, PF_66, 6), 1, X86InstInfo{"CLWB", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,      0}},
+-    {OPD(TYPE_GROUP_15, PF_66, 7), 1, X86InstInfo{"CLFLUSHOPT", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,      0}},
++    {OPD(TYPE_GROUP_15, PF_66, 7), 1, X86InstInfo{"CLFLUSHOPT", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_MOD_MEM_ONLY,      0}},
+ 
+     {OPD(TYPE_GROUP_15, PF_F2, 0), 1, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE,                    0}},
+     {OPD(TYPE_GROUP_15, PF_F2, 1), 1, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE,                    0}},
+@@ -481,41 +481,41 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     // It claims that /3 is still Prefetch Mod
+     // Tooling fails to decode past the /2 encoding but runs fine in hardware
+     // Hardware also runs all the prefixes correctly
+-    {OPD(TYPE_GROUP_P, PF_NONE, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-    {OPD(TYPE_GROUP_P, PF_NONE, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0}},
+-
+-    {OPD(TYPE_GROUP_P, PF_F3, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F3, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-
+-    {OPD(TYPE_GROUP_P, PF_66, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_66, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-
+-    {OPD(TYPE_GROUP_P, PF_F2, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
+-    {OPD(TYPE_GROUP_P, PF_F2, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY,   0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_P, PF_NONE, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM, 0}},
++
++    {OPD(TYPE_GROUP_P, PF_F3, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F3, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++
++    {OPD(TYPE_GROUP_P, PF_66, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_66, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++
++    {OPD(TYPE_GROUP_P, PF_F2, 0), 1, X86InstInfo{"PREFETCH Ex",  TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 1), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 2), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 3), 1, X86InstInfo{"PREFETCH Mod", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 4), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 5), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 6), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
++    {OPD(TYPE_GROUP_P, PF_F2, 7), 1, X86InstInfo{"PREFETCH Res", TYPE_INST, FLAGS_MODRM,   0}},
+   };
+ #undef OPD
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp
+index 48417f9ffbce31511c98ffdeaba981579d99c93f..0f20735f47022b4c8f9b3f9a1d62c0ef4750d910 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp
+@@ -27,7 +27,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_MODRM_TABLE_SIZE> SecondModRMTableO
+ 
+     // REG /2
+     {((1 << 3) | 0), 1, X86InstInfo{"XGETBV",   TYPE_INST,    FLAGS_NONE, 0}},
+-    {((1 << 3) | 1), 1, X86InstInfo{"XSETBV",   TYPE_PRIV,    FLAGS_NONE, 0}},
++    {((1 << 3) | 1), 1, X86InstInfo{"XSETBV",   TYPE_INST,    FLAGS_NONE, 0}},
+     {((1 << 3) | 2), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+     {((1 << 3) | 3), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+     {((1 << 3) | 4), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+index 96ad40743d104fab9ca06d8e8e7a0fc4df4d6890..76cb6065128258674a7595a3a16d63126293f22a 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+@@ -77,12 +77,12 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+     {0x14, 1, X86InstInfo{"UNPCKLPS",   TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                                                 0}},
+     {0x15, 1, X86InstInfo{"UNPCKHPS",   TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                                                 0}},
+     {0x16, 1, X86InstInfo{"MOVLHPS",    TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                                                 0}},
+-    {0x17, 1, X86InstInfo{"MOVHPS",     TYPE_INST, GenFlagsSizes(SIZE_64BIT, SIZE_128BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_XMM_FLAGS, 0}},
++    {0x17, 1, X86InstInfo{"MOVHPS",     TYPE_INST, GenFlagsSizes(SIZE_64BIT, SIZE_128BIT) | FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY | FLAGS_SF_MOD_DST | FLAGS_XMM_FLAGS, 0}},
+     {0x18, 1, X86InstInfo{"",           TYPE_GROUP_16, FLAGS_NO_OVERLAY,                                                                                      0}},
+     {0x19, 7, X86InstInfo{"NOP",        TYPE_INST, FLAGS_MODRM | FLAGS_NO_OVERLAY,                                                                                     0}},
+ 
+-    {0x20, 2, X86InstInfo{"MOV",        TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_NO_OVERLAY,                                                     0}},
+-    {0x22, 2, X86InstInfo{"MOV",        TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_NO_OVERLAY,                                                     0}},
++    {0x20, 2, X86InstInfo{"MOV",        TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                                     0}},
++    {0x22, 2, X86InstInfo{"MOV",        TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                                     0}},
+     {0x24, 4, X86InstInfo{"",           TYPE_INVALID, FLAGS_NONE,                                                                                       0}},
+     {0x28, 1, X86InstInfo{"MOVAPS",     TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                                                 0}},
+     {0x29, 1, X86InstInfo{"MOVAPS",     TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_XMM_FLAGS,                                                 0}},
+@@ -205,7 +205,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+     {0xA0, 1, X86InstInfo{"",        TYPE_ARCH_DISPATCHER, FLAGS_DEBUG_MEM_ACCESS | FLAGS_NO_OVERLAY, 0, { .Indirect = Secondary_ArchSelect_LUT[ENTRY_A0] }}},
+     {0xA1, 1, X86InstInfo{"",        TYPE_ARCH_DISPATCHER, FLAGS_DEBUG_MEM_ACCESS | FLAGS_NO_OVERLAY, 0, { .Indirect = Secondary_ArchSelect_LUT[ENTRY_A1] }}},
+     {0xA2, 1, X86InstInfo{"CPUID",   TYPE_INST,     FLAGS_NO_OVERLAY,                                              0}},
+-    {0xA3, 1, X86InstInfo{"BT",      TYPE_INST,     FLAGS_DEBUG_MEM_ACCESS | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY | FLAGS_SUPPORTS_LOCK, 0}},
++    {0xA3, 1, X86InstInfo{"BT",      TYPE_INST,     FLAGS_DEBUG_MEM_ACCESS | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY, 0}},
+     {0xA4, 1, X86InstInfo{"SHLD",    TYPE_INST,     FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY,                                              1}},
+     {0xA5, 1, X86InstInfo{"SHLD",    TYPE_INST,     FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY,                           0}},
+     {0xA6, 2, X86InstInfo{"",        TYPE_INVALID,  FLAGS_NO_OVERLAY,                                                                               0}},
+@@ -269,7 +269,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+     {0xE4, 1, X86InstInfo{"PMULHUW",  TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xE5, 1, X86InstInfo{"PMULHW",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xE6, 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                                                                         0}},
+-    {0xE7, 1, X86InstInfo{"MOVNTQ",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                   0}},
++    {0xE7, 1, X86InstInfo{"MOVNTQ",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY | FLAGS_SF_MOD_DST | FLAGS_XMM_FLAGS | FLAGS_SF_MMX, 0}},
+     {0xE8, 1, X86InstInfo{"PSUBSB",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xE9, 1, X86InstInfo{"PSUBSW",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xEA, 1, X86InstInfo{"PMINSW",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+@@ -383,7 +383,7 @@ constexpr std::array<X86InstInfo, MAX_REP_MOD_TABLE_SIZE> RepModOps = []() const
+     {0xC8, 8, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                     0}},
+ 
+     {0xD0, 6, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
+-    {0xD6, 1, X86InstInfo{"MOVQ2DQ",   TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX_SRC, 0}},
++    {0xD6, 1, X86InstInfo{"MOVQ2DQ",   TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_REG_ONLY | FLAGS_XMM_FLAGS | FLAGS_SF_MMX_SRC, 0}},
+     {0xD7, 1, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
+     {0xD8, 8, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
+ 
+@@ -457,7 +457,10 @@ constexpr std::array<X86InstInfo, MAX_REPNE_MOD_TABLE_SIZE> RepNEModOps = []() c
+     {0xB8, 1, X86InstInfo{"",           TYPE_INVALID, FLAGS_NONE,                                                               0}},
+     {0xB9, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},
+     {0xBA, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},
+-    {0xBB, 5,  X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                                         0}},
++    {0xBB, 1,  X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                                         0}},
++    // The prefix is ignored: BSF and BSR.
++    {0xBC, 2,  X86InstInfo{"",         TYPE_COPY_OTHER, FLAGS_NONE,                                                      0}},
++    {0xBE, 2,  X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                                         0}},
+     {0xC0, 2, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                                      0}},
+     {0xC2, 1, X86InstInfo{"CMPSD",     TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                    1}},
+     {0xC3, 5, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+@@ -465,7 +468,7 @@ constexpr std::array<X86InstInfo, MAX_REPNE_MOD_TABLE_SIZE> RepNEModOps = []() c
+ 
+     {0xD0, 1, X86InstInfo{"ADDSUBPS",  TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                   0}},
+     {0xD1, 5, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+-    {0xD6, 1, X86InstInfo{"MOVDQ2Q",   TYPE_INST, GenFlagsSizes(SIZE_64BIT, SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX_DST,     0}},
++    {0xD6, 1, X86InstInfo{"MOVDQ2Q",   TYPE_INST, GenFlagsSizes(SIZE_64BIT, SIZE_128BIT) | FLAGS_MODRM | FLAGS_SF_MOD_REG_ONLY | FLAGS_XMM_FLAGS | FLAGS_SF_MMX_DST,     0}},
+     {0xD7, 1, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+     {0xD8, 8, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+index 5d2dff353eafe4f7cd0a4ab3ed820f07ded4a3f1..aa2ff7fefa476f40e047a3dd1731d9f68c9a481e 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+@@ -17,7 +17,7 @@ using namespace IR;
+ // All OPDReg versions need it
+ #define OPDReg(op, reg) ((1 << 15) | ((op - 0xD8) << 8) | (reg << 3))
+ #define OPD(op, modrmop) (((op - 0xD8) << 8) | modrmop)
+-constexpr std::array<DispatchTableEntry, 140> X87F64OpTable = {{
++constexpr std::array<DispatchTableEntry, 143> X87F64OpTable = {{
+   {OPDReg(0xD8, 0) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FADDF64, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
+ 
+   {OPDReg(0xD8, 1) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FMULF64, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
+@@ -71,7 +71,7 @@ constexpr std::array<DispatchTableEntry, 140> X87F64OpTable = {{
+   {OPD(0xD9, 0xC8), 8, &OpDispatchBuilder::FXCH},
+   {OPD(0xD9, 0xD0), 1, &OpDispatchBuilder::NOPOp}, // FNOP
+   // D1 = Invalid
+-  // D8 = Invalid
++  {OPD(0xD9, 0xD8), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>}, // FSTP's alias
+   {OPD(0xD9, 0xE0), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80STACKCHANGESIGN, false>},
+   {OPD(0xD9, 0xE1), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80STACKABS, false>},
+   // E2 = Invalid
+@@ -159,10 +159,10 @@ constexpr std::array<DispatchTableEntry, 140> X87F64OpTable = {{
+   {OPD(0xDB, 0xC8), 8, &OpDispatchBuilder::X87FCMOV},
+   {OPD(0xDB, 0xD0), 8, &OpDispatchBuilder::X87FCMOV},
+   {OPD(0xDB, 0xD8), 8, &OpDispatchBuilder::X87FCMOV},
+-  // E0 = Invalid
++  {OPD(0xDB, 0xE0), 2, &OpDispatchBuilder::NOPOp}, // FNENI, FNDISI
+   {OPD(0xDB, 0xE2), 1, &OpDispatchBuilder::FNCLEX},
+   {OPD(0xDB, 0xE3), 1, &OpDispatchBuilder::FNINIT},
+-  // E4 = Invalid
++  {OPD(0xDB, 0xE4), 1, &OpDispatchBuilder::NOPOp}, // FNSETPM
+   {OPD(0xDB, 0xE8), 8,
+    &OpDispatchBuilder::Bind<&OpDispatchBuilder::FCOMIF64, OpSize::f80Bit, false, OpDispatchBuilder::FCOMIFlags::FLAGS_RFLAGS, false>},
+   {OPD(0xDB, 0xF0), 8,
+@@ -291,7 +291,7 @@ constexpr std::array<DispatchTableEntry, 140> X87F64OpTable = {{
+    &OpDispatchBuilder::Bind<&OpDispatchBuilder::FCOMIF64, OpSize::f80Bit, false, OpDispatchBuilder::FCOMIFlags::FLAGS_RFLAGS, false>},
+ }};
+ 
+-constexpr std::array<DispatchTableEntry, 140> X87F80OpTable = {{
++constexpr std::array<DispatchTableEntry, 143> X87F80OpTable = {{
+   {OPDReg(0xD8, 0) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FADD, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
+ 
+   {OPDReg(0xD8, 1) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FMUL, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
+@@ -343,7 +343,7 @@ constexpr std::array<DispatchTableEntry, 140> X87F80OpTable = {{
+   {OPD(0xD9, 0xC8), 8, &OpDispatchBuilder::FXCH},
+   {OPD(0xD9, 0xD0), 1, &OpDispatchBuilder::NOPOp}, // FNOP
+   // D1 = Invalid
+-  // D8 = Invalid
++  {OPD(0xD9, 0xD8), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>}, // FSTP's alias
+   {OPD(0xD9, 0xE0), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80STACKCHANGESIGN, false>},
+   {OPD(0xD9, 0xE1), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80STACKABS, false>},
+   // E2 = Invalid
+@@ -428,10 +428,10 @@ constexpr std::array<DispatchTableEntry, 140> X87F80OpTable = {{
+   {OPD(0xDB, 0xC8), 8, &OpDispatchBuilder::X87FCMOV},
+   {OPD(0xDB, 0xD0), 8, &OpDispatchBuilder::X87FCMOV},
+   {OPD(0xDB, 0xD8), 8, &OpDispatchBuilder::X87FCMOV},
+-  // E0 = Invalid
++  {OPD(0xDB, 0xE0), 2, &OpDispatchBuilder::NOPOp}, // FNENI, FNDISI
+   {OPD(0xDB, 0xE2), 1, &OpDispatchBuilder::FNCLEX},
+   {OPD(0xDB, 0xE3), 1, &OpDispatchBuilder::FNINIT},
+-  // E4 = Invalid
++  {OPD(0xDB, 0xE4), 1, &OpDispatchBuilder::NOPOp}, // FNSETPM
+   {OPD(0xDB, 0xE8), 8,
+    &OpDispatchBuilder::Bind<&OpDispatchBuilder::FCOMI, OpSize::f80Bit, false, OpDispatchBuilder::FCOMIFlags::FLAGS_RFLAGS, false>},
+   {OPD(0xDB, 0xF0), 8,
+@@ -601,7 +601,7 @@ auto GenerateX87TableLambda = [](const auto DispatchTable) consteval {
+       {OPD(0xD9, 0xD0), 1, X86InstInfo{"FNOP",  TYPE_X87, FLAGS_NONE, 0}},
+       {OPD(0xD9, 0xD1), 7, X86InstInfo{"",      TYPE_INVALID, FLAGS_NONE, 0}},
+       //  / 3
+-      {OPD(0xD9, 0xD8), 8, X86InstInfo{"",      TYPE_INVALID, FLAGS_NONE, 0}},
++      {OPD(0xD9, 0xD8), 8, X86InstInfo{"FSTP",  TYPE_X87, FLAGS_SF_MOD_DST | FLAGS_POP, 0}},
+       //  / 4
+       {OPD(0xD9, 0xE0), 1, X86InstInfo{"FCHS", TYPE_X87, FLAGS_NONE, 0}},
+       {OPD(0xD9, 0xE1), 1, X86InstInfo{"FABS", TYPE_X87, FLAGS_NONE, 0}},
+@@ -681,10 +681,12 @@ auto GenerateX87TableLambda = [](const auto DispatchTable) consteval {
+       //  / 3
+       {OPD(0xDB, 0xD8), 8, X86InstInfo{"FCMOVNU", TYPE_X87, FLAGS_NONE, 0}},
+       //  / 4
+-      {OPD(0xDB, 0xE0), 2, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE, 0}},
++      {OPD(0xDB, 0xE0), 1, X86InstInfo{"FNENI", TYPE_X87, FLAGS_NONE, 0}},
++      {OPD(0xDB, 0xE1), 1, X86InstInfo{"FNDISI", TYPE_X87, FLAGS_NONE, 0}},
+       {OPD(0xDB, 0xE2), 1, X86InstInfo{"FNCLEX", TYPE_X87, FLAGS_NONE, 0}},
+       {OPD(0xDB, 0xE3), 1, X86InstInfo{"FNINIT", TYPE_X87, FLAGS_NONE, 0}},
+-      {OPD(0xDB, 0xE4), 4, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE, 0}},
++      {OPD(0xDB, 0xE4), 1, X86InstInfo{"FNSETPM", TYPE_X87, FLAGS_NONE, 0}},
++      {OPD(0xDB, 0xE5), 3, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE, 0}},
+       //  / 5
+       {OPD(0xDB, 0xE8), 8, X86InstInfo{"FUCOMI", TYPE_INST, FLAGS_NONE, 0}},
+       //  / 6

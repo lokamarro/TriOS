@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 09:45:37 +0900
+Subject: [PATCH] nir/opt_vectorize_io: merge xfb elements a dword apart, in
+ order
+
+vectorize_store() merged the xfb elements of the scalar stores it replaces by
+testing out[i].offset == out[j].offset + xfb_comp_size * (j - i), with
+xfb_comp_size the store's bit size (or 32 for mediump, which upconverts).
+That is wrong twice: nir_io_xfb::offset counts dwords, not bits, so the stride
+is 16 or 32 where consecutive components of a run are one dword apart, and the
+comparison is reversed, requiring the later component j at the lower offset.
+An ascending run - every real one - therefore never merged, so the pass has
+never vectorized xfb at all, while a descending pair exactly one bit size
+apart did merge, and merged wrongly.
+
+The two halves come together as soon as nir_opt_varyings packs captured
+scalars into one location. An interleaved capture list already gives a
+location's components non-monotonic offsets once it contains an interior
+gl_SkipComponents1, and compaction then packs components from different
+locations together with no ordering at all. In
+KHR-GL46.enhanced_layouts.xfb_struct_explicit_location_geometry the packed
+location ends up capturing dwords 32, 0, 33 and 2, and 32 == 0 + 32 * 1 hits
+the predicate exactly. Component 1 is folded into component 0's run and
+zeroed, so the scalar that belongs at dword 0 is no longer written there: the
+now two-component run at dword 32 emits it at dword 33 instead, on top of the
+capture that belongs at 33. The next nir_opt_varyings_bulk rescalarizes the
+run and the shifted offset becomes the store's own, so the record permanently
+loses its first scalar and duplicates its third.
+
+Merge on the only relation a nir_io_xfb can express instead. One struct
+describes four components of one location going to one buffer, out[] indexed
+by start component and offset counted in dwords, and the low and high 16 bits
+of a location live in separate structs (xfb[0] and xfb[1]), so components that
+are contiguous in the buffer are always exactly one dword apart inside a
+single struct. A run starting at i continues at j only where j is captured, to
+the same buffer, at offset[i] + (j - i); no bit size can enter that relation,
+which is why the mediump case disappears rather than being corrected.
+Uncaptured components and components captured at unrelated offsets each keep
+their own element, which is what the pass emits for them today, so the only
+behaviour that changes is that genuine runs now merge and impossible ones no
+longer do.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/compiler/nir/nir_opt_vectorize_io.c | 28 +++++++++++++++++--------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/src/compiler/nir/nir_opt_vectorize_io.c b/src/compiler/nir/nir_opt_vectorize_io.c
+index 0669b6e9a11cc55ab2d84a082e455aa7a999123d..bcebafc13236688e7e626510b741d0153124b592 100644
+--- a/src/compiler/nir/nir_opt_vectorize_io.c
++++ b/src/compiler/nir/nir_opt_vectorize_io.c
+@@ -260,18 +260,28 @@ vectorize_store(nir_intrinsic_instr *chan[8], unsigned start, unsigned count,
+                 step != merge_low_high_16_to_32);
+       }
+ 
+-      /* Now vectorize xfb info by merging the individual elements. */
++      /* Now vectorize xfb info by merging the individual elements.
++       *
++       * nir_io_xfb::offset counts dwords, and one nir_io_xfb describes one
++       * set of four components that are one dword apart each (the low and
++       * the high 16 bits of a location live in xfb[0] and xfb[1], so a run
++       * never straddles them). A run therefore continues at component j only
++       * where j is also captured, into the same buffer, at exactly j - i
++       * dwords past the component the run starts at. Components captured at
++       * unrelated offsets - which an interleaved capture list produces as
++       * soon as it contains a gl_SkipComponents hole, and which a location
++       * packed by the varying compactor produces with no ordering at all -
++       * must each keep their own element.
++       */
+       for (unsigned i = start; i < start + count; i++) {
+-         /* mediump means that xfb upconverts to 32 bits when writing to
+-          * memory.
+-          */
+-         unsigned xfb_comp_size =
+-            nir_intrinsic_io_semantics(chan[i]).medium_precision ? 32 : chan[i]->src[0].ssa->bit_size;
++         if (!xfb[i / 4].out[i % 4].num_components)
++            continue;
+ 
+          for (unsigned j = i + 1; j < start + count; j++) {
+-            if (xfb[i / 4].out[i % 4].buffer != xfb[j / 4].out[j % 4].buffer ||
+-                xfb[i / 4].out[i % 4].offset != xfb[j / 4].out[j % 4].offset +
+-                                                   xfb_comp_size * (j - i))
++            if (!xfb[j / 4].out[j % 4].num_components ||
++                xfb[i / 4].out[i % 4].buffer != xfb[j / 4].out[j % 4].buffer ||
++                xfb[j / 4].out[j % 4].offset !=
++                   xfb[i / 4].out[i % 4].offset + (j - i))
+                break;
+ 
+             xfb[i / 4].out[i % 4].num_components++;

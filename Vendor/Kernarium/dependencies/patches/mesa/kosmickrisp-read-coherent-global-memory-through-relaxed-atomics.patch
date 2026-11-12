@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 02:29:40 +0900
+Subject: [PATCH] kosmickrisp: read coherent global memory through relaxed
+ atomics
+
+A compute kernel that reads device memory through a coherent pointer inside a loop miscompiles on macOS 27: the first such load in an iteration returns the right value and every later one returns zero. Two coherent loads are enough and one is not, and any unrelated edit moves the failure to a different kernel rather than removing it.
+
+An application reaches this without asking for coherency, because glslang decorates a volatile buffer member Coherent as well as Volatile. A robust read of a volatile storage buffer is one bounds-checked load per component, so a vec4 element comes back as its first component followed by zeroes, which is neither the stored data nor the zeroes an out-of-bounds read owes it.
+
+Perform a coherent 32-bit global access with atomic_load_explicit and atomic_store_explicit under memory_order_relaxed, one component at a time, instead of dereferencing a coherent device pointer. A relaxed device atomic is coherent at device scope by definition and the compiler cannot fold it. Components with no MSL atomic type, and the accesses the driver marks coherent itself, keep the pointer qualifier. Only a shader that has such an access declares the two helpers, so every other shader still translates byte for byte as before.
+
+Record the issue as KK_WORKAROUND_17 and pin the emitted MSL for a coherent access, an ordinary one, and the disabled workaround.
+---
+ docs/drivers/kosmickrisp/workarounds.rst      |  37 +++++
+ src/kosmickrisp/compiler/msl_private.h        |   5 +
+ src/kosmickrisp/compiler/msl_type_inference.c |  14 ++
+ src/kosmickrisp/compiler/nir_to_msl.c         | 149 ++++++++++++++++++
+ src/kosmickrisp/vulkan/meson.build            |  14 ++
+ .../vulkan/tests/test_msl_coherent_access.c   | 147 +++++++++++++++++
+ 6 files changed, 366 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_coherent_access.c
+
+diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
+index 8248ca1636417559b5ad7f6824277d8e682eba70..4e1a6c004110588e9b28418c0993361cf94c7121 100644
+--- a/docs/drivers/kosmickrisp/workarounds.rst
++++ b/docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,43 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_17
++----------------
++| macOS version: 27.0
++| Metal ticket: Not reported
++| Metal ticket status:
++| CTS test failure: ``dEQP-VK.robustness.robustness2.bind.notemplate.rgba32i.unroll.volatile.storage_buffer.readonly.no_fmt_qual.len_16.samples_1.1d.comp``
++| Comments:
++
++A compute kernel that reads ``device`` memory through a ``coherent`` pointer
++inside a loop miscompiles: the first such load in an iteration returns the
++right value and every later one returns zero. Two coherent loads are enough
++and one is not, and any unrelated edit - storing a value as soon as it is
++produced, or changing the loop bounds - moves the failure to a different
++kernel rather than removing it, which is the same shape as
++KK_WORKAROUND_15. ``coherent(device)`` and ``volatile coherent`` reproduce it
++too.
++
++An application reaches this without asking for coherency, because glslang
++decorates a ``volatile`` buffer member ``Coherent`` as well as ``Volatile``.
++A robust read of a ``volatile`` storage buffer is one bounds-checked load per
++component, so a vec4 element comes back as its first component followed by
++zeroes and the shader sees neither the stored data nor the zeroes that an
++out-of-bounds read owes it.
++
++Perform a coherent 32-bit global access with ``atomic_load_explicit`` and
++``atomic_store_explicit`` under ``memory_order_relaxed``, one component at a
++time, instead of dereferencing a ``coherent device`` pointer. A relaxed device
++atomic is coherent at device scope by definition and the compiler cannot fold
++it away. Components with no MSL atomic type, and the accesses the driver marks
++coherent itself (KK_WORKAROUND_6), keep the pointer qualifier. Only a shader
++that has such an access declares the two helpers, so every other shader still
++translates byte for byte as before. Disabling this workaround restores the
++pointer qualifier for application coherency as well.
++
++| Log:
++| 2026-09-12: Workaround implemented
++
+ KK_WORKAROUND_16
+ ----------------
+ | macOS version: 26.x
+diff --git a/src/kosmickrisp/compiler/msl_private.h b/src/kosmickrisp/compiler/msl_private.h
+index 00577811fdf4a55067d9a8effc891bb269da6650..ba7a292d87de9080797b3487eecfbbde368e39bc 100644
+--- a/src/kosmickrisp/compiler/msl_private.h
++++ b/src/kosmickrisp/compiler/msl_private.h
+@@ -52,6 +52,11 @@ struct hash_table *msl_infer_types(nir_shader *shader);
+ 
+ const char *msl_type_for_def(struct hash_table *types, nir_def *def);
+ 
++/* The MSL name of one component of the value, e.g. "uint" for a uint4. */
++const char *msl_scalar_type_for_def(struct hash_table *types, nir_def *def);
++
++const char *msl_scalar_type_for_src(struct hash_table *types, nir_src *src);
++
+ const char *msl_uint_type(uint8_t bit_size, uint8_t num_components);
+ 
+ const char *msl_type_for_src(struct hash_table *types, nir_src *src);
+diff --git a/src/kosmickrisp/compiler/msl_type_inference.c b/src/kosmickrisp/compiler/msl_type_inference.c
+index a419aff0c94ffc328010302bbf7c014189f7996a..9592bc547681efcd8aa88e04a93557e73b32e237 100644
+--- a/src/kosmickrisp/compiler/msl_type_inference.c
++++ b/src/kosmickrisp/compiler/msl_type_inference.c
+@@ -716,6 +716,20 @@ msl_type_for_def(struct hash_table *types, nir_def *def)
+    return ti_type_to_msl_type(type, def->bit_size, def->num_components);
+ }
+ 
++const char *
++msl_scalar_type_for_def(struct hash_table *types, nir_def *def)
++{
++   ti_type type = get_type(types, def);
++   return ti_type_to_msl_type(type, def->bit_size, 1);
++}
++
++const char *
++msl_scalar_type_for_src(struct hash_table *types, nir_src *src)
++{
++   ti_type type = get_type(types, src);
++   return ti_type_to_msl_type(type, src->ssa->bit_size, 1);
++}
++
+ const char *
+ msl_type_for_src(struct hash_table *types, nir_src *src)
+ {
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 318a0cbd32a608cab739ff7ebc066b1b1c052af3..b09a76d3b6220a88cddf39dbc0ce44978b1d4625 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -272,6 +272,82 @@ msl_coherent_workaround(const struct nir_to_msl_ctx *ctx,
+    return msl_instr_in_loop(instr);
+ }
+ 
++/* KK_WORKAROUND_17 */
++static bool
++msl_coherent_scalar_is_atomic(const char *scalar_type)
++{
++   return strcmp(scalar_type, "uint") == 0 || strcmp(scalar_type, "int") == 0 ||
++          strcmp(scalar_type, "float") == 0;
++}
++
++/* KK_WORKAROUND_17 */
++static bool
++msl_coherent_access_is_atomic(uint64_t disabled_workarounds,
++                              struct hash_table *types,
++                              nir_intrinsic_instr *instr)
++{
++   if (disabled_workarounds & BITFIELD64_BIT(17))
++      return false;
++   if (!nir_intrinsic_has_access(instr))
++      return false;
++
++   const enum gl_access_qualifier access = nir_intrinsic_access(instr);
++   if (!(access & ACCESS_COHERENT) || (access & ACCESS_ATOMIC))
++      return false;
++
++   switch (instr->intrinsic) {
++   case nir_intrinsic_load_global:
++      return instr->def.bit_size == 32 &&
++             msl_coherent_scalar_is_atomic(
++                msl_scalar_type_for_def(types, &instr->def));
++   case nir_intrinsic_store_global:
++      return instr->src[0].ssa->bit_size == 32 &&
++             msl_coherent_scalar_is_atomic(
++                msl_scalar_type_for_src(types, &instr->src[0]));
++   default:
++      return false;
++   }
++}
++
++/* KK_WORKAROUND_17 */
++static bool
++msl_shader_has_atomic_coherent_access(struct nir_to_msl_ctx *ctx)
++{
++   nir_foreach_function_impl(impl, ctx->shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            if (msl_coherent_access_is_atomic(ctx->disabled_workarounds,
++                                              ctx->types,
++                                              nir_instr_as_intrinsic(instr)))
++               return true;
++         }
++      }
++   }
++
++   return false;
++}
++
++/* KK_WORKAROUND_17 */
++static void
++emit_coherent_access_helpers(struct nir_to_msl_ctx *ctx)
++{
++   P(ctx,
++     "static inline uint kk_coherent_load_32(ulong address)\n"
++     "{\n"
++     "   return atomic_load_explicit((device atomic_uint *)address,\n"
++     "                               memory_order_relaxed);\n"
++     "}\n"
++     "\n"
++     "static inline void kk_coherent_store_32(ulong address, uint value)\n"
++     "{\n"
++     "   atomic_store_explicit((device atomic_uint *)address, value,\n"
++     "                         memory_order_relaxed);\n"
++     "}\n"
++     "\n");
++}
++
+ static void
+ emit_local_vars(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+ {
+@@ -1050,6 +1126,61 @@ src_to_packed_load_offset(struct nir_to_msl_ctx *ctx, nir_src *src,
+    P(ctx, "))");
+ }
+ 
++/* KK_WORKAROUND_17 */
++static void
++src_to_coherent_load(struct nir_to_msl_ctx *ctx, nir_src *src,
++                     const char *scalar_type, const char *type,
++                     uint32_t component_count)
++{
++   const bool cast = strcmp(scalar_type, "uint") != 0;
++
++   if (component_count > 1)
++      P(ctx, "%s(", type);
++   for (uint32_t i = 0; i < component_count; i++) {
++      if (i > 0)
++         P(ctx, ", ");
++      if (cast)
++         P(ctx, "as_type<%s>(", scalar_type);
++      P(ctx, "kk_coherent_load_32(");
++      src_to_msl(ctx, src);
++      if (i > 0)
++         P(ctx, " + %uu", i * 4u);
++      P(ctx, ")");
++      if (cast)
++         P(ctx, ")");
++   }
++   if (component_count > 1)
++      P(ctx, ")");
++}
++
++/* KK_WORKAROUND_17 */
++static void
++src_to_coherent_store(struct nir_to_msl_ctx *ctx, nir_src *address,
++                      nir_src *value, const char *scalar_type,
++                      unsigned write_mask, uint32_t component_count)
++{
++   const bool cast = strcmp(scalar_type, "uint") != 0;
++
++   for (uint32_t i = 0; i < component_count; i++) {
++      if (!(write_mask & (1u << i)))
++         continue;
++
++      P_IND(ctx, "kk_coherent_store_32(");
++      src_to_msl(ctx, address);
++      if (i > 0)
++         P(ctx, " + %uu", i * 4u);
++      P(ctx, ", ");
++      if (cast)
++         P(ctx, "as_type<uint>(");
++      src_to_msl(ctx, value);
++      if (component_count > 1)
++         P(ctx, ".%c", "xyzw"[i]);
++      if (cast)
++         P(ctx, ")");
++      P(ctx, ");\n");
++   }
++}
++
+ /* Non-packed types have stricter alignment requirements that packed types.
+  * This helps us cast the pointer to a packed type for storage.
+  */
+@@ -1493,6 +1624,13 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+          P(ctx, "atomic_load_explicit((%s atomic_%s*)", addressing, type);
+          src_to_msl(ctx, &instr->src[0]);
+          P(ctx, ", memory_order_relaxed);\n");
++      } else if (msl_coherent_access_is_atomic(ctx->disabled_workarounds,
++                                               ctx->types, instr)) {
++         /* KK_WORKAROUND_17 */
++         src_to_coherent_load(ctx, &instr->src[0],
++                              msl_scalar_type_for_def(ctx->types, &instr->def),
++                              type, instr->def.num_components);
++         P(ctx, ";\n");
+       } else {
+          src_to_packed_load(ctx, &instr->src[0], addressing, type,
+                             instr->def.num_components);
+@@ -1569,6 +1707,14 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+          src_to_packed(ctx, &instr->src[0], type,
+                        instr->src[0].ssa->num_components);
+          P(ctx, ", memory_order_relaxed);\n");
++      } else if (msl_coherent_access_is_atomic(ctx->disabled_workarounds,
++                                               ctx->types, instr)) {
++         /* KK_WORKAROUND_17 */
++         src_to_coherent_store(
++            ctx, &instr->src[1], &instr->src[0],
++            msl_scalar_type_for_src(ctx->types, &instr->src[0]),
++            nir_intrinsic_write_mask(instr),
++            instr->src[0].ssa->num_components);
+       } else {
+          src_to_packed_store(ctx, &instr->src[1], addressing, type,
+                              instr->src[0].ssa->num_components);
+@@ -2632,6 +2778,9 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+    P(&ctx, "using namespace metal;\n");
+    if (msl_shader_has_fp32_ffma(shader))
+       emit_fp32_fma_helpers(&ctx);
++   /* KK_WORKAROUND_17 */
++   if (msl_shader_has_atomic_coherent_access(&ctx))
++      emit_coherent_access_helpers(&ctx);
+ 
+    msl_emit_io_blocks(&ctx, shader);
+    if (shader->info.stage == MESA_SHADER_FRAGMENT &&
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index d8c39cafb8859ed2b2daebc9bee986aad6893702..6dc7d2003bb63f518a0f8a26e8bcf918108538c8 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1017,6 +1017,20 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_msl_coherent_access',
++    executable(
++      'test_kosmickrisp_msl_coherent_access',
++      files('tests/test_msl_coherent_access.c'),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_msl_to_nir,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_pipeline_statistics',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_coherent_access.c b/src/kosmickrisp/vulkan/tests/test_msl_coherent_access.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5942563dda3eef69a4ff18a915429155e6c9ddd8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_msl_coherent_access.c
+@@ -0,0 +1,147 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A coherent global access must reach Metal as a relaxed atomic rather than a
++ * `coherent device` pointer dereference, which the Metal compiler folds away
++ * once a kernel contains more than one of them.  See KK_WORKAROUND_17.
++ *
++ * Only a shader that actually asks for coherency may gain the helpers: the
++ * miscompilation this avoids is sensitive to unrelated changes in the emitted
++ * text, so every other shader has to translate byte for byte as before.
++ */
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(condition)                                                     \
++   do {                                                                      \
++      if (!(condition)) {                                                    \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,    \
++                 #condition);                                                \
++         abort();                                                            \
++      }                                                                      \
++   } while (0)
++
++/* A kernel that copies four 32-bit components through global memory inside a
++ * loop, which is the shape the robustness lowering produces for a vec4 read of
++ * a storage buffer. */
++static nir_shader *
++build_copy_cs(enum gl_access_qualifier access)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_COMPUTE, &kk_nir_options, "msl coherent access");
++   nir_shader *nir = b.shader;
++   nir->info.workgroup_size[0] = 1;
++   nir->info.workgroup_size[1] = 1;
++   nir->info.workgroup_size[2] = 1;
++
++   nir_variable *index =
++      nir_local_variable_create(b.impl, glsl_uint_type(), "index");
++   nir_store_var(&b, index, nir_imm_int(&b, 0), 0x1);
++
++   nir_def *source = nir_load_global_invocation_id(&b, 64);
++   nir_def *base = nir_channel(&b, source, 0);
++
++   nir_push_loop(&b);
++   {
++      nir_def *i = nir_load_var(&b, index);
++      nir_push_if(&b, nir_uge_imm(&b, i, 4));
++      {
++         nir_jump(&b, nir_jump_break);
++      }
++      nir_pop_if(&b, NULL);
++
++      nir_def *offset = nir_u2u64(&b, nir_imul_imm(&b, i, 16));
++      nir_def *from = nir_iadd(&b, base, offset);
++      nir_def *value = nir_load_global(&b, 4, 32, from, .align_mul = 4,
++                                       .access = access);
++      nir_def *to = nir_iadd_imm(&b, from, 4096);
++      nir_store_global(&b, value, to, .write_mask = 0xf, .align_mul = 4,
++                       .access = access);
++
++      nir_store_var(&b, index, nir_iadd_imm(&b, i, 1), 0x1);
++   }
++   nir_pop_loop(&b, NULL);
++
++   nir_validate_shader(nir, "msl coherent access");
++   return nir;
++}
++
++static char *
++translate(enum gl_access_qualifier access, uint64_t disabled_workarounds)
++{
++   nir_shader *nir = build_copy_cs(access);
++   msl_optimize_nir(nir);
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   struct nir_to_msl_options options = {
++      .disabled_workarounds = disabled_workarounds,
++   };
++   char *msl = nir_to_msl(nir, &options);
++   CHECK(msl != NULL);
++   ralloc_free(nir);
++   return msl;
++}
++
++static unsigned
++count(const char *text, const char *needle)
++{
++   unsigned found = 0;
++   for (const char *at = strstr(text, needle); at != NULL;
++        at = strstr(at + 1, needle))
++      found++;
++   return found;
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   /* A coherent access becomes one relaxed atomic per component and the
++    * kernel keeps no coherent pointer at all. */
++   char *coherent = translate(ACCESS_COHERENT, 0);
++   CHECK(count(coherent, "coherent device") == 0);
++   CHECK(count(coherent, "kk_coherent_load_32(") == 5);
++   CHECK(count(coherent, "kk_coherent_store_32(") == 5);
++   CHECK(count(coherent, "atomic_load_explicit") == 1);
++   CHECK(count(coherent, "atomic_store_explicit") == 1);
++
++   /* An access the shader did not ask to be coherent is translated as before:
++    * KK_WORKAROUND_6 still marks it through the pointer because it is inside a
++    * loop, and the helpers are not even declared. */
++   char *workaround_6 = translate(0, 0);
++   CHECK(count(workaround_6, "kk_coherent_load_32") == 0);
++   CHECK(count(workaround_6, "kk_coherent_store_32") == 0);
++   CHECK(count(workaround_6, "coherent device") == 2);
++
++   /* Without that marking the same shader keeps plain device accesses. */
++   char *plain = translate(0, BITFIELD64_BIT(6));
++   CHECK(count(plain, "kk_coherent_load_32") == 0);
++   CHECK(count(plain, "kk_coherent_store_32") == 0);
++   CHECK(count(plain, "coherent device") == 0);
++   CHECK(count(plain, "*(device packed_uint4*)") > 0);
++
++   /* Disabling this workaround restores the pointer qualifier. */
++   char *disabled = translate(ACCESS_COHERENT, BITFIELD64_BIT(17));
++   CHECK(count(disabled, "kk_coherent_load_32") == 0);
++   CHECK(count(disabled, "kk_coherent_store_32") == 0);
++   CHECK(count(disabled, "coherent device") == 2);
++
++   printf("msl coherent access PASS\n");
++
++   ralloc_free(coherent);
++   ralloc_free(workaround_6);
++   ralloc_free(plain);
++   ralloc_free(disabled);
++   glsl_type_singleton_decref();
++   return 0;
++}

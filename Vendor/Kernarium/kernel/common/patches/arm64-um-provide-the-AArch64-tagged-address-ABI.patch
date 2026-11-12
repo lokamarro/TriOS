@@ -1,0 +1,464 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:50:11 +0900
+Subject: [PATCH] arm64: um: provide the AArch64 tagged-address ABI
+
+arm64 Linux lets a task pass pointers whose top byte holds a tag to
+system calls once it has asked for that with
+prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE)
+(Documentation/arch/arm64/tagged-address-abi.rst). UML had neither
+prctl, so both failed with EINVAL. Bionic then leaves its heap at
+M_HEAP_TAGGING_LEVEL_NONE, no heap pointer carries a tag, and the
+Android CTS, which expects every arm64 device without MTE to tag its
+heap, fails.
+
+The port now provides the ABI as arm64 Linux 6.18 does on a CPU without
+MTE:
+
+- PR_SET_TAGGED_ADDR_CTRL and PR_GET_TAGGED_ADDR_CTRL, the
+  TIF_TAGGED_ADDR flag they keep (inherited by fork and clone, cleared
+  by exec), EINVAL for an AArch32 task, the abi.tagged_addr_disabled
+  sysctl, and NT_ARM_TAGGED_ADDR_CTRL for a tracer.
+- untagged_addr(): the top byte goes unless bit 55 is set.
+  untagged_addr_remote() is the generic one. The generic callers that
+  untag now see it: mprotect, madvise, mincore, mlock, munlock, msync,
+  munmap, the old address of mremap, GUP (process_vm_readv and
+  process_vm_writev, ptrace PEEK and POKE) and pagemap. Native untags
+  these whether or not the task enabled the ABI.
+- access_ok() untags for a task that enabled the ABI and for a kernel
+  thread, which has no flag of its own. The skas uaccess copy and the
+  futex operations untag the address they map, as the LDTR and STTR
+  accesses of the native kernel ignore the tag (TBI0).
+- A fault's si_addr is untagged, except for a TRAP_BRKPT watchpoint
+  (arch_untagged_si_addr()).
+- process_vm_writev() takes the remote address as the caller gave it.
+  Once GUP untags it, the pages pin, and the code invalidation that
+  follows must name the same address: the host rejected the tagged one
+  and the kernel panicked ("unable to invalidate guest mm code").
+  darwin_flush_icache_remote_user_range() untags.
+
+The host's engines ignore the top byte of a data address when it runs
+with top-byte-ignore. A fault they report is the address they
+translated, so the tag is already gone, and segv() must not untag it: a
+host without top-byte-ignore faults at the tagged address, and mapping
+the untagged page would only make the same access fault again. The
+comment in segv() says so. As a result si_addr never carries a tag,
+even with SA_EXPOSE_TAGBITS.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/um/Kconfig             |  7 ++++
+ arch/arm64/um/Makefile            |  1 +
+ arch/arm64/um/asm/memory.h        | 14 +++++++
+ arch/arm64/um/asm/processor.h     |  9 +++++
+ arch/arm64/um/asm/signal.h        | 11 ++++++
+ arch/arm64/um/ptrace.c            | 46 +++++++++++++++++++++-
+ arch/arm64/um/tagged_addr.c       | 65 +++++++++++++++++++++++++++++++
+ arch/um/include/asm/thread_info.h |  3 ++
+ arch/um/include/asm/uaccess.h     | 19 +++++++++
+ arch/um/kernel/exec.c             |  3 ++
+ arch/um/kernel/skas/uaccess.c     |  8 +++-
+ arch/um/kernel/tlb.c              |  4 ++
+ arch/um/kernel/trap.c             |  9 +++++
+ 13 files changed, 196 insertions(+), 3 deletions(-)
+ create mode 100644 arch/arm64/um/tagged_addr.c
+
+diff --git a/arch/arm64/um/Kconfig b/arch/arm64/um/Kconfig
+index e195e71dc38a3774ed660e4f7b722f6fe50705da..b9f9aa50995d24949cf14cfa5e3096f55f20414f 100644
+--- a/arch/arm64/um/Kconfig
++++ b/arch/arm64/um/Kconfig
+@@ -42,6 +42,13 @@ config UML_ARM64_AARCH32
+ config COMPAT
+ 	def_bool UML_ARM64_AARCH32
+ 
++# The AArch64 tagged-address ABI of arm64 Linux's ARM64_TAGGED_ADDR_ABI:
++# PR_SET_TAGGED_ADDR_CTRL, NT_ARM_TAGGED_ADDR_CTRL and the
++# abi.tagged_addr_disabled sysctl.  The host's engines ignore the top byte
++# of a data address (TBI0) for the task.
++config UML_ARM64_TAGGED_ADDR_ABI
++	def_bool y
++
+ config KUSER_HELPERS
+ 	bool "Enable kuser helpers page for 32-bit applications"
+ 	depends on UML_ARM64_AARCH32
+diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
+index 52e93d87551bb9ede3c0a780eabe8d66a1061475..ec420f2c6440b1dfb419a597bf60fa6e840bd672 100644
+--- a/arch/arm64/um/Makefile
++++ b/arch/arm64/um/Makefile
+@@ -3,6 +3,7 @@
+ obj-y := bugs.o delay.o fault.o mem.o ptrace.o registers.o setjmp.o \
+ 	signal.o subarch.o syscall_table.o syscalls.o sysrq.o tls.o
+ obj-$(CONFIG_UML_ARM64_SME) += sme.o sme_signal.o
++obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
+ obj-$(CONFIG_UML_ARM64_AARCH32) += aarch32.o aarch32_pages.o \
+ 	armv8_deprecated.o ptrace32.o signal32.o sys32.o sys_compat.o
+ 
+diff --git a/arch/arm64/um/asm/memory.h b/arch/arm64/um/asm/memory.h
+index 3a2ae67eaf993cb90f0fb06abf62d5fcc68c4db8..bb3fc4b1bd19b1c1748e53aafa90776465499449 100644
+--- a/arch/arm64/um/asm/memory.h
++++ b/arch/arm64/um/asm/memory.h
+@@ -2,7 +2,21 @@
+ #ifndef _ASM_UM_ARM64_MEMORY_H
+ #define _ASM_UM_ARM64_MEMORY_H
+ 
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++/*
++ * As arm64 Linux: a user address loses its top byte, and an address with
++ * bit 55 set keeps it.  The generic untagged_addr_remote() applies.
++ */
++#define __untagged_addr(addr) \
++	((__force __typeof__(addr))sign_extend64((__force u64)(addr), 55))
++#define untagged_addr(addr) ({						\
++	u64 __addr = (__force u64)(addr);				\
++	__addr &= __untagged_addr(__addr);				\
++	(__force __typeof__(addr))__addr;				\
++})
++#else
+ #define untagged_addr(address) (address)
+ #define untagged_addr_remote(mm, address) (address)
++#endif
+ 
+ #endif
+diff --git a/arch/arm64/um/asm/processor.h b/arch/arm64/um/asm/processor.h
+index fbd219461e197d4e1b66ca46b3100c8ce25fff13..17a153aa95c1ea04362efa00f564a8f5ff89543f 100644
+--- a/arch/arm64/um/asm/processor.h
++++ b/arch/arm64/um/asm/processor.h
+@@ -48,6 +48,15 @@ extern int uml_arm64_sme_get_current_vl(void);
+ #define SME_GET_VL() uml_arm64_sme_get_current_vl()
+ #endif
+ 
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++struct task_struct;
++extern long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg);
++extern long get_tagged_addr_ctrl(struct task_struct *task);
++extern void uml_arm64_tagged_addr_flush_thread(void);
++#define SET_TAGGED_ADDR_CTRL(arg)	set_tagged_addr_ctrl(current, arg)
++#define GET_TAGGED_ADDR_CTRL()		get_tagged_addr_ctrl(current)
++#endif
++
+ #define current_sp() ({ void *sp; asm("mov %0, sp" : "=r"(sp)); sp; })
+ #define current_bp() ({ unsigned long fp; asm("mov %0, x29" : "=r"(fp)); fp; })
+ 
+diff --git a/arch/arm64/um/asm/signal.h b/arch/arm64/um/asm/signal.h
+index 99fd33b71b5dbe720e91371c226204dfbe0a33e6..b63504931d92f547a003e07445c100002e45e5d1 100644
+--- a/arch/arm64/um/asm/signal.h
++++ b/arch/arm64/um/asm/signal.h
+@@ -2,13 +2,24 @@
+ #ifndef _ASM_UM_ARM64_SIGNAL_H
+ #define _ASM_UM_ARM64_SIGNAL_H
+ 
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++#include <linux/bitops.h>
++#include <asm/memory.h>
++#endif
+ #include <uapi/asm/signal.h>
+ #include <uapi/asm/siginfo.h>
+ 
+ static inline void __user *arch_untagged_si_addr(void __user *address,
+ 		unsigned long signal, unsigned long code)
+ {
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++	/* As arm64 Linux: a watchpoint keeps every address bit. */
++	if (signal == SIGTRAP && code == TRAP_BRKPT)
++		return address;
++	return untagged_addr(address);
++#else
+ 	return address;
++#endif
+ }
+ #define arch_untagged_si_addr arch_untagged_si_addr
+ 
+diff --git a/arch/arm64/um/ptrace.c b/arch/arm64/um/ptrace.c
+index 82097e4b037feec13f154fc8be15f9c516958feb..3c972ab22c74179fdb56ab2d0e80038fc567cc17 100644
+--- a/arch/arm64/um/ptrace.c
++++ b/arch/arm64/um/ptrace.c
+@@ -19,6 +19,10 @@
+ enum {
+ 	REGSET_TLS = REGSET_FP + 1,
+ 	REGSET_SYSTEM_CALL,
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++	REGSET_TAGGED_ADDR_CTRL,
++#endif
++	REGSET_BASE_COUNT,
+ };
+ 
+ static int register_index(int regno)
+@@ -213,6 +217,36 @@ int uml_arm64_system_call_set(struct task_struct *target,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++/* NT_ARM_TAGGED_ADDR_CTRL, as native arm64 on a CPU without MTE. */
++static int tagged_addr_ctrl_get(struct task_struct *target,
++				const struct user_regset *regset,
++				struct membuf to)
++{
++	long ctrl = get_tagged_addr_ctrl(target);
++
++	if (WARN_ON_ONCE(IS_ERR_VALUE(ctrl)))
++		return ctrl;
++	return membuf_write(&to, &ctrl, sizeof(ctrl));
++}
++
++static int tagged_addr_ctrl_set(struct task_struct *target,
++				const struct user_regset *regset,
++				unsigned int pos, unsigned int count,
++				const void *kbuf, const void __user *ubuf)
++{
++	long ctrl = get_tagged_addr_ctrl(target);
++	int ret;
++
++	if (WARN_ON_ONCE(IS_ERR_VALUE(ctrl)))
++		return ctrl;
++	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &ctrl, 0, -1);
++	if (ret)
++		return ret;
++	return set_tagged_addr_ctrl(target, ctrl);
++}
++#endif
++
+ static const struct user_regset uml_arm64_regsets[] = {
+ 	[REGSET_GENERAL] = {
+ 		USER_REGSET_NOTE_TYPE(PRSTATUS),
+@@ -246,6 +280,16 @@ static const struct user_regset uml_arm64_regsets[] = {
+ 		.regset_get = uml_arm64_system_call_get,
+ 		.set = uml_arm64_system_call_set,
+ 	},
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++	[REGSET_TAGGED_ADDR_CTRL] = {
++		USER_REGSET_NOTE_TYPE(ARM_TAGGED_ADDR_CTRL),
++		.n = 1,
++		.size = sizeof(long),
++		.align = sizeof(long),
++		.regset_get = tagged_addr_ctrl_get,
++		.set = tagged_addr_ctrl_set,
++	},
++#endif
+ #ifdef CONFIG_UML_ARM64_SME
+ 	/* Only the SME view below has these, as native arm64 with SME. */
+ 	{
+@@ -283,7 +327,7 @@ static const struct user_regset_view uml_arm64_view = {
+ 	.name = "aarch64",
+ 	.e_machine = EM_AARCH64,
+ 	.regsets = uml_arm64_regsets,
+-	.n = REGSET_SYSTEM_CALL + 1,
++	.n = REGSET_BASE_COUNT,
+ };
+ 
+ #ifdef CONFIG_UML_ARM64_SME
+diff --git a/arch/arm64/um/tagged_addr.c b/arch/arm64/um/tagged_addr.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d42af5947de03ff9deebc8d4dabe973c72d838c
+--- /dev/null
++++ b/arch/arm64/um/tagged_addr.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * The AArch64 tagged-address ABI (Documentation/arch/arm64/tagged-address-abi.rst),
++ * as arch/arm64/kernel/process.c provides it on a CPU without MTE.
++ */
++
++#include <linux/compat.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/prctl.h>
++#include <linux/sched.h>
++#include <linux/sysctl.h>
++#include <linux/thread_info.h>
++
++static unsigned int tagged_addr_disabled;
++
++long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg)
++{
++	struct thread_info *ti = task_thread_info(task);
++
++	if (is_compat_thread(ti))
++		return -EINVAL;
++	if (arg & ~PR_TAGGED_ADDR_ENABLE)
++		return -EINVAL;
++	/* Not while abi.tagged_addr_disabled forbids it. */
++	if ((arg & PR_TAGGED_ADDR_ENABLE) && tagged_addr_disabled)
++		return -EINVAL;
++	update_ti_thread_flag(ti, TIF_TAGGED_ADDR, arg & PR_TAGGED_ADDR_ENABLE);
++	return 0;
++}
++
++long get_tagged_addr_ctrl(struct task_struct *task)
++{
++	struct thread_info *ti = task_thread_info(task);
++
++	if (is_compat_thread(ti))
++		return -EINVAL;
++	return test_ti_thread_flag(ti, TIF_TAGGED_ADDR) ? PR_TAGGED_ADDR_ENABLE : 0;
++}
++
++/* exec() ends it; clone() and fork() copy the flag with the thread. */
++void uml_arm64_tagged_addr_flush_thread(void)
++{
++	clear_thread_flag(TIF_TAGGED_ADDR);
++}
++
++static const struct ctl_table tagged_addr_sysctl_table[] = {
++	{
++		.procname	= "tagged_addr_disabled",
++		.mode		= 0644,
++		.data		= &tagged_addr_disabled,
++		.maxlen		= sizeof(int),
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++};
++
++static int __init tagged_addr_init(void)
++{
++	if (!register_sysctl("abi", tagged_addr_sysctl_table))
++		return -EINVAL;
++	return 0;
++}
++core_initcall(tagged_addr_init);
+diff --git a/arch/um/include/asm/thread_info.h b/arch/um/include/asm/thread_info.h
+index f16b3b64d7b90b824a6d9b688227db446dab7a2a..bc38f7f3f1bea6c5fe40864343a26cb15f32b7cc 100644
+--- a/arch/um/include/asm/thread_info.h
++++ b/arch/um/include/asm/thread_info.h
+@@ -47,6 +47,9 @@ struct thread_info {
+ #ifdef CONFIG_COMPAT
+ #define TIF_32BIT		12	/* 32-bit userspace task */
+ #endif
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++#define TIF_TAGGED_ADDR		14	/* tagged-address ABI enabled */
++#endif
+ 
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+diff --git a/arch/um/include/asm/uaccess.h b/arch/um/include/asm/uaccess.h
+index b435f1b5c30e8d4aec59db9c353649836bf3173b..ea3f62f0caf163b43d534abf6de5cc218460c985 100644
+--- a/arch/um/include/asm/uaccess.h
++++ b/arch/um/include/asm/uaccess.h
+@@ -10,6 +10,10 @@
+ #include <asm/elf.h>
+ #include <linux/unaligned.h>
+ #include <sysdep/faultinfo.h>
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++/* untagged_addr(), ahead of linux/uaccess.h's identity default. */
++#include <asm/memory.h>
++#endif
+ #ifdef UML_HOST_DARWIN
+ #include <darwin-address-space.h>
+ #endif
+@@ -38,6 +42,21 @@ extern unsigned long raw_copy_to_user(void __user *to, const void *from, unsigne
+ extern unsigned long __clear_user(void __user *mem, unsigned long len);
+ static inline int __access_ok(const void __user *ptr, unsigned long size);
+ 
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++/*
++ * As arm64 Linux: a task that enabled the tagged-address ABI passes tagged
++ * pointers, and so does a kernel thread working for one (asynchronous I/O
++ * does not have the owner's thread flag).
++ */
++static inline int access_ok(const void __user *addr, unsigned long size)
++{
++	if ((current->flags & PF_KTHREAD) || test_thread_flag(TIF_TAGGED_ADDR))
++		addr = untagged_addr(addr);
++	return likely(__access_ok(addr, size));
++}
++#define access_ok access_ok
++#endif
++
+ /* Teach asm-generic/uaccess.h that we have C functions for these. */
+ #define __access_ok __access_ok
+ #define __clear_user __clear_user
+diff --git a/arch/um/kernel/exec.c b/arch/um/kernel/exec.c
+index c00611346a2ca3d58c464b914cad266bcd98de61..4809ef1346de85e2dd9d082bfcaff912f33b2ea3 100644
+--- a/arch/um/kernel/exec.c
++++ b/arch/um/kernel/exec.c
+@@ -27,6 +27,9 @@ void flush_thread(void)
+ 	uml_arm64_sme_flush_thread();
+ #endif
+ 	arch_flush_thread(&current->thread.arch);
++#ifdef CONFIG_UML_ARM64_TAGGED_ADDR_ABI
++	uml_arm64_tagged_addr_flush_thread();
++#endif
+ 
+ 	get_safe_registers(current_pt_regs()->regs.gp,
+ 			   current_pt_regs()->regs.fp);
+diff --git a/arch/um/kernel/skas/uaccess.c b/arch/um/kernel/skas/uaccess.c
+index a6d32d27031a4ecdc38d8f81873b7e106b4902cd..dad935fd36647c8278b427943d50169b6b7f3c5e 100644
+--- a/arch/um/kernel/skas/uaccess.c
++++ b/arch/um/kernel/skas/uaccess.c
+@@ -366,6 +366,9 @@ static long buffer_op(unsigned long addr, int len, int is_write,
+ {
+ 	long size, remain, n;
+ 
++	/* The native access ignores the top byte, as TBI0 does; access_ok()
++	 * already decided whether this task may pass a tag. */
++	addr = untagged_addr(addr);
+ 	size = min(PAGE_ALIGN(addr) - addr, (unsigned long) len);
+ 	remain = len;
+ 
+@@ -529,7 +532,7 @@ int arch_futex_atomic_op_inuser(int op, u32 oparg, int *oval, u32 __user *uaddr)
+ 	u32 oldval, newval, observed;
+ 	int ret;
+ 	struct page *page;
+-	unsigned long addr = (unsigned long) uaddr;
++	unsigned long addr = untagged_addr((unsigned long) uaddr);
+ 	unsigned long user_addr = addr;
+ 
+ 	ret = -EFAULT;
+@@ -616,12 +619,13 @@ int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+ 			      u32 oldval, u32 newval)
+ {
+ 	struct page *page;
+-	unsigned long user_addr = (unsigned long)uaddr;
++	unsigned long user_addr = untagged_addr((unsigned long)uaddr);
+ 	int ret = -EFAULT;
+ 
+ 	if (!access_ok(uaddr, sizeof(*uaddr)))
+ 		return -EFAULT;
+ 
++	uaddr = (u32 __user *)user_addr;
+ 	page = maybe_map((unsigned long) uaddr, 1);
+ 	if (page == NULL)
+ 		return -EFAULT;
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 56bc2c1dfb863fdccf832eba4e7a2afea18a7780..04cff8cc7fb270a9b3980c3324335b5cd8868104 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/sched/signal.h>
+ #include <linux/string.h>
++#include <linux/uaccess.h>
+ 
+ #include <asm/tlbflush.h>
+ #include <asm/cacheflush.h>
+@@ -1272,6 +1273,9 @@ void darwin_flush_icache_remote_user_range(struct mm_struct *mm,
+ {
+ 	if (mm == &init_mm || len == 0)
+ 		return;
++	/* process_vm_writev() passes the remote address as the caller gave it,
++	 * and pinning its pages ignored the tag. */
++	start = untagged_addr(start);
+ 	if (darwin_uml_vm_invalidate_code(mm->context.id.darwin_generation,
+ 					  start, len) < 0)
+ 		panic("Darwin: unable to invalidate guest mm %lu code %#lx+%#lx",
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index d8a452c5b234ad31f5712d3737201144293c6156..64a1006b06a4fcdee6a3749092d0f81a1b01b989 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -358,6 +358,15 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
+ 	int si_code;
+ 	int err;
+ 	int is_write = FAULT_WRITE(fi);
++	/*
++	 * The address is the one the host reports, and it is never untagged
++	 * here, as arm64 Linux's do_page_fault() untags FAR_EL1.  A host that
++	 * ignores the top byte (TBI0) translates the untagged address, so that
++	 * is the one it reports; a host that does not faults at the tagged
++	 * address, and mapping the untagged page would only make the same
++	 * access fault again.  The kernel cannot tell the two apart, so it
++	 * leaves the address alone.  si_addr carries no tag either way.
++	 */
+ 	unsigned long address = FAULT_ADDRESS(fi);
+ 
+ 	if (!is_user && regs)

@@ -1,0 +1,505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 01:28:59 +0900
+Subject: [PATCH] mesa/st: store integer pixel transfers without a blit
+
+A pixel transfer saturates an integer into the destination range. The blit
+paths hand the texels to a colour attachment, which keeps only the
+destination's low bits, so a conversion between two different pure-integer
+formats loses that saturation. ReadPixels already refused the signed/unsigned
+half of it. Report the conversion from the formats instead, so narrowing and
+component changes are covered too, and refuse it in the texture upload,
+GetTexImage, and pixel-buffer paths that had no such check.
+
+Conversions through a floating-point or normalized format, and transfers whose
+source and destination formats match, keep their blit. Check that the ones
+still routed through a blit are exactly the ones the generated blit shader
+reproduces.
+
+Routing those reads past the blit sends them to the ReadPixels fallback, whose
+compute download named slice 0 of the read attachment's texture instead of the
+slice the attachment is bound to. Every read of a layered attachment therefore
+returned layer 0 once the region was large enough for the driver to prefer the
+compute download over the CPU copy, so the OpenGL CTS reported layer 0's
+contents for every other layer of a 320x64x8 R32 image:
+dEQP-GL45-ES31.functional.image_load_store.{2d_array,3d}.atomic.*_return_value.
+Cube faces were unaffected because their base layer already selects the face.
+Name the attachment's slice so the download reads it.
+
+An array slice reaches the download through the sampler view, but its
+conversion shader samples a 3D texture at the invocation's own z and has no
+depth offset to start from, so it silently dropped the one GetTexSubImage
+already passed it. Refuse a 3D download that starts away from the first slice
+and let the CPU copy, which honours it, take those reads.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/meson.build             |  13 +
+ .../util/u_blitter_transfer_test.cpp          | 249 ++++++++++++++++++
+ src/mesa/state_tracker/st_cb_readpixels.c     |  47 ++--
+ src/mesa/state_tracker/st_cb_texture.c        |  21 ++
+ src/mesa/state_tracker/st_pbo_compute.c       |   7 +
+ src/util/format/u_format.c                    |   9 +
+ src/util/format/u_format.h                    |  13 +
+ 7 files changed, 329 insertions(+), 30 deletions(-)
+ create mode 100644 src/gallium/auxiliary/util/u_blitter_transfer_test.cpp
+
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index f975629a019145de04f991960511e14f51d4fbc5..b9385528911d1e5df6519b05f469c3360505420d 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -549,6 +549,19 @@ if with_tests
+       suite : 'gallium',
+       protocol : 'gtest',
+     )
++
++    test('gallium-integer-transfer',
++      executable(
++        'gallium-integer-transfer',
++        'util/u_blitter_transfer_test.cpp',
++        include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
++        link_with : libgallium,
++        dependencies : [idep_gtest, idep_nir, idep_mesautil],
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : 'gallium',
++      protocol : 'gtest',
++    )
+   endif
+ endif
+ 
+diff --git a/src/gallium/auxiliary/util/u_blitter_transfer_test.cpp b/src/gallium/auxiliary/util/u_blitter_transfer_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ef00acfd41c911070b3a42dc58c9207104739b7
+--- /dev/null
++++ b/src/gallium/auxiliary/util/u_blitter_transfer_test.cpp
+@@ -0,0 +1,249 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A pixel transfer saturates an integer into the destination range. The
++ * generated blit shader hands the sampled value to a colour attachment, which
++ * keeps only the destination's low bits, so only conversions that need no
++ * saturation survive a blit. Check that the reported conversions are exactly
++ * the ones a blit cannot carry.
++ */
++
++#include "compiler/nir/nir_builder.h"
++#include "util/format/u_format.h"
++#include "util/u_blit_shader_test.h"
++#include "util/u_simple_shaders.h"
++#include <vector>
++
++namespace {
++
++const struct util_format_channel_description &
++first_channel(const struct util_format_description *desc)
++{
++   return desc->channel[util_format_get_first_non_void_channel(desc->format)];
++}
++
++int64_t
++channel_min(const struct util_format_channel_description &channel)
++{
++   return channel.type == UTIL_FORMAT_TYPE_SIGNED ?
++      -(int64_t(1) << (channel.size - 1)) : 0;
++}
++
++int64_t
++channel_max(const struct util_format_channel_description &channel)
++{
++   return channel.type == UTIL_FORMAT_TYPE_SIGNED ?
++      (int64_t(1) << (channel.size - 1)) - 1 : (int64_t(1) << channel.size) - 1;
++}
++
++/* What GL stores: the source value saturated into the destination range. */
++int64_t
++saturate_to_channel(int64_t value, const struct util_format_channel_description &channel)
++{
++   return std::min(std::max(value, channel_min(channel)), channel_max(channel));
++}
++
++/* What a colour attachment stores: the low bits of the fragment's output. */
++int64_t
++attachment_store(uint32_t value, const struct util_format_channel_description &channel)
++{
++   const uint64_t kept = value & ((uint64_t(1) << channel.size) - 1);
++   if (channel.type == UTIL_FORMAT_TYPE_SIGNED &&
++       (kept >> (channel.size - 1)) & 1)
++      return int64_t(kept) - (int64_t(1) << channel.size);
++   return int64_t(kept);
++}
++
++struct conversion {
++   pipe_format src;
++   pipe_format dst;
++   const char *transfer;   /* the packed_pixels transfer it comes from */
++};
++
++/* Source and destination formats that KHR-GL46.packed_pixels asks for. */
++const conversion saturating[] = {
++   {PIPE_FORMAT_R8_UINT, PIPE_FORMAT_R8G8B8A8_SINT, "rgb8i from RED_INTEGER/UNSIGNED_BYTE"},
++   {PIPE_FORMAT_R16_UINT, PIPE_FORMAT_R8G8B8A8_SINT, "rgb8i from RED_INTEGER/UNSIGNED_SHORT"},
++   {PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R8G8B8A8_SINT, "rgb8i from RED_INTEGER/UNSIGNED_INT"},
++   {PIPE_FORMAT_R16_SINT, PIPE_FORMAT_R8_UINT, "r8ui from RED_INTEGER/SHORT"},
++   {PIPE_FORMAT_R16G16_SINT, PIPE_FORMAT_R8G8B8A8_UINT, "rgba8ui from RG_INTEGER/SHORT"},
++   {PIPE_FORMAT_R32G32_UINT, PIPE_FORMAT_R8_SINT, "rg32ui read as RED_INTEGER/BYTE"},
++   {PIPE_FORMAT_R32G32B32A32_UINT, PIPE_FORMAT_R16_SINT, "r16i from RGBA_INTEGER/UNSIGNED_INT"},
++   {PIPE_FORMAT_R32G32B32A32_SINT, PIPE_FORMAT_R16_SINT, "rgb32i read as RED_INTEGER/SHORT"},
++   {PIPE_FORMAT_R8G8_SINT, PIPE_FORMAT_R10G10B10A2_UINT, "rgb10_a2ui from RG_INTEGER/BYTE"},
++};
++
++/* Transfers that need no saturation and must keep using a blit. */
++const conversion blittable[] = {
++   {PIPE_FORMAT_R8_SINT, PIPE_FORMAT_R8_SINT, "r8i staging copy"},
++   {PIPE_FORMAT_R8G8B8A8_UINT, PIPE_FORMAT_R8G8B8A8_UINT, "rgba8ui staging copy"},
++   {PIPE_FORMAT_R32G32_SINT, PIPE_FORMAT_R32G32_SINT, "rg32i staging copy"},
++};
++
++/* Transfers through a floating-point or normalized format keep their defined
++ * blit behaviour.
++ */
++const conversion unchanged[] = {
++   {PIPE_FORMAT_R8G8B8A8_UNORM, PIPE_FORMAT_R16G16B16A16_FLOAT, "rgba16f from RGBA/UNSIGNED_BYTE"},
++   {PIPE_FORMAT_R32_FLOAT, PIPE_FORMAT_R8G8B8A8_UNORM, "rgba8 from RED/FLOAT"},
++   {PIPE_FORMAT_Z24_UNORM_S8_UINT, PIPE_FORMAT_Z24_UNORM_S8_UINT, "depth24_stencil8 staging copy"},
++};
++
++class integer_transfer : public blit_shader_fixture {
++protected:
++   /* Run one source value through the generated blit shader and return what
++    * the destination attachment ends up holding.
++    */
++   void run(pipe_format src, pipe_format dst, int64_t value, int64_t result[4])
++   {
++      const struct util_format_description *src_desc = util_format_description(src);
++      const struct util_format_description *dst_desc = util_format_description(dst);
++      const tgsi_return_type stype = util_format_is_pure_sint(src) ?
++         TGSI_RETURN_TYPE_SINT : TGSI_RETURN_TYPE_UINT;
++      const tgsi_return_type dtype = util_format_is_pure_sint(dst) ?
++         TGSI_RETURN_TYPE_SINT : TGSI_RETURN_TYPE_UINT;
++
++      ralloc_free(shader);
++      shader = nullptr;
++      ASSERT_NE(util_make_fragment_tex_shader(&pipe, TGSI_TEXTURE_2D, stype, dtype,
++                                              true, false), nullptr);
++      ASSERT_NE(shader, nullptr);
++
++      /* Replace the sampled texel with the source value the texture holds. A
++       * sampler hands an integer texel over sign- or zero-extended.
++       */
++      const uint32_t payload = uint32_t(value & 0xffffffffu);
++      unsigned samples = 0;
++      nir_builder b = nir_builder_create(nir_shader_get_entrypoint(shader));
++      nir_foreach_block(block, b.impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_tex)
++               continue;
++            nir_tex_instr *tex = nir_instr_as_tex(instr);
++            if (nir_tex_instr_is_query(tex))
++               continue;
++            ++samples;
++            b.cursor = nir_before_instr(instr);
++            nir_def *texel = nir_imm_ivec4(&b, payload, payload, payload, payload);
++            nir_def_rewrite_uses(&tex->def, texel);
++            nir_instr_remove(instr);
++         }
++      }
++      ASSERT_EQ(samples, 1u);
++
++      bool progress;
++      do {
++         progress = false;
++         NIR_PASS(progress, shader, nir_opt_copy_prop);
++         NIR_PASS(progress, shader, nir_opt_constant_folding);
++         NIR_PASS(progress, shader, nir_opt_dce);
++      } while (progress);
++
++      unsigned stores = 0;
++      nir_foreach_block(block, b.impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            auto *intr = nir_instr_as_intrinsic(instr);
++            nir_src *stored;
++            if (intr->intrinsic == nir_intrinsic_store_deref) {
++               if (nir_intrinsic_get_var(intr, 0)->data.mode != nir_var_shader_out)
++                  continue;
++               stored = &intr->src[1];
++            } else if (intr->intrinsic == nir_intrinsic_store_output) {
++               stored = &intr->src[0];
++            } else {
++               continue;
++            }
++            ++stores;
++            ASSERT_TRUE(nir_src_is_const(*stored));
++            const nir_const_value *values = nir_src_as_const_value(*stored);
++            for (unsigned c = 0; c < 4; ++c) {
++               result[c] = dst_desc->channel[c].size ?
++                  attachment_store(values[c].u32, dst_desc->channel[c]) : 0;
++            }
++         }
++      }
++      ASSERT_EQ(stores, 1u);
++      (void)src_desc;
++   }
++
++   /* Whether a blit reproduces the transfer for every representable source
++    * value the destination has to saturate.
++    */
++   bool blit_reproduces_transfer(pipe_format src, pipe_format dst)
++   {
++      const struct util_format_description *src_desc = util_format_description(src);
++      const struct util_format_description *dst_desc = util_format_description(dst);
++      const struct util_format_channel_description &src_channel = first_channel(src_desc);
++
++      /* The ends of the source range, plus every destination range boundary
++       * the source can step over.
++       */
++      std::vector<int64_t> values = {channel_min(src_channel), 0,
++                                     channel_max(src_channel)};
++      for (unsigned c = 0; c < 4; ++c) {
++         if (!dst_desc->channel[c].size)
++            continue;
++         for (int64_t past : {channel_max(dst_desc->channel[c]) + 1,
++                              channel_min(dst_desc->channel[c]) - 1}) {
++            if (past >= channel_min(src_channel) &&
++                past <= channel_max(src_channel))
++               values.push_back(past);
++         }
++      }
++
++      for (int64_t value : values) {
++         int64_t stored[4] = {};
++         run(src, dst, value, stored);
++         if (::testing::Test::HasFatalFailure())
++            return false;
++         for (unsigned c = 0; c < 4; ++c) {
++            if (!dst_desc->channel[c].size)
++               continue;
++            if (stored[c] != saturate_to_channel(value, dst_desc->channel[c]))
++               return false;
++         }
++      }
++      return true;
++   }
++};
++
++TEST_F(integer_transfer, blitted_conversions_are_exact)
++{
++   for (const auto &c : saturating) {
++      SCOPED_TRACE(c.transfer);
++      if (util_format_is_pure_integer_conversion(c.src, c.dst))
++         continue;   /* stored without a blit */
++      EXPECT_TRUE(blit_reproduces_transfer(c.src, c.dst))
++         << "a blit is used for a transfer it cannot carry";
++   }
++   for (const auto &c : blittable) {
++      SCOPED_TRACE(c.transfer);
++      ASSERT_FALSE(util_format_is_pure_integer_conversion(c.src, c.dst));
++      EXPECT_TRUE(blit_reproduces_transfer(c.src, c.dst));
++   }
++}
++
++TEST_F(integer_transfer, saturating_conversions_are_reported)
++{
++   for (const auto &c : saturating) {
++      SCOPED_TRACE(c.transfer);
++      EXPECT_TRUE(util_format_is_pure_integer_conversion(c.src, c.dst));
++      /* The report is worth making: the blit really does lose these. */
++      EXPECT_FALSE(blit_reproduces_transfer(c.src, c.dst));
++   }
++}
++
++TEST_F(integer_transfer, matching_and_non_integer_transfers_are_unchanged)
++{
++   for (const auto &c : blittable) {
++      SCOPED_TRACE(c.transfer);
++      EXPECT_FALSE(util_format_is_pure_integer_conversion(c.src, c.dst));
++   }
++   for (const auto &c : unchanged) {
++      SCOPED_TRACE(c.transfer);
++      EXPECT_FALSE(util_format_is_pure_integer_conversion(c.src, c.dst));
++   }
++}
++
++}  // namespace
+diff --git a/src/mesa/state_tracker/st_cb_readpixels.c b/src/mesa/state_tracker/st_cb_readpixels.c
+index bf6b0623b13ae9eaddde79165f9d4b20814cdd6b..4b63ccc665f3b1d98d299a8373420998e24e00c6 100644
+--- a/src/mesa/state_tracker/st_cb_readpixels.c
++++ b/src/mesa/state_tracker/st_cb_readpixels.c
+@@ -68,31 +68,6 @@
+  */
+ #define ALWAYS_READPIXELS_CACHE false
+ 
+-static bool
+-needs_integer_signed_unsigned_conversion(const struct gl_context *ctx,
+-                                         GLenum format, GLenum type)
+-{
+-   struct gl_renderbuffer *rb =
+-      _mesa_get_read_renderbuffer_for_format(ctx, format);
+-
+-   assert(rb);
+-
+-   GLenum srcType = _mesa_get_format_datatype(rb->Format);
+-
+-    if ((srcType == GL_INT &&
+-        (type == GL_UNSIGNED_INT ||
+-         type == GL_UNSIGNED_SHORT ||
+-         type == GL_UNSIGNED_BYTE)) ||
+-       (srcType == GL_UNSIGNED_INT &&
+-        (type == GL_INT ||
+-         type == GL_SHORT ||
+-         type == GL_BYTE))) {
+-      return true;
+-   }
+-
+-   return false;
+-}
+-
+ static bool
+ try_pbo_readpixels(struct st_context *st, struct gl_renderbuffer *rb,
+                    bool invert_y,
+@@ -497,6 +472,16 @@ st_ReadPixels(struct gl_context *ctx, GLint x, GLint y,
+       goto fallback;
+    }
+ 
++   /* Both the PBO readback and the blit below move the pixels through a shader
++    * that writes the destination format. That reinterprets an out-of-range
++    * integer instead of saturating it into the destination range, so a
++    * conversion between two different pure-integer formats has to be read back
++    * without them.
++    */
++   if (util_format_is_pure_integer_conversion(src_format, dst_format)) {
++      goto fallback;
++   }
++
+    if (st->pbo.download_enabled && pack->BufferObj) {
+       if (try_pbo_readpixels(st, rb,
+                              _mesa_fb_orientation(ctx->ReadBuffer) == Y_0_TOP,
+@@ -506,10 +491,6 @@ st_ReadPixels(struct gl_context *ctx, GLint x, GLint y,
+          return;
+    }
+ 
+-   if (needs_integer_signed_unsigned_conversion(ctx, format, type)) {
+-      goto fallback;
+-   }
+-
+    /* Cache a staging texture for back-to-back ReadPixels, to avoid CPU-GPU
+     * synchronization overhead.
+     */
+@@ -578,7 +559,13 @@ st_ReadPixels(struct gl_context *ctx, GLint x, GLint y,
+ 
+ fallback:
+    if (rb->TexImage && (st->allow_compute_based_texture_transfer || st->force_compute_based_texture_transfer)) {
+-      if (st_GetTexSubImage_shader(ctx, x, y, 0, width, height, 1, format, type, pixels, rb->TexImage))
++      /* The shader download samples rb->TexImage from its own base layer and
++       * adds the offset it is given, exactly as it does for GetTexSubImage,
++       * so an attachment bound to one slice of an array or 3D texture has to
++       * pass that slice. A cube face is already the image's base layer, which
++       * leaves rtt_slice holding what glFramebufferTextureLayer selected.
++       */
++      if (st_GetTexSubImage_shader(ctx, x, y, rb->rtt_slice, width, height, 1, format, type, pixels, rb->TexImage))
+          return;
+    }
+    _mesa_readpixels(ctx, x, y, width, height, format, type, pack, pixels);
+diff --git a/src/mesa/state_tracker/st_cb_texture.c b/src/mesa/state_tracker/st_cb_texture.c
+index 99249aa91ab6b2ecbe0c0a9a90ac0c059b7b3243..75ba80e31497368929fc5a1f71a26ad7e31cd5b9 100644
+--- a/src/mesa/state_tracker/st_cb_texture.c
++++ b/src/mesa/state_tracker/st_cb_texture.c
+@@ -2253,6 +2253,18 @@ st_TexSubImage(struct gl_context *ctx, GLuint dims,
+       goto fallback;
+    }
+ 
++   /* Both the PBO upload and the blit below move the texels through a shader
++    * that writes a colour attachment, which keeps only the destination's low
++    * bits instead of saturating an out-of-range integer into its range. Store
++    * a conversion between two different pure-integer formats on the CPU. The
++    * PBO upload picks its source format without a bind, so ask the same way.
++    */
++   if (util_format_is_pure_integer_conversion(
++          st_choose_matching_format(st, 0, format, type, unpack->SwapBytes),
++          dst_format)) {
++      goto fallback;
++   }
++
+    if (unpack->BufferObj) {
+       if (try_pbo_upload(ctx, dims, texImage, format, type, dst_format,
+                          xoffset, yoffset, zoffset,
+@@ -2735,6 +2747,15 @@ st_GetTexSubImage(struct gl_context * ctx,
+    if (dst_format == PIPE_FORMAT_NONE)
+       goto non_blit_transfer;
+ 
++   /* Both the PBO download and the blit below move the texels through a shader
++    * that writes the destination format. That reinterprets an out-of-range
++    * integer instead of saturating it into the destination range, so a
++    * conversion between two different pure-integer formats has to be read back
++    * without them.
++    */
++   if (util_format_is_pure_integer_conversion(src_format, dst_format))
++      goto non_blit_transfer;
++
+    if (st->pbo.download_enabled && ctx->Pack.BufferObj) {
+       if (try_pbo_download(st, texImage,
+                            src_format, dst_format,
+diff --git a/src/mesa/state_tracker/st_pbo_compute.c b/src/mesa/state_tracker/st_pbo_compute.c
+index 7409515ff1dc699e0757bfb4e9f3d1a425ba506e..cfd14f0c010eae4977c1153097d4c7b0f4bcdb0f 100644
+--- a/src/mesa/state_tracker/st_pbo_compute.c
++++ b/src/mesa/state_tracker/st_pbo_compute.c
+@@ -1315,6 +1315,13 @@ st_GetTexSubImage_shader(struct gl_context * ctx,
+ 
+    view_target = get_target_from_texture(src);
+ 
++   /* An array slice is selected through the sampler view, but the conversion
++    * shader samples a 3D texture at the invocation's own z, so it cannot start
++    * from a depth offset.
++    */
++   if (view_target == PIPE_TEXTURE_3D && (zoffset || layer))
++      return false;
++
+    /* 64K x 64K aren't supported by the shader (pbo_data::width/height have 16 bits) */
+    if (width >= UINT16_MAX || height >= UINT16_MAX ||
+        /* I don't know why this works only for the texture rects
+diff --git a/src/util/format/u_format.c b/src/util/format/u_format.c
+index 8f6defb3291e6f8b39f759ee4b43f027ec563b50..82538633c071d787920a4d4f30edc1f37bed4872 100644
+--- a/src/util/format/u_format.c
++++ b/src/util/format/u_format.c
+@@ -221,6 +221,15 @@ util_format_is_pure_uint(enum pipe_format format)
+    return (desc->channel[i].type == UTIL_FORMAT_TYPE_UNSIGNED && desc->channel[i].pure_integer) ? true : false;
+ }
+ 
++bool
++util_format_is_pure_integer_conversion(enum pipe_format src,
++                                       enum pipe_format dst)
++{
++   return src != dst &&
++          util_format_is_pure_integer(src) &&
++          util_format_is_pure_integer(dst);
++}
++
+ /**
+  * Returns true if the format contains normalized signed channels.
+  */
+diff --git a/src/util/format/u_format.h b/src/util/format/u_format.h
+index 2614a16150db17178b1cd68effd510029abfd5c6..7251d271c551a0482891c239a01671626a3abc95 100644
+--- a/src/util/format/u_format.h
++++ b/src/util/format/u_format.h
+@@ -826,6 +826,19 @@ util_format_is_pure_sint(enum pipe_format format) ATTRIBUTE_CONST;
+ bool
+ util_format_is_pure_uint(enum pipe_format format) ATTRIBUTE_CONST;
+ 
++/**
++ * Whether moving pixels from src to dst converts between two different
++ * pure-integer formats.
++ *
++ * A pixel transfer has to saturate such a conversion into the destination
++ * range. A rendering blit reinterprets the value instead, so it cannot carry
++ * one. Conversions that involve a floating-point or normalized format keep
++ * their defined blit behaviour and are not reported here.
++ */
++bool
++util_format_is_pure_integer_conversion(enum pipe_format src,
++                                       enum pipe_format dst) ATTRIBUTE_CONST;
++
+ bool
+ util_format_is_snorm(enum pipe_format format) ATTRIBUTE_CONST;
+ 

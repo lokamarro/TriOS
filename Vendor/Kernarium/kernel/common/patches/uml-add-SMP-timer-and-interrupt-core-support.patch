@@ -1,0 +1,757 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 17:24:05 +0900
+Subject: [PATCH] uml: add SMP timer and interrupt core support
+
+Keep CPU bring-up, per-CPU timing, interrupt dispatch, and the normal-mode
+nanosecond scheduler clock together as one reviewable final-state topic.
+---
+ arch/um/kernel/irq.c  |  52 +++++-
+ arch/um/kernel/smp.c  | 371 ++++++++++++++++++++++++++++++++++++++++++
+ arch/um/kernel/time.c | 109 ++++++++++---
+ 3 files changed, 505 insertions(+), 27 deletions(-)
+ create mode 100644 arch/um/kernel/smp.c
+
+diff --git a/arch/um/kernel/irq.c b/arch/um/kernel/irq.c
+index d69d137a0334aca25762ecb5219cf87f5e525db4..5f0f5df8be3588413636b27a81c957f55d2c18b2 100644
+--- a/arch/um/kernel/irq.c
++++ b/arch/um/kernel/irq.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/cpumask.h>
++#include <linux/context_tracking_irq.h>
+ #include <linux/hardirq.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+@@ -22,6 +23,9 @@
+ #include <irq_kern.h>
+ #include <linux/time-internal.h>
+ 
++DEFINE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
++
++#define irq_stats(x)		(&per_cpu(irq_stat, x))
+ 
+ /* When epoll triggers we do not know why it did so
+  * we can also have different IRQs for read and write.
+@@ -239,9 +243,33 @@ static void _sigio_handler(struct uml_pt_regs *regs,
+ void sigio_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs,
+ 		   void *mc)
+ {
++	bool rcu_watching = rcu_is_watching();
++
++	/*
++	 * A host signal normally interrupts an RCU-watched UML context.  Darwin
++	 * also calls this handler cooperatively from the idle loop, where RCU has
++	 * entered an extended quiescent state.  Temporarily make RCU watch that
++	 * work so lockdep and deferred process-context IRQ cleanup can safely use
++	 * kernel locks.  Individual device interrupts still establish their own
++	 * hard-IRQ context in do_IRQ().
++	 */
++	if (!rcu_watching)
++		ct_irq_enter();
+ 	preempt_disable();
+ 	_sigio_handler(regs, irqs_suspended);
++	/*
++	 * Darwin invokes this path inside a cooperative host boundary which still
++	 * has to restore per-CPU interrupt and timer state.  Do not let the final
++	 * preempt-count decrement migrate the carrier before that outer exit is
++	 * complete; userspace() calls interrupt_end() immediately afterwards.
++	 */
++#ifdef UML_HOST_DARWIN
++	preempt_enable_no_resched();
++#else
+ 	preempt_enable();
++#endif
++	if (!rcu_watching)
++		ct_irq_exit();
+ }
+ 
+ static struct irq_entry *get_irq_entry_by_fd(int fd)
+@@ -683,7 +711,7 @@ void __init init_IRQ(void)
+ {
+ 	int i;
+ 
+-	irq_set_chip_and_handler(TIMER_IRQ, &alarm_irq_type, handle_edge_irq);
++	irq_set_chip_and_handler(TIMER_IRQ, &alarm_irq_type, handle_percpu_irq);
+ 
+ 	for (i = 1; i < UM_LAST_SIGNAL_IRQ; i++)
+ 		irq_set_chip_and_handler(i, &normal_irq_type, handle_edge_irq);
+@@ -701,3 +729,25 @@ void sigchld_handler(int sig, struct siginfo *unused_si,
+ {
+ 	do_IRQ(SIGCHLD_IRQ, regs);
+ }
++
++/*
++ * /proc/interrupts printing for arch specific interrupts
++ */
++int arch_show_interrupts(struct seq_file *p, int prec)
++{
++#if IS_ENABLED(CONFIG_SMP)
++	int cpu;
++
++	seq_printf(p, "%*s: ", prec, "RES");
++	for_each_online_cpu(cpu)
++		seq_printf(p, "%10u ", irq_stats(cpu)->irq_resched_count);
++	seq_puts(p, "  Rescheduling interrupts\n");
++
++	seq_printf(p, "%*s: ", prec, "CAL");
++	for_each_online_cpu(cpu)
++		seq_printf(p, "%10u ", irq_stats(cpu)->irq_call_count);
++	seq_puts(p, "  Function call interrupts\n");
++#endif
++
++	return 0;
++}
+diff --git a/arch/um/kernel/smp.c b/arch/um/kernel/smp.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc0c6c58a384ebdf37713d4fa7e09deef3b505a5
+--- /dev/null
++++ b/arch/um/kernel/smp.c
+@@ -0,0 +1,371 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2025 Ant Group
++ * Author: Tiwei Bie <tiwei.btw@antgroup.com>
++ *
++ * Based on the previous implementation in TT mode
++ * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
++ */
++
++#include <linux/sched.h>
++#include <linux/sched/hotplug.h>
++#include <linux/sched/task.h>
++#include <linux/sched/task_stack.h>
++#include <linux/module.h>
++#include <linux/processor.h>
++#include <linux/threads.h>
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/context_tracking_irq.h>
++#include <linux/hardirq.h>
++#include <linux/smp.h>
++#include <linux/smp-internal.h>
++#include <init.h>
++#include <kern.h>
++#include <os.h>
++#include <skas.h>
++#include <smp.h>
++
++enum {
++	UML_IPI_RES = 0,
++	UML_IPI_CALL_SINGLE,
++	UML_IPI_CALL,
++	UML_IPI_STOP,
++};
++
++void arch_smp_send_reschedule(int cpu)
++{
++	os_send_ipi(cpu, UML_IPI_RES);
++}
++
++void arch_send_call_function_single_ipi(int cpu)
++{
++	os_send_ipi(cpu, UML_IPI_CALL_SINGLE);
++}
++
++void arch_send_call_function_ipi_mask(const struct cpumask *mask)
++{
++	int cpu;
++
++	for_each_cpu(cpu, mask)
++		os_send_ipi(cpu, UML_IPI_CALL);
++}
++
++void smp_send_stop(void)
++{
++	int cpu, me = smp_processor_id();
++
++	for_each_online_cpu(cpu) {
++		if (cpu == me)
++			continue;
++		os_send_ipi(cpu, UML_IPI_STOP);
++	}
++}
++
++static void ipi_handler(int vector, struct uml_pt_regs *regs)
++{
++	struct pt_regs *old_regs = set_irq_regs((struct pt_regs *)regs);
++	int cpu = raw_smp_processor_id();
++
++	irq_enter();
++
++	if (current->mm)
++		os_alarm_process(current->mm->context.id.pid);
++
++	switch (vector) {
++	case UML_IPI_RES:
++		inc_irq_stat(irq_resched_count);
++		scheduler_ipi();
++		break;
++
++	case UML_IPI_CALL_SINGLE:
++		inc_irq_stat(irq_call_count);
++		generic_smp_call_function_single_interrupt();
++		break;
++
++	case UML_IPI_CALL:
++		inc_irq_stat(irq_call_count);
++		generic_smp_call_function_interrupt();
++		break;
++
++	case UML_IPI_STOP:
++		set_cpu_online(cpu, false);
++		while (1)
++			pause();
++		break;
++
++	default:
++		pr_err("CPU#%d received unknown IPI (vector=%d)!\n", cpu, vector);
++		break;
++	}
++
++	irq_exit();
++	set_irq_regs(old_regs);
++}
++
++void uml_ipi_handler(int vector)
++{
++	uml_ipi_handler_mask(1U << vector);
++}
++
++void uml_ipi_handler_mask(unsigned int pending)
++{
++	struct uml_pt_regs r = { .is_user = 0 };
++	bool rcu_watching = rcu_is_watching();
++	int vector;
++
++	/*
++	 * A Darwin wake edge can coalesce several vectors.  Keep the captured
++	 * batch on its original virtual CPU: handling the reschedule vector may
++	 * otherwise switch this task to another CPU before a following call
++	 * function vector is dispatched, consuming the original CPU's pending
++	 * bit while flushing the new CPU's callback queue.
++	 */
++	/*
++	 * The cooperative Darwin idle path drains IPIs before returning from
++	 * arch_cpu_idle(), while context tracking still considers the CPU to be
++	 * in an extended quiescent state.  Make that interrupt work visible to
++	 * RCU.  Otherwise a callback can observe a grace period while an idle
++	 * carrier is actively executing its callback queue.
++	 */
++	if (!rcu_watching)
++		ct_irq_enter();
++	preempt_disable();
++	for (vector = 0; pending != 0; vector++, pending >>= 1)
++		if (pending & 1U)
++			ipi_handler(vector, &r);
++	/*
++	 * The host carrier is still inside the architecture's interrupt-exit
++	 * wrapper here.  A plain preempt_enable() may schedule immediately and
++	 * resume this task on another virtual CPU before drain_ipis() restores
++	 * the originating CPU's logical interrupt state.  It would also pair an
++	 * extended-quiescent-state exit with the wrong CPU.  Leave rescheduling to
++	 * interrupt_end() (or the generic idle loop) after all per-CPU exit state
++	 * has been restored.
++	 */
++#ifdef UML_HOST_DARWIN
++	preempt_enable_no_resched();
++#else
++	preempt_enable();
++#endif
++	if (!rcu_watching)
++		ct_irq_exit();
++}
++
++/* AP states used only during CPU startup */
++enum {
++	UML_CPU_PAUSED = 0,
++	UML_CPU_RUNNING,
++};
++
++static int cpu_states[NR_CPUS];
++
++static void __noreturn secondary_startup(void)
++{
++	int err, cpu = raw_smp_processor_id();
++
++	notify_cpu_starting(cpu);
++	err = um_setup_timer();
++	if (err)
++		panic("CPU#%d failed to setup timer, err = %d", cpu, err);
++	set_cpu_online(cpu, true);
++
++	local_irq_enable();
++	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
++	BUG();
++}
++
++static int start_secondary(void *unused)
++{
++	secondary_startup();
++}
++
++#ifdef CONFIG_HOTPLUG_CPU
++static int restart_secondary(void *unused)
++{
++	/* tick_offline_cpu() unregisters the per-CPU clockevent device.  Recreate
++	 * and register it before the normal STARTING callbacks run, just as on the
++	 * CPU's first boot.  Without a local tick, the next teardown can deadlock
++	 * in sched_cpu_deactivate() waiting for an RCU callback queued on this CPU.
++	 */
++	secondary_startup();
++}
++
++bool arch_cpu_is_hotpluggable(int cpu)
++{
++	/* Keep the boot CPU online so the process always has one scheduler and
++	 * serial-console owner.  Every secondary CPU is a parkable UML thread.
++	 */
++	return cpu != 0;
++}
++
++/* Runs on the virtual CPU after the generic hotplug callbacks have drained
++ * runnable work and moved timers away.  UML has no local interrupt controller
++ * to tear down, so changing the online mask is the architecture boundary.
++ */
++int __cpu_disable(void)
++{
++	set_cpu_online(smp_processor_id(), false);
++	return 0;
++}
++
++/* The host idle-task thread remains parked until a later __cpu_up().  By the
++ * time the boot CPU reaches this hook the target has already reported the
++ * standard CPUHP_AP_IDLE_DEAD state, so there is no physical shutdown to poll.
++ */
++void __cpu_die(unsigned int cpu)
++{
++}
++
++void __noreturn arch_cpu_idle_dead(void)
++{
++	struct mm_struct *mm = &init_mm;
++	int cpu = raw_smp_processor_id();
++
++	idle_task_exit();
++	WRITE_ONCE(cpu_states[cpu], UML_CPU_PAUSED);
++	smp_wmb();
++	cpuhp_ap_report_dead();
++	os_futex_wait(&cpu_states[cpu], UML_CPU_PAUSED);
++	smp_rmb();
++
++	/* finish_cpu() drops this reference after every successful offline. */
++	mmgrab(mm);
++	current->active_mm = mm;
++#ifdef UML_HOST_DARWIN
++	current->thread.prev_sched = NULL;
++	current->thread.request.thread.proc = restart_secondary;
++	current->thread.request.thread.arg = NULL;
++	os_restart_secondary(task_stack_page(current),
++			     &current->thread.switch_buf);
++#else
++	secondary_startup();
++#endif
++}
++#endif
++
++void uml_start_secondary(void *opaque)
++{
++	int cpu = raw_smp_processor_id();
++	struct mm_struct *mm = &init_mm;
++	struct task_struct *idle;
++
++	stack_protections((unsigned long) &cpu_irqstacks[cpu]);
++	set_sigstack(&cpu_irqstacks[cpu], THREAD_SIZE);
++
++	set_cpu_present(cpu, true);
++	os_futex_wait(&cpu_states[cpu], UML_CPU_PAUSED);
++
++	smp_rmb(); /* paired with smp_wmb() in __cpu_up() */
++
++	idle = cpu_tasks[cpu];
++	idle->thread_info.cpu = cpu;
++
++	mmgrab(mm);
++	idle->active_mm = mm;
++
++	idle->thread.request.thread.proc = start_secondary;
++	idle->thread.request.thread.arg = NULL;
++
++	new_thread(task_stack_page(idle), &idle->thread.switch_buf,
++		   new_thread_handler);
++	os_start_secondary(opaque, &idle->thread.switch_buf);
++}
++
++void __init smp_prepare_cpus(unsigned int max_cpus)
++{
++	int err, cpu, me = smp_processor_id();
++	unsigned long deadline;
++
++	os_init_smp();
++#ifdef UML_HOST_DARWIN
++	/*
++	 * ITIMER_REAL is process-wide on Darwin.  Stop using it before the first
++	 * secondary CPU can run: an asynchronous CPU0 tick may schedule the
++	 * interrupted task, whose host signal frame could then resume after Linux
++	 * migrates that task to another CPU.  Per-CPU deadline polling is already
++	 * ready for CPU0, and each secondary installs its deadline as it starts.
++	 */
++	darwin_enable_cooperative_timers();
++#endif
++
++	for_each_possible_cpu(cpu) {
++		if (cpu == me)
++			continue;
++
++		pr_debug("Booting processor %d...\n", cpu);
++		err = os_start_cpu_thread(cpu);
++		if (err) {
++			pr_crit("CPU#%d failed to start cpu thread, err = %d",
++				cpu, err);
++			continue;
++		}
++
++		deadline = jiffies + msecs_to_jiffies(1000);
++		spin_until_cond(cpu_present(cpu) ||
++				time_is_before_jiffies(deadline));
++
++		if (!cpu_present(cpu))
++			pr_crit("CPU#%d failed to boot\n", cpu);
++	}
++}
++
++int __cpu_up(unsigned int cpu, struct task_struct *tidle)
++{
++	cpu_tasks[cpu] = tidle;
++	smp_wmb(); /* paired with smp_rmb() in uml_start_secondary() */
++	cpu_states[cpu] = UML_CPU_RUNNING;
++	os_futex_wake(&cpu_states[cpu]);
++	spin_until_cond(cpu_online(cpu));
++
++	return 0;
++}
++
++void __init smp_cpus_done(unsigned int max_cpus)
++{
++}
++
++/* Set in uml_ncpus_setup */
++#ifdef UML_HOST_DARWIN
++/* Zero selects every online host CPU, capped by CONFIG_NR_CPUS. */
++int uml_ncpus;
++#else
++int uml_ncpus = 1;
++#endif
++
++void __init prefill_possible_map(void)
++{
++	int cpu;
++
++	if (uml_ncpus == 0)
++		uml_ncpus = clamp(os_num_processors(), 1, NR_CPUS);
++	os_info("UML: enabling %d virtual CPUs\n", uml_ncpus);
++
++	for (cpu = 0; cpu < uml_ncpus; cpu++)
++		set_cpu_possible(cpu, true);
++	for (; cpu < NR_CPUS; cpu++)
++		set_cpu_possible(cpu, false);
++}
++
++static int __init uml_ncpus_setup(char *line, int *add)
++{
++	*add = 0;
++
++	if (kstrtoint(line, 10, &uml_ncpus)) {
++		os_warn("%s: Couldn't parse '%s'\n", __func__, line);
++		return -1;
++	}
++
++	uml_ncpus = clamp(uml_ncpus, 1, NR_CPUS);
++
++	return 0;
++}
++
++__uml_setup("ncpus=", uml_ncpus_setup,
++"ncpus=<# of desired CPUs>\n"
++"    This tells UML how many virtual processors to start. The maximum\n"
++"    number of supported virtual processors can be obtained by querying\n"
++"    the CONFIG_NR_CPUS option using --showconfig.\n\n"
++);
++
++EXPORT_SYMBOL(uml_curr_cpu);
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 17da0a870650ae6dc48b5d6ca71ffd4820000fc9..b46649f2ea64a6d4b289cb0d9ab8c164da804ba1 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -8,11 +8,13 @@
+  */
+ 
+ #include <linux/clockchips.h>
++#include <linux/context_tracking_irq.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/jiffies.h>
+ #include <linux/mm.h>
+ #include <linux/sched.h>
++#include <linux/sched/clock.h>
+ #include <linux/spinlock.h>
+ #include <linux/threads.h>
+ #include <asm/irq.h>
+@@ -25,8 +27,6 @@
+ #include <shared/init.h>
+ 
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+-#include <linux/sched/clock.h>
+-
+ enum time_travel_mode time_travel_mode;
+ EXPORT_SYMBOL_GPL(time_travel_mode);
+ 
+@@ -51,13 +51,6 @@ static union um_timetravel_schedshm_client *time_travel_shm_client;
+ 
+ unsigned long tt_extra_sched_jiffies;
+ 
+-notrace unsigned long long sched_clock(void)
+-{
+-	return (unsigned long long)(jiffies - INITIAL_JIFFIES +
+-				    tt_extra_sched_jiffies)
+-					* (NSEC_PER_SEC / HZ);
+-}
+-
+ static void time_travel_set_time(unsigned long long ns)
+ {
+ 	if (unlikely(ns < time_travel_time))
+@@ -625,9 +618,10 @@ void time_travel_sleep(void)
+ 	 * controller application.
+ 	 */
+ 	unsigned long long next = S64_MAX;
++	int cpu = raw_smp_processor_id();
+ 
+ 	if (time_travel_mode == TT_MODE_BASIC)
+-		os_timer_disable();
++		os_timer_disable(cpu);
+ 
+ 	time_travel_update_time(next, true);
+ 
+@@ -638,9 +632,9 @@ void time_travel_sleep(void)
+ 			 * This is somewhat wrong - we should get the first
+ 			 * one sooner like the os_timer_one_shot() below...
+ 			 */
+-			os_timer_set_interval(time_travel_timer_interval);
++			os_timer_set_interval(cpu, time_travel_timer_interval);
+ 		} else {
+-			os_timer_one_shot(time_travel_timer_event.time - next);
++			os_timer_one_shot(cpu, time_travel_timer_event.time - next);
+ 		}
+ 	}
+ }
+@@ -758,8 +752,40 @@ extern u64 time_travel_ext_req(u32 op, u64 time);
+ #define time_travel_del_event(e) do { } while (0)
+ #endif
+ 
++static unsigned long long sched_clock_start;
++
++notrace unsigned long long sched_clock(void)
++{
++	unsigned long long start;
++	unsigned long long now;
++
++#ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
++	if (time_travel_mode != TT_MODE_OFF)
++		return (unsigned long long)(jiffies - INITIAL_JIFFIES +
++					    tt_extra_sched_jiffies)
++						* (NSEC_PER_SEC / HZ);
++#endif
++
++	now = os_nsecs();
++	start = READ_ONCE(sched_clock_start);
++	if (unlikely(!start)) {
++		unsigned long long previous;
++
++		previous = cmpxchg(&sched_clock_start, 0ULL, now);
++		start = previous ? previous : now;
++	}
++
++	if (unlikely(now < start))
++		return 0;
++
++	return now - start;
++}
++
++static struct clock_event_device timer_clockevent[NR_CPUS];
++
+ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ {
++	bool rcu_watching = rcu_is_watching();
+ 	unsigned long flags;
+ 
+ 	/*
+@@ -773,19 +799,31 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ 	if (time_travel_mode == TT_MODE_BASIC)
+ 		time_travel_handle_real_alarm();
+ 
++	/*
++	 * Darwin may deliver a cooperative deadline directly from
++	 * arch_cpu_idle(), before the generic idle loop leaves its extended
++	 * quiescent state.  Account the timer as interrupt work so callbacks and
++	 * softirqs cannot run while RCU still treats this CPU as inactive.
++	 */
++	if (!rcu_watching)
++		ct_irq_enter();
+ 	local_irq_save(flags);
+ 	do_IRQ(TIMER_IRQ, regs);
+ 	local_irq_restore(flags);
++	if (!rcu_watching)
++		ct_irq_exit();
+ }
+ 
+ static int itimer_shutdown(struct clock_event_device *evt)
+ {
++	int cpu = evt - &timer_clockevent[0];
++
+ 	if (time_travel_mode != TT_MODE_OFF)
+ 		time_travel_del_event(&time_travel_timer_event);
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU &&
+ 	    time_travel_mode != TT_MODE_EXTERNAL)
+-		os_timer_disable();
++		os_timer_disable(cpu);
+ 
+ 	return 0;
+ }
+@@ -793,6 +831,7 @@ static int itimer_shutdown(struct clock_event_device *evt)
+ static int itimer_set_periodic(struct clock_event_device *evt)
+ {
+ 	unsigned long long interval = NSEC_PER_SEC / HZ;
++	int cpu = evt - &timer_clockevent[0];
+ 
+ 	if (time_travel_mode != TT_MODE_OFF) {
+ 		time_travel_del_event(&time_travel_timer_event);
+@@ -805,7 +844,7 @@ static int itimer_set_periodic(struct clock_event_device *evt)
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU &&
+ 	    time_travel_mode != TT_MODE_EXTERNAL)
+-		os_timer_set_interval(interval);
++		os_timer_set_interval(cpu, interval);
+ 
+ 	return 0;
+ }
+@@ -825,7 +864,7 @@ static int itimer_next_event(unsigned long delta,
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU &&
+ 	    time_travel_mode != TT_MODE_EXTERNAL)
+-		return os_timer_one_shot(delta);
++		return os_timer_one_shot(raw_smp_processor_id(), delta);
+ 
+ 	return 0;
+ }
+@@ -835,10 +874,9 @@ static int itimer_one_shot(struct clock_event_device *evt)
+ 	return itimer_next_event(0, evt);
+ }
+ 
+-static struct clock_event_device timer_clockevent = {
++static struct clock_event_device _timer_clockevent = {
+ 	.name			= "posix-timer",
+ 	.rating			= 250,
+-	.cpumask		= cpu_possible_mask,
+ 	.features		= CLOCK_EVT_FEAT_PERIODIC |
+ 				  CLOCK_EVT_FEAT_ONESHOT,
+ 	.set_state_shutdown	= itimer_shutdown,
+@@ -856,6 +894,9 @@ static struct clock_event_device timer_clockevent = {
+ 
+ static irqreturn_t um_timer(int irq, void *dev)
+ {
++	int cpu = raw_smp_processor_id();
++	struct clock_event_device *evt = &timer_clockevent[cpu];
++
+ 	/*
+ 	 * Interrupt the (possibly) running userspace process, technically this
+ 	 * should only happen if userspace is currently executing.
+@@ -867,7 +908,7 @@ static irqreturn_t um_timer(int irq, void *dev)
+ 	    get_current()->mm)
+ 		os_alarm_process(get_current()->mm->context.id.pid);
+ 
+-	(*timer_clockevent.event_handler)(&timer_clockevent);
++	evt->event_handler(evt);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -904,7 +945,24 @@ static struct clocksource timer_clocksource = {
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+ 
+-static void __init um_timer_setup(void)
++int um_setup_timer(void)
++{
++	int cpu = raw_smp_processor_id();
++	struct clock_event_device *evt = &timer_clockevent[cpu];
++	int err;
++
++	err = os_timer_create();
++	if (err)
++		return err;
++
++	memcpy(evt, &_timer_clockevent, sizeof(*evt));
++	evt->cpumask = cpumask_of(cpu);
++	clockevents_register_device(evt);
++
++	return 0;
++}
++
++static void __init um_timer_init(void)
+ {
+ 	int err;
+ 
+@@ -913,8 +971,8 @@ static void __init um_timer_setup(void)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+-	err = os_timer_create();
+-	if (err != 0) {
++	err = um_setup_timer();
++	if (err) {
+ 		printk(KERN_ERR "creation of timer failed - errno = %d\n", -err);
+ 		return;
+ 	}
+@@ -924,7 +982,6 @@ static void __init um_timer_setup(void)
+ 		printk(KERN_ERR "clocksource_register_hz returned %d\n", err);
+ 		return;
+ 	}
+-	clockevents_register_device(&timer_clockevent);
+ }
+ 
+ void read_persistent_clock64(struct timespec64 *ts)
+@@ -945,7 +1002,7 @@ void read_persistent_clock64(struct timespec64 *ts)
+ void __init time_init(void)
+ {
+ 	timer_set_signal_handler();
+-	late_time_init = um_timer_setup;
++	late_time_init = um_timer_init;
+ }
+ 
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+@@ -961,21 +1018,21 @@ static int setup_time_travel(char *str)
+ {
+ 	if (strcmp(str, "=inf-cpu") == 0) {
+ 		time_travel_mode = TT_MODE_INFCPU;
+-		timer_clockevent.name = "time-travel-timer-infcpu";
++		_timer_clockevent.name = "time-travel-timer-infcpu";
+ 		timer_clocksource.name = "time-travel-clock";
+ 		return 1;
+ 	}
+ 
+ 	if (strncmp(str, "=ext:", 5) == 0) {
+ 		time_travel_mode = TT_MODE_EXTERNAL;
+-		timer_clockevent.name = "time-travel-timer-external";
++		_timer_clockevent.name = "time-travel-timer-external";
+ 		timer_clocksource.name = "time-travel-clock-external";
+ 		return time_travel_connect_external(str + 5);
+ 	}
+ 
+ 	if (!*str) {
+ 		time_travel_mode = TT_MODE_BASIC;
+-		timer_clockevent.name = "time-travel-timer";
++		_timer_clockevent.name = "time-travel-timer";
+ 		timer_clocksource.name = "time-travel-clock";
+ 		return 1;
+ 	}

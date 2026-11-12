@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 09:54:30 +0900
+Subject: [PATCH] uml: stop a vhost-user device whose backend has gone
+
+vu_interrupt() warns on every result that is not a would-block errno and does
+nothing else with it. When the backend closes its end of a virtqueue call
+socketpair the read returns end of file, so rc is 0, so the WARN fires -- and
+the descriptor stays readable, so the handler is re-entered at once, and again,
+forever. One observed run collected 221534 copies of "read returned 0" and a
+139 MB console before the spurious interrupt detector printed "nobody cared"
+and disabled the irq, 1500 seconds after the transport had died. Nothing told
+the guest the device was gone, so its userspace waited for completions that
+could not arrive.
+
+The driver already knows how to retire a dead backend: full_read() turns a read
+of 0 into -ECONNRESET, vhost_user_check_reset() latches on vu_dev->registered
+and schedules conn_broken_wk, and that work item breaks the virtio device and
+unregisters it. Only the control socket and the backend request stream ever
+reach it. Route the call and kick descriptors there too, and treat any hard
+error on the request stream as a lost backend rather than only -ECONNRESET.
+
+Stopping the interrupt source cannot wait for that work item, because the work
+item cannot be scheduled out of a loop that never yields. os_del_epoll_fd() is
+the one teardown step that is safe from the handler: it allocates nothing,
+takes no sleeping lock, and frees no irq_entry that the interrupt loop is still
+walking, which is exactly why that loop uses it to turn a descriptor off before
+touching its own structures. deactivate_fd() and um_free_irq() both free the
+entry the caller is walking, and um_free_irq() additionally waits on itself in
+__synchronize_irq(); disable_irq_nosync() is atomic but stops neither the other
+queues nor the host poll loop. Freeing the irq and closing the descriptor stay
+in the device teardown, in process context.
+
+A latch per queue and one per device keep this to a single report and let the
+shared irq chain -- one irq number carries a device's request descriptor and
+all of its call descriptors -- return IRQ_HANDLED for a queue that is already
+gone. A would-block still returns early, so a healthy device and a spurious
+wake are unaffected, and a partial notification is still a protocol WARN rather
+than a dead peer.
+
+A kick has a second shape, and it is the only one this port ever uses. In-band
+notifications are in VHOST_USER_SUPPORTED_PROTOCOL_F and every backend offers
+them, so vu_setup_vq() leaves kick_fd at -1 on every queue of every device and
+a kick is a synchronous VHOST_USER_VRING_KICK round trip on the main socket.
+That branch turned any failure of the round trip into a bare false, and
+virtqueue_notify() answers a false notification by latching vq->broken --
+permanently, irreversibly, with no message and no retirement. The guest is left
+holding a device that can never accept another buffer and is never told. Give
+the branch the same treatment as a descriptor: report once, naming the queue
+and the error, stop that queue's call descriptor, and hand the device to the
+connection-broken path.
+
+Stopping the call descriptor is not optional, and the kick-descriptor path was
+wrong about it too. Setting info->backend_gone makes vu_interrupt() return
+without draining info->call_fd, so a completion the backend has already written
+leaves that descriptor readable for ever. The read registration is level
+triggered, so the handler is re-entered from the host poll loop without end and
+the CPU that took the interrupt never leaves it -- measured as a vCPU pinned in
+os_waiting_for_events_epoll() and an RCU stall twenty seconds later, which is
+the very storm the call-descriptor path above exists to prevent. The latch and
+os_del_epoll_fd() must move together, exactly as they do in vu_interrupt().
+
+Reporting cannot cost a healthy guest its device, because that round trip has
+no transient left to lose. The guest endpoint of the main socket is blocking
+and neither the send nor the reply wait carries a deadline; -EINTR is retried
+at every step; full_read() loops over a split header; sock_lock serializes
+concurrent kicks; and backend requests that arrive during the reply wait are
+drained first. A kick is acknowledged only after its queue has run, so a reply
+behind a long submission is waited out rather than failed -- a reply held for
+45 s, four times the host GPU watchdog's own limit, costs 45 s of wall clock
+and nothing else. What is left is a desynchronized control stream, a non-zero
+acknowledgement status, end of file, or a hard errno, and each of those is a
+backend that is gone.
+
+Leaving that branch silent was measured. One run broke a virtio-gpu control
+queue through it and then printed 92335 WARN_ONs from drivers/gpu/drm/virtio
+and 1.02 million console lines without ever stopping, because the framebuffer
+console lives on that same device: each warning damages the framebuffer, whose
+repair submits the two buffers that warn again. The device was never retired
+and the workload never failed, it only stopped making progress.
+
+Note that a broken virtio device is not by itself enough for virtio-gpu, which
+never tests virtqueue_is_broken() and discards the -EIO from virtqueue_add_sgs();
+that is a separate defect in drivers/gpu/drm/virtio.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ arch/um/drivers/virtio_uml.c | 107 ++++++++++++++++++++++++++++++-----
+ 1 file changed, 93 insertions(+), 14 deletions(-)
+
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index a4eb1ce101ab427c58a14bc1568deb1452def089..8facd5d0bf72554b6b73bc76716222f1d338c7de 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -68,6 +68,7 @@ struct virtio_uml_device {
+ 	u8 suspended:1;
+ 	u8 no_vq_suspend:1;
+ 	u8 has_shmem_region:1;
++	u8 req_fd_gone:1;
+ 
+ 	/* Recorded under req_lock, taken and cleared by vu_req_interrupt() */
+ 	bool config_changed_irq;
+@@ -83,6 +84,7 @@ struct virtio_uml_vq_info {
+ 	int kick_fd, call_fd;
+ 	char name[32];
+ 	bool suspended;
++	bool backend_gone;
+ };
+ 
+ #define vu_err(vu_dev, ...)	dev_err(&(vu_dev)->pdev->dev, ##__VA_ARGS__)
+@@ -187,6 +189,31 @@ static void vhost_user_check_reset(struct virtio_uml_device *vu_dev,
+ 	schedule_work(&pdata->conn_broken_wk);
+ }
+ 
++/*
++ * Stop a descriptor whose peer has gone, then break the device.
++ *
++ * Stopping the interrupt source cannot wait for the work item that
++ * vhost_user_check_reset() schedules. The host read registration is level
++ * triggered, so a descriptor at end of file stays readable and its handler is
++ * re-entered until the spurious interrupt detector disables the irq -- and
++ * even then the host poll loop keeps spinning, because nothing has removed
++ * the descriptor from it.
++ *
++ * os_del_epoll_fd() is the one teardown step that is safe from an interrupt
++ * handler. It allocates nothing, takes no sleeping lock, and frees no
++ * irq_entry that the interrupt loop is still walking, which is why the loop
++ * itself uses it to turn a descriptor off before touching its own structures.
++ * Freeing the irq and closing the descriptor need process context and stay in
++ * the device teardown the work item reaches.
++ */
++static void vu_backend_gone(struct virtio_uml_device *vu_dev, int polled_fd)
++{
++	if (polled_fd >= 0)
++		os_del_epoll_fd(polled_fd);
++
++	vhost_user_check_reset(vu_dev, -ECONNRESET);
++}
++
+ #ifdef UML_HOST_DARWIN
+ /*
+  * Wait for the backend to answer on the main socket, serving its requests
+@@ -650,6 +677,13 @@ static irqreturn_t vu_req_interrupt(int irq, void *data)
+ 	unsigned long flags;
+ 	uint64_t vq_map;
+ 
++	/*
++	 * This device's virtqueues share the irq number with the request
++	 * descriptor, so the chain still calls us after it has gone.
++	 */
++	if (unlikely(vu_dev->req_fd_gone))
++		return IRQ_HANDLED;
++
+ #ifdef UML_HOST_DARWIN
+ 	/*
+ 	 * Darwin has no time-travel comm-handler dispatcher.  Its request fd is
+@@ -662,8 +696,12 @@ static irqreturn_t vu_req_interrupt(int irq, void *data)
+ #endif
+ 
+ 	if (vu_dev->recv_rc) {
+-		vhost_user_check_reset(vu_dev, vu_dev->recv_rc);
+-		return ret;
++		vu_dev->req_fd_gone = 1;
++		vu_err(vu_dev,
++		       "backend request descriptor returned %d, the vhost-user backend is gone\n",
++		       vu_dev->recv_rc);
++		vu_backend_gone(vu_dev, vu_dev->req_fd);
++		return IRQ_HANDLED;
+ 	}
+ 	/*
+ 	 * Deliver everything recorded. A request another reader drained leaves
+@@ -1064,6 +1102,7 @@ static int vhost_user_set_vring_enable(struct virtio_uml_device *vu_dev,
+ 
+ static bool vu_notify(struct virtqueue *vq)
+ {
++	struct virtio_uml_device *vu_dev = to_virtio_uml_device(vq->vdev);
+ 	struct virtio_uml_vq_info *info = vq->priv;
+ 	const uint64_t n = 1;
+ 	int rc;
+@@ -1071,38 +1110,78 @@ static bool vu_notify(struct virtqueue *vq)
+ 	if (info->suspended)
+ 		return true;
+ 
++	if (unlikely(info->backend_gone))
++		return false;
++
+ 	time_travel_propagate_time();
+ 
+ 	if (info->kick_fd < 0) {
+-		struct virtio_uml_device *vu_dev;
+-
+-		vu_dev = to_virtio_uml_device(vq->vdev);
+-
+-		return vhost_user_set_vring_state(vu_dev, VHOST_USER_VRING_KICK,
+-						  vq->index, 0) == 0;
++		/*
++		 * An in-band notification is a synchronous round trip on the
++		 * main socket. Its transient failures are already retried or
++		 * waited out inside that round trip, so anything it reports
++		 * here is a genuine transport failure.
++		 */
++		rc = vhost_user_set_vring_state(vu_dev, VHOST_USER_VRING_KICK,
++						vq->index, 0);
++		if (!rc)
++			return true;
++	} else {
++		do {
++			rc = os_write_file(info->kick_fd, &n, sizeof(n));
++		} while (rc == -EINTR);
++		if (rc == sizeof(n))
++			return true;
+ 	}
+ 
+-	do {
+-		rc = os_write_file(info->kick_fd, &n, sizeof(n));
+-	} while (rc == -EINTR);
+-	return !WARN(rc != sizeof(n), "write returned %d\n", rc);
++	info->backend_gone = true;
++	vu_err(vu_dev,
++	       "%s: kick returned %d, the vhost-user backend is gone\n",
++	       info->name, rc);
++	vu_backend_gone(vu_dev, info->call_fd);
++	return false;
+ }
+ 
+ static irqreturn_t vu_interrupt(int irq, void *opaque)
+ {
+ 	struct virtqueue *vq = opaque;
++	struct virtio_uml_device *vu_dev = to_virtio_uml_device(vq->vdev);
+ 	struct virtio_uml_vq_info *info = vq->priv;
+ 	uint64_t n;
+ 	int rc;
+ 	irqreturn_t ret = IRQ_NONE;
+ 
++	/*
++	 * This device's other queues and its request descriptor share the
++	 * irq number, so the chain still calls us after this queue's call
++	 * descriptor has gone.
++	 */
++	if (unlikely(info->backend_gone))
++		return IRQ_HANDLED;
++
+ 	do {
+ 		rc = os_read_file(info->call_fd, &n, sizeof(n));
+ 		if (rc == sizeof(n))
+ 			ret |= vring_interrupt(irq, vq);
+ 	} while (rc == sizeof(n) || rc == -EINTR);
+-	WARN(!os_error_is_would_block(rc), "read returned %d\n", rc);
+-	return ret;
++
++	/* Nothing left to read is the ordinary end of a healthy pass. */
++	if (os_error_is_would_block(rc))
++		return ret;
++
++	if (rc > 0) {
++		/* A partial notification is a protocol error, not a dead peer. */
++		WARN(1, "read returned %d\n", rc);
++		return ret;
++	}
++
++	/* rc == 0 is end of file: the backend closed its end. */
++	info->backend_gone = true;
++	vu_err(vu_dev,
++	       "%s: call descriptor returned %d, the vhost-user backend is gone\n",
++	       info->name, rc);
++	vu_backend_gone(vu_dev, info->call_fd);
++	return IRQ_HANDLED;
+ }
+ 
+ 

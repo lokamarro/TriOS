@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 18:31:18 +0900
+Subject: [PATCH] virtio-gpu: allocate host-visible blobs for in-kernel
+ consumers
+
+A guest driver that fills a buffer its client then renders from cannot use
+guest pages: the renderer imports host memory and has no way to name them, so
+the import is refused at PRIME_FD_TO_HANDLE and the client falls back to a
+copy. The memory has to be a host-visible Virtio-GPU blob, which the host owns
+and any renderer context can attach.
+
+Nothing in the kernel could allocate one. The blob path belonged to a DRM
+client's file descriptor: a context comes from a DRM file, and so does the
+handle the blob is returned as. This adds a small in-kernel interface that
+owns one renderer context for the kernel and hands out mappable blobs from it,
+with mmap and dma-buf export, so another driver's buffer is the same object a
+renderer can import.
+
+The context is created lazily on the first allocation and destroyed with the
+device. The blobs ask for VIRTGPU_BLOB_MEM_HOST3D with blob_id 0 and exactly
+VIRTGPU_BLOB_FLAG_USE_MAPPABLE, which is what makes the renderer serve the
+allocation out of its own shared memory rather than look for a host object,
+and every size is rounded to the aperture's 16 KiB mapping granule so a buffer
+is mappable whatever the guest page size.
+
+The export goes through Virtio-GPU's own exporter rather than the generic DRM
+one: an importer resolves a descriptor back to this object only when the
+descriptor carries Virtio-GPU's dma-buf ops, and only that exporter names the
+blob's shared-memory region to another virtio device.
+
+The allocation sends the commands it queues (the context's creation the first
+time, the blob's creation and its mapping) with virtio_gpu_notify(). A DRM
+client's ioctl notifies after it queues, this caller has no ioctl, and its
+client waits for the host's answer first, so without the call nothing sent the
+queue until some other user of the device did: a stateful decoder's
+VIDIOC_REQBUFS waited 53 to 60 seconds on a guest with nothing else to draw.
+
+Separate from naming a blob's shared-memory region: that describes a blob a
+DRM client already owns, while this one creates them for a driver that has no
+DRM client at all.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/virtio/Makefile            |   1 +
+ drivers/gpu/drm/virtio/virtgpu_drv.h       |   4 +
+ drivers/gpu/drm/virtio/virtgpu_host_blob.c | 238 +++++++++++++++++++++
+ drivers/gpu/drm/virtio/virtgpu_kms.c       |   8 +
+ include/linux/virtio_gpu_host_blob.h       |  81 +++++++
+ 5 files changed, 332 insertions(+)
+ create mode 100644 drivers/gpu/drm/virtio/virtgpu_host_blob.c
+ create mode 100644 include/linux/virtio_gpu_host_blob.h
+
+diff --git a/drivers/gpu/drm/virtio/Makefile b/drivers/gpu/drm/virtio/Makefile
+index d2e1788a82270a9b70cac3a0db0f74864ae5e3c4..437406234ab21926b4099e0b3cedb5738e946548 100644
+--- a/drivers/gpu/drm/virtio/Makefile
++++ b/drivers/gpu/drm/virtio/Makefile
+@@ -4,6 +4,7 @@
+ # Direct Rendering Infrastructure (DRI) in XFree86 4.1.0 and higher.
+ 
+ virtio-gpu-y := virtgpu_drv.o virtgpu_kms.o virtgpu_gem.o virtgpu_vram.o \
++	virtgpu_host_blob.o \
+ 	virtgpu_display.o virtgpu_vq.o \
+ 	virtgpu_fence.o virtgpu_object.o virtgpu_debugfs.o virtgpu_plane.o \
+ 	virtgpu_ioctl.o virtgpu_prime.o virtgpu_trace_points.o virtgpu_submit.o
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 8575c7787fc3695ac4dde86d81bffdd2f3afde18..60efab16c485afaa0f2b6aab2499e318c7f4092a 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -522,6 +522,10 @@ int virtgpu_dma_buf_import_sgt(struct virtio_gpu_mem_entry **ents,
+ /* virtgpu_debugfs.c */
+ void virtio_gpu_debugfs_init(struct drm_minor *minor);
+ 
++/* virtgpu_host_blob.c */
++void virtio_gpu_host_blob_register(struct virtio_gpu_device *vgdev);
++void virtio_gpu_host_blob_unregister(struct virtio_gpu_device *vgdev);
++
+ /* virtgpu_vram.c */
+ bool virtio_gpu_is_vram(struct virtio_gpu_object *bo);
+ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_host_blob.c b/drivers/gpu/drm/virtio/virtgpu_host_blob.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d05897adcb0444cd58813f61654b71ad22f827db
+--- /dev/null
++++ b/drivers/gpu/drm/virtio/virtgpu_host_blob.c
+@@ -0,0 +1,238 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Host-visible blobs for in-kernel consumers.
++ *
++ * The renderer allocates a logically contiguous host shared-memory blob when a
++ * context asks for a mappable blob that names no existing host object. That
++ * allocation needs no rendering object of its own, and any context can attach
++ * the resource afterwards, which is what lets a buffer another driver filled
++ * be rendered from. This file owns one renderer context for the kernel and
++ * hands out such blobs.
++ */
++#include "virtgpu_drv.h"
++
++#include <linux/dma-buf.h>
++#include <linux/err.h>
++#include <linux/mutex.h>
++#include <linux/sizes.h>
++#include <linux/virtio_gpu_host_blob.h>
++
++
++#define VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT	SZ_16K
++
++/*
++ * One device serves the kernel. A second one would need its consumers to say
++ * which renderer their buffer has to be visible to, and nothing asks that.
++ */
++static DEFINE_MUTEX(virtio_gpu_host_blob_lock);
++static struct virtio_gpu_device *virtio_gpu_host_blob_vgdev;
++static u32 virtio_gpu_host_blob_ctx_id;
++
++void virtio_gpu_host_blob_register(struct virtio_gpu_device *vgdev)
++{
++	mutex_lock(&virtio_gpu_host_blob_lock);
++	if (!virtio_gpu_host_blob_vgdev)
++		virtio_gpu_host_blob_vgdev = vgdev;
++	mutex_unlock(&virtio_gpu_host_blob_lock);
++}
++
++void virtio_gpu_host_blob_unregister(struct virtio_gpu_device *vgdev)
++{
++	mutex_lock(&virtio_gpu_host_blob_lock);
++	if (virtio_gpu_host_blob_vgdev == vgdev) {
++		if (virtio_gpu_host_blob_ctx_id) {
++			virtio_gpu_cmd_context_destroy(vgdev,
++						       virtio_gpu_host_blob_ctx_id);
++			virtio_gpu_notify(vgdev);
++			ida_free(&vgdev->ctx_id_ida,
++				 virtio_gpu_host_blob_ctx_id - 1);
++			virtio_gpu_host_blob_ctx_id = 0;
++		}
++		virtio_gpu_host_blob_vgdev = NULL;
++	}
++	mutex_unlock(&virtio_gpu_host_blob_lock);
++}
++
++/* Callers hold virtio_gpu_host_blob_lock. */
++static struct virtio_gpu_device *virtio_gpu_host_blob_device(void)
++{
++	struct virtio_gpu_device *vgdev = virtio_gpu_host_blob_vgdev;
++
++	if (!vgdev || !vgdev->has_virgl_3d || !vgdev->has_resource_blob ||
++	    !vgdev->has_host_visible || !vgdev->has_context_init)
++		return NULL;
++	if (!(vgdev->capset_id_mask & (1ULL << VIRTIO_GPU_CAPSET_VENUS)))
++		return NULL;
++
++	return vgdev;
++}
++
++bool virtio_gpu_host_blob_available(void)
++{
++	bool available;
++
++	mutex_lock(&virtio_gpu_host_blob_lock);
++	available = virtio_gpu_host_blob_device() != NULL;
++	mutex_unlock(&virtio_gpu_host_blob_lock);
++
++	return available;
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_available);
++
++/* Callers hold virtio_gpu_host_blob_lock. */
++static int virtio_gpu_host_blob_context(struct virtio_gpu_device *vgdev,
++					u32 *ctx_id)
++{
++	static const char name[] = "kernel-host-blob";
++	int handle;
++
++	if (virtio_gpu_host_blob_ctx_id) {
++		*ctx_id = virtio_gpu_host_blob_ctx_id;
++		return 0;
++	}
++
++	handle = ida_alloc(&vgdev->ctx_id_ida, GFP_KERNEL);
++	if (handle < 0)
++		return handle;
++
++	virtio_gpu_host_blob_ctx_id = handle + 1;
++	/*
++	 * The renderer decides how to serve a blob from the context's capset,
++	 * and only the Venus one answers a blob that names no host object.
++	 */
++	virtio_gpu_cmd_context_create(vgdev, virtio_gpu_host_blob_ctx_id,
++				      VIRTIO_GPU_CAPSET_VENUS,
++				      sizeof(name) - 1, name);
++	*ctx_id = virtio_gpu_host_blob_ctx_id;
++
++	return 0;
++}
++
++struct virtio_gpu_host_blob *virtio_gpu_host_blob_create(size_t size)
++{
++	struct virtio_gpu_object_params params = { 0 };
++	struct virtio_gpu_device *vgdev;
++	struct virtio_gpu_object *bo;
++	u32 ctx_id;
++	int ret;
++
++	if (!size || size > SIZE_MAX - (VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT - 1))
++		return ERR_PTR(-EINVAL);
++
++	mutex_lock(&virtio_gpu_host_blob_lock);
++	vgdev = virtio_gpu_host_blob_device();
++	if (!vgdev) {
++		mutex_unlock(&virtio_gpu_host_blob_lock);
++		return ERR_PTR(-ENODEV);
++	}
++
++	ret = virtio_gpu_host_blob_context(vgdev, &ctx_id);
++	if (ret) {
++		mutex_unlock(&virtio_gpu_host_blob_lock);
++		return ERR_PTR(ret);
++	}
++
++	params.blob = true;
++	params.blob_mem = VIRTGPU_BLOB_MEM_HOST3D;
++	/*
++	 * Exactly mappable: the renderer serves a blob from its own shared
++	 * memory only when that is all the guest asked of it, and any further
++	 * flag sends the request down the path that needs a host object.
++	 */
++	params.blob_flags = VIRTGPU_BLOB_FLAG_USE_MAPPABLE;
++	params.blob_id = 0;
++	params.ctx_id = ctx_id;
++	params.size = ALIGN(size, VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT);
++
++	ret = virtio_gpu_vram_create(vgdev, &params, &bo);
++	/*
++	 * Queueing a command does not send it: the context, the blob and its
++	 * mapping wait in the control queue until a caller notifies. A DRM
++	 * client's ioctl does, this caller has no ioctl, and the first thing
++	 * its client does is wait for the host's answer, so nothing else would
++	 * send them until some other user of the device happened to.
++	 */
++	virtio_gpu_notify(vgdev);
++	mutex_unlock(&virtio_gpu_host_blob_lock);
++	if (ret)
++		return ERR_PTR(ret);
++
++	bo->host3d_blob = true;
++	bo->blob_mem = params.blob_mem;
++	bo->blob_flags = params.blob_flags;
++
++	return (struct virtio_gpu_host_blob *)bo;
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_create);
++
++void virtio_gpu_host_blob_destroy(struct virtio_gpu_host_blob *blob)
++{
++	struct virtio_gpu_object *bo = (struct virtio_gpu_object *)blob;
++
++	drm_gem_object_put(&bo->base.base);
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_destroy);
++
++int virtio_gpu_host_blob_region(struct virtio_gpu_host_blob *blob,
++				u8 *region_id, u64 *offset, u64 *size)
++{
++	struct virtio_gpu_object *bo = (struct virtio_gpu_object *)blob;
++	struct virtio_gpu_object_vram *vram;
++	struct virtio_gpu_device *vgdev;
++
++	vgdev = bo->base.base.dev->dev_private;
++	vram = to_virtio_gpu_vram(bo);
++
++	wait_event(vgdev->resp_wq, vram->map_state != STATE_INITIALIZING);
++	if (vram->map_state != STATE_OK ||
++	    !drm_mm_node_allocated(&vram->vram_node))
++		return -ENXIO;
++
++	*region_id = VIRTIO_GPU_SHM_ID_HOST_VISIBLE;
++	*offset = vram->vram_node.start - vgdev->host_visible_region.addr;
++	*size = vram->vram_node.size;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_region);
++
++unsigned int virtio_gpu_host_blob_users(struct virtio_gpu_host_blob *blob)
++{
++	struct virtio_gpu_object *bo = (struct virtio_gpu_object *)blob;
++
++	/* Every user mapping holds its own reference through the vm ops. */
++	return kref_read(&bo->base.base.refcount);
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_users);
++
++int virtio_gpu_host_blob_mmap(struct virtio_gpu_host_blob *blob,
++			      struct vm_area_struct *vma)
++{
++	struct virtio_gpu_object *bo = (struct virtio_gpu_object *)blob;
++	struct drm_gem_object *obj = &bo->base.base;
++
++	/*
++	 * The object's own mmap subtracts the fake offset a user mapping
++	 * carries. An in-kernel caller has already chosen the range, so give
++	 * the call the offset it expects to remove.
++	 */
++	vma->vm_pgoff = drm_vma_node_start(&obj->vma_node);
++
++	return obj->funcs->mmap(obj, vma);
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_mmap);
++
++struct dma_buf *virtio_gpu_host_blob_export(struct virtio_gpu_host_blob *blob,
++					    int flags)
++{
++	struct virtio_gpu_object *bo = (struct virtio_gpu_object *)blob;
++
++	/*
++	 * The driver's own exporter, not the generic one: an importer resolves
++	 * a descriptor back to this object only when the descriptor carries
++	 * Virtio-GPU's dma-buf ops, and only that exporter names the blob's
++	 * shared-memory region to another virtio device.
++	 */
++	return virtgpu_gem_prime_export(&bo->base.base, flags);
++}
++EXPORT_SYMBOL_GPL(virtio_gpu_host_blob_export);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_kms.c b/drivers/gpu/drm/virtio/virtgpu_kms.c
+index 4a25347734fda44e776f21e129e2ca264b10845d..34bd7b36a488478f23b596c9526f267d8b2189b2 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c
+@@ -259,6 +259,13 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
+ 		wait_event_timeout(vgdev->resp_wq, !vgdev->display_info_pending,
+ 				   5 * HZ);
+ 	}
++
++	/*
++	 * An in-kernel consumer that has to hand a buffer to the renderer
++	 * allocates it here rather than out of guest pages.
++	 */
++	virtio_gpu_host_blob_register(vgdev);
++
+ 	return 0;
+ 
+ err_scanouts:
+@@ -284,6 +291,7 @@ void virtio_gpu_deinit(struct drm_device *dev)
+ {
+ 	struct virtio_gpu_device *vgdev = dev->dev_private;
+ 
++	virtio_gpu_host_blob_unregister(vgdev);
+ 	flush_work(&vgdev->obj_free_work);
+ 	flush_work(&vgdev->ctrlq.dequeue_work);
+ 	flush_work(&vgdev->cursorq.dequeue_work);
+diff --git a/include/linux/virtio_gpu_host_blob.h b/include/linux/virtio_gpu_host_blob.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..459fa6cabaa94d16af6394260f04fbb2cf51f0ad
+--- /dev/null
++++ b/include/linux/virtio_gpu_host_blob.h
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Host-visible Virtio-GPU blobs for in-kernel consumers.
++ *
++ * A guest driver that has to hand one of its buffers to the host renderer
++ * cannot do it with guest pages: a renderer that imports host memory has no
++ * way to name them. Such a buffer is allocated as a host-visible Virtio-GPU
++ * blob instead. The host owns the memory, the guest reaches it through the
++ * shared-memory aperture, and any renderer context can attach it, so the same
++ * buffer serves both the driver that fills it and the client that renders
++ * from it.
++ *
++ * Every allocation is a multiple of the aperture's mapping granule, which is
++ * the host page size rather than the guest's, so a buffer is mappable in both
++ * guest page profiles.
++ */
++#ifndef _LINUX_VIRTIO_GPU_HOST_BLOB_H
++#define _LINUX_VIRTIO_GPU_HOST_BLOB_H
++
++#include <linux/types.h>
++
++struct dma_buf;
++struct vm_area_struct;
++struct virtio_gpu_host_blob;
++
++#if IS_REACHABLE(CONFIG_DRM_VIRTIO_GPU)
++/* True once a Virtio-GPU device that can allocate host-visible blobs is up. */
++bool virtio_gpu_host_blob_available(void);
++struct virtio_gpu_host_blob *virtio_gpu_host_blob_create(size_t size);
++void virtio_gpu_host_blob_destroy(struct virtio_gpu_host_blob *blob);
++/* Names the blob for another virtio device: its aperture region and offset. */
++int virtio_gpu_host_blob_region(struct virtio_gpu_host_blob *blob,
++				u8 *region_id, u64 *offset, u64 *size);
++/* How many references the blob has, one per live user mapping plus the owner. */
++unsigned int virtio_gpu_host_blob_users(struct virtio_gpu_host_blob *blob);
++int virtio_gpu_host_blob_mmap(struct virtio_gpu_host_blob *blob,
++			      struct vm_area_struct *vma);
++struct dma_buf *virtio_gpu_host_blob_export(struct virtio_gpu_host_blob *blob,
++					    int flags);
++#else
++static inline bool virtio_gpu_host_blob_available(void)
++{
++	return false;
++}
++
++static inline struct virtio_gpu_host_blob *virtio_gpu_host_blob_create(size_t size)
++{
++	return ERR_PTR(-ENODEV);
++}
++
++static inline void virtio_gpu_host_blob_destroy(struct virtio_gpu_host_blob *blob)
++{
++}
++
++static inline int virtio_gpu_host_blob_region(struct virtio_gpu_host_blob *blob,
++					      u8 *region_id, u64 *offset,
++					      u64 *size)
++{
++	return -ENODEV;
++}
++
++static inline unsigned int
++virtio_gpu_host_blob_users(struct virtio_gpu_host_blob *blob)
++{
++	return 0;
++}
++
++static inline int virtio_gpu_host_blob_mmap(struct virtio_gpu_host_blob *blob,
++					    struct vm_area_struct *vma)
++{
++	return -ENODEV;
++}
++
++static inline struct dma_buf *
++virtio_gpu_host_blob_export(struct virtio_gpu_host_blob *blob, int flags)
++{
++	return ERR_PTR(-ENODEV);
++}
++#endif
++
++#endif /* _LINUX_VIRTIO_GPU_HOST_BLOB_H */

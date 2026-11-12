@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 11:54:45 +0900
+Subject: [PATCH] Embedding: run compat32 code
+
+An embedding host runs 32-bit tasks in a context of their own, built
+with Is64BitMode clear, and FEXCore relied on the guest's GDT for both
+the decode mode and segment bases, which it could not read: a block's
+mode came from the CS descriptor through Pointers.SegmentArrays, and a
+segment load read the descriptor table in guest memory.
+
+Embedded, a block decodes in the context's mode, and a load of FS or GS
+takes its base from Embedder.SegmentBases, which the host fills from
+the descriptors its kernel installed: entry n gives the base of
+selector n << 3 | 3, any other selector gives base 0, and no selector
+load faults, matching the host's other engine. ES, CS, SS and DS keep
+base 0. The cached base is stored whole, so a load clears its upper
+half. SYSCALL outside 64-bit mode raises #UD. 0x82, group 1's alias
+outside 64-bit mode, raises #UD in 64-bit mode only, and its ADD, OR,
+AND, SUB and XOR forms, which SecondaryALUOp did not name, run as
+0x80's do.
+---
+ FEXCore/Source/Interface/Core/Frontend.cpp    | 18 ++++++++---
+ .../Interface/Core/OpcodeDispatcher.cpp       | 30 ++++++++++++++++++-
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  1 +
+ .../Core/X86Tables/SecondaryTables.cpp        |  2 +-
+ FEXCore/include/FEXCore/Core/CoreState.h      |  5 ++++
+ 5 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 824ae842de97933dabd03b573f37a2633394af51..fbf5fdd1e6d503d1cd4a740b362cc8d90858e316 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -720,6 +720,10 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+ 
+ #define OPD(group, prefix, Reg) (((group - FEXCore::X86Tables::TYPE_GROUP_1) << 6) | (prefix) << 3 | (Reg))
+     Op = OPD(Info->Type, Info->MoreBytes, ModRM.reg);
++    // 0x82, group 1's alias outside 64-bit mode, is undefined in it.
++    if (CTX->Embedded && BlockInfo.Is64BitMode && Info->Type == FEXCore::X86Tables::TYPE_GROUP_1 && Info->MoreBytes == OpToIndex(0x82)) {
++      return DecodedBlockStatus::INVALID_INST;
++    }
+     return NormalOp(&PrimaryInstGroupOps[Op], Op);
+ #undef OPD
+   } else if (Info->Type >= FEXCore::X86Tables::TYPE_GROUP_6 && Info->Type <= FEXCore::X86Tables::TYPE_GROUP_P) {
+@@ -1777,10 +1781,16 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
+   MaxCondBranchBackwards = ~0ULL;
+   DecodedBuffer = PoolObject.ReownOrClaimBuffer();
+ 
+-  // Decode operating mode from thread's CS segment.
+-  const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
+-  BlockInfo.Is64BitMode = CSSegment->L == 1;
+-  LOGMAN_THROW_A_FMT(BlockInfo.Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
++  if (CTX->Embedded) {
++    // An embedding host runs each context in one operating mode, which a far
++    // transfer, IRET or segment load of CS does not change: CS is only data.
++    BlockInfo.Is64BitMode = CTX->Config.Is64BitMode;
++  } else {
++    // Decode operating mode from thread's CS segment.
++    const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
++    BlockInfo.Is64BitMode = CSSegment->L == 1;
++    LOGMAN_THROW_A_FMT(BlockInfo.Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
++  }
+ 
+   EntryPoint = PC;
+   BlockInfo.EntryPoints = {PC};
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 566cd9c0725a5589762035a84014ed5eb07adbd5..1b7012d3512636513bb0d52844000bc64ffb251b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -129,6 +129,14 @@ void OpDispatchBuilder::LEAOp(OpcodeArgs) {
+ 
+ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
+ 
++void OpDispatchBuilder::SyscallCompatOp(OpcodeArgs) {
++  // An embedding host models an Intel CPU, on which SYSCALL outside 64-bit
++  // mode is undefined.
++  if (CTX->Embedded) {
++    UnimplementedOp(Op);
++  }
++}
++
+ void OpDispatchBuilder::RETOp(OpcodeArgs) {
+   const auto GPRSize = GetGPROpSize();
+ 
+@@ -222,30 +230,35 @@ void OpDispatchBuilder::SecondaryALUOp(OpcodeArgs) {
+   switch (Op->OP) {
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 0):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 0):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 0):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 0):
+     IROp = FEXCore::IR::IROps::OP_ADD;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHADD;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 1):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 1):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 1):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 1):
+     IROp = FEXCore::IR::IROps::OP_OR;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHOR;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 4):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 4):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 4):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 4):
+     IROp = FEXCore::IR::IROps::OP_ANDWITHFLAGS;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHAND;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 5):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 5):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 5):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 5):
+     IROp = FEXCore::IR::IROps::OP_SUB;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHSUB;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 6):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 6):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 6):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 6):
+     IROp = FEXCore::IR::IROps::OP_XOR;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHXOR;
+@@ -4411,10 +4424,25 @@ void OpDispatchBuilder::CheckLegacySegmentWrite(Ref NewNode, uint32_t SegmentReg
+ }
+ 
+ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg) {
+-  if (CTX->Embedded && Is64BitMode) {
++  if (CTX->Embedded) {
+     // The descriptor tables are host memory, which embedded code reaches only
+     // through the guest TLB. Long mode ignores the CS/SS/DS/ES bases and the
+     // host keeps FS/GS bases itself, so a selector load changes no base.
++    if (Is64BitMode || (SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX &&
++                        SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX)) {
++      return;
++    }
++    // 32-bit code: the host's table of GDT bases gives FS and GS theirs, for
++    // an RPL 3 selector of the first 32 entries; every other selector loads
++    // base 0.
++    Ref Entry = _Bfe(OpSize::i32Bit, 5, 3, Segment);
++    Ref Base = _LoadContextGPRIndexed(Entry, OpSize::i32Bit, offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentBases[0]), 4);
++    Ref Checked = _And(OpSize::i32Bit, Segment, _Constant(0xff07));
++    Ref NewBase = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ, Checked, Constant(3), Base, Constant(0));
++    // The whole cached base, zero-extended, as the host reads it back.
++    _StoreContextGPR(OpSize::i64Bit, NewBase,
++                     SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX ? offsetof(FEXCore::Core::CPUState, fs_cached) :
++                                                                                     offsetof(FEXCore::Core::CPUState, gs_cached));
+     return;
+   }
+   // Use BFE to extract the selector index in bits [15,3] of the segment register.
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index bc93b3c63a260e9e39c6addebbf07a4ed1535b8c..37b159f31dabe734528636c6aad61464a9fcad2b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -375,6 +375,7 @@ public:
+   void ThunkOp(OpcodeArgs);
+   void LEAOp(OpcodeArgs);
+   void NOPOp(OpcodeArgs);
++  void SyscallCompatOp(OpcodeArgs);
+   void RETOp(OpcodeArgs);
+   void IRETOp(OpcodeArgs);
+   void CallbackReturnOp(OpcodeArgs);
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+index a08c243c23fdfd09a6ea15f7fda4e8f24d266a83..96ad40743d104fab9ca06d8e8e7a0fc4df4d6890 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+@@ -26,7 +26,7 @@ enum Secondary_LUT {
+ 
+ constexpr std::array<X86InstInfo[2], ENTRY_MAX> Secondary_ArchSelect_LUT = {{
+   {
+-    {"SYSCALL", TYPE_INST, FLAGS_NO_OVERLAY | FLAGS_BLOCK_END, 0, { .OpDispatch = &IR::OpDispatchBuilder::NOPOp } },
++    {"SYSCALL", TYPE_INST, FLAGS_NO_OVERLAY | FLAGS_BLOCK_END, 0, { .OpDispatch = &IR::OpDispatchBuilder::SyscallCompatOp } },
+     {"SYSCALL", TYPE_INST, FLAGS_NO_OVERLAY | FLAGS_BLOCK_END, 0, { .OpDispatch = &IR::OpDispatchBuilder::Bind<&IR::OpDispatchBuilder::SyscallOp, true> } },
+   },
+   {
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index ffd341b6cb4bc3ee8c00ced92676052693cf00c1..b6add6a8a8f5a66a80b1c8f5e535f208280ea7f0 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -548,6 +548,11 @@ struct CpuStateFrame {
+     uint32_t CodeSizePerNode {};
+     // Compiles on this thread that restarted for a larger buffer.
+     uint32_t CodeBufferRestarts {};
++    // 32-bit code: the base an FS or GS load of GDT entry n takes with
++    // RPL 3, selector n << 3 | 3. Any other selector, and a load of ES, CS,
++    // SS or DS, gives base 0, and no selector load faults. The host fills it
++    // from the descriptors its kernel installed before each dispatch.
++    uint32_t SegmentBases[32] {};
+     // Bounce buffer for an access that crosses a guest page, an ordered
+     // access across a 16-byte granule, and the copy of a locked operand
+     // across one.

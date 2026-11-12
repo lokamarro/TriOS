@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:49:34 +0900
+Subject: [PATCH] v4l2: keep decoding when the client switches the output
+ surface
+
+A client that detaches the output surface, or sets another one, makes the
+pool hand out the buffers of the new surface, which the decoder has not met.
+The pool counted every buffer it had ever handed out against the number of
+V4L2 buffers and dropped each new one once that many were seen, and the
+decoder tied a V4L2 buffer to a block for good. The decoder stalled in a
+loop of dropped buffers as soon as the surfaces had supplied that many
+different buffers between them.
+
+The pool counts the buffers whose frames are still in use, as the lease of
+their block shows, so that the buffers of a surface the client left do not
+use up the count, and the decoder lets a free V4L2 buffer stand for a block
+it has not met when it has no V4L2 buffer left to give it, since the
+picture buffer is passed again with every QBUF.
+---
+ components/VideoFramePool.cpp                 | 28 +++++++++++++++----
+ .../v4l2_codec2/components/VideoFramePool.h   | 17 +++++++++--
+ v4l2/V4L2Decoder.cpp                          | 26 ++++++++++++++---
+ 3 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+index 805ff65e6d6b9656d3630bd8f9a19aa0089e07ae..eb234eb52c108598fc3931ab3f60054265360c79 100644
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -183,15 +183,24 @@ void VideoFramePool::destroyTask() {
+ }
+ 
+ bool VideoFramePool::shouldDropBuffer(uint32_t bufferId) {
+-    if (mBuffers.size() < mMaxBufferCount) {
+-        return false;
+-    }
+-
++    // A buffer that was handed out before is one the device has a V4L2 buffer for.
+     if (mBuffers.find(bufferId) != mBuffers.end()) {
+         return false;
+     }
+ 
+-    return true;
++    // A new one is taken while fewer buffers than the maximum are in use. The buffers of a surface
++    // the client switched away from are gone for good once the frames they were in are released,
++    // and the ones of the new surface take their place.
++    size_t inUse = 0;
++    for (auto it = mBuffers.begin(); it != mBuffers.end();) {
++        if (it->second.permanent || !it->second.lease.expired()) {
++            ++inUse;
++            ++it;
++        } else {
++            it = mBuffers.erase(it);
++        }
++    }
++    return inUse >= mMaxBufferCount;
+ }
+ 
+ bool VideoFramePool::getVideoFrame(GetVideoFrameCB cb) {
+@@ -302,6 +311,13 @@ void VideoFramePool::getVideoFrameTask() {
+     }
+ 
+     ALOG_ASSERT(block != nullptr);
++    BufferLease buffer;
++    std::shared_ptr<_C2BlockPoolData> lease = _C2BlockFactory::GetGraphicBlockPoolData(*block);
++    if (lease) {
++        buffer.lease = lease;
++    } else {
++        buffer.permanent = true;
++    }
+     std::unique_ptr<VideoFrame> frame = VideoFrame::Create(std::move(block));
+     std::optional<FrameWithBlockId> frameWithBlockId;
+ 
+@@ -309,7 +325,7 @@ void VideoFramePool::getVideoFrameTask() {
+         // Only pass the frame + id pair if both have successfully been obtained.
+         // Otherwise exit the loop so a nullopt is passed to the client.
+         frameWithBlockId = std::make_pair(std::move(frame), *bufferId);
+-        mBuffers.insert(*bufferId);
++        mBuffers[*bufferId] = std::move(buffer);
+     } else {
+         ALOGE("%s(): Failed to generate VideoFrame or get the buffer id.", __func__);
+     }
+diff --git a/components/include/v4l2_codec2/components/VideoFramePool.h b/components/include/v4l2_codec2/components/VideoFramePool.h
+index 6bebc37f2904f858f98c7a7e5df28a8f3009984e..e9ebd577c3e9acb7866d065acb5d91eb96dae1a3 100644
+--- a/components/include/v4l2_codec2/components/VideoFramePool.h
++++ b/components/include/v4l2_codec2/components/VideoFramePool.h
+@@ -8,6 +8,7 @@
+ #include <atomic>
+ #include <memory>
+ #include <optional>
++#include <map>
+ #include <queue>
+ 
+ #include <C2Buffer.h>
+@@ -20,6 +21,8 @@
+ #include <v4l2_codec2/common/VideoTypes.h>
+ #include <v4l2_codec2/components/VideoFrame.h>
+ 
++struct _C2BlockPoolData;
++
+ namespace android {
+ 
+ // Fetch C2GraphicBlock from C2BlockPool and wrap to VideoFrame.
+@@ -60,7 +63,8 @@ private:
+     void getVideoFrameTask();
+     void onVideoFrameReady(std::optional<FrameWithBlockId> frameWithBlockId);
+ 
+-    // Returns true if a buffer shall not be handed to client.
++    // Returns true if a buffer shall not be handed to client: it is not one of the buffers handed
++    // out that are still in use, and these are as many as the pool may have.
+     bool shouldDropBuffer(uint32_t bufferId);
+ 
+     static std::optional<uint32_t> getBufferIdFromGraphicBlock(C2BlockPool& blockPool,
+@@ -71,8 +75,15 @@ private:
+     // Holds the number of maximum amount of buffers that VideoFramePool
+     // should provide to client.
+     size_t mMaxBufferCount;
+-    // Contains known buffer ids that are valid for the pool.
+-    std::set<uint32_t> mBuffers;
++    // The buffers the pool has handed out, by id, with the lease of the block each is held in. A
++    // buffer counts against the maximum while its lease lives, so that the buffers of an output
++    // surface the client switched away from do not use up the count for the new ones.
++    struct BufferLease {
++        std::weak_ptr<_C2BlockPoolData> lease;
++        // The pool data of the block is not available: the buffer counts for good.
++        bool permanent = false;
++    };
++    std::map<uint32_t, BufferLease> mBuffers;
+ 
+     const ui::Size mSize;
+     const HalPixelFormat mPixelFormat;
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index ef94f043733aa66ac345fb987f6463fca20dfc8b..7ed6e8a383e17b0e010e31b4222a94f9dbfbfb80 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -920,10 +920,28 @@ void V4L2Decoder::onVideoFrameReady(
+         mBlockIdToV4L2Id.emplace(blockId, v4l2BufferId);
+         outputBuffer = mOutputQueue->getFreeBuffer(v4l2BufferId);
+         ALOG_ASSERT(v4l2BufferId == outputBuffer->bufferId());
+-    } else {
+-        // If this happens, this is a bug in VideoFramePool. It should never
+-        // provide more blocks than we have V4L2 buffers.
+-        ALOGE("Got more different blocks than we have V4L2 buffers for.");
++    } else if (mReuseFrameQueue.empty()) {
++        // The client switched the output surface, whose buffers are others than the ones this
++        // decoder has met, and the ones of the surface it left may not come back. A free V4L2
++        // buffer stands for the block instead of the block it stood for, as the picture buffer is
++        // passed again with every QBUF.
++        outputBuffer = mOutputQueue->getFreeBuffer();
++        if (outputBuffer) {
++            const size_t v4l2BufferId = outputBuffer->bufferId();
++            for (auto it = mBlockIdToV4L2Id.begin(); it != mBlockIdToV4L2Id.end();) {
++                it = (it->second == v4l2BufferId) ? mBlockIdToV4L2Id.erase(it) : std::next(it);
++            }
++            mBlockIdToV4L2Id.emplace(blockId, v4l2BufferId);
++        }
++    }
++
++    if (!outputBuffer && !mReuseFrameQueue.empty()) {
++        // The frames the device dropped come first; this block comes back when the pool is asked
++        // again.
++        ALOGW("%s(): Dropping block %u, the frames the device dropped are to be queued first",
++              __func__, blockId);
++        tryFetchVideoFrame();
++        return;
+     }
+ 
+     if (!outputBuffer) {

@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 14:20:16 +0000
+Subject: [PATCH] adb: raise the USB debugging dialog again when it died
+ unanswered
+
+The "Allow USB debugging" dialog answers adbd only through its buttons
+and when it is destroyed while finishing. A dialog that never gets to
+run answers nothing: the system trims its task while it is still busy
+(a foreground change such as a Setup Wizard step, in the first half
+minute after boot), or SystemUI dies. adbd then keeps the prompt
+dispatched for good and ignores every later request, so debugging
+cannot be authorized until it is turned off and on again.
+
+AdbDebuggingManager now looks for the dialog's activity in the task
+list once, 15 s after each start of the dialog. If the activity is
+gone while the prompt is still awaited, it starts the dialog again and
+looks once more after that start, at most three times per prompt. The
+prompt stops being awaited with the user's allow or deny, a request to
+clear the keys, debugging turned off and the adbd socket closing.
+Nothing is scheduled while no prompt is awaited.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../server/adb/AdbDebuggingManager.java       | 97 ++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/services/core/java/com/android/server/adb/AdbDebuggingManager.java b/services/core/java/com/android/server/adb/AdbDebuggingManager.java
+index af8523dd855865c6995a6fb2123a10b26d09a080..969571e9c6039c3946ce9e6bb7c238351d93646a 100644
+--- a/services/core/java/com/android/server/adb/AdbDebuggingManager.java
++++ b/services/core/java/com/android/server/adb/AdbDebuggingManager.java
+@@ -122,6 +122,12 @@ public class AdbDebuggingManager {
+     // The field tracks the toggle of the wireless debugging setting.
+     private boolean mAdbWifiEnabled = false;
+     private String mFingerprints;
++    // The key adbd waits for the user's answer on, the dialog started to ask for it and how often
++    // that dialog was started again. Used on the handler thread only; mAwaitedKey is null while no
++    // answer is awaited.
++    private String mAwaitedKey;
++    private ComponentName mAwaitedDialog;
++    private int mAwaitedRestarts;
+     // A key can be used more than once (e.g. USB, wifi), so need to keep a refcount
+     private final Map<String, Integer> mConnectedKeys = new HashMap<>();
+     private final String mConfirmComponent;
+@@ -134,6 +140,17 @@ public class AdbDebuggingManager {
+     /** The maximum time to wait for the adbd service to change state when toggling. */
+     private static final long ADBD_STATE_CHANGE_TIMEOUT = DEFAULT_DISPATCHING_TIMEOUT_MILLIS;
+ 
++    /**
++     * How long after a confirmation dialog was started the framework looks for it once. The dialog
++     * answers adbd only through its buttons and when it is destroyed, so a dialog that never gets
++     * to run (its task is trimmed while the system is still busy booting, or SystemUI dies) would
++     * leave adbd's prompt dispatched for good.
++     */
++    private static final long CONFIRMATION_RECHECK_DELAY_MS = 15_000;
++
++    /** How often the dialog of one prompt is started again before the framework gives up. */
++    private static final int CONFIRMATION_MAX_RESTARTS = 3;
++
+     /**
+      * Parameters for QR code pairing.
+      *
+@@ -668,6 +685,9 @@ public class AdbDebuggingManager {
+         // Event sent when the mDNS hostname is known.
+         static final int MSG_ON_LOCALHOSTNAME_KNOWN = 34;
+ 
++        // Event sent a while after a confirmation dialog was started, to start it again if gone.
++        static final int MESSAGE_ADB_CONFIRM_RECHECK = 35;
++
+         // === Messages we can send to adbd ===========
+         static final String MSG_DISCONNECT_DEVICE = "DD";
+         static final String MSG_START_ADB_WIFI = "W1";
+@@ -790,6 +810,7 @@ public class AdbDebuggingManager {
+                         break;
+                     }
+                     mAdbUsbEnabled = false;
++                    stopAwaitingConfirmation();
+                 }
+                 case MESSAGE_ADB_ALLOW -> {
+                     String key = (String) msg.obj;
+@@ -806,6 +827,7 @@ public class AdbDebuggingManager {
+ 
+                     boolean alwaysAllow = msg.arg1 == 1;
+                     mThread.sendResponse("OK");
++                    stopAwaitingConfirmation();
+                     if (alwaysAllow) {
+                         if (!mConnectedKeys.containsKey(key)) {
+                             mConnectedKeys.put(key, 1);
+@@ -822,10 +844,13 @@ public class AdbDebuggingManager {
+                 case MESSAGE_ADB_DENY -> {
+                     Slog.w(TAG, "Denying adb confirmation");
+                     mThread.sendResponse("NO");
++                    stopAwaitingConfirmation();
+                     logAdbConnectionChanged(AdbProtoEnums.USER_DENIED);
+                 }
+                 case MESSAGE_ADB_CONFIRM -> {
+                     String key = (String) msg.obj;
++                    // A new request means adbd dropped the one that was awaited.
++                    stopAwaitingConfirmation();
+                     String fingerprints = getFingerprints(key);
+                     if ("".equals(fingerprints)) {
+                         mThread.sendResponse("NO");
+@@ -838,6 +863,7 @@ public class AdbDebuggingManager {
+                 }
+                 case MESSAGE_ADB_CLEAR -> {
+                     Slog.d(TAG, "Received a request to clear the adb authorizations");
++                    stopAwaitingConfirmation();
+                     mConnectedKeys.clear();
+                     mWifiConnectedKeys.clear();
+                     mAdbKeyStore.deleteKeyStore();
+@@ -929,6 +955,7 @@ public class AdbDebuggingManager {
+                         logAdbConnectionChanged(AdbProtoEnums.AUTOMATICALLY_ALLOWED);
+                     }
+                 }
++                case MESSAGE_ADB_CONFIRM_RECHECK -> recheckConfirmation();
+                 case MSG_ADBDWIFI_ENABLE -> {
+                     if (mAdbWifiEnabled) {
+                         break;
+@@ -1159,6 +1186,8 @@ public class AdbDebuggingManager {
+                 }
+                 case MSG_ADBD_SOCKET_DISCONNECTED -> {
+                     Slog.d(TAG, "adbd socket disconnected");
++                    // adbd, and the prompt it dispatched, are gone.
++                    stopAwaitingConfirmation();
+                     stopTLSPortPoller();
+                     if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                         mAdbdServicesManager.unregisterAll();
+@@ -1502,8 +1531,18 @@ public class AdbDebuggingManager {
+                                             .config_customAdbPublicKeyConfirmationSecondaryUserComponent);
+         }
+         ComponentName componentName = ComponentName.unflattenFromString(componentString);
+-        if (startConfirmationActivity(componentName, userInfo.getUserHandle(), extras)
+-                || startConfirmationService(componentName, userInfo.getUserHandle(), extras)) {
++        if (startConfirmationActivity(componentName, userInfo.getUserHandle(), extras)) {
++            mAwaitedKey = key;
++            mAwaitedDialog = componentName;
++            if (mAwaitedRestarts < CONFIRMATION_MAX_RESTARTS) {
++                // One look for this start of the dialog; nothing runs while no answer is awaited.
++                mHandler.sendEmptyMessageDelayed(
++                        AdbDebuggingHandler.MESSAGE_ADB_CONFIRM_RECHECK,
++                        CONFIRMATION_RECHECK_DELAY_MS);
++            }
++            return;
++        }
++        if (startConfirmationService(componentName, userInfo.getUserHandle(), extras)) {
+             return;
+         }
+         Slog.e(
+@@ -1513,6 +1552,60 @@ public class AdbDebuggingManager {
+                         + " as an Activity or a Service");
+     }
+ 
++    /**
++     * Starts the confirmation dialog again if the one started for the awaited key is gone without
++     * an answer. Runs on the handler thread, once after a start of the dialog.
++     */
++    private void recheckConfirmation() {
++        final String key = mAwaitedKey;
++        final ComponentName dialog = mAwaitedDialog;
++        if (key == null || dialog == null || isConfirmationShown(dialog)) {
++            return;
++        }
++        mAwaitedRestarts++;
++        Slog.w(
++                TAG,
++                "The adb confirmation "
++                        + dialog.flattenToShortString()
++                        + " is gone without an answer; starting it again ("
++                        + mAwaitedRestarts
++                        + ")");
++        startConfirmationForKey(key, mFingerprints);
++    }
++
++    /**
++     * Whether a task holds the confirmation dialog's activity, or the tasks cannot be listed. The
++     * handler thread is not in a Binder transaction, so the call runs as the system uid, which may
++     * list every task (ActivityTaskManagerService#isGetTasksAllowed).
++     */
++    @SuppressWarnings("deprecation")
++    private boolean isConfirmationShown(ComponentName dialog) {
++        ActivityManager activityManager = mContext.getSystemService(ActivityManager.class);
++        if (activityManager == null) {
++            return true;
++        }
++        try {
++            for (ActivityManager.RunningTaskInfo task :
++                    activityManager.getRunningTasks(Integer.MAX_VALUE)) {
++                if (dialog.equals(task.topActivity) || dialog.equals(task.baseActivity)) {
++                    return true;
++                }
++            }
++            return false;
++        } catch (SecurityException e) {
++            Slog.e(TAG, "unable to list the tasks to look for " + dialog, e);
++            return true;
++        }
++    }
++
++    /** Forgets the awaited answer and the look that was scheduled for it. */
++    private void stopAwaitingConfirmation() {
++        mAwaitedKey = null;
++        mAwaitedDialog = null;
++        mAwaitedRestarts = 0;
++        mHandler.removeMessages(AdbDebuggingHandler.MESSAGE_ADB_CONFIRM_RECHECK);
++    }
++
+     /**
+      * @return true if the componentName led to an Activity that was started.
+      */

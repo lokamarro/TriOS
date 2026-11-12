@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 22:59:57 +0900
+Subject: [PATCH] zink: keep a shared planar image in one allocation
+
+A planar image that leaves this process goes as one dma-buf whose planes sit
+at their own offsets, which is what a gbm buffer, an EGL dma-buf import and a
+video frame all describe. Zink instead made every planar image disjoint
+whenever the format offered the feature, and a disjoint image binds each
+plane separately and promises no such layout. Keep the planes joined for an
+image that is going to be shared through the renderer's linear modifier, and
+leave every other planar image as it was.
+
+A joined image also has one memory requirement rather than one per plane.
+Zink asked per plane regardless, which is invalid for a joined image and,
+where a driver answers it anyway, counts the whole image once per plane and
+places the second plane past the end of the memory it just sized. Ask per
+plane only for a disjoint image.
+
+Finally, a disjoint bind says which plane it is binding through
+VkBindImagePlaneMemoryInfo. Zink attached it for a video image only, so
+every other disjoint image bound its planes in an order the driver could
+not see, and a driver that reads the struct has nothing to read. Attach it
+to every disjoint bind.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_resource.c | 48 +++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index fc273bf1fb3773fd2b38ce2dbb1a7281a7665492..3ce373d857608ca86a8b3a76e16f76ec64779424 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -409,6 +409,21 @@ check_ici(struct zink_screen *screen, VkImageCreateInfo *ici, uint64_t modifier)
+    return true;
+ }
+ 
++/* A shared planar image hands every plane to its importer through one
++ * dma-buf, so the planes have to sit in one allocation at their own offsets.
++ * A disjoint image binds each plane separately and promises no such layout,
++ * so an image that is going to be shared keeps its planes joined.
++ */
++static bool
++can_be_disjoint(const struct zink_screen *screen, const struct pipe_resource *templ, unsigned bind)
++{
++   if (util_format_get_num_planes(templ->format) <= 1)
++      return false;
++   if (zink_bind_shares_dmabuf(bind) && zink_use_venus_linear_modifier(screen))
++      return false;
++   return true;
++}
++
+ static VkImageUsageFlags
+ get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feats, const struct pipe_resource *templ, unsigned bind, VkImageTiling tiling, bool *need_extended)
+ {
+@@ -579,7 +594,7 @@ build_usage_candidates(struct zink_screen *screen, const struct pipe_resource *t
+    const struct zink_format_props *props = zink_get_format_props(screen, templ->format);
+    VkFormatFeatureFlags2 feats = tiling == VK_IMAGE_TILING_LINEAR ?
+       props->linearTilingFeatures : props->optimalTilingFeatures;
+-   if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && util_format_get_num_planes(templ->format) > 1)
++   if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && can_be_disjoint(screen, templ, bind))
+       flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+    if (flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)
+       feats = UINT32_MAX;
+@@ -662,7 +677,7 @@ find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct p
+          continue;
+ 
+       VkImageCreateFlags try_flags = saved_flags;
+-      if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && util_format_get_num_planes(templ->format) > 1)
++      if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && can_be_disjoint(screen, templ, bind))
+          try_flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+       ici->flags = try_flags;
+ 
+@@ -737,7 +752,7 @@ negotiate_image_config(struct zink_screen *screen, VkImageCreateInfo *ici, const
+       if (feats) {
+          bool need_extended = false;
+          VkImageCreateFlags saved_flags = ici->flags;
+-         if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && util_format_get_num_planes(templ->format) > 1)
++         if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && can_be_disjoint(screen, templ, bind))
+             ici->flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+          VkImageUsageFlags usage = get_image_usage_for_feats(
+             screen, feats, templ, bind,
+@@ -929,9 +944,14 @@ static const VkImageAspectFlags plane_aspects[] = {
+ 
+ static inline bool
+ get_image_memory_requirement(struct zink_screen *screen, struct zink_resource_object *obj,
+-                             unsigned num_planes, VkMemoryRequirements *reqs)
++                             unsigned num_planes, bool disjoint, VkMemoryRequirements *reqs)
+ {
+    bool need_dedicated = false;
++   /* Only a disjoint image has a requirement per plane; a joined one has a
++    * single requirement covering all of them, and asking per plane would
++    * both be invalid and count its memory once per plane. */
++   if (!disjoint)
++      num_planes = 1;
+    if (VKSCR(GetImageMemoryRequirements2)) {
+       VkMemoryRequirements2 req2;
+       req2.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+@@ -946,7 +966,7 @@ get_image_memory_requirement(struct zink_screen *screen, struct zink_resource_ob
+       VkImagePlaneMemoryRequirementsInfo plane;
+       plane.sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO;
+       plane.pNext = NULL;
+-      if (num_planes > 1)
++      if (disjoint && num_planes > 1)
+          info2.pNext = &plane;
+       unsigned offset = 0;
+       for (unsigned i = 0; i < num_planes; i++) {
+@@ -1589,12 +1609,12 @@ bind_image_memory(struct zink_screen *screen, struct zink_resource_object *obj,
+          infos[i].memory = zink_bo_get_mem(obj->bo);
+          infos[i].memoryOffset = obj->plane_offsets[i];
+          assert(!alloc_info->need_dedicated || obj->plane_offsets[i] == 0);
+-         if (templ->bind & ZINK_BIND_VIDEO) {
+-            infos[i].pNext = &planes[i];
+-            planes[i].sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+-            planes[i].pNext = NULL;
+-            planes[i].planeAspect = plane_aspects[i];
+-         }
++         /* A disjoint image binds one plane at a time, and the driver is told
++          * which one by this struct rather than by the order of the binds. */
++         infos[i].pNext = &planes[i];
++         planes[i].sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
++         planes[i].pNext = NULL;
++         planes[i].planeAspect = plane_aspects[i];
+       }
+       if (VKSCR(BindImageMemory2)(screen->dev, num_planes, infos) != VK_SUCCESS) {
+          mesa_loge("ZINK: vkBindImageMemory2 failed");
+@@ -1732,7 +1752,8 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+ 
+    if (!(templ->bind & ZINK_BIND_VIDEO)) {
+       obj->vkfeats = get_format_feature_flags(ici, screen, templ);
+-      if (obj->vkfeats & VK_FORMAT_FEATURE_DISJOINT_BIT)
++      if (obj->vkfeats & VK_FORMAT_FEATURE_DISJOINT_BIT &&
++          can_be_disjoint(screen, templ, templ->bind))
+          ici.flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+    }
+    if (util_format_is_yuv(templ->format)) {
+@@ -1766,7 +1787,8 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+       assert(num_dmabuf_planes <= 4);
+    }
+ 
+-   alloc_info->need_dedicated = get_image_memory_requirement(screen, obj, num_planes, &reqs);
++   alloc_info->need_dedicated = get_image_memory_requirement(screen, obj, num_planes,
++                                                             (ici.flags & VK_IMAGE_CREATE_DISJOINT_BIT) != 0, &reqs);
+    if (templ->usage == PIPE_USAGE_STAGING && ici.tiling == VK_IMAGE_TILING_LINEAR)
+       alloc_info->flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    else

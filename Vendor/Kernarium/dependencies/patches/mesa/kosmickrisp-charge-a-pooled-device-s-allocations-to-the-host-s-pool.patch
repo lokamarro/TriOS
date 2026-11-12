@@ -1,0 +1,810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:36:59 +0900
+Subject: [PATCH] kosmickrisp: charge a pooled device's allocations to the
+ host's pool
+
+A host grants the GPU a share of the process's memory and has to keep every
+allocation made for the guest within it. Only Venus devices were charged, and
+only through the renderer: the OpenGL path, whose Zink device allocates every
+buffer and texture of a guest through vkAllocateMemory, was counted by the
+pool's usage but never refused, so a WebGL page could take the process past
+the share.
+
+Every byte either path makes is a heap that kk_alloc_bo creates, so the driver
+is where one reservation covers both. A process can now state one pool for all
+of its devices with kk_set_device_memory_pool(), exported by the driver library
+beside the per-device structure that Venus chained. The devices the renderer
+creates for a guest and the one Zink creates then share it without either
+chaining anything, and a device that names a pool of its own charges that one.
+Clearing the pool returns once no callback of it is running, so the host may
+free what the callbacks name afterwards.
+
+A pooled device reserves the size of every VkDeviceMemory heap before Metal
+makes it and releases the reservation once Metal counts it, or has refused it.
+A heap the pool cannot hold fails vkAllocateMemory with
+VK_ERROR_OUT_OF_DEVICE_MEMORY and allocates nothing, which Zink answers as it
+answers any failed allocation, by dropping its cached buffers and trying once
+more before it fails the resource. Memory a device imports names memory that
+exists already and is not charged. The geometry heap charges itself, as
+before, through the same pool; a Zink device now follows the pool-aware heap
+rules instead of the fixed cap.
+
+The device's other storage (command pools, descriptor pools, query pools,
+events and upload buffers) is counted once Metal does and never refused: a
+command buffer or pool that cannot get its storage ends the device's work, not
+an allocation, and Zink does not survive it.
+
+tests/test_device_memory_pool.c states a process pool and checks the limit, the
+balance of reservations and releases, a refusal that charges nothing and leaves
+the device usable, a pool cleared or stated with a callback missing, and a pool
+a device names itself taking precedence. test_heap_growth.c made the guest's
+allocation through the pool itself, as the renderer did; the device now charges
+that allocation, so the test lets it and tells the guest's reservation from a
+heap's by the thread.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_bo.c                |  36 ++-
+ src/kosmickrisp/vulkan/kk_bo.h                |  10 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  18 +-
+ src/kosmickrisp/vulkan/kk_device.h            |  10 +
+ src/kosmickrisp/vulkan/kk_device_memory.c     |   7 +-
+ .../vulkan/kk_device_memory_pool.c            |  99 ++++++++
+ .../vulkan/kk_device_memory_pool.h            |  25 +-
+ src/kosmickrisp/vulkan/meson.build            |   3 +
+ .../vulkan/tests/test_device_memory_pool.c    | 215 ++++++++++++++++++
+ .../vulkan/tests/test_heap_growth.c           |  86 ++++---
+ 10 files changed, 465 insertions(+), 44 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_device_memory_pool.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
+index 6926326969ed6cbf9653a8a7085b8f897d8c0f60..b02c2cbbb4b1a1518c986f752dafe64d77a15a05 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.c
++++ b/src/kosmickrisp/vulkan/kk_bo.c
+@@ -12,9 +12,10 @@
+ 
+ #include "util/u_memory.h"
+ 
+-VkResult
+-kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+-            uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
++static VkResult
++kk_alloc_bo_internal(struct kk_device *dev, struct vk_object_base *log_obj,
++                     uint64_t size_B, uint64_t align_B, bool charge,
++                     struct kk_bo **bo_out)
+ {
+    VkResult result = VK_SUCCESS;
+ 
+@@ -32,6 +33,17 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+ #endif
+ 
+    size_B = align64(size_B, minimum_alignment);
++
++   /* The reservation covers the heap from here until Metal counts it, or
++    * refuses it, so allocations that each fit the pool never together pass
++    * its limit. */
++   const bool reserved = charge && kk_device_pooled(dev);
++   if (reserved && !kk_device_pool_reserve(dev, size_B)) {
++      return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "the device memory pool cannot hold %" PRIu64 " bytes",
++                       size_B);
++   }
++
+    mtl_heap *handle =
+       mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS);
+    if (handle == NULL) {
+@@ -61,6 +73,8 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+    kk_device_add_heap_to_residency_set(dev, handle);
+ 
+    *bo_out = bo;
++   if (reserved)
++      kk_device_pool_release(dev, size_B);
+    return result;
+ 
+ fail_alloc:
+@@ -68,9 +82,25 @@ fail_alloc:
+ fail_map:
+    mtl_release(handle);
+ fail_heap:
++   if (reserved)
++      kk_device_pool_release(dev, size_B);
+    return result;
+ }
+ 
++VkResult
++kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
++            uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
++{
++   return kk_alloc_bo_internal(dev, log_obj, size_B, align_B, false, bo_out);
++}
++
++VkResult
++kk_alloc_bo_pooled(struct kk_device *dev, struct vk_object_base *log_obj,
++                   uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
++{
++   return kk_alloc_bo_internal(dev, log_obj, size_B, align_B, true, bo_out);
++}
++
+ void
+ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_bo.h b/src/kosmickrisp/vulkan/kk_bo.h
+index 6ea5ca6693da69170cbb9b5e922239c4c10a8ece..2407a1cc7262e976b840197c1223a498a0bb7042 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.h
++++ b/src/kosmickrisp/vulkan/kk_bo.h
+@@ -33,9 +33,19 @@ struct kk_ptr {
+    uint32_t offset;
+ };
+ 
++/* Allocates storage the driver needs for itself. The device's pool, if it has
++ * one, counts it once Metal does and never refuses it. */
+ VkResult kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+                      uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out);
+ 
++/* Allocates what an application asked for, or what a caller can fail without
++ * losing the device. A device with a pool (kk_device_memory_pool.h) reserves
++ * the heap's size first and fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, having
++ * allocated nothing, when the pool cannot hold it. */
++VkResult kk_alloc_bo_pooled(struct kk_device *dev,
++                            struct vk_object_base *log_obj, uint64_t size_B,
++                            uint64_t align_B, struct kk_bo **bo_out);
++
+ void kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo);
+ 
+ #endif /* KK_BO_H */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5eba5e053 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1162,8 +1162,9 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+  * so only 1 to 4095 MiB is honoured, and any other value keeps 16 MiB. The cap
+  * is 128 MiB or the starting size, whichever is larger.
+  *
+- * A device created with a device-memory pool (kk_device_memory_pool.h), as a
+- * Venus renderer creates the devices it serves a guest from, charges every
++ * A device with a device-memory pool (kk_device_memory_pool.h), whether it was
++ * created with one or the process states one for all its devices, as the host
++ * of a renderer does for the devices Venus and Zink create, charges every
+  * heap to it: it reserves a heap's size before creating the heap and never
+  * creates one the pool refuses, so the heap never takes the pool past its
+  * limit. A heap takes at most half of what the pool can still hold, except
+@@ -1205,7 +1206,7 @@ kk_heap_start_B(void)
+ static bool
+ kk_heap_pooled(const struct kk_device *dev)
+ {
+-   return dev->memory_pool.pfnReserve != NULL;
++   return kk_device_pooled(dev);
+ }
+ 
+ /* The most a heap may take of the device's pool, half of what the pool can
+@@ -1216,8 +1217,7 @@ kk_heap_pool_share_B(const struct kk_device *dev)
+    if (!kk_heap_pooled(dev))
+       return UINT64_MAX;
+ 
+-   const uint64_t headroom_B =
+-      dev->memory_pool.pfnHeadroom(dev->memory_pool.pUserData);
++   const uint64_t headroom_B = kk_device_pool_headroom(dev);
+    return (headroom_B / 2u) & ~(KK_HEAP_POOL_ALIGN_B - 1u);
+ }
+ 
+@@ -1230,8 +1230,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+ {
+    *pool_refused = false;
+    const bool pooled = kk_heap_pooled(dev);
+-   if (pooled &&
+-       !dev->memory_pool.pfnReserve(dev->memory_pool.pUserData, size_B)) {
++   if (pooled && !kk_device_pool_reserve(dev, size_B)) {
+       *pool_refused = true;
+       return NULL;
+    }
+@@ -1244,7 +1243,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+    }
+    /* Metal counts the heap now, or it was refused. */
+    if (pooled)
+-      dev->memory_pool.pfnRelease(dev->memory_pool.pUserData, size_B);
++      kk_device_pool_release(dev, size_B);
+    if (heap == NULL)
+       return NULL;
+ 
+@@ -1544,8 +1543,7 @@ kk_heap_return_idle(struct kk_device *dev)
+    struct kk_geometry_heap *heap = dev->heap;
+    if (heap != NULL && heap->refcount == 1 &&
+        heap->bo->size_B > dev->heap_start_B &&
+-       dev->memory_pool.pfnHeadroom(dev->memory_pool.pUserData) <
+-          heap->bo->size_B / 2u) {
++       kk_device_pool_headroom(dev) < heap->bo->size_B / 2u) {
+       kk_heap_observe_locked(dev, heap);
+       heap->refcount = 0;
+       idle = heap;
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index cb7f1868b1c3a4edfdadf492d0eba972a111be0d..73f8c1b6be7830faf761534d2c6277593900bc65 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -224,6 +224,16 @@ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ #define VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK_cast                 \
+    VkDeviceMemoryPoolCreateInfoKK
+ 
++/* Whether the device charges what it allocates to a pool: the one it was
++ * created with, else the process's (kk_device_memory_pool.h). The functions
++ * below reach that pool; reserving from an unpooled device always succeeds
++ * and its headroom is unbounded. A reservation is released once the pool's
++ * usage counts the allocation, or the allocation has failed. */
++bool kk_device_pooled(const struct kk_device *dev);
++bool kk_device_pool_reserve(const struct kk_device *dev, VkDeviceSize size);
++void kk_device_pool_release(const struct kk_device *dev, VkDeviceSize size);
++VkDeviceSize kk_device_pool_headroom(const struct kk_device *dev);
++
+ static inline struct kk_physical_device *
+ kk_device_physical(const struct kk_device *dev)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index f504640db6f92c217b934225cfebb4820d2e0581..b75375dce7d3b90125dcfc5abaa482bce07dee11 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -143,8 +143,11 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+       mem->bo->cpu = mtl_get_contents(mem->bo->map);
+    } else {
+-      result =
+-         kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
++      /* What an application allocates is what a pool charges: a refusal is
++       * the application's to handle, and the pool counts the heap once Metal
++       * does. */
++      result = kk_alloc_bo_pooled(dev, &dev->vk.base, aligned_size, alignment,
++                                  &mem->bo);
+       if (result != VK_SUCCESS)
+          goto fail_alloc;
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.c b/src/kosmickrisp/vulkan/kk_device_memory_pool.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4235d84f22579f0b61c2dc35eb75cf091699c993
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.c
+@@ -0,0 +1,99 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kk_device_memory_pool.h"
++
++#include "kk_device.h"
++
++#include "util/macros.h"
++#include "util/simple_mtx.h"
++#include "util/u_atomic.h"
++
++/* The pool this process states for all of its devices. Its callbacks run with
++ * the lock held, which is what makes clearing it final: no callback is running
++ * once kk_set_device_memory_pool() returns, and a device that charged it an
++ * instant earlier did so through callbacks that were valid. The host pool
++ * serializes reservations by itself, so holding the lock adds no contention.
++ * Both the lock and the pool live as long as the process, since a device may
++ * still be destroyed while exit() runs. */
++static simple_mtx_t kk_process_pool_mutex = SIMPLE_MTX_INITIALIZER;
++static VkDeviceMemoryPoolCreateInfoKK kk_process_pool;
++/* Whether kk_process_pool is set, readable without the lock. A stale answer
++ * is harmless: the reservation itself checks again under the lock. */
++static int kk_process_pool_set;
++
++static bool
++kk_pool_complete(const VkDeviceMemoryPoolCreateInfoKK *pool)
++{
++   return pool->pfnReserve != NULL && pool->pfnRelease != NULL &&
++          pool->pfnHeadroom != NULL;
++}
++
++PUBLIC void
++kk_set_device_memory_pool(const VkDeviceMemoryPoolCreateInfoKK *pPool)
++{
++   simple_mtx_lock(&kk_process_pool_mutex);
++   if (pPool != NULL && kk_pool_complete(pPool)) {
++      kk_process_pool = *pPool;
++      kk_process_pool.pNext = NULL;
++      p_atomic_set(&kk_process_pool_set, 1);
++   } else {
++      p_atomic_set(&kk_process_pool_set, 0);
++      kk_process_pool = (VkDeviceMemoryPoolCreateInfoKK){0};
++   }
++   simple_mtx_unlock(&kk_process_pool_mutex);
++}
++
++bool
++kk_device_pooled(const struct kk_device *dev)
++{
++   return dev->memory_pool.pfnReserve != NULL ||
++          p_atomic_read(&kk_process_pool_set) != 0;
++}
++
++bool
++kk_device_pool_reserve(const struct kk_device *dev, VkDeviceSize size)
++{
++   if (dev->memory_pool.pfnReserve != NULL)
++      return dev->memory_pool.pfnReserve(dev->memory_pool.pUserData, size);
++
++   simple_mtx_lock(&kk_process_pool_mutex);
++   /* A pool cleared since the device was last charged leaves it with none,
++    * and an unpooled device has no bound to refuse by. */
++   const bool admitted =
++      kk_process_pool.pfnReserve == NULL ||
++      kk_process_pool.pfnReserve(kk_process_pool.pUserData, size);
++   simple_mtx_unlock(&kk_process_pool_mutex);
++   return admitted;
++}
++
++void
++kk_device_pool_release(const struct kk_device *dev, VkDeviceSize size)
++{
++   if (dev->memory_pool.pfnRelease != NULL) {
++      dev->memory_pool.pfnRelease(dev->memory_pool.pUserData, size);
++      return;
++   }
++
++   simple_mtx_lock(&kk_process_pool_mutex);
++   if (kk_process_pool.pfnRelease != NULL)
++      kk_process_pool.pfnRelease(kk_process_pool.pUserData, size);
++   simple_mtx_unlock(&kk_process_pool_mutex);
++}
++
++VkDeviceSize
++kk_device_pool_headroom(const struct kk_device *dev)
++{
++   if (dev->memory_pool.pfnHeadroom != NULL)
++      return dev->memory_pool.pfnHeadroom(dev->memory_pool.pUserData);
++
++   simple_mtx_lock(&kk_process_pool_mutex);
++   const VkDeviceSize headroom =
++      kk_process_pool.pfnHeadroom != NULL
++         ? kk_process_pool.pfnHeadroom(kk_process_pool.pUserData)
++         : UINT64_MAX;
++   simple_mtx_unlock(&kk_process_pool_mutex);
++   return headroom;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+index d53a32784c40172e8d95777ef3e033f88f8e11b4..bc9493f65a4d4fa7cb9b90c9588036c7274e551d 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -20,7 +20,22 @@
+  *
+  * The callbacks may be called from any thread, with device locks held, so
+  * they must not call back into the device. The structure is copied when the
+- * device is created; pUserData must outlive the device. */
++ * device is created; pUserData must outlive the device.
++ *
++ * A process can also state one pool for every device it creates, whoever
++ * creates them, with kk_set_device_memory_pool(): the host of a renderer does
++ * so once, and the devices a Venus guest and the host's OpenGL driver create
++ * then share it without either having to chain the structure. A device that
++ * names its own pool charges that one instead.
++ *
++ * A pooled device also charges every VkDeviceMemory it allocates, since that
++ * is how an application takes memory of the host's GPU: vkAllocateMemory
++ * reserves the heap's size first and fails with VK_ERROR_OUT_OF_DEVICE_MEMORY
++ * when the pool cannot hold it. Memory it imports names memory that exists
++ * already and is not charged. The device's other storage (command pools,
++ * descriptor pools, query pools, events and upload buffers) is small, and
++ * what needs it cannot fail the way an allocation can, so it is counted once
++ * the pool's usage includes it but never refused. */
+ 
+ #pragma once
+ 
+@@ -49,6 +64,14 @@ typedef struct VkDeviceMemoryPoolCreateInfoKK {
+    VkDeviceSize(VKAPI_PTR *pfnHeadroom)(void *pUserData);
+ } VkDeviceMemoryPoolCreateInfoKK;
+ 
++/* States the pool of every device this process creates, or clears it with
++ * NULL (a pool the callbacks of which are not all set is cleared too). The
++ * structure is copied; pUserData must stay valid until the pool is cleared.
++ * A device already created uses the new pool from its next reservation, and
++ * clearing it returns once no callback of the old pool is running, so
++ * pUserData may be released after it. Exported by the driver library. */
++void kk_set_device_memory_pool(const VkDeviceMemoryPoolCreateInfoKK *pPool);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 8fed05bdee0170c34c0a18b281bd5630df373801..5875f020e09451dad4a2cd33f259c33329c8f1f8 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -76,6 +76,8 @@ kk_files = files(
+   'kk_device_address.h',
+   'kk_device_memory.h',
+   'kk_device_memory.c',
++  'kk_device_memory_pool.h',
++  'kk_device_memory_pool.c',
+   'kk_device.h',
+   'kk_device.c',
+   'kk_event.h',
+@@ -405,6 +407,7 @@ if with_tests
+       ['drm_plane_offset', []],
+       ['undescribed_format', []],
+       ['sysmem_heap_override', []],
++      ['device_memory_pool', []],
+       ['query_pool_lifetime', ['NSZombieEnabled=YES']],
+     ]
+       test(
+diff --git a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3e9b1349d4309cb1a106bfcb34d580335f7cb6c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+@@ -0,0 +1,215 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A process that states one device-memory pool has every vkAllocateMemory of
++ * its devices charged to it: the host of a renderer states the pool once, and
++ * the devices a Venus guest and the host's OpenGL driver create then share it
++ * without either chaining anything.  An allocation the pool cannot hold fails
++ * with VK_ERROR_OUT_OF_DEVICE_MEMORY and allocates nothing; the reservation of
++ * one that succeeds is returned once Metal counts the heap, so a pool that
++ * counts what its devices hold sees every byte once.
++ *
++ * The pool here counts what the test allocated, and refuses what would take
++ * that and the reservations under way past its limit.  The test checks the
++ * limit, the balance of reservations and releases, that a refusal charges
++ * nothing and leaves the device usable, that clearing the pool, or stating one
++ * with a callback missing, frees the devices of any bound, and that a pool a
++ * device names itself is charged instead of the process's. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "kosmickrisp/vulkan/kk_device_memory_pool.h"
++#include "kk_test.h"
++
++#define MIB(n) ((VkDeviceSize)(n) << 20)
++
++struct pool {
++   VkDeviceSize limit_B;
++   /* What the test has allocated and not freed, and the reservations under
++    * way. */
++   VkDeviceSize live_B, reserved_B;
++   unsigned reserves, refusals, releases;
++};
++
++static VkDeviceSize
++charge_B(VkDeviceSize size)
++{
++   return (size + 16383u) & ~(VkDeviceSize)16383u;
++}
++
++static VkBool32 VKAPI_PTR
++pool_reserve(void *data, VkDeviceSize size)
++{
++   struct pool *pool = data;
++   pool->reserves++;
++   if (charge_B(size) > pool->limit_B ||
++       pool->live_B + pool->reserved_B > pool->limit_B - charge_B(size)) {
++      pool->refusals++;
++      return VK_FALSE;
++   }
++   pool->reserved_B += charge_B(size);
++   return VK_TRUE;
++}
++
++static void VKAPI_PTR
++pool_release(void *data, VkDeviceSize size)
++{
++   struct pool *pool = data;
++   CHECK(pool->reserved_B >= charge_B(size));
++   pool->reserved_B -= charge_B(size);
++   pool->releases++;
++}
++
++static VkDeviceSize VKAPI_PTR
++pool_headroom(void *data)
++{
++   const struct pool *pool = data;
++   const VkDeviceSize used_B = pool->live_B + pool->reserved_B;
++   return used_B < pool->limit_B ? pool->limit_B - used_B : 0u;
++}
++
++static VkDeviceMemoryPoolCreateInfoKK
++pool_info(struct pool *pool)
++{
++   return (VkDeviceMemoryPoolCreateInfoKK){
++      .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK,
++      .pUserData = pool,
++      .pfnReserve = pool_reserve,
++      .pfnRelease = pool_release,
++      .pfnHeadroom = pool_headroom,
++   };
++}
++
++static VkResult
++allocate(const struct kk_test_device *t, uint32_t type, VkDeviceSize size,
++         VkDeviceMemory *memory, struct pool *pool)
++{
++   PFN_vkAllocateMemory allocate_memory =
++      (PFN_vkAllocateMemory)kk_test_device_proc(t, "vkAllocateMemory");
++   VkMemoryAllocateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = size,
++      .memoryTypeIndex = type,
++   };
++   *memory = VK_NULL_HANDLE;
++   const VkResult result = allocate_memory(t->device, &info, NULL, memory);
++   if (result == VK_SUCCESS && pool != NULL)
++      pool->live_B += charge_B(size);
++   return result;
++}
++
++static void
++release(const struct kk_test_device *t, VkDeviceSize size, VkDeviceMemory memory,
++        struct pool *pool)
++{
++   PFN_vkFreeMemory free_memory =
++      (PFN_vkFreeMemory)kk_test_device_proc(t, "vkFreeMemory");
++   free_memory(t->device, memory, NULL);
++   if (pool != NULL)
++      pool->live_B -= charge_B(size);
++}
++
++int
++main(void)
++{
++   /* The pool is stated before any device exists, as a host states it before
++    * it creates the renderer. */
++   struct pool process = {.limit_B = MIB(96)};
++   VkDeviceMemoryPoolCreateInfoKK info = pool_info(&process);
++   kk_set_device_memory_pool(&info);
++
++   struct kk_test_device t;
++   kk_test_create_instance(&t, NULL);
++   kk_test_create_device(&t, NULL, NULL, 0, NULL);
++   const uint32_t device_type =
++      kk_test_memory_type(&t, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++   const uint32_t host_type = kk_test_memory_type(&t, ~0u, KK_TEST_HOST_MEMORY);
++
++   /* What fits is admitted, and its reservation is returned. */
++   VkDeviceMemory memory[3] = {0}, extra = VK_NULL_HANDLE;
++   for (unsigned i = 0; i < 3; i++)
++      CHECK(allocate(&t, device_type, MIB(32), &memory[i], &process) ==
++            VK_SUCCESS);
++   CHECK(process.live_B == MIB(96));
++   CHECK(process.reserved_B == 0u);
++   CHECK(process.reserves >= 3u && process.reserves == process.releases);
++
++   /* What does not is refused with the error an application handles, and
++    * nothing is charged for it. */
++   const unsigned refused = process.refusals;
++   CHECK(allocate(&t, device_type, MIB(32), &extra, &process) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   CHECK(extra == VK_NULL_HANDLE);
++   CHECK(process.refusals == refused + 1u);
++   CHECK(process.reserved_B == 0u && process.live_B == MIB(96));
++   /* A full pool refuses the smallest allocation too, of either kind of
++    * memory. */
++   CHECK(allocate(&t, device_type, 16384u, &extra, &process) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   CHECK(allocate(&t, host_type, 16384u, &extra, &process) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++
++   /* A refusal leaves the device as it was: what is freed can be allocated
++    * again, in pieces as well. */
++   release(&t, MIB(32), memory[0], &process);
++   CHECK(allocate(&t, device_type, MIB(16), &memory[0], &process) ==
++         VK_SUCCESS);
++   VkDeviceMemory visible = VK_NULL_HANDLE;
++   CHECK(allocate(&t, host_type, MIB(16), &visible, &process) == VK_SUCCESS);
++   CHECK(process.live_B == MIB(96));
++   CHECK(allocate(&t, host_type, MIB(16), &extra, &process) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   release(&t, MIB(16), visible, &process);
++   release(&t, MIB(16), memory[0], &process);
++   for (unsigned i = 1; i < 3; i++)
++      release(&t, MIB(32), memory[i], &process);
++   CHECK(process.live_B == 0u && process.reserved_B == 0u);
++   CHECK(process.reserves == process.releases + process.refusals);
++
++   /* Clearing the pool frees every device of its bound; a pool with a
++    * callback missing is no pool. */
++   kk_set_device_memory_pool(NULL);
++   const unsigned reserves = process.reserves;
++   VkDeviceMemory large = VK_NULL_HANDLE;
++   CHECK(allocate(&t, device_type, MIB(128), &large, NULL) == VK_SUCCESS);
++   release(&t, MIB(128), large, NULL);
++   VkDeviceMemoryPoolCreateInfoKK incomplete = pool_info(&process);
++   incomplete.pfnHeadroom = NULL;
++   kk_set_device_memory_pool(&incomplete);
++   CHECK(allocate(&t, device_type, MIB(128), &large, NULL) == VK_SUCCESS);
++   release(&t, MIB(128), large, NULL);
++   CHECK(process.reserves == reserves);
++
++   /* A pool the process states again is charged from the next allocation,
++    * by the devices that exist already. */
++   process.limit_B = MIB(48);
++   kk_set_device_memory_pool(&info);
++   CHECK(allocate(&t, device_type, MIB(64), &large, &process) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   CHECK(allocate(&t, device_type, MIB(32), &large, &process) == VK_SUCCESS);
++   release(&t, MIB(32), large, &process);
++   kk_test_destroy_device(&t);
++
++   /* A device that names a pool itself charges that one, and the process's
++    * is left alone. */
++   struct pool own = {.limit_B = MIB(64)};
++   VkDeviceMemoryPoolCreateInfoKK own_info = pool_info(&own);
++   process.limit_B = 0u;
++   const unsigned process_reserves = process.reserves;
++   kk_test_create_device(&t, &own_info, NULL, 0, NULL);
++   CHECK(allocate(&t, device_type, MIB(32), &memory[0], &own) == VK_SUCCESS);
++   CHECK(allocate(&t, device_type, MIB(48), &memory[1], &own) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   CHECK(own.reserves >= 2u && own.refusals == 1u && own.reserved_B == 0u);
++   CHECK(process.reserves == process_reserves);
++   release(&t, MIB(32), memory[0], &own);
++
++   kk_set_device_memory_pool(NULL);
++   kk_test_destroy(&t);
++   printf("a pooled device charges every allocation and refuses what the "
++          "pool cannot hold\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_heap_growth.c b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+index fe39c707ef440cd4321026ac363958558aa89643..a3d11418489754f54c507dcee33470281785c744 100644
+--- a/src/kosmickrisp/vulkan/tests/test_heap_growth.c
++++ b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+@@ -16,7 +16,9 @@
+  * the devices it serves a guest from, charges its heaps to the pool: they
+  * take at most half of what the pool can still hold, so the heap and a guest
+  * allocation on another thread never take it past its limit, and a guest
+- * allocation that fits what the pool has left is not refused. */
++ * allocation that fits what the pool has left is not refused. The device
++ * charges the guest's vkAllocateMemory itself, so the test makes the
++ * allocation and the pool tells it apart from a heap's by the thread. */
+ 
+ #define VK_NO_PROTOTYPES
+ #include "kk_bo.h"
+@@ -95,7 +97,8 @@ enum guest_order {
+ /* A device-memory pool like the one a Venus renderer shares with the devices
+  * it creates: what Metal has allocated for the process and the reservations
+  * it does not count yet, within a limit. Reservations are charged in the
+- * 16 KiB pages Metal counts. */
++ * 16 KiB pages Metal counts. Until the test arms it, it admits what the
++ * device allocates while the test sets up. */
+ struct test_pool {
+    /* The room the pool leaves above what the device holds before it
+     * records, and a guest allocation of guest_B on another thread in the
+@@ -112,6 +115,7 @@ struct test_pool {
+    pthread_cond_t cond;
+    mtl_device *mtl;
+    uint64_t limit_B, reserved_B;
++   bool armed;
+    /* 1 once the first of the heap and the guest has reserved, 2 once the
+     * other has. */
+    unsigned stage;
+@@ -120,6 +124,17 @@ struct test_pool {
+    unsigned heap_reservations, heap_refusals;
+ };
+ 
++static void pool_wait_locked(struct test_pool *pool, unsigned stage);
++
++/* What the reservation the calling thread makes is for: the guest thread's
++ * allocation, the test's fill of what is left, or the device's own heap. */
++enum reservation_kind {
++   HEAP,
++   GUEST_ALLOCATION,
++   FILL_ALLOCATION,
++};
++static _Thread_local enum reservation_kind reservation_kind;
++
+ static uint64_t
+ pool_charge_B(VkDeviceSize size)
+ {
+@@ -149,6 +164,31 @@ pool_reserve(void *data, VkDeviceSize size)
+ {
+    struct test_pool *pool = data;
+    pthread_mutex_lock(&pool->mutex);
++   if (!pool->armed) {
++      pool->reserved_B += pool_charge_B(size);
++      pthread_mutex_unlock(&pool->mutex);
++      return VK_TRUE;
++   }
++   if (reservation_kind == GUEST_ALLOCATION) {
++      /* The guest's allocation, as the device charges it: in HEAP_FIRST
++       * after the heap has reserved, and in GUEST_FIRST before, holding its
++       * reservation until the heap has reserved too. */
++      if (pool->guest == HEAP_FIRST)
++         pool_wait_locked(pool, 1u);
++      pool->guest_admitted = pool_reserve_locked(pool, size);
++      pool->stage++;
++      pthread_cond_broadcast(&pool->cond);
++      if (pool->guest == GUEST_FIRST)
++         pool_wait_locked(pool, 2u);
++      const bool guest_admitted = pool->guest_admitted;
++      pthread_mutex_unlock(&pool->mutex);
++      return guest_admitted;
++   }
++   if (reservation_kind == FILL_ALLOCATION) {
++      const bool filled = pool_reserve_locked(pool, size);
++      pthread_mutex_unlock(&pool->mutex);
++      return filled;
++   }
+    const bool admitted = pool_reserve_locked(pool, size);
+    pool->heap_reservations++;
+    pool->heap_refusals += !admitted;
+@@ -212,33 +252,23 @@ struct guest {
+    VkDeviceMemory memory;
+ };
+ 
+-/* Makes the guest allocation through the pool, as a Venus renderer admits
+- * one, in its turn. */
++/* Makes the guest allocation, as a Venus renderer serves one: the device
++ * charges the pool for it, in its turn (see pool_reserve). */
+ static void *
+ guest_main(void *data)
+ {
+    struct guest *guest = data;
+    struct test_pool *pool = guest->pool;
+-   pthread_mutex_lock(&pool->mutex);
+-   if (pool->guest == HEAP_FIRST)
+-      pool_wait_locked(pool, 1u);
+-   pool->guest_admitted = pool_reserve_locked(pool, pool->guest_B);
+-   pool->stage++;
+-   pthread_cond_broadcast(&pool->cond);
+-   if (pool->guest == GUEST_FIRST)
+-      pool_wait_locked(pool, 2u);
+-   pthread_mutex_unlock(&pool->mutex);
+-
+-   if (pool->guest_admitted) {
+-      VkMemoryAllocateInfo info = {
+-         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-         .allocationSize = pool->guest_B,
+-         .memoryTypeIndex = guest->type,
+-      };
+-      pool->guest_allocated = guest->allocate(guest->device, &info, NULL,
+-                                              &guest->memory) == VK_SUCCESS;
+-      pool_release(pool, pool->guest_B);
+-   }
++   VkMemoryAllocateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = pool->guest_B,
++      .memoryTypeIndex = guest->type,
++   };
++   reservation_kind = GUEST_ALLOCATION;
++   pool->guest_allocated =
++      guest->allocate(guest->device, &info, NULL, &guest->memory) ==
++      VK_SUCCESS;
++   reservation_kind = HEAP;
+    return NULL;
+ }
+ 
+@@ -487,6 +517,7 @@ run(struct kk_test_device *t, const struct draw_case *c)
+       pthread_mutex_lock(&pool->mutex);
+       pool->limit_B = mtl_device_current_allocated_size(pool->mtl) +
+                       pool->reserved_B + pool->room_B;
++      pool->armed = true;
+       pthread_mutex_unlock(&pool->mutex);
+       if (pool->guest != NO_GUEST)
+          CHECK(pthread_create(&guest_thread, NULL, guest_main, &guest) == 0);
+@@ -589,20 +620,19 @@ run(struct kk_test_device *t, const struct draw_case *c)
+          pool->fill_B = headroom_B > (64u << 10)
+                            ? (headroom_B - (64u << 10)) & ~(uint64_t)16383u
+                            : 0u;
+-         const bool admitted =
+-            pool->fill_B != 0u && pool_reserve_locked(pool, pool->fill_B);
+          pthread_mutex_unlock(&pool->mutex);
+-         if (admitted) {
++         if (pool->fill_B != 0u) {
+             VkMemoryAllocateInfo fill_info = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = pool->fill_B,
+                .memoryTypeIndex = image_type,
+             };
+             VkDeviceMemory fill = VK_NULL_HANDLE;
++            reservation_kind = FILL_ALLOCATION;
+             pool->fill_admitted =
+                vkAllocateMemory(device, &fill_info, NULL, &fill) ==
+                VK_SUCCESS;
+-            pool_release(pool, pool->fill_B);
++            reservation_kind = HEAP;
+             if (fill != VK_NULL_HANDLE)
+                vkFreeMemory(device, fill, NULL);
+          }

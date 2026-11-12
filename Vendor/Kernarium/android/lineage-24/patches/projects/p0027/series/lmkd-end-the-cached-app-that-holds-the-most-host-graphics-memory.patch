@@ -1,0 +1,1615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:04:39 +0000
+Subject: [PATCH] lmkd: end the cached app that holds the most host graphics
+ memory
+
+The graphics memory of a virtual device lives on the host, in a budget
+that Android's memory accounting cannot see: PSI shows no stall while
+the host's pool fills, and the host can only refuse allocations. The
+guest's virtio-gpu driver keeps the host's last report of that budget
+in /sys/class/drm/card0/gpu_memory_report and notifies the file when a
+new report arrives.
+
+liblmkd_gpu_reclaim (gpu_reclaim.cpp) holds the report format, the
+choice of the victim and the limits. lmkd.cpp polls the file in its
+epoll loop, with a timer that asks for a new report every 3 s while the
+pressure lasts. Under pressure it ends the registered process that holds
+the most host graphics memory (at least 32 MiB, idle for at least 10 s)
+among the cached apps (oom_score_adj 900 and up), or among the previous
+app's band (700 to 799) when no cached app qualifies. Nothing else is
+ended, and there is no fallback to the RAM or LRU order: when no holder
+qualifies, nothing happens. The pid must be one the activity manager
+registered with lmkd, and /proc/<pid>/comm must be the name the host
+gave. At most one kill every 3 s, three while one pressure episode
+lasts, none while another kill is pending.
+
+The kill goes through kill_one_process with the vendor kill reason 1000
+("graphics memory pressure"), so the activity manager and statsd report
+it as they report any other lmkd kill, and nothing else is shown.
+
+ro.lmk.gpu_reclaim (default false) turns it on. Without it, or when the
+file does not exist, nothing is opened and nothing changes. The unit
+test lmkd_unit_test covers the parser, the choice and the limits.
+---
+ Android.bp                 |  12 +
+ README.md                  |   6 +
+ gpu_reclaim.cpp            | 360 +++++++++++++++++++++
+ include/gpu_reclaim.h      | 164 ++++++++++
+ lmkd.cpp                   | 282 ++++++++++++++++-
+ tests/Android.bp           |   6 +-
+ tests/gpu_reclaim_test.cpp | 626 +++++++++++++++++++++++++++++++++++++
+ 7 files changed, 1454 insertions(+), 2 deletions(-)
+ create mode 100644 gpu_reclaim.cpp
+ create mode 100644 include/gpu_reclaim.h
+ create mode 100644 tests/gpu_reclaim_test.cpp
+
+diff --git a/Android.bp b/Android.bp
+index a4f0f844561710b84c408d072b1602b8da2c9e55..b87e42ae90b6b7afefaaf7a084b2acfbbbe04d5c 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -54,6 +54,7 @@ cc_binary {
+     static_libs: [
+         "libstatslogc",
+         "liblmkd_utils",
++        "liblmkd_gpu_reclaim",
+     ],
+     header_libs: [
+         "bpf_headers",
+@@ -108,3 +109,14 @@ cc_library_static {
+         "-Werror",
+     ],
+ }
++
++cc_library_static {
++    name: "liblmkd_gpu_reclaim",
++    srcs: ["gpu_reclaim.cpp"],
++    export_include_dirs: ["include"],
++    cflags: [
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++    ],
++}
+diff --git a/README.md b/README.md
+index 0db27731bc576f4bbd2ba32b90485e9f40a6a215..e5b949eff90e3fc6d66dcf5104f8cd4ffd7e0521 100644
+--- a/README.md
++++ b/README.md
+@@ -126,6 +126,12 @@ properties:
+                                  reclaimed without writing to disk is considered
+                                  available.
+                                  Default = false
++  - `ro.lmk.gpu_reclaim`:        end the cached app that holds the most host
++                                 graphics memory when the host reports that its
++                                 graphics memory budget is under pressure (see
++                                 gpu_reclaim.h). Needs the virtual device's
++                                 /sys/class/drm/card0/gpu_memory_report; stays off
++                                 without it. Default = false
+ 
+ lmkd will set the following Android properties according to current system
+ configurations:
+diff --git a/gpu_reclaim.cpp b/gpu_reclaim.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8af9855670c8d921d325087bed302749bf29b3b
+--- /dev/null
++++ b/gpu_reclaim.cpp
+@@ -0,0 +1,360 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "gpu_reclaim.h"
++
++#include <string.h>
++
++#include <algorithm>
++
++namespace gpu_reclaim {
++
++namespace {
++
++constexpr size_t kMaxLineLen = 255;
++
++bool is_space(char c) {
++    return c == ' ' || c == '\t' || c == '\r';
++}
++
++/* Parses [begin, end) as an unsigned decimal number: digits only, at least one, no overflow. */
++bool parse_u64(const char* begin, const char* end, uint64_t* out) {
++    if (begin == end) {
++        return false;
++    }
++    uint64_t value = 0;
++    for (const char* p = begin; p < end; p++) {
++        if (*p < '0' || *p > '9') {
++            return false;
++        }
++        const uint64_t digit = static_cast<uint64_t>(*p - '0');
++        if (value > (UINT64_MAX - digit) / 10) {
++            return false;
++        }
++        value = value * 10 + digit;
++    }
++    *out = value;
++    return true;
++}
++
++/* Splits the next space-separated token off [*pos, end). Returns false at the end of the line. */
++bool next_token(const char** pos, const char* end, const char** token_begin,
++                const char** token_end) {
++    const char* p = *pos;
++    while (p < end && is_space(*p)) {
++        p++;
++    }
++    if (p == end) {
++        *pos = p;
++        return false;
++    }
++    *token_begin = p;
++    while (p < end && !is_space(*p)) {
++        p++;
++    }
++    *token_end = p;
++    *pos = p;
++    return true;
++}
++
++bool parse_header(const char* begin, const char* end, Report* report) {
++    bool have_seq = false;
++    bool have_state = false;
++    const char* pos = begin;
++    const char* tb;
++    const char* te;
++
++    while (next_token(&pos, end, &tb, &te)) {
++        const char* eq = static_cast<const char*>(memchr(tb, '=', te - tb));
++        if (eq == nullptr) {
++            return false;
++        }
++        const char* key = tb;
++        const size_t key_len = eq - tb;
++        uint64_t value;
++        if (!parse_u64(eq + 1, te, &value)) {
++            return false;
++        }
++        auto is_key = [&](const char* name) {
++            return strlen(name) == key_len && memcmp(key, name, key_len) == 0;
++        };
++        if (is_key("seq")) {
++            report->seq = value;
++            have_seq = true;
++        } else if (is_key("age_ms")) {
++            report->age_ms = value;
++        } else if (is_key("state")) {
++            if (value > UINT32_MAX) {
++                return false;
++            }
++            report->state = static_cast<uint32_t>(value);
++            have_state = true;
++        } else if (is_key("refused")) {
++            report->refused = value;
++        } else if (is_key("budget")) {
++            report->budget = value;
++        } else if (is_key("used")) {
++            report->used = value;
++        } else if (is_key("held")) {
++            report->held = value;
++        } else if (is_key("armed")) {
++            report->armed = value != 0;
++        }
++        // Other keys belong to a later version of the driver.
++    }
++    return have_seq && have_state;
++}
++
++/* "<pid> <bytes> <idle_ms> <contexts> <comm>"; the name runs to the end of the line. */
++bool parse_holder(const char* begin, const char* end, Holder* holder) {
++    const char* pos = begin;
++    const char* tb;
++    const char* te;
++    uint64_t number[4];
++
++    for (int i = 0; i < 4; i++) {
++        if (!next_token(&pos, end, &tb, &te) || !parse_u64(tb, te, &number[i])) {
++            return false;
++        }
++    }
++    if (number[0] == 0 || number[0] > INT32_MAX || number[3] > UINT32_MAX) {
++        return false;
++    }
++    while (pos < end && is_space(*pos)) {
++        pos++;
++    }
++    const char* comm_end = end;
++    while (comm_end > pos && is_space(comm_end[-1])) {
++        comm_end--;
++    }
++    const size_t comm_len = comm_end - pos;
++    if (comm_len == 0 || comm_len >= kCommLen) {
++        return false;
++    }
++    for (const char* p = pos; p < comm_end; p++) {
++        // A name has no control characters; a NUL would also cut it short.
++        if (static_cast<unsigned char>(*p) < 0x20 || *p == 0x7f) {
++            return false;
++        }
++    }
++    holder->pid = static_cast<int32_t>(number[0]);
++    holder->bytes = number[1];
++    holder->idle_ms = number[2];
++    holder->contexts = static_cast<uint32_t>(number[3]);
++    memcpy(holder->comm, pos, comm_len);
++    holder->comm[comm_len] = '\0';
++    return true;
++}
++
++}  // namespace
++
++bool parse_report(const char* text, size_t len, Report* report) {
++    memset(report, 0, sizeof(*report));
++
++    const char* pos = text;
++    const char* const end = text + len;
++    bool have_header = false;
++
++    while (pos < end) {
++        const char* nl = static_cast<const char*>(memchr(pos, '\n', end - pos));
++        if (nl == nullptr) {
++            // The text ends in the middle of a line (a file cut at the page size): drop it.
++            break;
++        }
++        const char* line_begin = pos;
++        const char* line_end = nl;
++        pos = nl + 1;
++        if (static_cast<size_t>(line_end - line_begin) > kMaxLineLen) {
++            if (!have_header) {
++                return false;
++            }
++            continue;
++        }
++        const char* p = line_begin;
++        while (p < line_end && is_space(*p)) {
++            p++;
++        }
++        if (p == line_end) {
++            continue;  // blank
++        }
++        if (!have_header) {
++            if (!parse_header(line_begin, line_end, report)) {
++                return false;
++            }
++            have_header = true;
++            continue;
++        }
++        if (report->holder_count >= kMaxHolders) {
++            break;
++        }
++        if (parse_holder(line_begin, line_end, &report->holders[report->holder_count])) {
++            report->holder_count++;
++        }
++    }
++    return have_header;
++}
++
++bool comm_matches(const char* holder_comm, const char* proc_comm) {
++    if (holder_comm == nullptr || proc_comm == nullptr || holder_comm[0] == '\0') {
++        return false;
++    }
++    // The kernel keeps 15 characters of a name; compare no more than that of either.
++    return strncmp(holder_comm, proc_comm, kCommLen - 1) == 0;
++}
++
++int choose_victim(const Report& report, ProcLookup lookup, void* cookie, int* band_adj) {
++    int best_cached = -1;
++    int best_previous = -1;
++
++    for (int i = 0; i < report.holder_count && i < kMaxHolders; i++) {
++        const Holder& holder = report.holders[i];
++        if (holder.bytes < kMinHolderBytes || holder.idle_ms < kMinIdleMs) {
++            continue;
++        }
++        int oomadj;
++        if (!lookup(holder, &oomadj, cookie)) {
++            continue;
++        }
++        if (oomadj >= kCachedAppMinAdj) {
++            if (best_cached < 0 || holder.bytes > report.holders[best_cached].bytes) {
++                best_cached = i;
++            }
++        } else if (oomadj >= kPreviousAppAdj && oomadj <= kPreviousAppMaxAdj) {
++            if (best_previous < 0 || holder.bytes > report.holders[best_previous].bytes) {
++                best_previous = i;
++            }
++        }
++    }
++
++    if (best_cached >= 0) {
++        *band_adj = kCachedAppMinAdj;
++        return best_cached;
++    }
++    if (best_previous >= 0) {
++        *band_adj = kPreviousAppAdj;
++        return best_previous;
++    }
++    return -1;
++}
++
++Policy::Decision Policy::none(int64_t next_ms, const char* note) const {
++    return Decision{Decision::Action::kNone, -1, 0, next_ms, note};
++}
++
++void Policy::end_episode() {
++    episode_ = false;
++    kills_ = 0;
++    unanswered_ = 0;
++    next_pass_ms_ = 0;
++}
++
++Policy::Decision Policy::on_report(const Report& report, int64_t now_ms, bool kill_pending,
++                                   ProcLookup lookup, void* cookie) {
++    // Nothing has been sent yet.
++    if (report.seq == 0) {
++        return none(episode_ ? kRefreshIntervalMs : 0, "no snapshot yet");
++    }
++
++    if (!have_seq_ || report.seq != last_seq_) {
++        unanswered_ = 0;
++        last_seq_ = report.seq;
++        have_seq_ = true;
++    }
++
++    // A refusal is an event of its own: the report says so with the state bit, and the counter
++    // moves. The first counter seen is only a baseline.
++    const bool refusal = (report.state & kStateRefused) != 0 ||
++                         (have_refused_ && report.refused > refused_seen_);
++    refused_seen_ = report.refused;
++    have_refused_ = true;
++
++    const bool pressure = (report.state & kStatePressure) != 0 || refusal;
++    if (!pressure) {
++        end_episode();
++        return none(0, "calm");
++    }
++    if (!episode_) {
++        episode_ = true;
++        kills_ = 0;
++        unanswered_ = 0;
++        next_pass_ms_ = 0;
++    }
++
++    if (kills_ >= kMaxKillsPerEpisode) {
++        return none(0, "kill limit of the episode reached");
++    }
++    if (kill_pending) {
++        return none(kRefreshIntervalMs, "a kill is pending");
++    }
++    if (report.age_ms > kMaxSnapshotAgeMs) {
++        return none(kRefreshIntervalMs, "snapshot is stale");
++    }
++    if (have_kill_ && report.seq <= last_kill_seq_) {
++        return none(kRefreshIntervalMs, "snapshot is not newer than the last kill");
++    }
++    if (have_kill_ && now_ms - last_kill_ms_ < kMinKillIntervalMs) {
++        return none(std::max<int64_t>(last_kill_ms_ + kMinKillIntervalMs - now_ms, 1),
++                    "last kill is too recent");
++    }
++    if (now_ms < next_pass_ms_) {
++        return none(next_pass_ms_ - now_ms, "backing off after a pass without a victim");
++    }
++
++    int band_adj = 0;
++    const int index = choose_victim(report, lookup, cookie, &band_adj);
++    if (index < 0) {
++        next_pass_ms_ = now_ms + kEmptyPassBackoffMs;
++        return none(kEmptyPassBackoffMs, "no cached holder qualifies");
++    }
++    return Decision{Decision::Action::kKill, index, band_adj, kMinKillIntervalMs, "kill"};
++}
++
++int64_t Policy::on_kill_result(int64_t now_ms, uint64_t seq, bool killed) {
++    if (!killed) {
++        // The process was gone or could not be ended; its record is dropped, so the next pass
++        // sees the next holder, after the same wait as a kill.
++        next_pass_ms_ = now_ms + kMinKillIntervalMs;
++        return kMinKillIntervalMs;
++    }
++    kills_++;
++    have_kill_ = true;
++    last_kill_ms_ = now_ms;
++    last_kill_seq_ = seq;
++    next_pass_ms_ = 0;
++    // A little past the interval, so the timer does not fire a tick early on a coarse clock.
++    return kills_ >= kMaxKillsPerEpisode ? 0 : kMinKillIntervalMs + 50;
++}
++
++Policy::Decision Policy::on_timer(int64_t now_ms) {
++    if (!episode_ || kills_ >= kMaxKillsPerEpisode) {
++        return none(0, "no episode");
++    }
++    if (have_kill_ && now_ms - last_kill_ms_ < kMinKillIntervalMs) {
++        return none(std::max<int64_t>(last_kill_ms_ + kMinKillIntervalMs - now_ms, 1),
++                    "last kill is too recent");
++    }
++    if (now_ms < next_pass_ms_) {
++        return none(next_pass_ms_ - now_ms, "backing off after a pass without a victim");
++    }
++    if (unanswered_ >= kMaxUnansweredRefreshes) {
++        end_episode();
++        return none(0, "the host does not answer");
++    }
++    unanswered_++;
++    return Decision{Decision::Action::kRefresh, -1, 0, kRefreshIntervalMs, "refresh"};
++}
++
++}  // namespace gpu_reclaim
+diff --git a/include/gpu_reclaim.h b/include/gpu_reclaim.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a43cea4d572da7d4fef00d4437e9ce3867d8a206
+--- /dev/null
++++ b/include/gpu_reclaim.h
+@@ -0,0 +1,164 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _LMKD_GPU_RECLAIM_H_
++#define _LMKD_GPU_RECLAIM_H_
++
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/types.h>
++
++/*
++ * GPU-aware reclaim. A virtual device whose graphics memory lives on the host has a budget that
++ * Android's own memory accounting cannot see. When the host reports that the budget is under
++ * pressure, lmkd ends the one cached app that holds the most host graphics memory, and nothing else.
++ *
++ * This is the part without side effects: the report, the choice of the victim and the limits. The
++ * file descriptors and the kill itself are in lmkd.cpp. It does not allocate and does not log.
++ *
++ * The report is /sys/class/drm/card0/gpu_memory_report, a root-only sysfs attribute of the guest's
++ * virtio-gpu driver that holds the last snapshot the host sent:
++ *
++ *   seq=<n> age_ms=<n> state=<n> refused=<n> budget=<n> used=<n> held=<n> armed=<0|1>
++ *   <pid> <bytes> <idle_ms> <contexts> <comm>
++ *   ...
++ *
++ * The first line is key=value pairs. `seq` counts snapshots from 1 (0 is "none yet") and `age_ms` is
++ * the age of this one. `state` has bit 0 set while the host's pool is under pressure and bit 1 set
++ * when an allocation was refused since the previous snapshot. The other numbers are bytes (`refused`
++ * counts refusals). A holder line is one process of the guest that holds host graphics memory, at
++ * most 16, largest first, with the process name as the guest gave it to the host. The driver
++ * notifies the file (poll for POLLPRI) when it stores a new snapshot.
++ *
++ * Writes to the file: "arm <min_bytes> <min_idle_ms>" asks the host to send snapshots, listing only
++ * holders of at least that many bytes that have been idle for at least that long; "refresh" asks for
++ * a new snapshot; "disarm" stops them.
++ */
++namespace gpu_reclaim {
++
++// The limits.
++constexpr uint64_t kMinHolderBytes = 32ull << 20;  // a holder must hold at least this much
++constexpr uint64_t kMinIdleMs = 10000;             // and have been idle for this long
++constexpr int64_t kMinKillIntervalMs = 3000;       // at most one kill in this time
++constexpr int kMaxKillsPerEpisode = 3;             // and this many while the pressure lasts
++constexpr int64_t kRefreshIntervalMs = 3000;       // snapshot refresh period while it lasts
++constexpr int64_t kEmptyPassBackoffMs = 10000;     // wait this long after a pass found no victim
++constexpr uint64_t kMaxSnapshotAgeMs = 6000;       // an older snapshot is not acted on
++constexpr int kMaxUnansweredRefreshes = 3;         // the host is silent: give the episode up
++
++// oom_score_adj bands, from frameworks/base/services/core/java/com/android/server/am/psc.
++constexpr int kCachedAppMinAdj = 900;      // CACHED_APP_MIN_ADJ
++constexpr int kPreviousAppAdj = 700;       // PREVIOUS_APP_ADJ
++constexpr int kPreviousAppMaxAdj = 799;    // PREVIOUS_APP_MAX_ADJ_LADDERED
++
++constexpr int kMaxHolders = 16;
++constexpr size_t kCommLen = 16;  // TASK_COMM_LEN, including the terminating NUL
++
++constexpr uint32_t kStatePressure = 1u << 0;
++constexpr uint32_t kStateRefused = 1u << 1;
++
++struct Holder {
++    int32_t pid;
++    uint64_t bytes;
++    uint64_t idle_ms;
++    uint32_t contexts;
++    char comm[kCommLen];
++};
++
++struct Report {
++    uint64_t seq;
++    uint64_t age_ms;
++    uint32_t state;
++    uint64_t refused;
++    uint64_t budget;
++    uint64_t used;
++    uint64_t held;
++    bool armed;
++    int holder_count;
++    Holder holders[kMaxHolders];
++};
++
++/*
++ * Parses the text of the report into *report. Returns false, leaving *report unspecified, when the
++ * header is missing, malformed or lacks seq or state. A holder line that is malformed, or beyond
++ * kMaxHolders, is skipped; so is a last line the text ends in the middle of.
++ */
++bool parse_report(const char* text, size_t len, Report* report);
++
++/* Whether the name a holder carries is the name the kernel has for the process (up to 15 chars). */
++bool comm_matches(const char* holder_comm, const char* proc_comm);
++
++/*
++ * Tells whether the process is registered with lmkd, and if so its oom_score_adj. The caller checks
++ * that the pid is still the process the holder names.
++ */
++typedef bool (*ProcLookup)(const Holder& holder, int* oomadj, void* cookie);
++
++/*
++ * Chooses the process to end among report.holders: the largest holder of at least kMinHolderBytes
++ * and idle for at least kMinIdleMs whose oom_score_adj is CACHED_APP_MIN_ADJ or more; if there is
++ * none, the largest such holder of the previous app's band. Anything below the previous app
++ * (service B, home, services, perceptible, visible, foreground) and any process lmkd does not know
++ * is never chosen. Returns its index, or -1, and stores the band's lowest adj in *band_adj.
++ */
++int choose_victim(const Report& report, ProcLookup lookup, void* cookie, int* band_adj);
++
++class Policy {
++  public:
++    struct Decision {
++        enum class Action {
++            kNone,     // nothing to do
++            kKill,     // end report.holders[holder]; then call on_kill_result()
++            kRefresh,  // ask the driver for a new snapshot
++        };
++        Action action;
++        int holder;        // kKill: index into the report
++        int band_adj;      // kKill: lowest adj of the band the victim is in
++        int64_t next_ms;   // the episode timer: fire in this long (0: cancel it)
++        const char* note;  // why nothing was done, for the debug log
++    };
++
++    /* Feeds a new snapshot. kill_pending is lmkd's own is_kill_pending(). */
++    Decision on_report(const Report& report, int64_t now_ms, bool kill_pending, ProcLookup lookup,
++                       void* cookie);
++    /* Reports the outcome of a kKill; returns the next timer. seq is the snapshot's. */
++    int64_t on_kill_result(int64_t now_ms, uint64_t seq, bool killed);
++    /* The episode timer fired. */
++    Decision on_timer(int64_t now_ms);
++
++    bool in_episode() const { return episode_; }
++    int kills_in_episode() const { return kills_; }
++
++  private:
++    void end_episode();
++    Decision none(int64_t next_ms, const char* note) const;
++
++    bool episode_ = false;
++    int kills_ = 0;
++    int unanswered_ = 0;
++    bool have_kill_ = false;
++    int64_t last_kill_ms_ = 0;
++    uint64_t last_kill_seq_ = 0;
++    int64_t next_pass_ms_ = 0;
++    bool have_seq_ = false;
++    uint64_t last_seq_ = 0;
++    bool have_refused_ = false;
++    uint64_t refused_seen_ = 0;
++};
++
++}  // namespace gpu_reclaim
++
++#endif
+diff --git a/lmkd.cpp b/lmkd.cpp
+index 4bac215d9a177827752534e64cbee913aeba4b21..ffa34aed51f24624abd97f5e286e594e1f0a7848 100644
+--- a/lmkd.cpp
++++ b/lmkd.cpp
+@@ -32,6 +32,7 @@
+ #include <sys/socket.h>
+ #include <sys/syscall.h>
+ #include <sys/sysinfo.h>
++#include <sys/timerfd.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -61,6 +62,7 @@
+ #include <processgroup/processgroup.h>
+ #include <psi/psi.h>
+ 
++#include "gpu_reclaim.h"
+ #include "reaper.h"
+ #include "statslog.h"
+ #include "watchdog.h"
+@@ -228,6 +230,7 @@ static int swap_compression_ratio;
+ static int swap_compression_ratio_div;
+ static bool relaxed_available_memory;
+ static int lowmem_min_oom_score;
++static bool gpu_reclaim_enabled;
+ static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
+     { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
+     { PSI_SOME, 100 },   /* 100ms out of 1sec for partial stall */
+@@ -290,8 +293,9 @@ static struct event_handler_info vmpressure_hinfo[VMPRESS_LEVEL_COUNT];
+  * 1 ctrl listen socket, 3 ctrl data socket, 3 memory pressure levels,
+  * 1 lmk events + 1 fd to wait for process death + 1 fd to receive kill failure notifications
+  * + 1 fd to receive memevent_listener notifications
++ * + 1 fd for the GPU memory report + 1 timer fd for its episodes
+  */
+-#define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1 + 1)
++#define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1 + 1 + 1 + 1)
+ static int epollfd;
+ static int maxevents;
+ 
+@@ -3667,6 +3671,278 @@ static void destroy_monitors() {
+     destroy_mp_psi(VMPRESS_LEVEL_LOW);
+ }
+ 
++/*
++ * GPU-aware reclaim (see gpu_reclaim.h). The guest's virtio-gpu driver keeps the host's last report
++ * of graphics memory pressure in a sysfs file and notifies the file when a new report arrives.
++ * While the host is under pressure, lmkd ends the cached app that holds the most of that memory,
++ * through the same path as every other kill. It is off unless ro.lmk.gpu_reclaim is set, and it
++ * stays off when the file does not exist: a kernel or a host without the report.
++ */
++#define GPU_REPORT_PATH "/sys/class/drm/card0/gpu_memory_report"
++#define GPU_REPORT_BUF_SIZE 4096
++
++static int gpu_report_fd = -1;
++static int gpu_timer_fd = -1;
++static gpu_reclaim::Policy gpu_policy;
++
++static int64_t gpu_now_ms(struct timespec* tm) {
++    clock_gettime(CLOCK_MONOTONIC_COARSE, tm);
++    return (int64_t)tm->tv_sec * 1000 + tm->tv_nsec / 1000000;
++}
++
++/* (Re)starts the episode timer to fire once in ms milliseconds; 0 stops it. */
++static void gpu_set_timer(int64_t ms) {
++    struct itimerspec its = {};
++
++    if (ms > 0) {
++        its.it_value.tv_sec = ms / 1000;
++        its.it_value.tv_nsec = (ms % 1000) * 1000000;
++    }
++    if (timerfd_settime(gpu_timer_fd, 0, &its, NULL) < 0) {
++        ALOGE("timerfd_settime for GPU reclaim failed; errno=%d", errno);
++    }
++}
++
++/* The name the kernel has for a process: /proc/<pid>/comm without its newline. */
++static bool read_proc_comm(int pid, char* buf, size_t buf_sz) {
++    char path[PROCFS_PATH_MAX];
++    ssize_t size;
++    int fd;
++
++    snprintf(path, PROCFS_PATH_MAX, "/proc/%d/comm", pid);
++    fd = TEMP_FAILURE_RETRY(open(path, O_RDONLY | O_CLOEXEC));
++    if (fd < 0) {
++        return false;
++    }
++    size = read_all(fd, buf, buf_sz - 1);
++    close(fd);
++    if (size <= 0) {
++        return false;
++    }
++    buf[size] = '\0';
++    char* newline = strchr(buf, '\n');
++    if (newline) {
++        *newline = '\0';
++    }
++    return buf[0] != '\0';
++}
++
++/*
++ * A holder is a candidate when the activity manager registered its process with lmkd, and the
++ * process under that pid still has the name the host gave for it. The name check keeps a pid that
++ * was reused since the host's report from naming another process.
++ */
++static bool gpu_proc_lookup(const gpu_reclaim::Holder& holder, int* oomadj, void*) {
++    struct proc* procp = pid_lookup(holder.pid);
++    char comm[32];
++
++    if (!procp || !procp->valid) {
++        return false;
++    }
++    if (!read_proc_comm(holder.pid, comm, sizeof(comm)) ||
++        !gpu_reclaim::comm_matches(holder.comm, comm)) {
++        return false;
++    }
++    *oomadj = procp->oomadj;
++    return true;
++}
++
++static bool read_gpu_report(gpu_reclaim::Report* report) {
++    static bool bad_report_logged = false;
++    char buf[GPU_REPORT_BUF_SIZE];
++
++    // One read of the whole file: its text is one snapshot, made when it is read.
++    ssize_t size = TEMP_FAILURE_RETRY(pread(gpu_report_fd, buf, sizeof(buf) - 1, 0));
++    if (size < 0) {
++        if (!bad_report_logged) {
++            bad_report_logged = true;
++            ALOGW("GPU reclaim: reading %s failed; errno=%d", GPU_REPORT_PATH, errno);
++        }
++        return false;
++    }
++    if (size == 0) {
++        // Nothing yet.
++        return false;
++    }
++    if (!gpu_reclaim::parse_report(buf, size, report)) {
++        if (!bad_report_logged) {
++            bad_report_logged = true;
++            ALOGW("GPU reclaim: %s is not a report this lmkd understands", GPU_REPORT_PATH);
++        }
++        return false;
++    }
++    return true;
++}
++
++/* Ends the holder the policy chose. Returns when the episode timer should fire next. */
++static int64_t gpu_kill(const gpu_reclaim::Report& report,
++                        const gpu_reclaim::Policy::Decision& decision, struct timespec* curr_tm,
++                        int64_t now_ms) {
++    const gpu_reclaim::Holder& holder = report.holders[decision.holder];
++    struct proc* procp = pid_lookup(holder.pid);
++    union meminfo mi;
++    struct kill_info ki = {
++            .kill_reason = VENDOR_KILL_REASON_BASE,
++            .kill_desc = "graphics memory pressure",
++            .thrashing = 0,
++            .max_thrashing = 0,
++    };
++
++    if (!procp) {
++        return gpu_policy.on_kill_result(now_ms, report.seq, false);
++    }
++    // kill_one_process reports the free memory; a failed parse leaves the fields zero.
++    meminfo_parse(&mi);
++    ALOGI("GPU reclaim: ending '%s' (%d), oom_score_adj %d: it holds %" PRIu64
++          "kB of host graphics memory and has been idle for %" PRIu64 "ms",
++          holder.comm, holder.pid, procp->oomadj, holder.bytes / 1024, holder.idle_ms);
++    int result = kill_one_process(procp, decision.band_adj, &ki, &mi, NULL, curr_tm, NULL);
++    return gpu_policy.on_kill_result(now_ms, report.seq, result >= 0);
++}
++
++static void gpu_log_episode(bool was_in_episode, const gpu_reclaim::Report* report) {
++    if (!was_in_episode && gpu_policy.in_episode()) {
++        ALOGI("GPU reclaim: the host reports graphics memory pressure (state %u, %" PRIu64
++              " of %" PRIu64 "kB used)",
++              report ? report->state : 0, report ? report->used / 1024 : 0,
++              report ? report->budget / 1024 : 0);
++    } else if (was_in_episode && !gpu_policy.in_episode()) {
++        ALOGI("GPU reclaim: the graphics memory pressure is over");
++    }
++}
++
++/* A new report: decide, and end the cached holder when it is time. */
++static void gpu_report_handler(int data __unused, uint32_t events __unused,
++                               struct polling_params* poll_params __unused) {
++    gpu_reclaim::Report report;
++    struct timespec curr_tm;
++
++    if (!read_gpu_report(&report)) {
++        return;
++    }
++    bool was_in_episode = gpu_policy.in_episode();
++    int64_t now_ms = gpu_now_ms(&curr_tm);
++    gpu_reclaim::Policy::Decision decision =
++            gpu_policy.on_report(report, now_ms, is_kill_pending(), gpu_proc_lookup, NULL);
++    int64_t next_ms = decision.next_ms;
++
++    if (decision.action == gpu_reclaim::Policy::Decision::Action::kKill) {
++        next_ms = gpu_kill(report, decision, &curr_tm, now_ms);
++    } else if (debug_process_killing && decision.note) {
++        ALOGI("GPU reclaim: no kill: %s", decision.note);
++    }
++    gpu_log_episode(was_in_episode, &report);
++    gpu_set_timer(next_ms);
++}
++
++/* The episode timer: while the pressure lasts, ask the driver for a new report. */
++static void gpu_timer_handler(int data __unused, uint32_t events __unused,
++                              struct polling_params* poll_params __unused) {
++    static const char refresh[] = "refresh";
++    static bool refresh_failure_logged = false;
++    struct timespec curr_tm;
++    uint64_t expirations;
++
++    if (TEMP_FAILURE_RETRY(read(gpu_timer_fd, &expirations, sizeof(expirations))) !=
++        (ssize_t)sizeof(expirations)) {
++        return;
++    }
++    bool was_in_episode = gpu_policy.in_episode();
++    gpu_reclaim::Policy::Decision decision = gpu_policy.on_timer(gpu_now_ms(&curr_tm));
++
++    if (decision.action == gpu_reclaim::Policy::Decision::Action::kRefresh) {
++        if (TEMP_FAILURE_RETRY(write(gpu_report_fd, refresh, sizeof(refresh) - 1)) !=
++                    (ssize_t)(sizeof(refresh) - 1) &&
++            !refresh_failure_logged) {
++            // The count of unanswered refreshes ends the episode.
++            refresh_failure_logged = true;
++            ALOGW("GPU reclaim: asking %s for a new report failed; errno=%d", GPU_REPORT_PATH,
++                  errno);
++        }
++    } else if (debug_process_killing && decision.note) {
++        ALOGI("GPU reclaim: %s", decision.note);
++    }
++    gpu_log_episode(was_in_episode, NULL);
++    gpu_set_timer(decision.next_ms);
++}
++
++static void init_gpu_reclaim() {
++    static struct event_handler_info report_hinfo = {0, gpu_report_handler};
++    static struct event_handler_info timer_hinfo = {0, gpu_timer_handler};
++    struct epoll_event epev;
++    char arm[64];
++    int report_fd;
++    int timer_fd;
++
++    if (!gpu_reclaim_enabled) {
++        return;
++    }
++    if (use_inkernel_interface) {
++        // The in-kernel killer keeps no table of processes to choose from.
++        ALOGI("GPU reclaim needs the userspace killer; it stays off");
++        return;
++    }
++
++    report_fd = TEMP_FAILURE_RETRY(open(GPU_REPORT_PATH, O_RDWR | O_CLOEXEC | O_NONBLOCK));
++    if (report_fd < 0) {
++        if (errno == ENOENT) {
++            // A kernel or a host without the report is not an error.
++            ALOGI("GPU reclaim is enabled but %s does not exist; it stays off", GPU_REPORT_PATH);
++        } else {
++            ALOGW("GPU reclaim: cannot open %s; errno=%d; it stays off", GPU_REPORT_PATH, errno);
++        }
++        return;
++    }
++
++    // Ask the host for reports of the holders worth ending.
++    snprintf(arm, sizeof(arm), "arm %" PRIu64 " %" PRIu64, gpu_reclaim::kMinHolderBytes,
++             gpu_reclaim::kMinIdleMs);
++    ssize_t arm_len = strlen(arm);
++    if (TEMP_FAILURE_RETRY(write(report_fd, arm, arm_len)) != arm_len) {
++        ALOGW("GPU reclaim: %s did not take \"%s\"; errno=%d; it stays off", GPU_REPORT_PATH, arm,
++              errno);
++        close(report_fd);
++        return;
++    }
++
++    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
++    if (timer_fd < 0) {
++        ALOGE("timerfd_create for GPU reclaim failed; errno=%d; it stays off", errno);
++        close(report_fd);
++        return;
++    }
++    epev.events = EPOLLIN;
++    epev.data.ptr = (void*)&timer_hinfo;
++    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, timer_fd, &epev) != 0) {
++        ALOGE("epoll_ctl for the GPU reclaim timer failed; errno=%d; it stays off", errno);
++        close(timer_fd);
++        close(report_fd);
++        return;
++    }
++
++    gpu_report_fd = report_fd;
++    gpu_timer_fd = timer_fd;
++    // Read what the file holds now. That also clears its pending change, so that the poll below
++    // reports only reports that arrive later.
++    gpu_report_handler(0, 0, NULL);
++
++    epev.events = EPOLLPRI | EPOLLERR;
++    epev.data.ptr = (void*)&report_hinfo;
++    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, report_fd, &epev) != 0) {
++        ALOGE("epoll_ctl for %s failed; errno=%d; GPU reclaim stays off", GPU_REPORT_PATH, errno);
++        epoll_ctl(epollfd, EPOLL_CTL_DEL, timer_fd, &epev);
++        gpu_report_fd = -1;
++        gpu_timer_fd = -1;
++        close(timer_fd);
++        close(report_fd);
++        return;
++    }
++    maxevents += 2;
++    ALOGI("GPU reclaim is on: ending cached apps that hold at least %" PRIu64
++          "kB of host graphics memory under pressure",
++          gpu_reclaim::kMinHolderBytes / 1024);
++}
++
+ static void drop_reaper_comm() {
+     close(reaper_comm_fd[0]);
+     close(reaper_comm_fd[1]);
+@@ -3844,6 +4120,8 @@ static int init(void) {
+         ALOGE("Failed to read %s: %s", file_data.filename, strerror(errno));
+     }
+ 
++    init_gpu_reclaim();
++
+     if (!lmkd_init_hook()) {
+         ALOGE("Failed to initialize LMKD hooks.");
+         return -1;
+@@ -4142,6 +4420,8 @@ static bool update_props() {
+             std::max(PERCEPTIBLE_APP_ADJ + 1,
+                      GET_LMK_PROPERTY(int32, "lowmem_min_oom_score", DEF_LOWMEM_MIN_SCORE));
+ 
++    gpu_reclaim_enabled = property_get_bool("ro.lmk.gpu_reclaim", false);
++
+     reaper.enable_debug(debug_process_killing);
+ 
+     /* Call the update props hook */
+diff --git a/tests/Android.bp b/tests/Android.bp
+index 07dd038d0d4eee8a3936c9070b08064220725679..70a2a7c68abc4ccfef3a2f3ddb34a5e05649e69a 100644
+--- a/tests/Android.bp
++++ b/tests/Android.bp
+@@ -29,11 +29,15 @@ cc_test {
+ 
+     static_libs: [
+         "liblmkd_utils",
++        "liblmkd_gpu_reclaim",
+     ],
+ 
+     target: {
+         android: {
+-            srcs: ["lmkd_test.cpp"],
++            srcs: [
++                "gpu_reclaim_test.cpp",
++                "lmkd_test.cpp",
++            ],
+         },
+     },
+ 
+diff --git a/tests/gpu_reclaim_test.cpp b/tests/gpu_reclaim_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a72475df21f6ee19154d3e0bc522fbc53bcee8b
+--- /dev/null
++++ b/tests/gpu_reclaim_test.cpp
+@@ -0,0 +1,626 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <string.h>
++
++#include <string>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++#include "gpu_reclaim.h"
++
++using gpu_reclaim::Holder;
++using gpu_reclaim::Policy;
++using gpu_reclaim::Report;
++
++namespace {
++
++constexpr uint64_t kMiB = 1ull << 20;
++using Action = Policy::Decision::Action;
++
++struct Proc {
++    int pid;
++    int oomadj;
++    const char* comm;
++};
++
++// The processes lmkd knows, with the adj the framework gave them.
++struct Table {
++    std::vector<Proc> procs;
++};
++
++bool lookup(const Holder& holder, int* oomadj, void* cookie) {
++    const Table* table = static_cast<const Table*>(cookie);
++    for (const Proc& proc : table->procs) {
++        if (proc.pid == holder.pid && gpu_reclaim::comm_matches(holder.comm, proc.comm)) {
++            *oomadj = proc.oomadj;
++            return true;
++        }
++    }
++    return false;
++}
++
++void add_holder(Report* report, int pid, uint64_t mib, uint64_t idle_ms, const char* comm) {
++    ASSERT_LT(report->holder_count, gpu_reclaim::kMaxHolders);
++    Holder& holder = report->holders[report->holder_count++];
++    memset(&holder, 0, sizeof(holder));
++    holder.pid = pid;
++    holder.bytes = mib * kMiB;
++    holder.idle_ms = idle_ms;
++    holder.contexts = 1;
++    strncpy(holder.comm, comm, sizeof(holder.comm) - 1);
++}
++
++Report make_report(uint64_t seq, uint32_t state) {
++    Report report;
++    memset(&report, 0, sizeof(report));
++    report.seq = seq;
++    report.state = state;
++    report.armed = true;
++    return report;
++}
++
++// A pressured snapshot with one cached app that holds 200 MiB.
++Report pressured(uint64_t seq) {
++    Report report = make_report(seq, gpu_reclaim::kStatePressure);
++    add_holder(&report, 100, 200, 60000, "cached.app");
++    return report;
++}
++
++const Table kCachedApp = {{{100, 950, "cached.app"}}};
++
++Policy::Decision feed(Policy* policy, const Report& report, int64_t now_ms, const Table& table,
++                      bool kill_pending = false) {
++    return policy->on_report(report, now_ms, kill_pending, lookup,
++                             const_cast<Table*>(&table));
++}
++
++void parse_text(const std::string& text, Report* report, bool* ok) {
++    *ok = gpu_reclaim::parse_report(text.data(), text.size(), report);
++}
++
++}  // namespace
++
++TEST(gpu_reclaim, the_limits_are_the_decided_ones) {
++    EXPECT_EQ(32u << 20, gpu_reclaim::kMinHolderBytes);
++    EXPECT_EQ(10000u, gpu_reclaim::kMinIdleMs);
++    EXPECT_EQ(3000, gpu_reclaim::kMinKillIntervalMs);
++    EXPECT_EQ(3, gpu_reclaim::kMaxKillsPerEpisode);
++    EXPECT_EQ(900, gpu_reclaim::kCachedAppMinAdj);
++    EXPECT_EQ(700, gpu_reclaim::kPreviousAppAdj);
++    EXPECT_EQ(799, gpu_reclaim::kPreviousAppMaxAdj);
++}
++
++TEST(gpu_reclaim, parse_the_documented_report) {
++    Report report;
++    bool ok;
++    parse_text(
++            "seq=7 age_ms=12 state=3 refused=4 budget=536870912 used=500000000 held=450000000 "
++            "armed=1\n"
++            "4242 209715200 65000 3 org.example.app\n"
++            "315 67108864 12000 1 surfaceflinger\n",
++            &report, &ok);
++    ASSERT_TRUE(ok);
++    EXPECT_EQ(7u, report.seq);
++    EXPECT_EQ(12u, report.age_ms);
++    EXPECT_EQ(3u, report.state);
++    EXPECT_EQ(4u, report.refused);
++    EXPECT_EQ(536870912u, report.budget);
++    EXPECT_EQ(500000000u, report.used);
++    EXPECT_EQ(450000000u, report.held);
++    EXPECT_TRUE(report.armed);
++    ASSERT_EQ(2, report.holder_count);
++    EXPECT_EQ(4242, report.holders[0].pid);
++    EXPECT_EQ(209715200u, report.holders[0].bytes);
++    EXPECT_EQ(65000u, report.holders[0].idle_ms);
++    EXPECT_EQ(3u, report.holders[0].contexts);
++    EXPECT_STREQ("org.example.app", report.holders[0].comm);
++    EXPECT_EQ(315, report.holders[1].pid);
++    EXPECT_STREQ("surfaceflinger", report.holders[1].comm);
++}
++
++TEST(gpu_reclaim, parse_a_report_without_holders) {
++    Report report;
++    bool ok;
++    parse_text("seq=1 state=0\n", &report, &ok);
++    ASSERT_TRUE(ok);
++    EXPECT_EQ(1u, report.seq);
++    EXPECT_EQ(0u, report.state);
++    EXPECT_FALSE(report.armed);
++    EXPECT_EQ(0, report.holder_count);
++}
++
++TEST(gpu_reclaim, parse_ignores_unknown_header_keys) {
++    Report report;
++    bool ok;
++    parse_text("seq=2 future=99 state=1 armed=1\n", &report, &ok);
++    ASSERT_TRUE(ok);
++    EXPECT_EQ(2u, report.seq);
++    EXPECT_EQ(1u, report.state);
++}
++
++TEST(gpu_reclaim, parse_rejects_a_bad_header) {
++    Report report;
++    bool ok;
++    parse_text("", &report, &ok);
++    EXPECT_FALSE(ok);
++    parse_text("\n\n", &report, &ok);
++    EXPECT_FALSE(ok);
++    parse_text("seq=1\n", &report, &ok);  // no state
++    EXPECT_FALSE(ok);
++    parse_text("state=1\n", &report, &ok);  // no seq
++    EXPECT_FALSE(ok);
++    parse_text("seq=x state=1\n", &report, &ok);
++    EXPECT_FALSE(ok);
++    parse_text("seq=1 state=1 armed\n", &report, &ok);  // not key=value
++    EXPECT_FALSE(ok);
++    parse_text("seq=-1 state=1\n", &report, &ok);
++    EXPECT_FALSE(ok);
++    parse_text("seq=99999999999999999999 state=1\n", &report, &ok);  // overflow
++    EXPECT_FALSE(ok);
++    parse_text("seq=1 state=4294967296\n", &report, &ok);  // does not fit
++    EXPECT_FALSE(ok);
++    parse_text("seq=1 state=1", &report, &ok);  // the line is cut: no newline
++    EXPECT_FALSE(ok);
++    parse_text("4242 209715200 65000 3 app\nseq=1 state=1\n", &report, &ok);  // header not first
++    EXPECT_FALSE(ok);
++    parse_text(std::string(300, 'a') + "\nseq=1 state=1\n", &report, &ok);  // header too long
++    EXPECT_FALSE(ok);
++}
++
++TEST(gpu_reclaim, parse_skips_bad_holder_lines) {
++    Report report;
++    bool ok;
++    parse_text(
++            "seq=3 state=1\n"
++            "0 100 100 1 pid-zero\n"
++            "-5 100 100 1 negative\n"
++            "2147483648 100 100 1 pid-too-big\n"
++            "10 100 100 1\n"                  // no name
++            "11 100 100 x name\n"             // not a number
++            "12 100 100 1 name-is-too-long-16\n"  // 16 characters
++            "13 100\n"                        // short
++            "17 100 100 1 bad\tname\n"          // a control character in the name
++            "14 100 100 4294967296 name\n"    // contexts do not fit
++            "15 100 100 1 fine\n"
++            "\n"
++            "16 100 100 1 with space \r\n",
++            &report, &ok);
++    ASSERT_TRUE(ok);
++    ASSERT_EQ(2, report.holder_count);
++    EXPECT_EQ(15, report.holders[0].pid);
++    EXPECT_STREQ("fine", report.holders[0].comm);
++    EXPECT_EQ(16, report.holders[1].pid);
++    EXPECT_STREQ("with space", report.holders[1].comm);
++}
++
++TEST(gpu_reclaim, parse_keeps_a_15_character_name) {
++    Report report;
++    bool ok;
++    parse_text("seq=3 state=1\n10 100 100 1 123456789012345\n", &report, &ok);
++    ASSERT_TRUE(ok);
++    ASSERT_EQ(1, report.holder_count);
++    EXPECT_STREQ("123456789012345", report.holders[0].comm);
++}
++
++TEST(gpu_reclaim, parse_stops_at_sixteen_holders) {
++    std::string text = "seq=3 state=1\n";
++    for (int i = 0; i < 20; i++) {
++        text += std::to_string(100 + i) + " 100 100 1 app\n";
++    }
++    Report report;
++    bool ok;
++    parse_text(text, &report, &ok);
++    ASSERT_TRUE(ok);
++    ASSERT_EQ(gpu_reclaim::kMaxHolders, report.holder_count);
++    EXPECT_EQ(100, report.holders[0].pid);
++    EXPECT_EQ(115, report.holders[15].pid);
++}
++
++TEST(gpu_reclaim, parse_drops_a_line_the_text_ends_in) {
++    Report report;
++    bool ok;
++    parse_text("seq=3 state=1\n10 100 100 1 app\n11 100 100 1 ap", &report, &ok);
++    ASSERT_TRUE(ok);
++    ASSERT_EQ(1, report.holder_count);
++    EXPECT_EQ(10, report.holders[0].pid);
++}
++
++TEST(gpu_reclaim, parse_survives_every_truncation_and_byte_change) {
++    const std::string sample =
++            "seq=7 age_ms=12 state=3 refused=4 budget=536870912 used=500000000 held=450000000 "
++            "armed=1\n"
++            "4242 209715200 65000 3 org.example.app\n"
++            "315 67108864 12000 1 surfaceflinger\n";
++    auto check = [](const std::string& text) {
++        Report report;
++        if (gpu_reclaim::parse_report(text.data(), text.size(), &report)) {
++            EXPECT_LE(report.holder_count, gpu_reclaim::kMaxHolders);
++            for (int i = 0; i < report.holder_count; i++) {
++                EXPECT_GT(report.holders[i].pid, 0);
++                EXPECT_LT(strlen(report.holders[i].comm), gpu_reclaim::kCommLen);
++                EXPECT_GT(strlen(report.holders[i].comm), 0u);
++            }
++        }
++    };
++    for (size_t len = 0; len <= sample.size(); len++) {
++        check(sample.substr(0, len));
++    }
++    for (size_t i = 0; i < sample.size(); i++) {
++        for (int value : {0, 10, 32, 61, 57, 120, 255}) {
++            std::string mutated = sample;
++            mutated[i] = static_cast<char>(value);
++            check(mutated);
++        }
++    }
++}
++
++TEST(gpu_reclaim, comm_matches_compares_fifteen_characters) {
++    EXPECT_TRUE(gpu_reclaim::comm_matches("surfaceflinger", "surfaceflinger"));
++    EXPECT_FALSE(gpu_reclaim::comm_matches("surfaceflinger", "surfaceflinge"));
++    EXPECT_FALSE(gpu_reclaim::comm_matches("surfaceflinger", "other"));
++    EXPECT_TRUE(gpu_reclaim::comm_matches("123456789012345", "123456789012345678"));
++    EXPECT_FALSE(gpu_reclaim::comm_matches("", ""));
++    EXPECT_FALSE(gpu_reclaim::comm_matches(nullptr, "a"));
++    EXPECT_FALSE(gpu_reclaim::comm_matches("a", nullptr));
++}
++
++TEST(gpu_reclaim, victim_is_the_largest_cached_holder) {
++    Report report = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&report, 1, 100, 20000, "small");
++    add_holder(&report, 2, 300, 20000, "large");
++    add_holder(&report, 3, 200, 20000, "middle");
++    Table table = {{{1, 900, "small"}, {2, 999, "large"}, {3, 1000, "middle"}}};
++    int band = 0;
++    EXPECT_EQ(1, gpu_reclaim::choose_victim(report, lookup, &table, &band));
++    EXPECT_EQ(900, band);
++}
++
++TEST(gpu_reclaim, victim_ties_go_to_the_first) {
++    Report report = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&report, 1, 100, 20000, "a");
++    add_holder(&report, 2, 100, 20000, "b");
++    Table table = {{{1, 950, "a"}, {2, 950, "b"}}};
++    int band = 0;
++    EXPECT_EQ(0, gpu_reclaim::choose_victim(report, lookup, &table, &band));
++}
++
++TEST(gpu_reclaim, victim_is_a_cached_holder_before_a_larger_previous_app) {
++    Report report = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&report, 1, 900, 20000, "previous");
++    add_holder(&report, 2, 40, 20000, "cached");
++    Table table = {{{1, 700, "previous"}, {2, 900, "cached"}}};
++    int band = 0;
++    EXPECT_EQ(1, gpu_reclaim::choose_victim(report, lookup, &table, &band));
++    EXPECT_EQ(900, band);
++}
++
++TEST(gpu_reclaim, victim_is_the_previous_app_when_no_cached_holder_qualifies) {
++    Report report = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&report, 1, 100, 20000, "prev-small");
++    add_holder(&report, 2, 400, 20000, "prev-large");
++    add_holder(&report, 3, 20, 20000, "cached-tiny");  // below the minimum
++    Table table = {{{1, 700, "prev-small"}, {2, 799, "prev-large"}, {3, 950, "cached-tiny"}}};
++    int band = 0;
++    EXPECT_EQ(1, gpu_reclaim::choose_victim(report, lookup, &table, &band));
++    EXPECT_EQ(700, band);
++}
++
++TEST(gpu_reclaim, victim_is_never_below_the_previous_app) {
++    const int adjs[] = {-1000, -900, 0, 100, 199, 200, 250, 300, 400, 500, 600, 699, 800, 850, 899};
++    for (int adj : adjs) {
++        Report report = make_report(1, gpu_reclaim::kStatePressure);
++        add_holder(&report, 1, 500, 60000, "app");
++        Table table = {{{1, adj, "app"}}};
++        int band = 0;
++        EXPECT_EQ(-1, gpu_reclaim::choose_victim(report, lookup, &table, &band)) << adj;
++    }
++}
++
++TEST(gpu_reclaim, victim_bands_have_exact_edges) {
++    const struct {
++        int adj;
++        int band;  // 0: none
++    } cases[] = {{700, 700}, {750, 700}, {799, 700}, {900, 900}, {950, 900}, {999, 900},
++                 {1000, 900}};
++    for (const auto& c : cases) {
++        Report report = make_report(1, gpu_reclaim::kStatePressure);
++        add_holder(&report, 1, 500, 60000, "app");
++        Table table = {{{1, c.adj, "app"}}};
++        int band = 0;
++        EXPECT_EQ(0, gpu_reclaim::choose_victim(report, lookup, &table, &band)) << c.adj;
++        EXPECT_EQ(c.band, band) << c.adj;
++    }
++}
++
++TEST(gpu_reclaim, victim_needs_the_minimum_size_and_idle_time) {
++    Table table = {{{1, 950, "app"}}};
++    int band = 0;
++
++    Report exact = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&exact, 1, 32, gpu_reclaim::kMinIdleMs, "app");
++    EXPECT_EQ(0, gpu_reclaim::choose_victim(exact, lookup, &table, &band));
++
++    Report small = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&small, 1, 32, gpu_reclaim::kMinIdleMs, "app");
++    small.holders[0].bytes -= 1;
++    EXPECT_EQ(-1, gpu_reclaim::choose_victim(small, lookup, &table, &band));
++
++    Report busy = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&busy, 1, 500, gpu_reclaim::kMinIdleMs - 1, "app");
++    EXPECT_EQ(-1, gpu_reclaim::choose_victim(busy, lookup, &table, &band));
++}
++
++TEST(gpu_reclaim, victim_must_be_known_and_the_same_process) {
++    Report report = make_report(1, gpu_reclaim::kStatePressure);
++    add_holder(&report, 1, 500, 60000, "unregistered");
++    add_holder(&report, 2, 400, 60000, "reused-pid");
++    add_holder(&report, 3, 100, 60000, "good");
++    Table table = {{{2, 950, "another-process"}, {3, 950, "good"}}};
++    int band = 0;
++    EXPECT_EQ(2, gpu_reclaim::choose_victim(report, lookup, &table, &band));
++}
++
++TEST(gpu_reclaim, no_holders_no_victim) {
++    Report report = make_report(1, gpu_reclaim::kStatePressure);
++    Table table = {{}};
++    int band = 0;
++    EXPECT_EQ(-1, gpu_reclaim::choose_victim(report, lookup, &table, &band));
++}
++
++TEST(gpu_reclaim, calm_snapshot_does_nothing) {
++    Policy policy;
++    Report report = make_report(1, 0);
++    add_holder(&report, 100, 200, 60000, "cached.app");
++    Policy::Decision d = feed(&policy, report, 1000, kCachedApp);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(0, d.next_ms);
++    EXPECT_FALSE(policy.in_episode());
++}
++
++TEST(gpu_reclaim, no_snapshot_yet_does_nothing) {
++    Policy policy;
++    Report report = make_report(0, gpu_reclaim::kStatePressure);
++    add_holder(&report, 100, 200, 60000, "cached.app");
++    Policy::Decision d = feed(&policy, report, 1000, kCachedApp);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_FALSE(policy.in_episode());
++}
++
++TEST(gpu_reclaim, pressure_ends_the_cached_holder) {
++    Policy policy;
++    Policy::Decision d = feed(&policy, pressured(1), 1000, kCachedApp);
++    ASSERT_TRUE(d.action == Action::kKill);
++    EXPECT_EQ(0, d.holder);
++    EXPECT_EQ(900, d.band_adj);
++    EXPECT_TRUE(policy.in_episode());
++    EXPECT_EQ(gpu_reclaim::kMinKillIntervalMs + 50, policy.on_kill_result(1000, 1, true));
++    EXPECT_EQ(1, policy.kills_in_episode());
++}
++
++TEST(gpu_reclaim, a_refusal_alone_opens_an_episode) {
++    Policy policy;
++    Report report = make_report(1, gpu_reclaim::kStateRefused);
++    add_holder(&report, 100, 200, 60000, "cached.app");
++    EXPECT_TRUE(feed(&policy, report, 1000, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, a_rising_refusal_count_is_a_refusal) {
++    Policy policy;
++    Report first = make_report(1, 0);
++    first.refused = 5;
++    add_holder(&first, 100, 200, 60000, "cached.app");
++    // The first count is a baseline.
++    EXPECT_TRUE(feed(&policy, first, 1000, kCachedApp).action == Action::kNone);
++    EXPECT_FALSE(policy.in_episode());
++
++    Report same = first;
++    same.seq = 2;
++    EXPECT_TRUE(feed(&policy, same, 2000, kCachedApp).action == Action::kNone);
++
++    Report more = first;
++    more.seq = 3;
++    more.refused = 6;
++    EXPECT_TRUE(feed(&policy, more, 3000, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, at_most_one_kill_in_three_seconds) {
++    Policy policy;
++    Table table = {{{100, 950, "cached.app"}, {101, 950, "second.app"}}};
++    Report first = pressured(1);
++    add_holder(&first, 101, 100, 60000, "second.app");
++    ASSERT_TRUE(feed(&policy, first, 10000, table).action == Action::kKill);
++    policy.on_kill_result(10000, 1, true);
++
++    Report next = pressured(2);
++    add_holder(&next, 101, 100, 60000, "second.app");
++    next.holders[0].pid = 101;  // the first holder is gone: only the second remains
++    strncpy(next.holders[0].comm, "second.app", sizeof(next.holders[0].comm) - 1);
++    next.holder_count = 1;
++    Policy::Decision d = feed(&policy, next, 12999, table);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(1, d.next_ms);
++    d = feed(&policy, next, 11000, table);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(2000, d.next_ms);
++    d = feed(&policy, next, 13000, table);
++    EXPECT_TRUE(d.action == Action::kKill);
++}
++
++TEST(gpu_reclaim, the_snapshot_must_be_newer_than_the_last_kill) {
++    Policy policy;
++    ASSERT_TRUE(feed(&policy, pressured(5), 1000, kCachedApp).action == Action::kKill);
++    policy.on_kill_result(1000, 5, true);
++    Table table = {{{100, 950, "cached.app"}}};
++    EXPECT_TRUE(feed(&policy, pressured(5), 9000, table).action == Action::kNone);
++    EXPECT_TRUE(feed(&policy, pressured(4), 9000, table).action == Action::kNone);
++    EXPECT_TRUE(feed(&policy, pressured(6), 9000, table).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, three_kills_in_an_episode) {
++    Policy policy;
++    int64_t now = 1000;
++    for (int i = 0; i < gpu_reclaim::kMaxKillsPerEpisode; i++) {
++        Policy::Decision d = feed(&policy, pressured(1 + i), now, kCachedApp);
++        ASSERT_TRUE(d.action == Action::kKill) << i;
++        int64_t next = policy.on_kill_result(now, 1 + i, true);
++        if (i + 1 < gpu_reclaim::kMaxKillsPerEpisode) {
++            EXPECT_GT(next, 0);
++        } else {
++            EXPECT_EQ(0, next);
++        }
++        now += 3100;
++    }
++    Policy::Decision d = feed(&policy, pressured(10), now, kCachedApp);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(0, d.next_ms);
++    EXPECT_TRUE(policy.in_episode());
++    EXPECT_EQ(gpu_reclaim::kMaxKillsPerEpisode, policy.kills_in_episode());
++}
++
++TEST(gpu_reclaim, a_calm_snapshot_ends_the_episode_and_the_next_one_may_kill) {
++    Policy policy;
++    int64_t now = 1000;
++    for (int i = 0; i < gpu_reclaim::kMaxKillsPerEpisode; i++) {
++        ASSERT_TRUE(feed(&policy, pressured(1 + i), now, kCachedApp).action == Action::kKill);
++        policy.on_kill_result(now, 1 + i, true);
++        now += 3100;
++    }
++    Report calm = make_report(20, 0);
++    EXPECT_TRUE(feed(&policy, calm, now, kCachedApp).action == Action::kNone);
++    EXPECT_FALSE(policy.in_episode());
++    EXPECT_EQ(0, policy.kills_in_episode());
++    EXPECT_TRUE(feed(&policy, pressured(21), now + 100, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, nothing_while_a_kill_is_pending) {
++    Policy policy;
++    Policy::Decision d = feed(&policy, pressured(1), 1000, kCachedApp, true);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(gpu_reclaim::kRefreshIntervalMs, d.next_ms);
++    EXPECT_TRUE(policy.in_episode());
++    EXPECT_TRUE(feed(&policy, pressured(2), 5000, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, a_stale_snapshot_is_not_acted_on) {
++    Policy policy;
++    Report report = pressured(1);
++    report.age_ms = gpu_reclaim::kMaxSnapshotAgeMs + 1;
++    EXPECT_TRUE(feed(&policy, report, 1000, kCachedApp).action == Action::kNone);
++    report.age_ms = gpu_reclaim::kMaxSnapshotAgeMs;
++    report.seq = 2;
++    EXPECT_TRUE(feed(&policy, report, 1000, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, a_pass_without_a_victim_backs_off) {
++    Policy policy;
++    Table nobody = {{}};
++    Policy::Decision d = feed(&policy, pressured(1), 1000, nobody);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(gpu_reclaim::kEmptyPassBackoffMs, d.next_ms);
++    EXPECT_TRUE(policy.in_episode());
++
++    d = feed(&policy, pressured(2), 4000, kCachedApp);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(gpu_reclaim::kEmptyPassBackoffMs - 3000, d.next_ms);
++
++    EXPECT_TRUE(feed(&policy, pressured(3), 11000, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, a_failed_kill_is_not_counted_and_waits) {
++    Policy policy;
++    ASSERT_TRUE(feed(&policy, pressured(1), 1000, kCachedApp).action == Action::kKill);
++    EXPECT_EQ(gpu_reclaim::kMinKillIntervalMs, policy.on_kill_result(1000, 1, false));
++    EXPECT_EQ(0, policy.kills_in_episode());
++    EXPECT_TRUE(feed(&policy, pressured(2), 2000, kCachedApp).action == Action::kNone);
++    EXPECT_TRUE(feed(&policy, pressured(3), 4000, kCachedApp).action == Action::kKill);
++}
++
++TEST(gpu_reclaim, timer_without_an_episode_stops) {
++    Policy policy;
++    Policy::Decision d = policy.on_timer(1000);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(0, d.next_ms);
++}
++
++TEST(gpu_reclaim, timer_asks_for_a_refresh_while_the_pressure_lasts) {
++    Policy policy;
++    Table nobody = {{}};
++    feed(&policy, pressured(1), 1000, nobody);  // opens the episode; backs off until 11000
++
++    Policy::Decision d = policy.on_timer(4000);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(7000, d.next_ms);
++
++    d = policy.on_timer(11000);
++    EXPECT_TRUE(d.action == Action::kRefresh);
++    EXPECT_EQ(gpu_reclaim::kRefreshIntervalMs, d.next_ms);
++}
++
++TEST(gpu_reclaim, timer_gives_up_when_the_host_does_not_answer) {
++    Policy policy;
++    ASSERT_TRUE(feed(&policy, pressured(1), 1000, kCachedApp, true).action == Action::kNone);
++    int64_t now = 4000;
++    for (int i = 0; i < gpu_reclaim::kMaxUnansweredRefreshes; i++) {
++        EXPECT_TRUE(policy.on_timer(now).action == Action::kRefresh) << i;
++        now += 3000;
++    }
++    Policy::Decision d = policy.on_timer(now);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(0, d.next_ms);
++    EXPECT_FALSE(policy.in_episode());
++}
++
++TEST(gpu_reclaim, an_answer_resets_the_count_of_unanswered_refreshes) {
++    Policy policy;
++    ASSERT_TRUE(feed(&policy, pressured(1), 1000, kCachedApp, true).action == Action::kNone);
++    int64_t now = 4000;
++    for (int round = 0; round < 3; round++) {
++        EXPECT_TRUE(policy.on_timer(now).action == Action::kRefresh);
++        now += 3000;
++        EXPECT_TRUE(policy.on_timer(now).action == Action::kRefresh);
++        now += 3000;
++        // A new snapshot arrives (the kill stays pending).
++        EXPECT_TRUE(feed(&policy, pressured(2 + round), now, kCachedApp, true).action ==
++                    Action::kNone);
++    }
++    EXPECT_TRUE(policy.in_episode());
++    EXPECT_TRUE(policy.on_timer(now).action == Action::kRefresh);
++}
++
++TEST(gpu_reclaim, timer_waits_out_the_interval_after_a_kill) {
++    Policy policy;
++    ASSERT_TRUE(feed(&policy, pressured(1), 1000, kCachedApp).action == Action::kKill);
++    policy.on_kill_result(1000, 1, true);
++    Policy::Decision d = policy.on_timer(3990);  // a clock that runs a tick early
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(10, d.next_ms);
++    EXPECT_TRUE(policy.on_timer(4050).action == Action::kRefresh);
++}
++
++TEST(gpu_reclaim, timer_stops_at_the_kill_limit) {
++    Policy policy;
++    int64_t now = 1000;
++    for (int i = 0; i < gpu_reclaim::kMaxKillsPerEpisode; i++) {
++        ASSERT_TRUE(feed(&policy, pressured(1 + i), now, kCachedApp).action == Action::kKill);
++        policy.on_kill_result(now, 1 + i, true);
++        now += 3100;
++    }
++    Policy::Decision d = policy.on_timer(now);
++    EXPECT_TRUE(d.action == Action::kNone);
++    EXPECT_EQ(0, d.next_ms);
++}

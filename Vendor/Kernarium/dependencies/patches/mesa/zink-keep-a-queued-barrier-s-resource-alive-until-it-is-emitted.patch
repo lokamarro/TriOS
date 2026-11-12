@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 22:44:01 +0900
+Subject: [PATCH] zink: keep a queued barrier's resource alive until it is
+ emitted
+
+ctx->need_barriers[] holds bare struct zink_resource pointers, but every
+counter that decides when an entry goes in or comes out - bind_count,
+fb_bind_count, sampler_bind_count - is counted on the zink_resource, which all
+the contexts of a screen share. A context that only barriers a resource, in a
+blit, a transfer or a readpixels, therefore queues it whenever some other
+context of the share group has it bound, and nothing ever removes that entry:
+update_img_bind_count() and unbind_fb_surface() remove from the set of the
+context that makes the unbind, resource_release() cleans only the context it is
+called on, and zink_resource_destroy() runs at screen level with no context at
+all. The next draw of the queueing context then reads a freed resource.
+
+A virglrenderer host is exactly that share group - one pipe_context per guest
+virgl context, one resource table - and it crashes there. Two guest OpenGL ES
+conformance cases reproduce it, KHR-GLES3.packed_depth_stencil.verify_partial_-
+attachments.depth24_stencil8 and KHR-GLES3.copy_tex_image_conversions.required.-
+texture2d_texture2d, in zink_update_barriers() reading res->obj out of a block
+that has already been recycled. An instrumented build that tags every queueing
+site and marks a resource dead in zink_resource_destroy() caught twenty such
+keys in a single 813-case shard, nine of them queued by
+resource_defer_image_barrier() and the rest from sites whose resource address
+had since been reused.
+
+Give a queued entry a reference to the resource it names. The owning context
+drains its queue on the next draw or dispatch and drops the reference again, so
+the resource lives no longer than the barrier that asks for it, and no context
+can be left holding a pointer to a resource another context destroyed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_batch.c         |   2 +-
+ src/gallium/drivers/zink/zink_context.c       | 125 +++++++++++++++---
+ src/gallium/drivers/zink/zink_context.h       |   6 +
+ .../drivers/zink/zink_synchronization.cpp     |   8 +-
+ 4 files changed, 119 insertions(+), 22 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index f1e6258b9957145fef0c9bc927c690fb8c6528df..846ae0a748f5981974093ae599f44e87d4cfe06a 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -956,7 +956,7 @@ zink_end_batch(struct zink_context *ctx)
+        */
+       for (unsigned i = 0; i < ARRAY_SIZE(ctx->need_barriers); i++) {
+          if (res->bind_count[i])
+-            _mesa_set_add(ctx->need_barriers[i], res);
++            zink_queue_barrier(ctx, i == 1, res);
+       }
+ 
+       for (; res; res = zink_resource(res->base.b.next)) {
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index a57e5843cce3e386ee219a4bebcf9e8099661487..86fd508be22e6b69cd1070b3154fa1413b9716c2 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -97,6 +97,8 @@ check_resource_for_batch_ref(struct zink_context *ctx, struct zink_resource *res
+       zink_batch_reference_resource(ctx, res);
+ }
+ 
++static void drop_queued_barrier_reference(struct zink_resource *res);
++
+ static void
+ texture_handle_residency(struct zink_context *ctx, struct zink_bindless_descriptor *bd, bool resident);
+ static void
+@@ -125,6 +127,27 @@ zink_context_destroy(struct pipe_context *pctx)
+       }
+    }
+ 
++   /* the queue outlives no resource: release what this context still holds.
++    * Each pass takes the entry out before it drops the reference, so a destroy
++    * that runs from here cannot disturb the walk.
++    */
++   for (unsigned i = 0; i < ARRAY_SIZE(ctx->update_barriers); i++) {
++      for (unsigned j = 0; j < ARRAY_SIZE(ctx->update_barriers[i]); j++) {
++         struct set *queued = &ctx->update_barriers[i][j];
++
++         while (queued->entries) {
++            struct set_entry *he = _mesa_set_next_entry(queued, NULL);
++            struct zink_resource *res;
++
++            if (!he)
++               break;
++            res = (struct zink_resource *)he->key;
++            _mesa_set_remove(queued, he);
++            drop_queued_barrier_reference(res);
++         }
++      }
++   }
++
+ #if HAVE_RENDERDOC_INTEGRATION
+    if (screen->base.num_contexts == 1 && screen->renderdoc_capturing) {
+       ctx->bs->has_work = true;
+@@ -1373,13 +1396,69 @@ zink_set_polygon_stipple(struct pipe_context *pctx,
+ {
+ }
+ 
++/* The barrier queue holds bare zink_resource pointers, and every counter that
++ * decides when an entry goes in or comes out - bind_count, fb_bind_count,
++ * sampler_bind_count - is counted on the resource, which all the contexts of a
++ * screen share, while the queue itself belongs to one context. A context that
++ * only barriers a resource therefore queues it whenever some *other* context
++ * has it bound, and no removal ever reaches that queue: the unbind paths remove
++ * from the set of the context that makes the unbind, resource_release() cleans
++ * only the context it is called on, and zink_resource_destroy() runs at screen
++ * level with no context at all. The entry then outlives the resource.
++ *
++ * Give every queued entry a reference instead. The next draw or dispatch of the
++ * owning context drains the queue and drops it again, so a resource is held no
++ * longer than the barrier that names it.
++ */
++void
++zink_queue_barrier(struct zink_context *ctx, bool is_compute, struct zink_resource *res)
++{
++   struct set *set = ctx->need_barriers[is_compute];
++   uint32_t entries = set->entries;
++
++   _mesa_set_add(set, res);
++   if (set->entries != entries)
++      pipe_reference(NULL, &res->base.b.reference);
++}
++
++static bool
++queue_barrier_pre_hashed(struct zink_context *ctx, bool is_compute, uint32_t hash,
++                         struct zink_resource *res)
++{
++   struct set *set = ctx->need_barriers[is_compute];
++   uint32_t entries = set->entries;
++
++   _mesa_set_add_pre_hashed(set, hash, res);
++   return set->entries != entries;
++}
++
++static void
++drop_queued_barrier_reference(struct zink_resource *res)
++{
++   struct zink_resource *reference = res;
++
++   zink_resource_reference(&reference, NULL);
++}
++
++void
++zink_unqueue_barrier(struct zink_context *ctx, bool is_compute, struct zink_resource *res)
++{
++   struct set_entry *entry =
++      _mesa_set_search(ctx->need_barriers[is_compute], res);
++
++   if (!entry)
++      return;
++   _mesa_set_remove(ctx->need_barriers[is_compute], entry);
++   drop_queued_barrier_reference(res);
++}
++
+ ALWAYS_INLINE static void
+ resource_release(struct zink_context *ctx, struct zink_resource *res)
+ {
+    if (zink_resource_has_usage(res) && !zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res, ZINK_RESOURCE_ACCESS_RW))
+       zink_batch_reference_resource(ctx, res);
+-   _mesa_set_remove_key(ctx->need_barriers[0], res);
+-   _mesa_set_remove_key(ctx->need_barriers[1], res);
++   zink_unqueue_barrier(ctx, false, res);
++   zink_unqueue_barrier(ctx, true, res);
+    zink_resource_reference(&res, NULL);
+ }
+ 
+@@ -1390,7 +1469,7 @@ update_img_bind_count(struct zink_context *ctx, struct zink_resource *res, bool
+    if (decrement) {
+       assert(res->bind_count[is_compute]);
+       if (p_atomic_dec_zero(&res->bind_count[is_compute]))
+-         _mesa_set_remove_key(ctx->need_barriers[is_compute], res);
++         zink_unqueue_barrier(ctx, is_compute, res);
+       check_resource_for_batch_ref(ctx, res);
+    } else
+       p_atomic_inc(&res->bind_count[is_compute]);
+@@ -2031,9 +2110,9 @@ update_binds_for_samplerviews(struct zink_context *ctx, struct zink_resource *re
+       }
+     }
+     if (gfx_rebind)
+-      _mesa_set_add(ctx->need_barriers[0], res);
++      zink_queue_barrier(ctx, false, res);
+     if (compute_rebind)
+-      _mesa_set_add(ctx->need_barriers[1], res);
++      zink_queue_barrier(ctx, true, res);
+ }
+ 
+ static void
+@@ -2064,14 +2143,19 @@ check_for_layout_update(struct zink_context *ctx, struct zink_resource *res, boo
+    bool ret = false;
+    if (!is_compute && res->fb_binds && !(ctx->feedback_loops & res->fb_binds)) {
+       /* always double check feedback loops */
+-      ret = !!_mesa_set_add(ctx->need_barriers[0], res);
++      zink_queue_barrier(ctx, false, res);
++      ret = true;
+    } else {
+       if (res->bind_count[is_compute] && ((layout && res->layout != layout) ||
+                                           /* Check if we need a queue family transfer */
+-                                          (res->queue != zink_screen(ctx->base.screen)->gfx_queue && res->queue != VK_QUEUE_FAMILY_IGNORED)))
+-         ret = !!_mesa_set_add(ctx->need_barriers[is_compute], res);
+-      if (res->bind_count[!is_compute] && other_layout && (layout != other_layout || res->layout != other_layout))
+-         ret = !!_mesa_set_add(ctx->need_barriers[!is_compute], res);
++                                          (res->queue != zink_screen(ctx->base.screen)->gfx_queue && res->queue != VK_QUEUE_FAMILY_IGNORED))) {
++         zink_queue_barrier(ctx, is_compute, res);
++         ret = true;
++      }
++      if (res->bind_count[!is_compute] && other_layout && (layout != other_layout || res->layout != other_layout)) {
++         zink_queue_barrier(ctx, !is_compute, res);
++         ret = true;
++      }
+    }
+    return ret;
+ }
+@@ -2093,7 +2177,7 @@ unbind_shader_image(struct zink_context *ctx, mesa_shader_stage stage, unsigned
+    if (image_view->import2d) {
+       unbind_buffer_descriptor_stage(res, stage);
+       unbind_buffer_descriptor_reads(res, stage == MESA_SHADER_COMPUTE);
+-      _mesa_set_remove_key(ctx->need_barriers[is_compute], image_view->import2d);
++      zink_unqueue_barrier(ctx, is_compute, image_view->import2d);
+    } else if (image_view->base.resource->target == PIPE_BUFFER) {
+       unbind_buffer_descriptor_stage(res, stage);
+       unbind_buffer_descriptor_reads(res, stage == MESA_SHADER_COMPUTE);
+@@ -4202,7 +4286,7 @@ unbind_fb_surface(struct zink_context *ctx, const struct pipe_surface *surf, uns
+    }
+    res->fb_bind_count--;
+    if (!res->fb_bind_count && !res->bind_count[0])
+-      _mesa_set_remove_key(ctx->need_barriers[0], res);
++      zink_unqueue_barrier(ctx, false, res);
+    unsigned feedback_loops = ctx->feedback_loops;
+    if (!general_layout && ctx->feedback_loops & BITFIELD_BIT(idx)) {
+       ctx->dynamic_fb.attachments[idx].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+@@ -4236,7 +4320,7 @@ unbind_fb_surface(struct zink_context *ctx, const struct pipe_surface *surf, uns
+             update_res_sampler_layouts(ctx, res);
+             VkImageLayout layout = zink_descriptor_util_image_layout_eval(ctx, res, false);
+             if (res->layout != layout && !ctx->blitting)
+-               _mesa_set_add(ctx->need_barriers[0], res);
++               zink_queue_barrier(ctx, false, res);
+          }
+       }
+    }
+@@ -5684,7 +5768,7 @@ rebind_image(struct zink_context *ctx, struct zink_resource *res)
+             ctx->invalidate_descriptor_state(ctx, i, ZINK_DESCRIPTOR_TYPE_IMAGE, j, 1);
+             update_descriptor_state_image(ctx, i, j, res);
+             if (!general_layout)
+-               _mesa_set_add(ctx->need_barriers[i == MESA_SHADER_COMPUTE], res);
++               zink_queue_barrier(ctx, i == MESA_SHADER_COMPUTE, res);
+          }
+       }
+    }
+@@ -5795,7 +5879,7 @@ zink_rebind_all_images(struct zink_context *ctx)
+             ctx->invalidate_descriptor_state(ctx, i, ZINK_DESCRIPTOR_TYPE_IMAGE, j, 1);
+             update_descriptor_state_image(ctx, i, j, res);
+             if (!general_layout)
+-               _mesa_set_add(ctx->need_barriers[i == MESA_SHADER_COMPUTE], res);
++               zink_queue_barrier(ctx, i == MESA_SHADER_COMPUTE, res);
+          }
+       }
+    }
+@@ -6462,9 +6546,14 @@ zink_update_barriers(struct zink_context *ctx, bool is_compute,
+    ASSERTED bool check_rp = ctx->in_rp && ctx->dynamic_fb.tc_info.zsbuf_invalidate;
+    set_foreach(need_barriers, he) {
+       struct zink_resource *res = (struct zink_resource *)he->key;
++      /* a re-queue moves this entry's reference to the live set; anything else
++       * drops it when the entry goes away */
++      bool requeued = false;
+       if (!is_compute && barrier_is_for_another_context(ctx, res)) {
+-         _mesa_set_add_pre_hashed(ctx->need_barriers[is_compute], he->hash, res);
++         requeued = queue_barrier_pre_hashed(ctx, is_compute, he->hash, res);
+          _mesa_set_remove(need_barriers, he);
++         if (!requeued)
++            drop_queued_barrier_reference(res);
+          if (!need_barriers->entries)
+             break;
+          continue;
+@@ -6495,9 +6584,11 @@ zink_update_barriers(struct zink_context *ctx, bool is_compute,
+           * image write binds and image read binds
+           */
+          if (res->write_bind_count[is_compute] && res->bind_count[is_compute] > 1)
+-            _mesa_set_add_pre_hashed(ctx->need_barriers[is_compute], he->hash, res);
++            requeued = queue_barrier_pre_hashed(ctx, is_compute, he->hash, res);
+       }
+       _mesa_set_remove(need_barriers, he);
++      if (!requeued)
++         drop_queued_barrier_reference(res);
+       if (!need_barriers->entries)
+          break;
+    }
+diff --git a/src/gallium/drivers/zink/zink_context.h b/src/gallium/drivers/zink/zink_context.h
+index 18e231b7261b6acd9d8c9118e671e75a5537f28a..72c10eca23aa9af9321d9d5efb5f570e7bd07134 100644
+--- a/src/gallium/drivers/zink/zink_context.h
++++ b/src/gallium/drivers/zink/zink_context.h
+@@ -224,6 +224,12 @@ zink_init_grid_functions(struct zink_context *ctx);
+ struct zink_context *
+ zink_tc_context_unwrap(struct pipe_context *pctx);
+ 
++void
++zink_queue_barrier(struct zink_context *ctx, bool is_compute, struct zink_resource *res);
++
++void
++zink_unqueue_barrier(struct zink_context *ctx, bool is_compute, struct zink_resource *res);
++
+ void
+ zink_update_barriers(struct zink_context *ctx, bool is_compute,
+                      struct pipe_resource *index, struct pipe_resource *indirect, struct pipe_resource *indirect_draw_count);
+diff --git a/src/gallium/drivers/zink/zink_synchronization.cpp b/src/gallium/drivers/zink/zink_synchronization.cpp
+index 1521a9e2c175f9e3173a2035ce2e6b1fe03542ef..a14dd2780b8a62fcdbc4b6e16ca778aa208945a5 100644
+--- a/src/gallium/drivers/zink/zink_synchronization.cpp
++++ b/src/gallium/drivers/zink/zink_synchronization.cpp
+@@ -108,11 +108,11 @@ resource_check_defer_buffer_barrier(struct zink_context *ctx, struct zink_resour
+          /* or if has more than just vbo binds and is not a gfx stage */
+           (res->vbo_bind_count != bind_count0 && !is_shader_pipline_stage(pipeline)))
+          /* sync on next draw */
+-         _mesa_set_add(ctx->need_barriers[0], res);
++         zink_queue_barrier(ctx, false, res);
+    }
+    if (res->bind_count[1] && !(pipeline & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))
+       /* if writing from non-compute and has compute binds, sync on next dispatch */
+-      _mesa_set_add(ctx->need_barriers[1], res);
++      zink_queue_barrier(ctx, true, res);
+ }
+ 
+ static inline bool
+@@ -180,10 +180,10 @@ resource_defer_image_barrier(struct zink_context *ctx, struct zink_resource *res
+ 
+    /* queue a layout change if a layout change will be needed */
+    if (res->bind_count[!is_compute])
+-      _mesa_set_add(ctx->need_barriers[!is_compute], res);
++      zink_queue_barrier(ctx, !is_compute, res);
+    /* also queue a layout change if this is a non-shader layout */
+    if (res->bind_count[is_compute] && !is_shader && !is_compute)
+-      _mesa_set_add(ctx->need_barriers[is_compute], res);
++      zink_queue_barrier(ctx, is_compute, res);
+ 
+ }
+ 

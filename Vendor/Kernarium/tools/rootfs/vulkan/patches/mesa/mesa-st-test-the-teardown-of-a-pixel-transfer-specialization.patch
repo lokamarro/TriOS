@@ -1,0 +1,329 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 20:13:28 +0900
+Subject: [PATCH] mesa/st: test the teardown of a pixel-transfer specialization
+
+A specialized pixel-transfer conversion shader is prepared in two steps: a
+driver thread clones the conversion NIR and inlines the specialization
+constants into it, which sets `created`, and a later download of the same
+shape compiles that clone into a compute state. Teardown read `created` as if
+it also meant a compute state existed and handed `spec->cs` to
+pipe_context::delete_compute_state, so a specialization whose clone finished
+but which no later download picked up passed NULL to a hook that dereferences
+its argument at once in every driver.
+
+Mesa 26.2.6 carries the fix itself: teardown frees the clone when `created`
+and deletes the compute state only when `spec->cs` is set. This topic keeps
+what upstream lacks. The two structures move to a private header so
+st_pbo_compute_deinit can be driven directly by a test, which covers an
+uncompiled specialization, one still queued, and compiled shaders, which must
+still be released.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/mesa/state_tracker/st_pbo_compute.c       |  21 +--
+ src/mesa/state_tracker/st_pbo_compute.h       |  65 +++++++
+ src/mesa/state_tracker/tests/meson.build      |  14 ++
+ .../tests/st_pbo_compute_deinit.cpp           | 159 ++++++++++++++++++
+ 4 files changed, 239 insertions(+), 20 deletions(-)
+ create mode 100644 src/mesa/state_tracker/st_pbo_compute.h
+ create mode 100644 src/mesa/state_tracker/tests/st_pbo_compute_deinit.cpp
+
+diff --git a/src/mesa/state_tracker/st_pbo_compute.c b/src/mesa/state_tracker/st_pbo_compute.c
+index cfd14f0c010eae4977c1153097d4c7b0f4bcdb0f..7c9ea0938b44940d331121a51fc222eb9f512ca6 100644
+--- a/src/mesa/state_tracker/st_pbo_compute.c
++++ b/src/mesa/state_tracker/st_pbo_compute.c
+@@ -32,6 +32,7 @@
+ #include "state_tracker/st_nir.h"
+ #include "state_tracker/st_format.h"
+ #include "state_tracker/st_pbo.h"
++#include "state_tracker/st_pbo_compute.h"
+ #include "state_tracker/st_program.h"
+ #include "state_tracker/st_texture.h"
+ #include "compiler/nir/nir_builder.h"
+@@ -43,26 +44,6 @@
+ 
+ #define SPEC_USES_THRESHOLD 5
+ 
+-struct pbo_spec_async_data {
+-   uint32_t data[4]; //must be first
+-   bool created;
+-   unsigned uses;
+-   struct util_queue_fence fence;
+-   nir_shader *nir;
+-   void *cs;
+-};
+-
+-struct pbo_async_data {
+-   struct st_context *st;
+-   enum pipe_texture_target target;
+-   unsigned num_components;
+-   struct util_queue_fence fence;
+-   nir_shader *nir;
+-   nir_shader *copy; //immutable
+-   struct pipe_shader_state *cs;
+-   struct set specialized;
+-};
+-
+ #define BGR_FORMAT(NAME) \
+     {{ \
+      [0] = PIPE_FORMAT_##NAME##_SNORM, \
+diff --git a/src/mesa/state_tracker/st_pbo_compute.h b/src/mesa/state_tracker/st_pbo_compute.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..926750a312c6e27a18e321d5dbd448664bcedcb7
+--- /dev/null
++++ b/src/mesa/state_tracker/st_pbo_compute.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright © 2021 Valve Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#ifndef ST_PBO_COMPUTE_H
++#define ST_PBO_COMPUTE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "pipe/p_defines.h"
++#include "util/set.h"
++#include "util/u_queue.h"
++
++struct nir_shader;
++struct pipe_shader_state;
++struct st_context;
++
++/* One specialization of a pixel-transfer conversion shader.
++ *
++ * The specialized NIR is cloned on a driver thread, so `created` reports only
++ * that `nir` is this entry's own clone. The compute state is compiled later,
++ * on the next download that picks this specialization up, so `cs` stays NULL
++ * until then and is the only field that says whether one exists.
++ */
++struct pbo_spec_async_data {
++   uint32_t data[4]; //must be first
++   bool created;
++   unsigned uses;
++   struct util_queue_fence fence;
++   struct nir_shader *nir;
++   void *cs;
++};
++
++struct pbo_async_data {
++   struct st_context *st;
++   enum pipe_texture_target target;
++   unsigned num_components;
++   struct util_queue_fence fence;
++   struct nir_shader *nir;
++   struct nir_shader *copy; //immutable
++   struct pipe_shader_state *cs;
++   struct set specialized;
++};
++
++#endif /* ST_PBO_COMPUTE_H */
+diff --git a/src/mesa/state_tracker/tests/meson.build b/src/mesa/state_tracker/tests/meson.build
+index 1c362c91795eb00185d49a816d723da6251cae4d..bbe2ba973feebd7e7e816b18d6be09fa1158d9b3 100644
+--- a/src/mesa/state_tracker/tests/meson.build
++++ b/src/mesa/state_tracker/tests/meson.build
+@@ -13,4 +13,18 @@ if not with_platform_windows
+     ),
+     suite : ['st_mesa'],
+   )
++
++  test(
++    'st_pbo_compute_deinit',
++    executable(
++      'st_pbo_compute_deinit',
++      ['st_pbo_compute_deinit.cpp'],
++      include_directories : [inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux],
++      link_with : [libmesa, libglapi, libgallium],
++      dependencies : [idep_gtest, idep_mesautil],
++      override_options : ['cpp_std=c++20'],
++    ),
++    suite : ['st_mesa'],
++    protocol : 'gtest',
++  )
+ endif
+diff --git a/src/mesa/state_tracker/tests/st_pbo_compute_deinit.cpp b/src/mesa/state_tracker/tests/st_pbo_compute_deinit.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..273919a67986391cb3ac9ef4b7869d5cb88a72ed
+--- /dev/null
++++ b/src/mesa/state_tracker/tests/st_pbo_compute_deinit.cpp
+@@ -0,0 +1,159 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "state_tracker/st_context.h"
++#include "state_tracker/st_pbo_compute.h"
++#include "util/hash_table.h"
++#include "util/ralloc.h"
++#include "util/set.h"
++#include "util/u_queue.h"
++
++extern "C" {
++#include "state_tracker/st_pbo.h"
++}
++
++#include <gtest/gtest.h>
++#include <algorithm>
++#include <cstdlib>
++#include <type_traits>
++#include <vector>
++
++namespace {
++
++struct recording_context {
++   pipe_context base = {};
++   std::vector<void *> deleted;
++};
++static_assert(std::is_standard_layout_v<recording_context>);
++
++void
++record_delete_compute_state(struct pipe_context *pipe, void *state)
++{
++   auto *driver = reinterpret_cast<recording_context *>(pipe);
++   driver->deleted.push_back(state);
++}
++
++void
++unexpected_job(struct pipe_screen *, void *, struct util_queue_fence *,
++               pipe_driver_thread_func, pipe_driver_thread_func, const size_t)
++{
++   ADD_FAILURE() << "teardown must not queue driver-thread work";
++}
++
++uint32_t
++hash_spec(const void *key)
++{
++   return _mesa_hash_pointer(key);
++}
++
++bool
++equals_spec(const void *a, const void *b)
++{
++   return a == b;
++}
++
++class pbo_compute_deinit : public ::testing::Test {
++protected:
++   void SetUp() override
++   {
++      /* st_context is large and only a few fields matter here. */
++      st = static_cast<struct st_context *>(calloc(1, sizeof(struct st_context)));
++      ASSERT_NE(st, nullptr);
++      screen.driver_thread_add_job = unexpected_job;
++      driver.base.delete_compute_state = record_delete_compute_state;
++      st->screen = &screen;
++      st->pipe = &driver.base;
++      st->pbo.shaders = _mesa_hash_table_create_u32_keys(NULL);
++      ASSERT_NE(st->pbo.shaders, nullptr);
++   }
++
++   void TearDown() override { free(st); }
++
++   /* Mirrors add_async_data(): one conversion shader whose specializations
++    * live in a set keyed by the specialization itself.
++    */
++   struct pbo_async_data *add_async(uint32_t key)
++   {
++      auto *async = static_cast<struct pbo_async_data *>(
++         calloc(1, sizeof(struct pbo_async_data)));
++      async->st = st;
++      util_queue_fence_init(&async->fence);
++      _mesa_set_init(&async->specialized, NULL, hash_spec, equals_spec);
++      _mesa_hash_table_insert(st->pbo.shaders, (void *)(uintptr_t)key, async);
++      return async;
++   }
++
++   /* Mirrors add_spec_data() plus create_spec_shader_async(): the driver
++    * thread clones the NIR and sets created; the compute state is only
++    * compiled by a later download.
++    */
++   struct pbo_spec_async_data *add_spec(struct pbo_async_data *async, bool created,
++                                        void *cs)
++   {
++      auto *spec = static_cast<struct pbo_spec_async_data *>(
++         calloc(1, sizeof(struct pbo_spec_async_data)));
++      util_queue_fence_init(&spec->fence);
++      spec->created = created;
++      spec->cs = cs;
++      if (created && !cs) {
++         /* the clone the driver thread produced, still uncompiled */
++         spec->nir = static_cast<struct nir_shader *>(ralloc_context(NULL));
++      }
++      _mesa_set_add(&async->specialized, spec);
++      return spec;
++   }
++
++   pipe_screen screen = {};
++   recording_context driver;
++   struct st_context *st = nullptr;
++};
++
++/* A specialization whose NIR clone exists but whose compute state was never
++ * compiled must not be handed to the driver: pipe_context::delete_compute_state
++ * takes a live shader handle, and every driver dereferences it immediately.
++ */
++TEST_F(pbo_compute_deinit, uncompiled_specialization_is_not_deleted)
++{
++   struct pbo_async_data *async = add_async(1);
++   add_spec(async, true, nullptr);
++
++   st_pbo_compute_deinit(st);
++
++   EXPECT_TRUE(driver.deleted.empty());
++}
++
++/* A specialization queued on the driver thread but not yet cloned owns
++ * nothing of its own, and equally has no compute state to delete.
++ */
++TEST_F(pbo_compute_deinit, pending_specialization_is_not_deleted)
++{
++   struct pbo_async_data *async = add_async(1);
++   add_spec(async, false, nullptr);
++
++   st_pbo_compute_deinit(st);
++
++   EXPECT_TRUE(driver.deleted.empty());
++}
++
++/* Compiled shaders are still released, both the generic one and the
++ * specializations.
++ */
++TEST_F(pbo_compute_deinit, compiled_shaders_are_deleted)
++{
++   struct pbo_async_data *async = add_async(1);
++   int generic = 0, specialized = 0;
++   async->cs = reinterpret_cast<struct pipe_shader_state *>(&generic);
++   add_spec(async, true, &specialized);
++   add_spec(async, true, nullptr);
++
++   st_pbo_compute_deinit(st);
++
++   ASSERT_EQ(driver.deleted.size(), 2u);
++   EXPECT_NE(std::find(driver.deleted.begin(), driver.deleted.end(), &generic),
++             driver.deleted.end());
++   EXPECT_NE(std::find(driver.deleted.begin(), driver.deleted.end(), &specialized),
++             driver.deleted.end());
++}
++
++} // namespace

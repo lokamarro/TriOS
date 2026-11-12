@@ -1,0 +1,808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 07:25:57 +0900
+Subject: [PATCH] v4l2: pass the colours and the HDR10 metadata to the encoder
+ device
+
+The encoder interface had no colour aspects, so a client's colour range,
+primaries, transfer and matrix never reached the device or the stream.
+Add the colour aspects of the frames and the VUI colour aspects of the
+stream, as the software encoders do. The encoder sets the V4L2 colorimetry
+of the raw frames from them, in the format of the raw queue, which is
+where the device reads it.
+
+Main 10 encodes 10-bit frames, which the device must take as P010 for the
+profile to make sense. The device query leaves Main 10 out of the profiles
+when the device lists no P010 input; it lists the raw formats for the HEVC
+coded format, since a device lists them per coded format. The interface
+offers the P010 pixel format with that profile, which the framework lists as
+a colour format, and the encoder takes P010 frames for the profile. P010 is
+one buffer that holds both colour planes, so V4L2 names it with the fourcc
+of a single buffer, the CbCr plane starts after the Y plane at the same
+stride, and its element is a pair of 16-bit samples. A device that lists the
+HDR10 mastering display and content light level controls on top of that
+offers the HDR static info parameter, which is the sign for the framework to
+list the HDR10 profile, and the encoder sets the two compound controls from
+it in the units of the SEI messages.
+---
+ common/VideoPixelFormat.cpp                   |   7 +-
+ common/include/v4l2_codec2/common/Common.h    |   2 +
+ components/EncodeComponent.cpp                |  18 ++-
+ components/EncodeInterface.cpp                | 148 +++++++++++++++++-
+ .../v4l2_codec2/components/EncodeInterface.h  |  19 +++
+ .../v4l2_codec2/components/VideoEncoder.h     |   9 ++
+ v4l2/V4L2Device.cpp                           | 148 +++++++++++++++++-
+ v4l2/V4L2EncodeComponent.cpp                  |  15 +-
+ v4l2/V4L2Encoder.cpp                          |  75 ++++++++-
+ v4l2/include/v4l2_codec2/v4l2/V4L2Device.h    |  26 ++-
+ v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h   |   8 +-
+ 11 files changed, 456 insertions(+), 19 deletions(-)
+
+diff --git a/common/VideoPixelFormat.cpp b/common/VideoPixelFormat.cpp
+index 48eb2a30ef888312abfa5b11f0e5b1dd1ea74f16..a097151a547f6f1a9d05b1bfd62398981c490500 100644
+--- a/common/VideoPixelFormat.cpp
++++ b/common/VideoPixelFormat.cpp
+@@ -300,7 +300,6 @@ int bytesPerElement(VideoPixelFormat format, size_t plane) {
+     case VideoPixelFormat::YUV422P12:
+     case VideoPixelFormat::YUV444P12:
+     case VideoPixelFormat::P016LE:
+-    case VideoPixelFormat::P010:
+         return 2;
+     case VideoPixelFormat::NV12:
+     case VideoPixelFormat::NV21: {
+@@ -308,6 +307,12 @@ int bytesPerElement(VideoPixelFormat format, size_t plane) {
+         ALOG_ASSERT(plane < base::size(bytes_per_element));
+         return bytes_per_element[plane];
+     }
++    case VideoPixelFormat::P010: {
++        // 16-bit samples, and the interleaved CbCr plane holds one pair per element.
++        static const int bytes_per_element[] = {2, 4};
++        ALOG_ASSERT(plane < base::size(bytes_per_element));
++        return bytes_per_element[plane];
++    }
+     case VideoPixelFormat::YV12:
+     case VideoPixelFormat::I420:
+     case VideoPixelFormat::I422:
+diff --git a/common/include/v4l2_codec2/common/Common.h b/common/include/v4l2_codec2/common/Common.h
+index aa72bef7c5cda98dbd0ba9f5434fa63830bb4ba5..1eaa41af8eb85bcc277060c2a961bbf577559a56 100644
+--- a/common/include/v4l2_codec2/common/Common.h
++++ b/common/include/v4l2_codec2/common/Common.h
+@@ -69,6 +69,8 @@ struct SupportedCapabilities {
+     uint32_t maxBFrames = 0;
+     // The largest number of temporal layers, 1 for none.
+     uint32_t maxTemporalLayers = 1;
++    // Whether the encoder takes the HDR10 static metadata, which it only does for 10-bit frames.
++    bool supportsHdr10 = false;
+ };
+ 
+ // Check whether |rect1| completely contains |rect2|.
+diff --git a/components/EncodeComponent.cpp b/components/EncodeComponent.cpp
+index 3712112bf0b635252735ccb39381fb11959410f7..27762166ed9afa414bcf283d37c5965b99b40293 100644
+--- a/components/EncodeComponent.cpp
++++ b/components/EncodeComponent.cpp
+@@ -109,7 +109,15 @@ std::optional<std::vector<VideoFramePlane>> getVideoFrameLayout(const C2ConstGra
+             semiplanar = true;
+         }
+ 
+-        if (!crcb && !semiplanar) {
++        if (layout.planes[C2PlanarLayout::PLANE_Y].bitDepth > 8) {
++            // Frames of more than 8 bits are P010, the one 10-bit format the encoder takes.
++            const uint32_t bitDepth = layout.planes[C2PlanarLayout::PLANE_Y].bitDepth;
++            if (crcb || !semiplanar || bitDepth != 10) {
++                ALOGW("Unsupported %u-bit YUV layout", bitDepth);
++                return std::nullopt;
++            }
++            *format = VideoPixelFormat::P010;
++        } else if (!crcb && !semiplanar) {
+             *format = VideoPixelFormat::I420;
+         } else if (!crcb && semiplanar) {
+             *format = VideoPixelFormat::NV12;
+@@ -156,8 +164,12 @@ std::optional<uint32_t> getVideoFrameStride(VideoPixelFormat format, ui::Size si
+ 
+     // Android HAL format doesn't have I420, we use YV12 instead and swap the U and V planes when
+     // converting to NV12. YCBCR_420_888 will allocate NV12 by minigbm.
+-    HalPixelFormat halFormat = (format == VideoPixelFormat::I420) ? HalPixelFormat::YV12
+-                                                                  : HalPixelFormat::YCBCR_420_888;
++    HalPixelFormat halFormat = HalPixelFormat::YCBCR_420_888;
++    if (format == VideoPixelFormat::I420) {
++        halFormat = HalPixelFormat::YV12;
++    } else if (format == VideoPixelFormat::P010) {
++        halFormat = HalPixelFormat::YCBCR_P010;
++    }
+ 
+     std::shared_ptr<C2GraphicBlock> block;
+     status = pool->fetchGraphicBlock(size.width, size.height, static_cast<uint32_t>(halFormat),
+diff --git a/components/EncodeInterface.cpp b/components/EncodeInterface.cpp
+index 6b12dcef9ab496a17985e900b946cac7458c43a0..f9aa39d12b60606992a510e4ee05ebc04ed1de9b 100644
+--- a/components/EncodeInterface.cpp
++++ b/components/EncodeInterface.cpp
+@@ -404,13 +404,59 @@ C2R EncodeInterface::InputDelaySetter(bool /*mayBlock*/, C2P<C2PortActualDelayTu
+     return C2R::Ok();
+ }
+ 
++// static
++C2R EncodeInterface::ColorAspectsSetter(bool /*mayBlock*/,
++                                        C2P<C2StreamColorAspectsInfo::input>& me) {
++    if (me.v.range > C2Color::RANGE_OTHER) me.set().range = C2Color::RANGE_OTHER;
++    if (me.v.primaries > C2Color::PRIMARIES_OTHER) me.set().primaries = C2Color::PRIMARIES_OTHER;
++    if (me.v.transfer > C2Color::TRANSFER_OTHER) me.set().transfer = C2Color::TRANSFER_OTHER;
++    if (me.v.matrix > C2Color::MATRIX_OTHER) me.set().matrix = C2Color::MATRIX_OTHER;
++    return C2R::Ok();
++}
++
++// static
++C2R EncodeInterface::CodedColorAspectsSetter(bool /*mayBlock*/,
++                                             C2P<C2StreamColorAspectsInfo::output>& me,
++                                             const C2P<C2StreamColorAspectsInfo::input>& coded) {
++    // The stream describes its colours the way the client described the frames.
++    me.set().range = coded.v.range;
++    me.set().primaries = coded.v.primaries;
++    me.set().transfer = coded.v.transfer;
++    me.set().matrix = coded.v.matrix;
++    return C2R::Ok();
++}
++
++// static
++C2R EncodeInterface::HdrStaticInfoSetter(bool /*mayBlock*/,
++                                         C2P<C2StreamHdrStaticInfo::input>& me) {
++    // The chromaticities are fractions, the luminances and light levels are in the units and
++    // ranges of the SEI messages that carry them.
++    auto clampTo = [](float* value, float high) { *value = std::clamp(*value, 0.f, high); };
++    C2HdrStaticMetadataStruct& info = me.set();
++    for (C2ColorXyStruct* xy : {&info.mastering.red, &info.mastering.green, &info.mastering.blue,
++                                &info.mastering.white}) {
++        clampTo(&xy->x, 1.f);
++        clampTo(&xy->y, 1.f);
++    }
++    clampTo(&info.mastering.maxLuminance, 65535.f);
++    clampTo(&info.mastering.minLuminance, 6.5535f);
++    clampTo(&info.maxCll, 65535.f);
++    clampTo(&info.maxFall, 65535.f);
++    return C2R::Ok();
++}
++
+ EncodeInterface::EncodeInterface(const C2String& name, std::shared_ptr<C2ReflectorHelper> helper,
+                                  const SupportedCapabilities& caps)
+-      : C2InterfaceHelper(std::move(helper)) {
++      : C2InterfaceHelper(helper) {
+     ALOGV("%s(%s)", __func__, name.c_str());
+ 
+     setDerivedInstance(this);
+ 
++    // The HDR10 metadata is a struct that the reflector does not know yet.
++    if (caps.supportsHdr10) {
++        helper->addStructDescriptors<C2MasteringDisplayColorVolumeStruct, C2ColorXyStruct>();
++    }
++
+     Initialize(name, caps);
+ }
+ 
+@@ -615,6 +661,84 @@ void EncodeInterface::Initialize(const C2String& name, const SupportedCapabiliti
+                          .withSetter(Setter<decltype(*mKeyFramePeriodUs)>::StrictValueWithNoDeps)
+                          .build());
+ 
++    // The raw formats of the frames: flexible YUV, and P010 when the device encodes Main 10, which
++    // is what makes the framework list the 10-bit colour formats.
++    std::vector<uint32_t> pixelFormats = {HAL_PIXEL_FORMAT_YCBCR_420_888};
++    if (std::any_of(caps.supportedProfiles.begin(), caps.supportedProfiles.end(),
++                    [](const SupportedProfile& profile) {
++                        return profile.profile == C2Config::PROFILE_HEVC_MAIN_10;
++                    })) {
++        pixelFormats.push_back(HAL_PIXEL_FORMAT_YCBCR_P010);
++    }
++    addParameter(DefineParam(mPixelFormat, C2_PARAMKEY_PIXEL_FORMAT)
++                         .withDefault(new C2StreamPixelFormatInfo::input(
++                                 0u, HAL_PIXEL_FORMAT_YCBCR_420_888))
++                         .withFields({C2F(mPixelFormat, value).oneOf(pixelFormats)})
++                         .withSetter(Setter<decltype(*mPixelFormat)>::NonStrictValueWithNoDeps)
++                         .build());
++
++    // The colours of the frames, which the stream describes the way the client does.
++    addParameter(DefineParam(mColorAspects, C2_PARAMKEY_COLOR_ASPECTS)
++                         .withDefault(new C2StreamColorAspectsInfo::input(
++                                 0u, C2Color::RANGE_UNSPECIFIED, C2Color::PRIMARIES_UNSPECIFIED,
++                                 C2Color::TRANSFER_UNSPECIFIED, C2Color::MATRIX_UNSPECIFIED))
++                         .withFields({C2F(mColorAspects, range)
++                                              .inRange(C2Color::RANGE_UNSPECIFIED,
++                                                       C2Color::RANGE_OTHER),
++                                      C2F(mColorAspects, primaries)
++                                              .inRange(C2Color::PRIMARIES_UNSPECIFIED,
++                                                       C2Color::PRIMARIES_OTHER),
++                                      C2F(mColorAspects, transfer)
++                                              .inRange(C2Color::TRANSFER_UNSPECIFIED,
++                                                       C2Color::TRANSFER_OTHER),
++                                      C2F(mColorAspects, matrix)
++                                              .inRange(C2Color::MATRIX_UNSPECIFIED,
++                                                       C2Color::MATRIX_OTHER)})
++                         .withSetter(ColorAspectsSetter)
++                         .build());
++
++    addParameter(DefineParam(mCodedColorAspects, C2_PARAMKEY_VUI_COLOR_ASPECTS)
++                         .withDefault(new C2StreamColorAspectsInfo::output(
++                                 0u, C2Color::RANGE_LIMITED, C2Color::PRIMARIES_UNSPECIFIED,
++                                 C2Color::TRANSFER_UNSPECIFIED, C2Color::MATRIX_UNSPECIFIED))
++                         .withFields({C2F(mCodedColorAspects, range)
++                                              .inRange(C2Color::RANGE_UNSPECIFIED,
++                                                       C2Color::RANGE_OTHER),
++                                      C2F(mCodedColorAspects, primaries)
++                                              .inRange(C2Color::PRIMARIES_UNSPECIFIED,
++                                                       C2Color::PRIMARIES_OTHER),
++                                      C2F(mCodedColorAspects, transfer)
++                                              .inRange(C2Color::TRANSFER_UNSPECIFIED,
++                                                       C2Color::TRANSFER_OTHER),
++                                      C2F(mCodedColorAspects, matrix)
++                                              .inRange(C2Color::MATRIX_UNSPECIFIED,
++                                                       C2Color::MATRIX_OTHER)})
++                         .withSetter(CodedColorAspectsSetter, mColorAspects)
++                         .build());
++
++    // The HDR10 static metadata, which the framework takes as the sign of a codec that encodes HDR
++    // and 10-bit frames.
++    if (caps.supportsHdr10) {
++        addParameter(
++                DefineParam(mHdrStaticInfo, C2_PARAMKEY_HDR_STATIC_INFO)
++                        .withDefault(new C2StreamHdrStaticInfo::input(
++                                0u, C2HdrStaticMetadataStruct()))
++                        .withFields({C2F(mHdrStaticInfo, mastering.red.x).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.red.y).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.green.x).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.green.y).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.blue.x).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.blue.y).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.white.x).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.white.y).inRange(0, 1),
++                                     C2F(mHdrStaticInfo, mastering.maxLuminance).inRange(0, 65535),
++                                     C2F(mHdrStaticInfo, mastering.minLuminance).inRange(0, 6.5535),
++                                     C2F(mHdrStaticInfo, maxCll).inRange(0, 0xFFFF),
++                                     C2F(mHdrStaticInfo, maxFall).inRange(0, 0xFFFF)})
++                        .withSetter(HdrStaticInfoSetter)
++                        .build());
++    }
++
+     // The bounds of the quantization parameter, if the device has them.
+     if (caps.qpRange) {
+         mQpRange = caps.qpRange;
+@@ -750,6 +874,28 @@ float EncodeInterface::getBaseLayerBitrateRatio() const {
+     return std::clamp(mLayering->m.bitrateRatios[0], 0.05f, 0.95f);
+ }
+ 
++C2ColorAspectsStruct EncodeInterface::getColorAspects() const {
++    Lock lock = this->lock();
++    C2ColorAspectsStruct aspects;
++    aspects.range = mColorAspects->range;
++    aspects.primaries = mColorAspects->primaries;
++    aspects.transfer = mColorAspects->transfer;
++    aspects.matrix = mColorAspects->matrix;
++    return aspects;
++}
++
++std::optional<C2HdrStaticMetadataStruct> EncodeInterface::getHdrStaticInfo() const {
++    if (!mHdrStaticInfo) return std::nullopt;
++
++    Lock lock = this->lock();
++    const C2HdrStaticMetadataStruct& info = *mHdrStaticInfo;
++    // The defaults are all zero, and a client that sets some of the values leaves the others zero.
++    if (info.mastering.maxLuminance == 0.f && info.maxCll == 0.f && info.maxFall == 0.f) {
++        return std::nullopt;
++    }
++    return info;
++}
++
+ uint32_t EncodeInterface::getKeyFramePeriod() const {
+     if (mKeyFramePeriodUs->value < 0 || mKeyFramePeriodUs->value == INT64_MAX) {
+         return 0;
+diff --git a/components/include/v4l2_codec2/components/EncodeInterface.h b/components/include/v4l2_codec2/components/EncodeInterface.h
+index 3211883d75b8ccb1461119b4be5a130f229d4c62..d26f533b70a03ef4c8561294e00b0e89c04f253e 100644
+--- a/components/include/v4l2_codec2/components/EncodeInterface.h
++++ b/components/include/v4l2_codec2/components/EncodeInterface.h
+@@ -68,6 +68,10 @@ public:
+     uint32_t getTemporalLayerCount() const;
+     // Get the share of the bitrate that the base temporal layer gets.
+     float getBaseLayerBitrateRatio() const;
++    // Get the colour aspects of the frames to encode, which the client set or left unspecified.
++    C2ColorAspectsStruct getColorAspects() const;
++    // Get the HDR10 static metadata the client set, if it set any and the device takes it.
++    std::optional<C2HdrStaticMetadataStruct> getHdrStaticInfo() const;
+ 
+ protected:
+     void Initialize(const C2String& name, const SupportedCapabilities& caps);
+@@ -98,8 +102,16 @@ protected:
+ 
+     static C2R GopSetter(bool mayBlock, C2P<C2StreamGopTuning::output>& me);
+ 
++    static C2R ColorAspectsSetter(bool mayBlock, C2P<C2StreamColorAspectsInfo::input>& me);
++
++    static C2R CodedColorAspectsSetter(bool mayBlock, C2P<C2StreamColorAspectsInfo::output>& me,
++                                       const C2P<C2StreamColorAspectsInfo::input>& coded);
++
++    static C2R HdrStaticInfoSetter(bool mayBlock, C2P<C2StreamHdrStaticInfo::input>& me);
++
+     static C2R PipelineDelaySetter(bool mayBlock, C2P<C2PipelineDelayTuning>& me,
+                                    const C2P<C2StreamGopTuning::output>& gop);
++
+     static C2R InputDelaySetter(bool mayBlock, C2P<C2PortActualDelayTuning::input>& me,
+                                 const C2P<C2StreamGopTuning::output>& gop);
+ 
+@@ -167,6 +179,13 @@ protected:
+     // The temporal layering of the stream.
+     std::shared_ptr<C2StreamTemporalLayeringTuning::output> mLayering;
+ 
++    // The colour aspects of the frames to encode, and the ones the stream carries.
++    std::shared_ptr<C2StreamPixelFormatInfo::input> mPixelFormat;
++    std::shared_ptr<C2StreamColorAspectsInfo::input> mColorAspects;
++    std::shared_ptr<C2StreamColorAspectsInfo::output> mCodedColorAspects;
++    // The HDR10 static metadata of the frames, if the device takes it.
++    std::shared_ptr<C2StreamHdrStaticInfo::input> mHdrStaticInfo;
++
+     // The limits of the device that the setters, which are static, cannot see. The getters clamp to
+     // them.
+     std::optional<std::pair<int32_t, int32_t>> mQpRange;
+diff --git a/components/include/v4l2_codec2/components/VideoEncoder.h b/components/include/v4l2_codec2/components/VideoEncoder.h
+index bf207e895c9311bdf8413683acb61f90394af60d..d05f1caa5e6624e5ac1a237f6a6ab2486f500df1 100644
+--- a/components/include/v4l2_codec2/components/VideoEncoder.h
++++ b/components/include/v4l2_codec2/components/VideoEncoder.h
+@@ -45,6 +45,15 @@ public:
+         uint32_t temporalLayers = 1;
+         // The share of the bitrate that the base temporal layer gets.
+         float baseLayerBitrateRatio = 1.0f;
++        // The pixel format of the frames the client gives to the encoder.
++        VideoPixelFormat inputFormat = kInputPixelFormat;
++        // The colours of those frames, which the encoder passes on to the device and the stream.
++        C2Color::range_t colorRange = C2Color::RANGE_UNSPECIFIED;
++        C2Color::primaries_t colorPrimaries = C2Color::PRIMARIES_UNSPECIFIED;
++        C2Color::transfer_t colorTransfer = C2Color::TRANSFER_UNSPECIFIED;
++        C2Color::matrix_t colorMatrix = C2Color::MATRIX_UNSPECIFIED;
++        // The HDR10 static metadata of the frames, if the client set any.
++        std::optional<C2HdrStaticMetadataStruct> hdrStaticInfo;
+     };
+ 
+     // The InputFrame class can be used to store raw video frames.
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index 82f3c62fe86c467339b736bfbfc5edeab9840b0a..345c1c2cca2d818ba0f15131b15e95f041fe6f57 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -95,6 +95,11 @@ V4L2ExtCtrl::V4L2ExtCtrl(uint32_t id, int32_t val) : V4L2ExtCtrl(id) {
+     ctrl.value = val;
+ }
+ 
++V4L2ExtCtrl::V4L2ExtCtrl(uint32_t id, void* payload, uint32_t size) : V4L2ExtCtrl(id) {
++    ctrl.ptr = payload;
++    ctrl.size = size;
++}
++
+ // Class used to store the state of a buffer that should persist between reference creations. This
+ // includes:
+ // * Result of initial VIDIOC_QUERYBUF ioctl,
+@@ -737,9 +742,16 @@ V4L2Queue::~V4L2Queue() {
+ }
+ 
+ std::optional<struct v4l2_format> V4L2Queue::setFormat(uint32_t fourcc, const ui::Size& size,
+-                                                       size_t bufferSize, uint32_t stride) {
++                                                       size_t bufferSize, uint32_t stride,
++                                                       const V4L2Colorimetry& colorimetry) {
+     ATRACE_CALL();
+     struct v4l2_format format = buildV4L2Format(mType, fourcc, size, bufferSize, stride);
++    if (V4L2_TYPE_IS_MULTIPLANAR(mType)) {
++        format.fmt.pix_mp.colorspace = colorimetry.colorspace;
++        format.fmt.pix_mp.ycbcr_enc = colorimetry.ycbcrEnc;
++        format.fmt.pix_mp.quantization = colorimetry.quantization;
++        format.fmt.pix_mp.xfer_func = colorimetry.xferFunc;
++    }
+     if (mDevice->ioctl(VIDIOC_S_FMT, &format) != 0 || format.fmt.pix_mp.pixelformat != fourcc) {
+         ALOGEQ("Failed to set format (format_fourcc=0x%" PRIx32 ")", fourcc);
+         return std::nullopt;
+@@ -1878,6 +1890,104 @@ int32_t V4L2Device::h264LevelIdcToV4L2H264Level(uint8_t levelIdc) {
+     }
+ }
+ 
++// static
++V4L2Colorimetry V4L2Device::c2ColorAspectsToV4L2Colorimetry(C2Color::range_t range,
++                                                            C2Color::primaries_t primaries,
++                                                            C2Color::transfer_t transfer,
++                                                            C2Color::matrix_t matrix) {
++    V4L2Colorimetry colorimetry;
++
++    switch (primaries) {
++    case C2Color::PRIMARIES_BT709:
++        colorimetry.colorspace = V4L2_COLORSPACE_REC709;
++        break;
++    case C2Color::PRIMARIES_BT470_M:
++        colorimetry.colorspace = V4L2_COLORSPACE_470_SYSTEM_M;
++        break;
++    case C2Color::PRIMARIES_BT601_625:
++    case C2Color::PRIMARIES_EBU3213:
++        colorimetry.colorspace = V4L2_COLORSPACE_470_SYSTEM_BG;
++        break;
++    case C2Color::PRIMARIES_BT601_525:
++        colorimetry.colorspace = V4L2_COLORSPACE_SMPTE170M;
++        break;
++    case C2Color::PRIMARIES_BT2020:
++        colorimetry.colorspace = V4L2_COLORSPACE_BT2020;
++        break;
++    case C2Color::PRIMARIES_RP431:
++    case C2Color::PRIMARIES_EG432:
++        colorimetry.colorspace = V4L2_COLORSPACE_DCI_P3;
++        break;
++    default:
++        break;
++    }
++
++    switch (transfer) {
++    case C2Color::TRANSFER_LINEAR:
++        colorimetry.xferFunc = V4L2_XFER_FUNC_NONE;
++        break;
++    case C2Color::TRANSFER_SRGB:
++        colorimetry.xferFunc = V4L2_XFER_FUNC_SRGB;
++        break;
++    case C2Color::TRANSFER_170M:
++        colorimetry.xferFunc = V4L2_XFER_FUNC_709;
++        break;
++    case C2Color::TRANSFER_240M:
++        colorimetry.xferFunc = V4L2_XFER_FUNC_SMPTE240M;
++        break;
++    case C2Color::TRANSFER_ST2084:
++        colorimetry.xferFunc = V4L2_XFER_FUNC_SMPTE2084;
++        break;
++    default:
++        break;
++    }
++
++    switch (matrix) {
++    case C2Color::MATRIX_BT709:
++        colorimetry.ycbcrEnc = V4L2_YCBCR_ENC_709;
++        break;
++    case C2Color::MATRIX_BT601:
++    case C2Color::MATRIX_FCC47_73_682:
++        colorimetry.ycbcrEnc = V4L2_YCBCR_ENC_601;
++        break;
++    case C2Color::MATRIX_240M:
++        colorimetry.ycbcrEnc = V4L2_YCBCR_ENC_SMPTE240M;
++        break;
++    case C2Color::MATRIX_BT2020:
++        colorimetry.ycbcrEnc = V4L2_YCBCR_ENC_BT2020;
++        break;
++    case C2Color::MATRIX_BT2020_CONSTANT:
++        colorimetry.ycbcrEnc = V4L2_YCBCR_ENC_BT2020_CONST_LUM;
++        break;
++    default:
++        break;
++    }
++
++    switch (range) {
++    case C2Color::RANGE_FULL:
++        colorimetry.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++        break;
++    case C2Color::RANGE_LIMITED:
++        colorimetry.quantization = V4L2_QUANTIZATION_LIM_RANGE;
++        break;
++    default:
++        break;
++    }
++
++    // The V4L2 core resets the transfer function, the matrix and the quantization to the default
++    // whenever the colorspace is the default, so a stream that states some of them but not its
++    // primaries would lose them. RAW states no primaries and keeps the rest as given: every
++    // default then means unspecified, not what a standard implies.
++    if (colorimetry.colorspace == V4L2_COLORSPACE_DEFAULT &&
++        (colorimetry.xferFunc != V4L2_XFER_FUNC_DEFAULT ||
++         colorimetry.ycbcrEnc != V4L2_YCBCR_ENC_DEFAULT ||
++         colorimetry.quantization != V4L2_QUANTIZATION_DEFAULT)) {
++        colorimetry.colorspace = V4L2_COLORSPACE_RAW;
++    }
++
++    return colorimetry;
++}
++
+ // static
+ v4l2_mpeg_video_bitrate_mode V4L2Device::c2BitrateModeToV4L2BitrateMode(
+         C2Config::bitrate_mode_t bitrateMode) {
+@@ -2142,7 +2252,8 @@ std::optional<VideoFrameLayout> V4L2Device::v4L2FormatToVideoFrameLayout(
+         const size_t yStrideAbs = static_cast<size_t>(yStride);
+         switch (pixFmt) {
+         case V4L2_PIX_FMT_NV12:
+-            // The stride of UV is the same as Y in NV12. The height is half of Y plane.
++        case V4L2_PIX_FMT_P010:
++            // The stride of UV is the same as Y in NV12 and P010. The height is half of Y plane.
+             planes.push_back(VideoFramePlane{yStride, yStrideAbs * pixMp.height,
+                                              yStrideAbs * pixMp.height / 2});
+             ALOG_ASSERT(2u == planes.size());
+@@ -2492,6 +2603,39 @@ void V4L2Device::queryEncoderControls(VideoCodec codec, uint32_t pixFmt,
+     if (isCtrlExposed(isHEVC ? V4L2_CID_MPEG_VIDEO_HEVC_LEVEL : V4L2_CID_MPEG_VIDEO_H264_LEVEL)) {
+         caps->supportedLevels = queryC2Levels(pixFmt);
+     }
++
++    // Main 10 takes 10-bit frames, so a device that lists the profile but takes no 10-bit frame
++    // cannot encode it. The HDR10 metadata only has a meaning for that profile.
++    if (isHEVC) {
++        // A device lists the raw formats of the coded format its stream is set to, so set the
++        // coded format of this codec before the list is asked for.
++        v4l2_format codedFormat;
++        memset(&codedFormat, 0, sizeof(codedFormat));
++        codedFormat.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        codedFormat.fmt.pix_mp.pixelformat = pixFmt;
++        codedFormat.fmt.pix_mp.width = 1920;
++        codedFormat.fmt.pix_mp.height = 1080;
++        codedFormat.fmt.pix_mp.num_planes = 1;
++        ioctl(VIDIOC_S_FMT, &codedFormat);
++
++        const std::vector<uint32_t> rawFormats =
++                enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++        const bool takesP010 = std::find(rawFormats.begin(), rawFormats.end(),
++                                         V4L2_PIX_FMT_P010) != rawFormats.end();
++        if (!takesP010) {
++            caps->supportedProfiles.erase(
++                    std::remove_if(caps->supportedProfiles.begin(), caps->supportedProfiles.end(),
++                                   [](const SupportedProfile& profile) {
++                                       return profile.profile == C2Config::PROFILE_HEVC_MAIN_10 ||
++                                              profile.profile ==
++                                                      C2Config::PROFILE_HEVC_MAIN_10_INTRA;
++                                   }),
++                    caps->supportedProfiles.end());
++        }
++        caps->supportsHdr10 = takesP010 &&
++                              queryControl(V4L2_CID_COLORIMETRY_HDR10_CLL_INFO, &ctrl) &&
++                              queryControl(V4L2_CID_COLORIMETRY_HDR10_MASTERING_DISPLAY, &ctrl);
++    }
+ }
+ 
+ std::vector<C2Config::level_t> V4L2Device::enumerateSupportedDecodeLevels(
+diff --git a/v4l2/V4L2EncodeComponent.cpp b/v4l2/V4L2EncodeComponent.cpp
+index f484743e02071f8c78c114a7d5912cca7a618a63..1c395a638f4e43b245246c4a3278e387661467b9 100644
+--- a/v4l2/V4L2EncodeComponent.cpp
++++ b/v4l2/V4L2EncodeComponent.cpp
+@@ -80,10 +80,16 @@ bool V4L2EncodeComponent::initializeEncoder() {
+         level = c2LevelToV4L2HEVCLevel(mInterface->getOutputLevel());
+     }
+ 
++    // Main 10 takes 10-bit frames, the other profiles 8-bit ones.
++    VideoEncoder::EncodingParams params;
++    if (outputProfile == C2Config::PROFILE_HEVC_MAIN_10) {
++        params.inputFormat = VideoPixelFormat::P010;
++    }
++
+     // Get the stride used by the C2 framework, as this might be different from the stride used by
+     // the V4L2 encoder.
+     std::optional<uint32_t> stride =
+-            getVideoFrameStride(VideoEncoder::kInputPixelFormat, mInterface->getInputVisibleSize());
++            getVideoFrameStride(params.inputFormat, mInterface->getInputVisibleSize());
+     if (!stride) {
+         ALOGE("Failed to get video frame stride");
+         reportError(C2_CORRUPTED);
+@@ -101,7 +107,6 @@ bool V4L2EncodeComponent::initializeEncoder() {
+ 
+     mBitrate = mInterface->getBitrate();
+ 
+-    VideoEncoder::EncodingParams params;
+     params.quality = mInterface->getQuality();
+     params.qpBounds = mInterface->getQpBounds();
+     params.maxBFrames = mInterface->getMaxBFrames();
+@@ -118,6 +123,12 @@ bool V4L2EncodeComponent::initializeEncoder() {
+         params.maxBFrames = 0;
+         if (mBitrateMode == C2Config::BITRATE_CONST) mBitrateMode = C2Config::BITRATE_VARIABLE;
+     }
++    const C2ColorAspectsStruct colorAspects = mInterface->getColorAspects();
++    params.colorRange = colorAspects.range;
++    params.colorPrimaries = colorAspects.primaries;
++    params.colorTransfer = colorAspects.transfer;
++    params.colorMatrix = colorAspects.matrix;
++    params.hdrStaticInfo = mInterface->getHdrStaticInfo();
+     mReordersOutput = params.maxBFrames > 0;
+     mQuality = params.quality;
+ 
+diff --git a/v4l2/V4L2Encoder.cpp b/v4l2/V4L2Encoder.cpp
+index 241e7c0cf83b88f249fc35296cdd254ca0eff7bc..a3c4b336558451e14dad3c1e4977b7043bef29c4 100644
+--- a/v4l2/V4L2Encoder.cpp
++++ b/v4l2/V4L2Encoder.cpp
+@@ -8,7 +8,9 @@
+ #include <v4l2_codec2/v4l2/V4L2Encoder.h>
+ 
+ #include <stdint.h>
++#include <string.h>
+ #include <algorithm>
++#include <cmath>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+@@ -296,7 +298,9 @@ bool V4L2Encoder::initialize(C2Config::profile_t outputProfile, std::optional<ui
+ 
+     // Configure the input format. If the device doesn't support the specified format we'll use one
+     // of the device's preferred formats in combination with an input format convertor.
+-    if (!configureInputFormat(kInputPixelFormat, stride)) return false;
++    const V4L2Colorimetry colorimetry = V4L2Device::c2ColorAspectsToV4L2Colorimetry(
++            params.colorRange, params.colorPrimaries, params.colorTransfer, params.colorMatrix);
++    if (!configureInputFormat(params.inputFormat, stride, colorimetry)) return false;
+ 
+     // Create input and output buffers.
+     if (!createInputBuffers() || !createOutputBuffers()) return false;
+@@ -483,7 +487,8 @@ void V4L2Encoder::onDrainDone(bool done) {
+     }
+ }
+ 
+-bool V4L2Encoder::configureInputFormat(VideoPixelFormat inputFormat, uint32_t stride) {
++bool V4L2Encoder::configureInputFormat(VideoPixelFormat inputFormat, uint32_t stride,
++                                       const V4L2Colorimetry& colorimetry) {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
+     ALOG_ASSERT(mState == State::UNINITIALIZED);
+@@ -492,9 +497,12 @@ bool V4L2Encoder::configureInputFormat(VideoPixelFormat inputFormat, uint32_t st
+ 
+     // First try to use the requested pixel format directly.
+     std::optional<struct v4l2_format> format;
+-    auto fourcc = Fourcc::fromVideoPixelFormat(inputFormat, false);
++    // P010 is one buffer holding both colour planes, which V4L2 names with the fourcc of a
++    // single-planar format.
++    auto fourcc = Fourcc::fromVideoPixelFormat(inputFormat, inputFormat == VideoPixelFormat::P010);
+     if (fourcc) {
+-        format = mInputQueue->setFormat(fourcc->toV4L2PixFmt(), mVisibleSize, 0, stride);
++        format = mInputQueue->setFormat(fourcc->toV4L2PixFmt(), mVisibleSize, 0, stride,
++                                        colorimetry);
+     }
+ 
+     // If the device doesn't support the requested input format we'll try the device's preferred
+@@ -504,7 +512,8 @@ bool V4L2Encoder::configureInputFormat(VideoPixelFormat inputFormat, uint32_t st
+         std::vector<uint32_t> preferredFormats =
+                 mDevice->preferredInputFormat(V4L2Device::Type::kEncoder);
+         for (uint32_t i = 0; !format && i < preferredFormats.size(); ++i) {
+-            format = mInputQueue->setFormat(preferredFormats[i], mVisibleSize, 0, stride);
++            format = mInputQueue->setFormat(preferredFormats[i], mVisibleSize, 0, stride,
++                                            colorimetry);
+         }
+     }
+ 
+@@ -640,6 +649,9 @@ bool V4L2Encoder::configureDevice(C2Config::profile_t outputProfile,
+         return configureH264(outputProfile, outputLevel, bitrate, params);
+     }
+     if (isHEVCProfile(outputProfile)) {
++        if (params.hdrStaticInfo && outputProfile == C2Config::PROFILE_HEVC_MAIN_10) {
++            configureHdr(*params.hdrStaticInfo);
++        }
+         return configureHEVC(outputProfile, outputLevel, bitrate, params);
+     }
+ 
+@@ -760,6 +772,59 @@ bool V4L2Encoder::configureHEVC(C2Config::profile_t outputProfile,
+     return true;
+ }
+ 
++void V4L2Encoder::configureHdr(const C2HdrStaticMetadataStruct& info) {
++    auto scaled = [](float value, float unit, int32_t low, int32_t high) {
++        return std::clamp(static_cast<int32_t>(std::lround(value / unit)), low, high);
++    };
++
++    // The units of the controls are those of the SEI messages that carry the metadata: 0.00002 for
++    // the chromaticity coordinates and 0.0001 cd/m2 for the mastering luminance.
++    constexpr float kChromaticity = 0.00002f;
++    constexpr float kLuminance = 0.0001f;
++    // The primaries are in the order green, blue, red, as the SEI message has them.
++    const C2ColorXyStruct* primaries[] = {&info.mastering.green, &info.mastering.blue,
++                                          &info.mastering.red};
++    struct v4l2_ctrl_hdr10_mastering_display mastering;
++    memset(&mastering, 0, sizeof(mastering));
++    for (size_t i = 0; i < 3; ++i) {
++        mastering.display_primaries_x[i] =
++                scaled(primaries[i]->x, kChromaticity, V4L2_HDR10_MASTERING_PRIMARIES_X_LOW,
++                       V4L2_HDR10_MASTERING_PRIMARIES_X_HIGH);
++        mastering.display_primaries_y[i] =
++                scaled(primaries[i]->y, kChromaticity, V4L2_HDR10_MASTERING_PRIMARIES_Y_LOW,
++                       V4L2_HDR10_MASTERING_PRIMARIES_Y_HIGH);
++    }
++    mastering.white_point_x = scaled(info.mastering.white.x, kChromaticity,
++                                     V4L2_HDR10_MASTERING_WHITE_POINT_X_LOW,
++                                     V4L2_HDR10_MASTERING_WHITE_POINT_X_HIGH);
++    mastering.white_point_y = scaled(info.mastering.white.y, kChromaticity,
++                                     V4L2_HDR10_MASTERING_WHITE_POINT_Y_LOW,
++                                     V4L2_HDR10_MASTERING_WHITE_POINT_Y_HIGH);
++    mastering.max_display_mastering_luminance =
++            scaled(info.mastering.maxLuminance, kLuminance, V4L2_HDR10_MASTERING_MAX_LUMA_LOW,
++                   V4L2_HDR10_MASTERING_MAX_LUMA_HIGH);
++    mastering.min_display_mastering_luminance =
++            scaled(info.mastering.minLuminance, kLuminance, V4L2_HDR10_MASTERING_MIN_LUMA_LOW,
++                   V4L2_HDR10_MASTERING_MIN_LUMA_HIGH);
++
++    struct v4l2_ctrl_hdr10_cll_info lightLevel;
++    memset(&lightLevel, 0, sizeof(lightLevel));
++    lightLevel.max_content_light_level = scaled(info.maxCll, 1.f, 0, UINT16_MAX);
++    lightLevel.max_pic_average_light_level = scaled(info.maxFall, 1.f, 0, UINT16_MAX);
++
++    // The metadata is optional, so a device that refuses it still encodes the stream.
++    if (!mDevice->setExtCtrls(V4L2_CTRL_CLASS_COLORIMETRY,
++                              {V4L2ExtCtrl(V4L2_CID_COLORIMETRY_HDR10_MASTERING_DISPLAY, &mastering,
++                                           sizeof(mastering))})) {
++        ALOGW("Setting the HDR10 mastering display metadata failed");
++    }
++    if (!mDevice->setExtCtrls(V4L2_CTRL_CLASS_COLORIMETRY,
++                              {V4L2ExtCtrl(V4L2_CID_COLORIMETRY_HDR10_CLL_INFO, &lightLevel,
++                                           sizeof(lightLevel))})) {
++        ALOGW("Setting the HDR10 content light level failed");
++    }
++}
++
+ std::optional<std::pair<int32_t, int32_t>> V4L2Encoder::controlRange(uint32_t id) {
+     struct v4l2_queryctrl ctrl;
+     memset(&ctrl, 0, sizeof(ctrl));
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+index ebc8b45f6832b524158084aac708d243b224fd09..7c8e6333e3d7185f6d6883636840aee4aaf584eb 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+@@ -66,9 +66,21 @@ class V4L2DecodeSurface;
+ struct V4L2ExtCtrl {
+     V4L2ExtCtrl(uint32_t id);
+     V4L2ExtCtrl(uint32_t id, int32_t val);
++    // A compound control, whose value is the |size| bytes at |payload|. The payload must stay valid
++    // until the control has been set.
++    V4L2ExtCtrl(uint32_t id, void* payload, uint32_t size);
+     struct v4l2_ext_control ctrl;
+ };
+ 
++// The colour description of a V4L2 format: the colour space and the components of it that a client
++// can set apart from it. A zero value leaves the choice to the driver.
++struct V4L2Colorimetry {
++    uint32_t colorspace = 0;  // v4l2_colorspace
++    uint32_t ycbcrEnc = 0;    // v4l2_ycbcr_encoding
++    uint32_t quantization = 0;  // v4l2_quantization
++    uint32_t xferFunc = 0;    // v4l2_xfer_func
++};
++
+ bool isValidPixFmtForCodec(VideoCodec codec, uint32_t pixFmt);
+ 
+ // A unique reference to a buffer for clients to prepare and submit.
+@@ -226,9 +238,11 @@ public:
+     // |v4l2_format| reflecting the actual format is returned. It is guaranteed to feature the
+     // specified |fourcc|, but any other parameter (including |size| and |bufferSize| may have been
+     // adjusted by the driver, so the caller must check their values.
+-    std::optional<struct v4l2_format> setFormat(uint32_t fourcc, const ui::Size& size,
+-                                                size_t bufferSize,
+-                                                uint32_t stride = 0) WARN_UNUSED_RESULT;
++    // |colorimetry| describes the colours of the frames of the queue, for a queue that takes raw
++    // frames.
++    std::optional<struct v4l2_format> setFormat(
++            uint32_t fourcc, const ui::Size& size, size_t bufferSize, uint32_t stride = 0,
++            const V4L2Colorimetry& colorimetry = V4L2Colorimetry()) WARN_UNUSED_RESULT;
+ 
+     // Identical to |setFormat|, but does not actually apply the format, and can be called anytime.
+     // Returns an adjusted V4L2 format if |fourcc| is supported by the queue, or |nullopt| if
+@@ -368,6 +382,12 @@ public:
+     static int32_t c2ProfileToV4L2HEVCProfile(C2Config::profile_t profile);
+     static v4l2_mpeg_video_bitrate_mode c2BitrateModeToV4L2BitrateMode(
+             C2Config::bitrate_mode_t bitrateMode);
++    // Convert the colour aspects of a client to the colorimetry of a V4L2 format. An aspect that
++    // V4L2 has no value for is left to the driver.
++    static V4L2Colorimetry c2ColorAspectsToV4L2Colorimetry(C2Color::range_t range,
++                                                           C2Color::primaries_t primaries,
++                                                           C2Color::transfer_t transfer,
++                                                           C2Color::matrix_t matrix);
+ 
+     // Converts v4l2_memory to a string.
+     static const char* v4L2MemoryToString(const v4l2_memory memory);
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
+index c4288237cddd1a52dbc7aa9913aca6eabd21d9e3..607148a47219614324b8808307a597aa8cc68e48 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
+@@ -21,6 +21,7 @@
+ namespace android {
+ 
+ struct BitstreamBuffer;
++struct V4L2Colorimetry;
+ struct VideoFramePlane;
+ class V4L2Device;
+ class V4L2Queue;
+@@ -106,8 +107,9 @@ private:
+     // Called when draining the encoder has completed.
+     void onDrainDone(bool done);
+ 
+-    // Configure input format on the V4L2 device.
+-    bool configureInputFormat(VideoPixelFormat inputFormat, uint32_t stride);
++    // Configure input format on the V4L2 device, with the colours of the frames.
++    bool configureInputFormat(VideoPixelFormat inputFormat, uint32_t stride,
++                              const V4L2Colorimetry& colorimetry);
+     // Configure output format on the V4L2 device.
+     bool configureOutputFormat(C2Config::profile_t outputProfile);
+     // Configure required and optional controls on the V4L2 device.
+@@ -122,6 +124,8 @@ private:
+     bool configureHEVC(C2Config::profile_t outputProfile,
+                        std::optional<const uint8_t> outputHEVCLevel, uint32_t bitrate,
+                        const EncodingParams& params);
++    // Set the HDR10 static metadata of the stream on the V4L2 device.
++    void configureHdr(const C2HdrStaticMetadataStruct& info);
+     // Set the control |id| to |value| if the device has it and |value| is within its range, and
+     // return whether the control was set. The controls are optional, so a device without one is
+     // not an error.

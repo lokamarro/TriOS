@@ -1,0 +1,615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 16:59:49 +0900
+Subject: [PATCH] kosmickrisp: never let an image view end the process
+
+Metal answers a texture view it cannot make with an assertion that
+aborts the process: a view type the source texture cannot be viewed as,
+or levels and slices it does not have. The view type and subresource
+range of every Vulkan image view come from the application, and a Venus
+guest's reach the host driver unchecked, so one invalid view ended the
+emulator. 3DMark Wild Life Extreme sends a 3D view of a 2D image on its
+second run in one process.
+
+mtl_new_texture_view_with() now refuses such a view with NULL instead
+of reaching Metal, and kk_image_view_init() checks every texture it
+creates, and a missing base texture, and fails with
+VK_ERROR_OUT_OF_DEVICE_MEMORY. A 3D view of a non-3D image is made as
+the 2D (or 2D array) texture it is, because Venus creates views without
+waiting for the result and a refusal would surface later as a lost
+device. Metal's pixel-format compatibility is still left to Metal, and
+a cube view's faces need not be square: the chroma planes of a 4:2:2
+cube image are not, and Metal views them.
+
+kosmickrisp_invalid_view_type aborts with that assertion before this
+change and passes after it. It asks the bridge for each impossible view
+directly, so it runs in the assertion-enabled regression suite; the
+same views through vkCreateImageView are invalid usage the common
+runtime asserts on, so those cases run only in a build without
+assertions, as the driver ships.
+---
+ src/kosmickrisp/bridge/mtl_texture.m          |  68 ++++
+ src/kosmickrisp/vulkan/kk_image_view.c        |  50 ++-
+ src/kosmickrisp/vulkan/meson.build            |  20 ++
+ .../vulkan/tests/test_invalid_view_type.c     | 327 ++++++++++++++++++
+ 4 files changed, 460 insertions(+), 5 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_invalid_view_type.c
+
+diff --git a/src/kosmickrisp/bridge/mtl_texture.m b/src/kosmickrisp/bridge/mtl_texture.m
+index 496ce143324596b2d1616ed0b0a6a36eac2057f5..e44a8309fab17e73f55b7c478fb45f407aa04ae1 100644
+--- a/src/kosmickrisp/bridge/mtl_texture.m
++++ b/src/kosmickrisp/bridge/mtl_texture.m
+@@ -64,6 +64,70 @@
+    return map[swizzle];
+ }
+ 
++/* Metal answers a texture view it cannot make, whether of a type the source
++ * cannot be viewed as or of levels and slices the source does not have, with
++ * an assertion that ends the process. Every one of these comes from the
++ * application, so such a view has to become a failure the caller reports
++ * instead. Only the pixel format is left to Metal. */
++static bool
++mtl_texture_view_is_creatable(id<MTLTexture> tex, MTLTextureType type,
++                              NSRange levels, NSRange slices)
++{
++   if (tex == nil)
++      return false;
++
++   const MTLTextureType source = tex.textureType;
++   bool compatible;
++   switch (source) {
++   case MTLTextureType1D:
++   case MTLTextureType1DArray:
++      compatible = type == MTLTextureType1D || type == MTLTextureType1DArray;
++      break;
++   case MTLTextureType2D:
++      compatible = type == MTLTextureType2D || type == MTLTextureType2DArray;
++      break;
++   case MTLTextureType2DArray:
++   case MTLTextureTypeCube:
++   case MTLTextureTypeCubeArray:
++      compatible = type == MTLTextureType2D || type == MTLTextureType2DArray ||
++                   type == MTLTextureTypeCube ||
++                   type == MTLTextureTypeCubeArray;
++      break;
++   case MTLTextureType2DMultisample:
++   case MTLTextureType2DMultisampleArray:
++      compatible = type == MTLTextureType2DMultisample ||
++                   type == MTLTextureType2DMultisampleArray;
++      break;
++   default:
++      compatible = type == source;
++      break;
++   }
++   if (!compatible)
++      return false;
++
++   NSUInteger source_slices = tex.arrayLength;
++   if (source == MTLTextureTypeCube || source == MTLTextureTypeCubeArray)
++      source_slices *= 6u;
++
++   if (levels.length == 0u || levels.location >= tex.mipmapLevelCount ||
++       levels.length > tex.mipmapLevelCount - levels.location)
++      return false;
++   if (slices.length == 0u || slices.location >= source_slices ||
++       slices.length > source_slices - slices.location)
++      return false;
++
++   /* A cube view's faces need not be square: a 4:2:2 cube image's chroma
++    * planes are twice as tall as they are wide, and Metal views them as
++    * cubes. */
++   if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) {
++      if (slices.length % 6u != 0u ||
++          (type == MTLTextureTypeCube && slices.length != 6u))
++         return false;
++   }
++
++   return true;
++}
++
+ mtl_texture *
+ mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *layout)
+ {
+@@ -72,6 +136,8 @@
+       MTLTextureType type = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
+       NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
+       NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
++      if (!mtl_texture_view_is_creatable(tex, type, levels, slices))
++         return NULL;
+       MTLTextureSwizzleChannels swizzle = MTLTextureSwizzleChannelsMake(mtl_texture_swizzle(layout->swizzle.red),
+                                                                         mtl_texture_swizzle(layout->swizzle.green),
+                                                                         mtl_texture_swizzle(layout->swizzle.blue),
+@@ -88,6 +154,8 @@
+       MTLTextureType type = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
+       NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
+       NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
++      if (!mtl_texture_view_is_creatable(tex, type, levels, slices))
++         return NULL;
+       return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
+    }
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index 682a65f74e339a2e50409a9c6e7f924a5b270070..2839fb35f7ebd2f921f2e3d318d71694e74fdcb0 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -49,6 +49,22 @@ remove_1d_view_types(enum VkImageViewType type)
+    return type;
+ }
+ 
++/* A 3D view of an image that is not 3D is invalid usage, and no Metal
++ * texture view can express it. Venus creates image views without waiting for
++ * the result, so refusing the view would only resurface later as a lost
++ * device. The view is made of the image as the 2D texture it is instead. */
++static enum VkImageViewType
++kk_image_view_metal_type(const struct kk_image *image,
++                         const struct kk_image_view *view)
++{
++   const enum VkImageViewType type = remove_1d_view_types(view->vk.view_type);
++   if (type == VK_IMAGE_VIEW_TYPE_3D &&
++       image->vk.image_type != VK_IMAGE_TYPE_3D)
++      return view->vk.layer_count > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
++                                      : VK_IMAGE_VIEW_TYPE_2D;
++   return type;
++}
++
+ VkResult
+ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                    const VkImageViewCreateInfo *pCreateInfo)
+@@ -105,7 +121,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+       assert(supported_format);
+ 
+       struct kk_view_layout view_layout = {
+-         .view_type = remove_1d_view_types(view->vk.view_type),
++         .view_type = kk_image_view_metal_type(image, view),
+          .sample_count_sa = plane->layout.sample_count_sa,
+          .format = {.pipe = p_format,
+                     .mtl = supported_format->mtl_pixel_format},
+@@ -162,6 +178,11 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+             mtl_handle = image->planes[image_plane].mtl_handle_array;
+       }
+ 
++      /* An unbound image has no texture, and neither has the 2D array alias
++       * of a 3D image created without 2D array compatibility. */
++      if (mtl_handle == NULL)
++         goto fail_no_texture;
++
+       /* Block texel view requires subresource aliasing. We do it here to avoid
+        * having to create a texture for every possible subresource up-front */
+       if (util_format_is_compressed(plane->layout.format.pipe) &&
+@@ -182,6 +203,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+ 
+          mtl_handle = kk_image_plane_create_texture(plane, &subres_layout,
+                                                     subres_offset_B);
++         if (mtl_handle == NULL)
++            goto fail_view;
+          view->planes[view_plane].mtl_handle_subres = mtl_handle;
+ 
+          /* Adjust for new base texture pointing to subresource */
+@@ -196,6 +219,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+            (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) {
+          view->planes[view_plane].mtl_handle_sampled =
+             mtl_new_texture_view_with(mtl_handle, &view_layout);
++         if (!view->planes[view_plane].mtl_handle_sampled)
++            goto fail_view;
+          view->planes[view_plane].sampled_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_sampled);
+@@ -207,10 +232,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+             array_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+             view->planes[view_plane].mtl_handle_cube_array =
+                mtl_new_texture_view_with(mtl_handle, &array_layout);
+-            if (!view->planes[view_plane].mtl_handle_cube_array) {
+-               kk_image_view_finish(dev, view);
+-               return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-            }
++            if (!view->planes[view_plane].mtl_handle_cube_array)
++               goto fail_view;
+             view->planes[view_plane].cube_array_gpu_resource_id =
+                mtl_texture_get_gpu_resource_id(
+                   view->planes[view_plane].mtl_handle_cube_array);
+@@ -225,6 +248,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+ 
+          view->planes[view_plane].mtl_handle_storage =
+             mtl_new_texture_view_with(mtl_handle, &view_layout);
++         if (!view->planes[view_plane].mtl_handle_storage)
++            goto fail_view;
+          view->planes[view_plane].storage_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_storage);
+@@ -254,6 +279,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                                        : original_type;
+             view->planes[view_plane].mtl_handle_input =
+                mtl_new_texture_view_with(mtl_handle, &view_layout);
++            if (!view->planes[view_plane].mtl_handle_input)
++               goto fail_view;
+          } else
+             view->planes[view_plane].mtl_handle_input = mtl_retain(mtl_handle);
+          if (view->planes[view_plane].mtl_handle_input)
+@@ -288,10 +315,23 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                renders_as_3d ? image->planes[image_plane].mtl_handle
+                              : mtl_handle);
+          }
++         if (!view->planes[view_plane].mtl_handle_render)
++            goto fail_view;
+       }
+    }
+ 
+    return VK_SUCCESS;
++
++fail_no_texture:
++   kk_image_view_finish(dev, view);
++   return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                    "no Metal texture to take a view of");
++
++fail_view:
++   kk_image_view_finish(dev, view);
++   return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                    "Metal cannot make a view of type %d of this image",
++                    (int)pCreateInfo->viewType);
+ }
+ 
+ void
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 3731ff09f215b95f1dd0a868593e77472cd6d695..6ae1f164327f924a1675ac28d68dfc0453c071ea 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -518,6 +518,26 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_invalid_view_type',
++      executable(
++        'test_kosmickrisp_invalid_view_type',
++        files('tests/test_invalid_view_type.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_maintenance10_resolve',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_invalid_view_type.c b/src/kosmickrisp/vulkan/tests/test_invalid_view_type.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ee7cd7489c9f5b460bb57ae6a4faaac96ff6545
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_invalid_view_type.c
+@@ -0,0 +1,327 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Metal ends the process when asked for a texture view it cannot make, and
++ * the view type and subresource range of every image view come from the
++ * application. A 3D view of a 2D image, which a Venus guest sends and cannot
++ * see refused, must still yield a usable view. Any other view Metal cannot
++ * make must be refused, and every valid view must still be made.
++ *
++ * The bridge's refusals are checked directly, so they run with assertions
++ * enabled. The same views through vkCreateImageView are invalid usage the
++ * common runtime asserts on, so those run only in a build without
++ * assertions, which is what the driver ships as. */
++#include "kosmickrisp/bridge/mtl_bridge.h"
++#include "kosmickrisp/bridge/mtl_texture.h"
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/vulkan/kk_entrypoints.h"
++#include "kosmickrisp/vulkan/kk_image.h"
++#include "kosmickrisp/vulkan/kk_image_view.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(expr) do { \
++   VkResult result_ = (expr); \
++   if (result_ != VK_SUCCESS) { \
++      fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #expr, result_); \
++      abort(); \
++   } \
++} while (0)
++
++struct context {
++   VkDevice device;
++   const struct vk_device_dispatch_table *api;
++   VkPhysicalDeviceMemoryProperties memory;
++};
++
++struct bound_image {
++   VkImage image;
++   VkDeviceMemory memory;
++};
++
++static uint32_t
++memory_type(struct context *ctx, uint32_t bits)
++{
++   for (uint32_t i = 0; i < ctx->memory.memoryTypeCount; i++) {
++      if ((bits & BITFIELD_BIT(i)) &&
++          (ctx->memory.memoryTypes[i].propertyFlags &
++           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         return i;
++   }
++   abort();
++}
++
++static struct bound_image
++create_image_of(struct context *ctx, VkFormat format, VkImageType type,
++                VkImageCreateFlags flags, VkExtent3D extent, uint32_t levels,
++                uint32_t layers)
++{
++   const VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .flags = flags,
++      .imageType = type,
++      .format = format,
++      .extent = extent,
++      .mipLevels = levels,
++      .arrayLayers = layers,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   struct bound_image bound;
++   CHECK(ctx->api->CreateImage(ctx->device, &info, NULL, &bound.image));
++   VkMemoryRequirements req;
++   ctx->api->GetImageMemoryRequirements(ctx->device, bound.image, &req);
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = memory_type(ctx, req.memoryTypeBits),
++   };
++   CHECK(ctx->api->AllocateMemory(ctx->device, &alloc, NULL, &bound.memory));
++   CHECK(ctx->api->BindImageMemory(ctx->device, bound.image, bound.memory, 0));
++   return bound;
++}
++
++static struct bound_image
++create_image(struct context *ctx, VkImageType type, VkImageCreateFlags flags,
++             VkExtent3D extent, uint32_t levels, uint32_t layers)
++{
++   return create_image_of(ctx, VK_FORMAT_R8G8B8A8_SRGB, type, flags, extent,
++                          levels, layers);
++}
++
++static void
++destroy_image(struct context *ctx, struct bound_image bound)
++{
++   ctx->api->DestroyImage(ctx->device, bound.image, NULL);
++   ctx->api->FreeMemory(ctx->device, bound.memory, NULL);
++}
++
++/* Creates the view and reports whether it was made with every Metal texture
++ * its usage needs. */
++UNUSED static bool
++make_view(struct context *ctx, VkImage image, VkImageViewType type,
++          uint32_t base_level, uint32_t levels, uint32_t base_layer,
++          uint32_t layers)
++{
++   const VkImageViewCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = type,
++      .format = VK_FORMAT_R8G8B8A8_SRGB,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, base_level, levels,
++                           base_layer, layers},
++   };
++   VkImageView view;
++   if (ctx->api->CreateImageView(ctx->device, &info, NULL, &view) !=
++       VK_SUCCESS)
++      return false;
++
++   const struct kk_image_view *kk_view = kk_image_view_from_handle(view);
++   const bool complete = kk_view->planes[0].mtl_handle_sampled != NULL &&
++                         kk_view->planes[0].sampled_gpu_resource_id != 0u &&
++                         kk_view->planes[0].mtl_handle_render != NULL;
++   ctx->api->DestroyImageView(ctx->device, view, NULL);
++   return complete;
++}
++
++/* Asks the bridge itself for a view of one plane's own Metal texture and
++ * reports whether it made one. */
++static bool
++bridge_plane_view(VkImage image, uint32_t plane_index, VkImageViewType type,
++                  uint32_t base_level, uint32_t levels, uint32_t base_layer,
++                  uint32_t layers)
++{
++   const struct kk_image_plane *plane =
++      &kk_image_from_handle(image)->planes[plane_index];
++   const struct kk_view_layout layout = {
++      .view_type = type,
++      .sample_count_sa = 1,
++      .format = {.pipe = plane->layout.format.pipe,
++                 .mtl = plane->layout.format.mtl},
++      .base_array_layer = base_layer,
++      .array_len = layers,
++      .swizzle = {.red = PIPE_SWIZZLE_X, .green = PIPE_SWIZZLE_Y,
++                  .blue = PIPE_SWIZZLE_Z, .alpha = PIPE_SWIZZLE_W},
++      .base_level = base_level,
++      .num_levels = levels,
++   };
++   mtl_texture *view = mtl_new_texture_view_with(plane->mtl_handle, &layout);
++   if (view == NULL)
++      return false;
++   mtl_release(view);
++   return true;
++}
++
++static bool
++bridge_view(VkImage image, VkImageViewType type, uint32_t base_level,
++            uint32_t levels, uint32_t base_layer, uint32_t layers)
++{
++   return bridge_plane_view(image, 0, type, base_level, levels, base_layer,
++                            layers);
++}
++
++static uint32_t failures;
++
++static void
++expect(const char *name, bool made, bool want)
++{
++   printf("%-44s %s\n", name, made ? "made" : "refused");
++   if (made != want) {
++      fprintf(stderr, "%s: expected the view to be %s\n", name,
++              want ? "made" : "refused");
++      failures++;
++   }
++}
++
++/* Views Metal cannot make, asked of the bridge directly. */
++static void
++check_bridge(struct context *ctx)
++{
++   struct bound_image flat =
++      create_image(ctx, VK_IMAGE_TYPE_2D, 0, (VkExtent3D){32, 32, 1}, 6, 1);
++   expect("bridge: 2D view of a 2D texture",
++          bridge_view(flat.image, VK_IMAGE_VIEW_TYPE_2D, 0, 6, 0, 1), true);
++   expect("bridge: 3D view of a 2D texture",
++          bridge_view(flat.image, VK_IMAGE_VIEW_TYPE_3D, 0, 6, 0, 1), false);
++   expect("bridge: cube view of a single layer",
++          bridge_view(flat.image, VK_IMAGE_VIEW_TYPE_CUBE, 0, 1, 0, 6), false);
++   expect("bridge: levels the texture does not have",
++          bridge_view(flat.image, VK_IMAGE_VIEW_TYPE_2D, 4, 3, 0, 1), false);
++   expect("bridge: a layer the texture does not have",
++          bridge_view(flat.image, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 1, 1), false);
++   expect("bridge: no levels",
++          bridge_view(flat.image, VK_IMAGE_VIEW_TYPE_2D, 0, 0, 0, 1), false);
++   destroy_image(ctx, flat);
++
++   struct bound_image volume =
++      create_image(ctx, VK_IMAGE_TYPE_3D, 0, (VkExtent3D){16, 16, 4}, 1, 1);
++   expect("bridge: 3D view of a 3D texture",
++          bridge_view(volume.image, VK_IMAGE_VIEW_TYPE_3D, 0, 1, 0, 1), true);
++   expect("bridge: cube view of a 3D texture",
++          bridge_view(volume.image, VK_IMAGE_VIEW_TYPE_CUBE, 0, 1, 0, 6),
++          false);
++   destroy_image(ctx, volume);
++
++   /* A valid view the refusals must not catch: the chroma planes of a
++    * square 4:2:2 cube image are 8 by 16 texels. */
++   struct bound_image chroma =
++      create_image_of(ctx, VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM,
++                      VK_IMAGE_TYPE_2D, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
++                      (VkExtent3D){16, 16, 1}, 1, 12);
++   expect("bridge: cube view of a 4:2:2 chroma plane",
++          bridge_plane_view(chroma.image, 1, VK_IMAGE_VIEW_TYPE_CUBE, 0, 1, 0,
++                            6),
++          true);
++   expect("bridge: cube array view of a 4:2:2 chroma plane",
++          bridge_plane_view(chroma.image, 1, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 0,
++                            1, 0, 12),
++          true);
++   destroy_image(ctx, chroma);
++}
++
++int
++main(void)
++{
++   const VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .apiVersion = VK_API_VERSION_1_3,
++   };
++   const VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   VkInstance instance;
++   CHECK(kk_CreateInstance(&instance_info, NULL, &instance));
++   PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)
++      kk_GetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices");
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(enumerate(instance, &count, &physical));
++   const float priority = 1;
++   const VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &priority,
++   };
++   const VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
++   };
++   struct context ctx = {0};
++   CHECK(kk_CreateDevice(physical, &device_info, NULL, &ctx.device));
++   PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
++      (PFN_vkGetPhysicalDeviceMemoryProperties)kk_GetInstanceProcAddr(
++         instance, "vkGetPhysicalDeviceMemoryProperties");
++   get_memory(physical, &ctx.memory);
++   ctx.api = &kk_device_from_handle(ctx.device)->exposed_dispatch_table;
++
++   check_bridge(&ctx);
++
++#ifndef NDEBUG
++   printf("views through vkCreateImageView: skipped, assertions are enabled\n");
++#else
++   /* The image 3DMark Wild Life Extreme views as a volume on its second run
++    * in one process. */
++   struct bound_image flat =
++      create_image(&ctx, VK_IMAGE_TYPE_2D, 0, (VkExtent3D){32, 32, 1}, 6, 1);
++   expect("3D view of a 2D image",
++          make_view(&ctx, flat.image, VK_IMAGE_VIEW_TYPE_3D, 0, 6, 0, 1), true);
++   expect("2D view of a 2D image",
++          make_view(&ctx, flat.image, VK_IMAGE_VIEW_TYPE_2D, 0, 6, 0, 1), true);
++   expect("cube view of a single layer 2D image",
++          make_view(&ctx, flat.image, VK_IMAGE_VIEW_TYPE_CUBE, 0, 1, 0, 6),
++          false);
++   expect("view of levels the image does not have",
++          make_view(&ctx, flat.image, VK_IMAGE_VIEW_TYPE_2D, 4, 3, 0, 1),
++          false);
++   expect("view of a layer the image does not have",
++          make_view(&ctx, flat.image, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 1, 1),
++          false);
++   expect("view of no levels",
++          make_view(&ctx, flat.image, VK_IMAGE_VIEW_TYPE_2D, 0, 0, 0, 1),
++          false);
++   destroy_image(&ctx, flat);
++
++   struct bound_image layered =
++      create_image(&ctx, VK_IMAGE_TYPE_2D, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
++                   (VkExtent3D){16, 16, 1}, 1, 6);
++   expect("3D view of a layered 2D image",
++          make_view(&ctx, layered.image, VK_IMAGE_VIEW_TYPE_3D, 0, 1, 0, 6),
++          true);
++   expect("cube view of a cube compatible image",
++          make_view(&ctx, layered.image, VK_IMAGE_VIEW_TYPE_CUBE, 0, 1, 0, 6),
++          true);
++   destroy_image(&ctx, layered);
++
++   struct bound_image volume =
++      create_image(&ctx, VK_IMAGE_TYPE_3D, 0, (VkExtent3D){16, 16, 4}, 1, 1);
++   expect("3D view of a 3D image",
++          make_view(&ctx, volume.image, VK_IMAGE_VIEW_TYPE_3D, 0, 1, 0, 1),
++          true);
++   expect("2D view of a 3D image without an alias",
++          make_view(&ctx, volume.image, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1),
++          false);
++   destroy_image(&ctx, volume);
++
++   struct bound_image aliased =
++      create_image(&ctx, VK_IMAGE_TYPE_3D,
++                   VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT,
++                   (VkExtent3D){16, 16, 4}, 1, 1);
++   expect("2D array view of a 2D array compatible 3D image",
++          make_view(&ctx, aliased.image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, 1, 0,
++                    4),
++          true);
++   expect("cube view of a 3D image",
++          make_view(&ctx, aliased.image, VK_IMAGE_VIEW_TYPE_CUBE, 0, 1, 0, 6),
++          false);
++   destroy_image(&ctx, aliased);
++#endif
++
++   ctx.api->DestroyDevice(ctx.device, NULL);
++   kk_DestroyInstance(instance, NULL);
++   return failures == 0 ? 0 : 1;
++}

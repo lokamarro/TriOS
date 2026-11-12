@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 22:45:31 +0900
+Subject: [PATCH] x87: FPREM and FPREM1 compute x87's exact remainders
+
+FPREM computed its remainder in one step through a rounded quotient,
+which is wrong once the quotient no longer fits the significand, and
+set no quotient bits; x86 reduces operands whose exponents differ by 64
+or more only partly and reports that in C2, and otherwise sets C0, C3
+and C1 to the quotient's low three bits. FPREM1 used SoftFloat's IEEE
+remainder, right in value but without the bits.
+
+A new SoftFloat routine, extF80_x87Rem, computes both exactly with
+integer division of the significands: a complete remainder for an
+exponent difference D below 64, the quotient truncated for FPREM and
+rounded to nearest even for FPREM1; for D of 64 or more a reduction by
+the divisor scaled to N = 32 + D mod 32 bits below the dividend,
+truncated for both, with C2 set. Denormal operands count by their
+normalized exponents, a pseudo-denormal dividend comes back
+normalized, an exact zero takes the dividend's sign, and a quiet NaN
+propagates without raising invalid operation. This matches 6588
+results of a Xeon 8581C, denormal operands and partial remainders
+included.
+
+The FPREM helpers set C0 to C3 after the exception handling, unless an
+unmasked invalid operation or denormal operand leaves them as they
+were, and the dispatcher no longer clears C2 after them. The reduced
+precision path, which an embedding host turns off, now leaves C2 as
+it was.
+---
+ External/SoftFloat-3e/CMakeLists.txt          |   1 +
+ .../include/SoftFloat-3e/softfloat.h          |   4 +
+ External/SoftFloat-3e/src/extF80_x87Rem.c     | 149 ++++++++++++++++++
+ FEXCore/Source/Common/SoftFloat.h             | 121 ++++----------
+ .../Core/Interpreter/Fallbacks/F80Fallbacks.h |  30 +++-
+ .../Interface/Core/X86Tables/X87Tables.cpp    |   8 +-
+ 6 files changed, 217 insertions(+), 96 deletions(-)
+ create mode 100644 External/SoftFloat-3e/src/extF80_x87Rem.c
+
+diff --git a/External/SoftFloat-3e/CMakeLists.txt b/External/SoftFloat-3e/CMakeLists.txt
+index a6c1bc94f9e7d29b9a5994d3e930b5768e6412cd..ba903435815f6c84d6abe52220011712cbacf039 100644
+--- a/External/SoftFloat-3e/CMakeLists.txt
++++ b/External/SoftFloat-3e/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_library(softfloat_3e STATIC
+   src/extF80_sub.c
+   src/extF80_mul.c
+   src/extF80_rem.c
++  src/extF80_x87Rem.c
+   src/extF80_sqrt.c
+   src/extF80_le.c
+   src/extF80_to_i32.c
+diff --git a/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h b/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h
+index 1bf64c24f89cfffcb83d299b90b9d8ca13e04dfa..cef590039c2ecc396ff69a41b29151ec2ec343bc 100644
+--- a/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h
++++ b/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h
+@@ -240,6 +240,10 @@ extFloat80_t extF80_div( struct softfloat_state *, extFloat80_t, extFloat80_t );
+ FEXCORE_PRESERVE_ALL_ATTR
+ extFloat80_t extF80_rem( struct softfloat_state *, extFloat80_t, extFloat80_t );
+ FEXCORE_PRESERVE_ALL_ATTR
++extFloat80_t
++ extF80_x87Rem(
++     struct softfloat_state *, extFloat80_t, extFloat80_t, bool, uint_fast16_t * );
++FEXCORE_PRESERVE_ALL_ATTR
+ extFloat80_t extF80_sqrt( struct softfloat_state *, extFloat80_t );
+ FEXCORE_PRESERVE_ALL_ATTR
+ bool extF80_eq( struct softfloat_state *, extFloat80_t, extFloat80_t );
+diff --git a/External/SoftFloat-3e/src/extF80_x87Rem.c b/External/SoftFloat-3e/src/extF80_x87Rem.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d2d15e2873217ac4dd272036542f301682c1653
+--- /dev/null
++++ b/External/SoftFloat-3e/src/extF80_x87Rem.c
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*============================================================================
++
++An addition to the SoftFloat IEEE Floating-Point Arithmetic Package,
++Release 3e, by John R. Hauser, distributed under the package's terms.
++
++=============================================================================*/
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "platform.h"
++#include "internals.h"
++#include "specialize.h"
++#include "softfloat.h"
++
++/*----------------------------------------------------------------------------
++| x87 FPREM (nearest false) and FPREM1 (nearest true) of a by b, exactly as
++| x87 computes them.  `*conditions' receives the status word's condition
++| codes: C2 (0x0400) for a partial remainder, or else C0 (0x0100), C3
++| (0x4000) and C1 (0x0200) set to bits 2, 1 and 0 of the quotient's
++| magnitude.
++|
++| With D the difference of the operands' normalized exponents, a D below 64
++| gives the complete remainder a - q * b, q being a / b truncated, or for
++| FPREM1 rounded to nearest even.  A D of 64 or more reduces a by b scaled
++| up by 2^(D - N), N being 32 + D mod 32, with the quotient truncated for
++| both instructions, and sets C2.  The remainder is exact, so it rounds
++| only into a denormal, which loses nothing, or under x87 exponent rebias.
++| A zero dividend, and a dividend over an infinite divisor, come back with
++| the condition codes clear; an infinite dividend or a zero divisor is
++| invalid, and a NaN propagates.
++*----------------------------------------------------------------------------*/
++FEXCORE_PRESERVE_ALL_ATTR
++extFloat80_t
++ extF80_x87Rem(
++     struct softfloat_state *state,
++     extFloat80_t a,
++     extFloat80_t b,
++     bool nearest,
++     uint_fast16_t *conditions
++ )
++{
++    union { struct extFloat80M s; extFloat80_t f; } uA, uB, uZ;
++    uint_fast16_t uiA64, uiB64;
++    uint_fast64_t sigA, sigB, q, rem;
++    bool signA, signZ, partial;
++    int_fast32_t expA, expB, expDiff, expZ, steps;
++    struct exp32_sig64 normExpSig;
++    struct uint128 uiZ;
++    unsigned __int128 dividend;
++    int_fast8_t shiftDist;
++
++    uA.f = a;
++    uiA64 = uA.s.signExp;
++    sigA = uA.s.signif;
++    signA = signExtF80UI64( uiA64 );
++    expA = expExtF80UI64( uiA64 );
++    uB.f = b;
++    uiB64 = uB.s.signExp;
++    sigB = uB.s.signif;
++    expB = expExtF80UI64( uiB64 );
++    *conditions = 0;
++    if (
++        ((expA == 0x7FFF) && (sigA & UINT64_C( 0x7FFFFFFFFFFFFFFF )))
++            || ((expB == 0x7FFF) && (sigB & UINT64_C( 0x7FFFFFFFFFFFFFFF )))
++    ) {
++        uiZ = softfloat_propagateNaNExtF80UI( state, uiA64, sigA, uiB64, sigB );
++        uZ.s.signExp = uiZ.v64;
++        uZ.s.signif = uiZ.v0;
++        return uZ.f;
++    }
++    if ( (expA == 0x7FFF) || ! sigB ) {
++        softfloat_raiseFlags( state, softfloat_flag_invalid );
++        uZ.s.signExp = defaultNaNExtF80UI64;
++        uZ.s.signif = defaultNaNExtF80UI0;
++        return uZ.f;
++    }
++    if ( ! sigA ) return a;
++    if ( ! expA ) expA = 1;
++    if ( ! (sigA & UINT64_C( 0x8000000000000000 )) ) {
++        normExpSig = softfloat_normSubnormalExtF80Sig( sigA );
++        expA += normExpSig.exp;
++        sigA = normExpSig.sig;
++    }
++    signZ = signA;
++    q = 0;
++    partial = false;
++    if ( expB == 0x7FFF ) {
++        rem = sigA;
++        expZ = expA;
++        goto pack;
++    }
++    if ( ! expB ) expB = 1;
++    if ( ! (sigB & UINT64_C( 0x8000000000000000 )) ) {
++        normExpSig = softfloat_normSubnormalExtF80Sig( sigB );
++        expB += normExpSig.exp;
++        sigB = normExpSig.sig;
++    }
++    expDiff = expA - expB;
++    if ( 64 <= expDiff ) {
++        partial = true;
++        steps = 32 + (expDiff & 31);
++        expB += expDiff - steps;
++        expDiff = steps;
++    }
++    if ( expDiff < 0 ) {
++        /*--------------------------------------------------------------------
++        | |a| < |b|: a itself, unless FPREM1 rounds a quotient above 1/2 to 1.
++        *--------------------------------------------------------------------*/
++        if ( nearest && (expDiff == -1) && (sigB < sigA) ) {
++            q = 1;
++            rem = sigB - (sigA - sigB);
++            signZ = ! signA;
++        } else {
++            rem = sigA;
++        }
++        expZ = expA;
++    } else {
++        dividend = (unsigned __int128) sigA << expDiff;
++        q = (uint_fast64_t) (dividend / sigB);
++        rem = (uint_fast64_t) (dividend % sigB);
++        if ( nearest && ! partial ) {
++            if ( (sigB - rem < rem) || ((sigB - rem == rem) && (q & 1)) ) {
++                ++q;
++                rem = sigB - rem;
++                signZ = ! signA;
++            }
++        }
++        expZ = expB;
++    }
++ pack:
++    if ( partial ) {
++        *conditions = 0x0400;
++    } else {
++        *conditions =
++            ((q & 4) ? 0x0100 : 0) | ((q & 2) ? 0x4000 : 0)
++                | ((q & 1) ? 0x0200 : 0);
++    }
++    if ( ! rem ) {
++        /* An exact zero takes the dividend's sign. */
++        uZ.s.signExp = packToExtF80UI64( signA, 0 );
++        uZ.s.signif = 0;
++        return uZ.f;
++    }
++    shiftDist = softfloat_countLeadingZeros64( rem );
++    return
++        softfloat_roundPackToExtF80(
++            state, signZ, expZ - shiftDist, rem<<shiftDist, 0, 80 );
++}
+diff --git a/FEXCore/Source/Common/SoftFloat.h b/FEXCore/Source/Common/SoftFloat.h
+index c212c5c1d5bdd2096f2c671492e17a018ed794ae..11837c316c19be252d2cc4f79dda0f3138feda55 100644
+--- a/FEXCore/Source/Common/SoftFloat.h
++++ b/FEXCore/Source/Common/SoftFloat.h
+@@ -143,97 +143,46 @@ struct FEX_PACKED X80SoftFloat {
+ #endif
+   }
+ 
+-  FEXCORE_PRESERVE_ALL_ATTR static X80SoftFloat FREM(softfloat_state* state, const X80SoftFloat& lhs, const X80SoftFloat& rhs) {
++  // FPREM (Nearest false) and FPREM1: x87's exact remainder, partial for
++  // operands whose exponents differ by 64 or more, with the condition codes
++  // it sets in Conditions: C2 for a partial remainder, else the quotient's
++  // low three bits in C0, C3 and C1 (extF80_x87Rem).
++  FEXCORE_PRESERVE_ALL_ATTR static X80SoftFloat
++  FREM(softfloat_state* state, const X80SoftFloat& lhs, const X80SoftFloat& rhs, bool Nearest, uint_fast16_t* Conditions) {
+ #if defined(DEBUG_X86_FLOAT)
+     BIGFLOAT Result;
+-    asm(R"(
+-    fninit;
+-    fldt %[rhs]; # st1
+-    fldt %[lhs]; # st0
+-    fprem;
+-    fstpt %[result];
+-    ffreep %%st(0);
+-    )"
+-        : [result] "=m"(Result)
+-        : [lhs] "m"(lhs), [rhs] "m"(rhs)
+-        : "st", "st(1)");
+-
+-    return Result;
+-#else
+-    /*
+-     * Check for invalid operation cases first - Intel FPREM sets Invalid Operation
+-     * for several cases including infinity dividend and zero divisor.
+-     */
+-    X80SoftFloat result = 0;
+-    if (HandleInfinityOp(state, lhs, result)) {
+-      return result;
+-    } else if (lhs.Top.Exponent == 0x7FFF && (lhs.Significand & 0x7FFFFFFFFFFFFFFFULL)) { // NaN
+-      // propagate NaN
+-      state->exceptionFlags |= softfloat_flag_invalid;
+-      return lhs;
+-    }
+-
+-    // Check for zero divisor - fprem(x, 0) is invalid operation
+-    if (rhs.Top.Exponent == 0 && rhs.Significand == 0) {
+-      state->exceptionFlags |= softfloat_flag_invalid;
+-      // Return QNaN
+-      result.Top.Sign = 0;
+-      result.Top.Exponent = 0x7FFF;
+-      result.Significand = 0xC000000000000000ULL;
+-      return result;
+-    }
+-
+-    /*
+-     * FPREM is not an IEEE-754 remainder.  From the Intel spec:
+-     *
+-     *    Computes the remainder obtained from dividing the value in the ST(0)
+-     *    register (the dividend) by the value in the ST(1) register (the divisor
+-     *    or modulus), and stores the result in ST(0). The remainder represents the
+-     *    following value:
+-     *
+-     *    Remainder := ST(0) − (Q * ST(1))
+-     *
+-     *    Here, Q is an integer value that is obtained by truncating the
+-     *    floating-point number quotient of [ST(0) / ST(1)] toward zero.
+-     *
+-     * We implement this sequence literally. softfloat_round_minMag means
+-     * "truncate towards zero".
+-     */
+-    extFloat80_t quotient = extF80_div(state, lhs, rhs);
+-    extFloat80_t Q = extF80_roundToInt(state, quotient, softfloat_round_minMag, true);
+-    bool Q_zero = Q.signif == 0 && (Q.signExp & ~(1 << 15)) == 0;
+-
+-    if (Q_zero) {
+-      return lhs;
+-    }
+-    X80SoftFloat Remainder = extF80_sub(state, lhs, extF80_mul(state, Q, rhs));
+-    // An exact remainder of zero takes the dividend's sign; the
+-    // subtraction alone would give +0.
+-    if (Remainder.Top.Exponent == 0 && Remainder.Significand == 0) {
+-      Remainder.Top.Sign = lhs.Top.Sign;
++    uint16_t FSW;
++    if (Nearest) {
++      asm(R"(
++      fninit;
++      fldt %[rhs]; # st1
++      fldt %[lhs]; # st0
++      fprem1;
++      fnstsw %[fsw];
++      fstpt %[result];
++      ffreep %%st(0);
++      )"
++          : [result] "=m"(Result), [fsw] "=m"(FSW)
++          : [lhs] "m"(lhs), [rhs] "m"(rhs)
++          : "st", "st(1)");
++    } else {
++      asm(R"(
++      fninit;
++      fldt %[rhs]; # st1
++      fldt %[lhs]; # st0
++      fprem;
++      fnstsw %[fsw];
++      fstpt %[result];
++      ffreep %%st(0);
++      )"
++          : [result] "=m"(Result), [fsw] "=m"(FSW)
++          : [lhs] "m"(lhs), [rhs] "m"(rhs)
++          : "st", "st(1)");
+     }
+-    return Remainder;
+-#endif
+-  }
+-
+-  FEXCORE_PRESERVE_ALL_ATTR static X80SoftFloat FREM1(softfloat_state* state, const X80SoftFloat& lhs, const X80SoftFloat& rhs) {
+-#if defined(DEBUG_X86_FLOAT)
+-    BIGFLOAT Result;
+-    asm(R"(
+-    fninit;
+-    fldt %[rhs]; # st1
+-    fldt %[lhs]; # st0
+-    fprem1;
+-    fstpt %[result];
+-    ffreep %%st(0);
+-    )"
+-        : [result] "=m"(Result)
+-        : [lhs] "m"(lhs), [rhs] "m"(rhs)
+-        : "st", "st(1)");
+-
++    *Conditions = FSW & 0x4700;
+     return Result;
+ #else
+-    return extF80_rem(state, lhs, rhs);
++    return extF80_x87Rem(state, lhs, rhs, Nearest, Conditions);
+ #endif
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+index 7c9695b9355ece6bdeed3b6e64c5caefede2d07a..8f933869e2aea0948b3b19dd161a90901798176d 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+@@ -138,6 +138,28 @@ private:
+   FEXCore::Core::CpuStateFrame* Frame;
+ };
+ 
++// FPREM and FPREM1 set C0 to C3 themselves, after the exception handling,
++// which would clear C1: C2 for a partial remainder, else the quotient's low
++// three bits in C0, C3 and C1. An unmasked invalid operation or denormal
++// operand leaves them as they were, as it leaves the result.
++FEXCORE_PRESERVE_ALL_ATTR static VectorRegType
++X87Remainder(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame, bool Nearest) {
++  uint_fast16_t Conditions {};
++  X80SoftFloat Result;
++  {
++    ScopedSoftFloatState State {FCW, Frame, true};
++    State.Operands(Src1, Src2);
++    Result = X80SoftFloat::FREM(&State.State, Src1, Src2, Nearest, &Conditions);
++  }
++  if ((Frame->Embedder.X87Raised & 0x07U) == 0) {
++    Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (Conditions & 0x0100U) != 0;
++    Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (Conditions & 0x0200U) != 0;
++    Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (Conditions & 0x0400U) != 0;
++    Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (Conditions & 0x4000U) != 0;
++  }
++  return Result;
++}
++
+ template<>
+ struct OpHandlers<IR::OP_F80CVTTO> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle4(uint16_t FCW, float src, FEXCore::Core::CpuStateFrame* Frame) {
+@@ -431,9 +453,7 @@ template<>
+ struct OpHandlers<IR::OP_F80FPREM1> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+-    ScopedSoftFloatState State {FCW, Frame, true};
+-    State.Operands(Src1, Src2);
+-    return X80SoftFloat::FREM1(&State.State, Src1, Src2);
++    return X87Remainder(FCW, Src1, Src2, Frame, true);
+   }
+ };
+ 
+@@ -441,9 +461,7 @@ template<>
+ struct OpHandlers<IR::OP_F80FPREM> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+-    ScopedSoftFloatState State {FCW, Frame, true};
+-    State.Operands(Src1, Src2);
+-    return X80SoftFloat::FREM(&State.State, Src1, Src2);
++    return X87Remainder(FCW, Src1, Src2, Frame, false);
+   }
+ };
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+index 76023fed59a434d5aa2323fba443e4b8ab68fc79..b9b109b90eacfaca28eaa1435caf1113861c811e 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+@@ -92,10 +92,10 @@ constexpr std::array<DispatchTableEntry, 143> X87F64OpTable = {{
+   {OPD(0xD9, 0xF2), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80PTANSTACK, true>},
+   {OPD(0xD9, 0xF3), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80ATANSTACK, false>},
+   {OPD(0xD9, 0xF4), 1, &OpDispatchBuilder::X87FXTRACTF64},
+-  {OPD(0xD9, 0xF5), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREM1STACK, true>},
++  {OPD(0xD9, 0xF5), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREM1STACK, false>},
+   {OPD(0xD9, 0xF6), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, false>},
+   {OPD(0xD9, 0xF7), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
+-  {OPD(0xD9, 0xF8), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREMSTACK, true>},
++  {OPD(0xD9, 0xF8), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREMSTACK, false>},
+   {OPD(0xD9, 0xF9), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87FYL2X, true>},
+   {OPD(0xD9, 0xFA), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SQRTSTACK, false>},
+   {OPD(0xD9, 0xFB), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SINCOSSTACK, true>},
+@@ -362,10 +362,10 @@ constexpr std::array<DispatchTableEntry, 143> X87F80OpTable = {{
+   {OPD(0xD9, 0xF2), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80PTANSTACK, true>},
+   {OPD(0xD9, 0xF3), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80ATANSTACK, false>},
+   {OPD(0xD9, 0xF4), 1, &OpDispatchBuilder::X87FXTRACT},
+-  {OPD(0xD9, 0xF5), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREM1STACK, true>},
++  {OPD(0xD9, 0xF5), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREM1STACK, false>},
+   {OPD(0xD9, 0xF6), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, false>},
+   {OPD(0xD9, 0xF7), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
+-  {OPD(0xD9, 0xF8), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREMSTACK, true>},
++  {OPD(0xD9, 0xF8), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREMSTACK, false>},
+   {OPD(0xD9, 0xF9), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87FYL2X, true>},
+   {OPD(0xD9, 0xFA), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SQRTSTACK, false>},
+   {OPD(0xD9, 0xFB), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SINCOSSTACK, true>},

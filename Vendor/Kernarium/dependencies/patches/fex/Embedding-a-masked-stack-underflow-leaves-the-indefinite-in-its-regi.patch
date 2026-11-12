@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 07:43:07 +0900
+Subject: [PATCH] Embedding: a masked stack underflow leaves the indefinite in
+ its register
+
+A masked stack underflow answers with the QNaN indefinite and writes it
+to the destination register, which becomes valid. The embedded x87
+translation computed and stored the answer but left the destination's
+tag empty (FST ST(i), FADD, FSUB, FMUL and FDIV into an empty register,
+FXCH, FSQRT, FSIN, FYL2X and the other stores), so a later read of the
+register saw it empty again.
+
+- The pass stores to a register that was not known valid as a valid one
+  when it translates for the embedder at full precision.
+- FSINCOS marks the register its sine goes to valid on the same terms.
+- FST ST(0) stores ST(0) onto itself so an empty register ends up
+  holding the indefinite (FSTP still only reads it, then pops).
+- FCMOVcc with an empty source or destination is a stack fault whichever
+  way the condition goes, and leaves the indefinite in ST(0); a new
+  SelectIndefinite helper shares the select with X87StackFault.
+- A register freed or popped after the pass cached its value is read as
+  empty: the cached value used to bypass the stack fault check, so
+  FFREE followed by an operation on that register in the same block
+  computed with the stale value and raised nothing.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../Interface/Core/OpcodeDispatcher/X87.cpp   |  8 +++---
+ .../IR/Passes/x87StackOptimizationPass.cpp    | 27 ++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 7f719b367702cabfe4652f7f16df3a2f8059543f..e495f8726de9b40724cd7493bfae831af45251cd 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -151,11 +151,13 @@ void OpDispatchBuilder::FST(OpcodeArgs, IR::OpSize Width) {
+ void OpDispatchBuilder::FSTToStack(OpcodeArgs) {
+   SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Constant(0));
+   const uint8_t Offset = Op->OP & 7;
+-  if (Offset == 0 && CTX->Embedded) {
+-    // FST ST(0) and FSTP ST(0) store nothing, but read ST(0): an empty
+-    // register is a stack underflow.
++  if (Offset == 0 && CTX->Embedded && (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP)) {
++    // FSTP ST(0) stores nothing, but reads ST(0): an empty register is a
++    // stack underflow.
+     _ReadStackValue(0);
+   } else {
++    // FST ST(0) stores ST(0) onto itself, so an empty register ends up
++    // holding the indefinite.
+     _StoreStackToStack(Offset);
+   }
+ 
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index f53310936de149a81190b15d25c7af71b428ac7b..1a92a68251036c4288e32f14bf16d99f721682f3 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -291,6 +291,8 @@ private:
+   // invalid operation, and returns the QNaN indefinite in place of Value.
+   // Fault is 1 for a fault and 0 otherwise.
+   Ref X87StackFault(Ref Value, Ref Fault, bool Overflow);
++  // Value, or the QNaN indefinite when Fault is 1, with no fault raised.
++  Ref SelectIndefinite(Ref Value, Ref Fault);
+   // Embedded, FPTAN and FSINCOS check the register their second result goes
+   // to before they compute: on a full stack x86 computes nothing, and both
+   // results are the QNaN indefinite of a stack overflow. Returns the
+@@ -561,6 +563,10 @@ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset, boo
+       TopValueCache[Offset] =
+         IREmit->_LoadMemFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+     }
++  } else if (Embedded && !Quiet && !ReducedPrecisionMode && TopValidCache[Offset] == StackSlot::INVALID) {
++    // A register freed or popped since its value was cached still holds that
++    // value, but is empty: reading it is a stack underflow.
++    return X87StackFault(TopValueCache[Offset], GetConstant(1), false);
+   }
+   return TopValueCache[Offset];
+ }
+@@ -592,6 +598,10 @@ inline Ref X87StackOptimization::X87StackFault(Ref Value, Ref Fault, bool Overfl
+     IREmit->_StoreContextGPR(OpSize::i32Bit, IREmit->_Or(OpSize::i32Bit, IREmit->_LoadContextGPR(OpSize::i32Bit, Raised), Unmasked), Raised);
+   }
+ 
++  return SelectIndefinite(Value, Fault);
++}
++
++inline Ref X87StackOptimization::SelectIndefinite(Ref Value, Ref Fault) {
+   Ref Indefinite = IREmit->_VCastFromGPR(OpSize::i128Bit, OpSize::i64Bit, IREmit->_Constant(0xC000'0000'0000'0000ULL));
+   Indefinite = IREmit->_VInsGPR(OpSize::i128Bit, OpSize::i64Bit, 1, Indefinite, IREmit->_Constant(0xFFFF));
+   Ref Mask = IREmit->_VDupFromGPR(OpSize::i128Bit, OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, GetConstant(0), Fault));
+@@ -644,6 +654,11 @@ inline Ref X87StackOptimization::LoadStackValue(uint8_t Offset, bool Quiet) {
+ 
+ inline void X87StackOptimization::StoreStackValue(Ref Value, uint8_t Offset, bool SetValid) {
+   if (SlowPath) {
++    // A register that was empty holds the result of a masked stack underflow,
++    // which is the QNaN indefinite, and is valid.
++    if (Embedded && !ReducedPrecisionMode && TopValidCache[Offset] != StackSlot::VALID) {
++      SetValid = true;
++    }
+     StoreStackValueAtOffset_Slow(Value, Offset, SetValid);
+   } else {
+     StackData.setTop(StackMemberInfo {Value}, Offset);
+@@ -1065,7 +1080,9 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+         // Push values
+         if (SlowPath) {
+-          StoreStackValueAtOffset_Slow(SinValue, 0, false);
++          // A register that was empty holds the result of a masked stack
++          // underflow, and is valid.
++          StoreStackValueAtOffset_Slow(SinValue, 0, Embedded && !ReducedPrecisionMode && TopValidCache[0] != StackSlot::VALID);
+           UpdateTopForPush_Slow();
+           StoreStackValueAtOffset_Slow(CosValue, 0, true);
+         } else {
+@@ -1392,6 +1409,14 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         Ref Value2 = LoadStackValue(StackOffset2);
+ 
+         Ref StackNode = IREmit->_VBSL(OpSize::i128Bit, CurrentIR.GetNode(Op->VectorMask), Value1, Value2);
++        if (Embedded && !ReducedPrecisionMode && SlowPath &&
++            (TopValidCache[StackOffset1] != StackSlot::VALID || TopValidCache[StackOffset2] != StackSlot::VALID)) {
++          // An empty source or destination is a stack fault whichever way the
++          // condition goes, and leaves the QNaN indefinite in ST(0).
++          Ref Empty = IREmit->_Or(OpSize::i32Bit, IREmit->_Xor(OpSize::i32Bit, GetX87ValidTag_Slow(StackOffset1), GetConstant(1)),
++                                  IREmit->_Xor(OpSize::i32Bit, GetX87ValidTag_Slow(StackOffset2), GetConstant(1)));
++          StackNode = SelectIndefinite(StackNode, Empty);
++        }
+         StoreStackValue(StackNode, 0, StackOffset1 && StackOffset2);
+         break;
+       }

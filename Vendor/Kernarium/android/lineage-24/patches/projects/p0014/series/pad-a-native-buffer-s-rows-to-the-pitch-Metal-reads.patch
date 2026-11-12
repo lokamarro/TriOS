@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:48:32 +0900
+Subject: [PATCH] pad a native buffer's rows to the pitch Metal reads
+
+The host imports a buffer's memory into Vulkan at the row pitch the guest
+reports, and Metal reads a texture over a buffer only at a pitch that is a
+multiple of 16 bytes. A single-plane buffer the driver creates natively had
+rows packed to its width, so any RGBA buffer whose width is not a multiple of
+four could not be imported: 642 pixels are 2568 bytes a row, and the import
+failed with VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, as did every
+RGB565, RGBA16F and R8 width that is not a multiple of eight, four and sixteen
+pixels. A swapchain whose extent is odd is such a buffer: its images are GPU
+blobs, and dEQP's swapchain image_extent and scaled incremental_present cases
+could not create one.
+
+Pad a row to the first whole number of pixels that makes it a multiple of 16
+bytes (642 RGBA pixels become 2576 bytes), for a classic resource and for the
+layout a GPU blob is created with alike. The buffer keeps its width, which
+Android allows to be smaller than its stride, and the resource keeps the width
+too: the host texture has to stay as wide as the guest samples it, or a layer
+cropped or scaled in normalised coordinates lands a few pixels off. The
+renderer lays the segment it shares for such a texture out by the same rule.
+A byte buffer has no rows, and a multi-planar format keeps the layout its
+helpers define.
+
+The renderer takes the guest rows of a transfer at the row length of the
+texture's width unless the transfer names a stride, and the kernel's transfer
+ioctls carry none for a classic resource, so a padded buffer would land every
+row after the first at the wrong place. A buffer whose rows are padded is
+transferred by a VIRGL_CCMD_TRANSFER3D in a command buffer instead, which names
+the row pitch as its stride and the offset of the first byte of the box: one
+command for a whole lock or for a rectangle of it, in either direction. The
+resource id comes from the resource info ioctl, and the buffer travels with the
+command buffer, so the wait on the buffer that follows is ordered after the
+transfer. Sent a row at a time, each row cost the renderer a readback or an
+upload of its own, and locking a 342x604 buffer took half a second.
+---
+ virtgpu_virgl.c | 111 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/virtgpu_virgl.c b/virtgpu_virgl.c
+index 5a1cbf944416f5c5a5c39175a75932571c5c89ea..fcc50537c2a0165ce9da524fd2a16ca7dc7df1ae 100644
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -583,6 +583,46 @@ static uint32_t compute_virgl_bind_flags(uint64_t use_flags)
+ 	return bind;
+ }
+ 
++// Metal reads a texture over a buffer only at a row pitch that is a multiple of 16 bytes, and the
++// host imports a buffer's memory into Vulkan at the pitch the guest reports. Rows packed to the
++// buffer's width, 2568 bytes for 642 RGBA pixels, can not be imported, so a single-plane buffer's
++// rows are padded to the first whole number of pixels that meets the alignment (2576 bytes), and
++// the renderer lays the texture's shared segment out by the same rule (vrend_renderer.c). The
++// buffer keeps its width: Android allows a stride wider than the width, and the host texture must
++// stay as wide as the guest samples it. A byte buffer has no rows, and a multi-planar format keeps
++// the layout its helpers define.
++#define VIRGL_ROW_ALIGNMENT 16
++
++static uint32_t virgl_native_stride(uint32_t format, uint32_t width, uint64_t use_flags)
++{
++	uint32_t stride = drv_stride_from_format(format, width, 0);
++	uint32_t bytes_per_pixel, pixels;
++
++	if ((use_flags & BO_USE_GPU_DATA_BUFFER) || drv_num_planes_from_format(format) != 1)
++		return stride;
++
++	bytes_per_pixel = drv_stride_from_format(format, 1, 0);
++	if (!bytes_per_pixel)
++		return stride;
++
++	for (pixels = 1; (pixels * bytes_per_pixel) % VIRGL_ROW_ALIGNMENT; pixels++)
++		;
++
++	return drv_stride_from_format(format, ALIGN(width, pixels), 0);
++}
++
++// The renderer reads and writes the guest rows of a texture at the row length of the texture's
++// width unless the transfer names a stride, and the kernel's transfer ioctls carry no stride for a
++// classic resource, so a transfer of several rows of a buffer padded as above would land every row
++// after the first at the wrong place. Such a buffer is transferred by a VIRGL_CCMD_TRANSFER3D in a
++// command buffer, which does carry the stride (virgl_transfer_padded_box): one command for the
++// whole lock, where a transfer per row costs the renderer a readback or an upload each.
++static bool virgl_rows_are_padded(const struct bo *bo)
++{
++	return bo->meta.num_planes == 1 &&
++	       bo->meta.strides[0] != drv_stride_from_format(bo->meta.format, bo->meta.width, 0);
++}
++
+ static int virgl_3d_bo_create(struct bo *bo, uint32_t width, uint32_t height, uint32_t format,
+ 			      uint64_t use_flags)
+ {
+@@ -593,7 +633,7 @@ static int virgl_3d_bo_create(struct bo *bo, uint32_t width, uint32_t height, ui
+ 	struct bo_metadata emulated_metadata = { 0 };
+ 
+ 	if (virgl_creates_natively(bo->drv, format, use_flags)) {
+-		stride = drv_stride_from_format(format, width, 0);
++		stride = virgl_native_stride(format, width, use_flags);
+ 		drv_bo_from_format(bo, stride, 1, height, format);
+ 	} else {
+ 		assert(virgl_supports_combination_through_emulation(bo->drv, format, use_flags));
+@@ -953,7 +993,10 @@ static int virgl_blob_get_host_format(struct driver *drv, struct bo_metadata *me
+ 			uint32_t total_size = 0;
+ 			for (int i = 0; i < num_planes; i++) {
+ 				local_strides[i] =
+-				    drv_stride_from_format(meta->format, meta->width, i);
++				    num_planes == 1
++					? virgl_native_stride(meta->format, meta->width,
++							      meta->use_flags)
++					: drv_stride_from_format(meta->format, meta->width, i);
+ 				local_sizes[i] = drv_size_from_format(
+ 				    meta->format, local_strides[i], meta->height, i);
+ 				local_offsets[i] = total_size;
+@@ -1183,10 +1226,55 @@ static bool is_arc_screen_capture_bo(struct bo *bo)
+ 	return strstr(tmp, "ARC-SCREEN-CAP");
+ }
+ 
++// Sends the box of a padded buffer in one VIRGL_CCMD_TRANSFER3D, which names the row pitch as its
++// stride and the offset of the box's first byte, and leaves the completion to the caller's wait on
++// the buffer: the command buffer carries the buffer, so the kernel fences the buffer with it.
++static int virgl_transfer_padded_box(struct bo *bo, struct mapping *mapping,
++				     const struct rectangle *box, uint32_t direction)
++{
++	int ret;
++	uint32_t bo_handle = mapping->vma->handle;
++	uint32_t cmd[VIRGL_TRANSFER3D_SIZE + 1] = { 0 };
++	struct drm_virtgpu_resource_info_cros res_info = { 0 };
++	struct drm_virtgpu_execbuffer exec = { 0 };
++
++	res_info.bo_handle = bo_handle;
++	ret = drmIoctl(bo->drv->fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS, &res_info);
++	if (ret) {
++		drv_loge("DRM_IOCTL_VIRTGPU_RESOURCE_INFO failed with %s\n", strerror(errno));
++		return -errno;
++	}
++
++	cmd[0] = VIRGL_CMD0(VIRGL_CCMD_TRANSFER3D, 0, VIRGL_TRANSFER3D_SIZE);
++	cmd[VIRGL_RESOURCE_IW_RES_HANDLE] = res_info.res_handle;
++	cmd[VIRGL_RESOURCE_IW_STRIDE] = bo->meta.strides[0];
++	cmd[VIRGL_RESOURCE_IW_X] = box->x;
++	cmd[VIRGL_RESOURCE_IW_Y] = box->y;
++	cmd[VIRGL_RESOURCE_IW_W] = box->width;
++	cmd[VIRGL_RESOURCE_IW_H] = box->height;
++	cmd[VIRGL_RESOURCE_IW_D] = 1;
++	cmd[VIRGL_TRANSFER3D_DATA_OFFSET] =
++	    bo->meta.strides[0] * box->y + drv_bytes_per_pixel_from_format(bo->meta.format, 0) * box->x;
++	cmd[VIRGL_TRANSFER3D_DIRECTION] = direction;
++
++	exec.command = (uintptr_t)cmd;
++	exec.size = sizeof(cmd);
++	exec.bo_handles = (uintptr_t)&bo_handle;
++	exec.num_bo_handles = 1;
++	ret = drmIoctl(bo->drv->fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &exec);
++	if (ret) {
++		drv_loge("DRM_IOCTL_VIRTGPU_EXECBUFFER failed with %s\n", strerror(errno));
++		return -errno;
++	}
++
++	return 0;
++}
++
+ static int virgl_bo_invalidate(struct bo *bo, struct mapping *mapping)
+ {
+ 	int ret;
+ 	size_t i;
++	bool padded;
+ 	struct drm_virtgpu_3d_transfer_from_host xfer = { 0 };
+ 	struct drm_virtgpu_3d_wait waitcmd = { 0 };
+ 	struct virtio_transfers_params xfer_params;
+@@ -1257,7 +1345,16 @@ static int virgl_bo_invalidate(struct bo *bo, struct mapping *mapping)
+ 		virgl_get_emulated_transfers_params(bo, &mapping->rect, &xfer_params);
+ 	}
+ 
++	padded = !emulated && virgl_rows_are_padded(bo);
+ 	for (i = 0; i < xfer_params.xfers_needed; i++) {
++		if (padded) {
++			ret = virgl_transfer_padded_box(bo, mapping, &xfer_params.xfer_boxes[i],
++							VIRGL_TRANSFER_FROM_HOST);
++			if (ret)
++				return ret;
++			continue;
++		}
++
+ 		xfer.box.x = xfer_params.xfer_boxes[i].x;
+ 		xfer.box.y = xfer_params.xfer_boxes[i].y;
+ 		xfer.box.w = xfer_params.xfer_boxes[i].width;
+@@ -1291,6 +1388,7 @@ static int virgl_bo_flush(struct bo *bo, struct mapping *mapping)
+ {
+ 	int ret;
+ 	size_t i;
++	bool padded;
+ 	struct drm_virtgpu_3d_transfer_to_host xfer = { 0 };
+ 	struct drm_virtgpu_3d_wait waitcmd = { 0 };
+ 	struct virtio_transfers_params xfer_params;
+@@ -1336,7 +1434,16 @@ static int virgl_bo_flush(struct bo *bo, struct mapping *mapping)
+ 		virgl_get_emulated_transfers_params(bo, &mapping->rect, &xfer_params);
+ 	}
+ 
++	padded = !emulated && virgl_rows_are_padded(bo);
+ 	for (i = 0; i < xfer_params.xfers_needed; i++) {
++		if (padded) {
++			ret = virgl_transfer_padded_box(bo, mapping, &xfer_params.xfer_boxes[i],
++							VIRGL_TRANSFER_TO_HOST);
++			if (ret)
++				return ret;
++			continue;
++		}
++
+ 		xfer.box.x = xfer_params.xfer_boxes[i].x;
+ 		xfer.box.y = xfer_params.xfer_boxes[i].y;
+ 		xfer.box.w = xfer_params.xfer_boxes[i].width;

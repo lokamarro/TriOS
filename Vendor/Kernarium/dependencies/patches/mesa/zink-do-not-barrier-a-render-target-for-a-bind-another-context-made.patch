@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 20:23:59 +0900
+Subject: [PATCH] zink: do not barrier a render target for a bind another
+ context made
+
+Zink counts binds on the zink_resource, which every context of the screen
+shares, not on the context that made the bind. When a second context in the
+share group samples a texture that the first context is rendering into - an X
+server compositing a window the application is still drawing - the first
+context's own draws see a non-zero bind_count and start deferring shader
+barriers for a read that never happens in that context.
+
+The barrier is then taken inside the render pass, which ends it, and the next
+draw begins a new one, whose attachment write re-queues the barrier. Every
+draw that cannot be merged into the previous one therefore pays a whole render
+pass: a new Metal render command encoder plus a store and a load of the entire
+attachment. On an Apple GPU that is 534 us per draw against 17.8 us with
+nobody else bound, measured with a two-context probe on a 1024x576 target, and
+it is what makes a guest's windowed rendering 21x slower than the identical
+draws into an application FBO.
+
+Leave the barrier queued rather than emitting it when the resource is a
+framebuffer attachment of this context that no bound program samples and that
+has no image or write binds. A program that really does sample it picks the
+barrier up on the draw that binds it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_context.c | 55 +++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 24c9461f62497b263bb025ff0e623a31fbb4247c..a57e5843cce3e386ee219a4bebcf9e8099661487 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -6400,6 +6400,54 @@ add_implicit_feedback_loop(struct zink_context *ctx, struct zink_resource *res)
+    return true;
+ }
+ 
++/* Zink counts binds on the resource, not on the context that made them, so a
++ * second context in the same share group that samples this context's render
++ * target - an X server compositing a window that the application is still
++ * drawing into, for example - leaves bind_count set for every context that
++ * touches the resource. The attachment write then defers a shader barrier
++ * that this context's next draw has no use for, and taking that barrier
++ * inside a render pass ends the render pass, so every draw that cannot be
++ * merged into the previous one pays a whole new render pass. Leave the
++ * barrier queued instead: it is emitted as soon as a bound program really
++ * does sample the resource.
++ */
++static bool
++barrier_is_for_another_context(struct zink_context *ctx, struct zink_resource *res)
++{
++   if (res->base.b.target == PIPE_BUFFER || !res->fb_bind_count)
++      return false;
++   /* image (storage) binds, writes, bindless handles and compute binds always
++    * need the barrier */
++   if (res->image_bind_count[0] || res->write_bind_count[0] ||
++       res->bind_count[1] || res->all_bindless)
++      return false;
++   /* only while this context is rendering to it */
++   bool is_attachment = false;
++   for (unsigned i = 0; i < ctx->fb_state.nr_cbufs && !is_attachment; i++)
++      is_attachment = ctx->fb_state.cbufs[i].texture == &res->base.b;
++   if (!is_attachment && ctx->fb_state.zsbuf.texture == &res->base.b)
++      is_attachment = true;
++   if (!is_attachment)
++      return false;
++   /* a bound program that samples it in *this* context needs the barrier after
++    * all; sampler_binds is per-resource, so the slot it names may well belong
++    * to another context's view of another texture
++    */
++   for (unsigned stage = 0; stage < ZINK_GFX_SHADER_COUNT; stage++) {
++      if (!ctx->gfx_stages[stage])
++         continue;
++      uint32_t texuse = res->sampler_binds[stage] & ctx->gfx_stages[stage]->info.textures_used[0];
++      u_foreach_bit(slot, texuse) {
++         if (slot >= ctx->di.num_sampler_views[stage])
++            continue;
++         const struct pipe_sampler_view *sv = ctx->sampler_views[stage][slot];
++         if (sv && sv->texture == &res->base.b)
++            return false;
++      }
++   }
++   return true;
++}
++
+ void
+ zink_update_barriers(struct zink_context *ctx, bool is_compute,
+                      struct pipe_resource *index, struct pipe_resource *indirect, struct pipe_resource *indirect_draw_count)
+@@ -6414,6 +6462,13 @@ zink_update_barriers(struct zink_context *ctx, bool is_compute,
+    ASSERTED bool check_rp = ctx->in_rp && ctx->dynamic_fb.tc_info.zsbuf_invalidate;
+    set_foreach(need_barriers, he) {
+       struct zink_resource *res = (struct zink_resource *)he->key;
++      if (!is_compute && barrier_is_for_another_context(ctx, res)) {
++         _mesa_set_add_pre_hashed(ctx->need_barriers[is_compute], he->hash, res);
++         _mesa_set_remove(need_barriers, he);
++         if (!need_barriers->entries)
++            break;
++         continue;
++      }
+       if (res->bind_count[is_compute]) {
+          VkPipelineStageFlagBits pipeline = is_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : res->gfx_barrier;
+          if (res->base.b.target == PIPE_BUFFER) {

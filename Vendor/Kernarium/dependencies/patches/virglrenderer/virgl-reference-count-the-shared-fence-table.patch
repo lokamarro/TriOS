@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 16:33:14 +0900
+Subject: [PATCH] virgl: reference-count the shared fence table
+
+virgl_fence_table is one process-global singleton, but two independent
+owners create and destroy it. The VMM side takes it in
+virgl_renderer_init() and holds it until virgl_renderer_cleanup();
+render_state_init() and render_state_fini() take it while the render
+server has contexts. With a separate render-server process those are two
+processes and two tables, but ENABLE_SAME_PROCESS_RENDER_SERVER puts both
+owners in one address space, so they share this one.
+
+Each owner assumed it was the only one. The server's init overwrote the
+live table, abandoning it and every fd registered in it, and
+re-initialised the mutex already guarding it; its fini then destroyed the
+table and left the pointer NULL while the VMM side was still using it.
+Losing the last render-server context is ordinary -- a Venus context
+whose host device is lost exits its worker -- and the VMM side's next
+fence retire then dereferenced NULL:
+
+  _mesa_hash_table_u64_search
+  virgl_fence_retire
+  proxy_context_destroy / proxy_context_retire_fences_internal
+
+Count the owners instead, so the table and its registered fds live until
+the last owner releases it, and keep the lock for the life of the process
+rather than destroying it under another owner.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/virgl_fence.c | 73 +++++++++++++++++++++++++++++++++++++++--------
+ src/virgl_fence.h |  8 ++++++
+ 2 files changed, 69 insertions(+), 12 deletions(-)
+
+diff --git a/src/virgl_fence.c b/src/virgl_fence.c
+index a22727fb741cd3a4af8f12a4b8acff4019e86569..5703baa49b3af13cef34c36d6e9cdbf881083cfd 100644
+--- a/src/virgl_fence.c
++++ b/src/virgl_fence.c
+@@ -27,6 +27,29 @@ struct virgl_fence {
+ static struct virgl_fence last_signalled_fence = { .fd = -1 };
+ static struct hash_table_u64 *virgl_fence_table;
+ static mtx_t virgl_fence_table_lock;
++static once_flag virgl_fence_table_lock_once = ONCE_FLAG_INIT;
++
++/*
++ * The table is one process-global singleton with more than one owner.  The
++ * VMM side takes it in virgl_renderer_init() and holds it until
++ * virgl_renderer_cleanup().  A render server takes it while it has contexts:
++ * in a separate server process that is a second process and a second table,
++ * but ENABLE_SAME_PROCESS_RENDER_SERVER puts both owners in one address
++ * space, sharing this one.
++ *
++ * Count the owners so each can pair its own init and cleanup.  Destroying the
++ * table on the first cleanup instead left the other owner holding a NULL
++ * table: when a same-process render server lost its last context -- a Venus
++ * context whose host device was lost, say -- the VMM side's next retire
++ * dereferenced NULL.  A second init likewise used to leak the live table,
++ * abandoning every fd registered in it, and re-initialise a live mutex.
++ */
++static unsigned virgl_fence_table_owners;
++
++static void virgl_fence_table_lock_init(void)
++{
++   mtx_init(&virgl_fence_table_lock, mtx_plain);
++}
+ 
+ static void virgl_fence_table_cleanup_cb(struct hash_entry *entry)
+ {
+@@ -36,31 +59,57 @@ static void virgl_fence_table_cleanup_cb(struct hash_entry *entry)
+    free(fence);
+ }
+ 
++/*
++ * Release one owner's reference.  The table, and every fd still registered in
++ * it, survives until the last owner is gone.
++ */
+ void
+ virgl_fence_table_cleanup(void)
+ {
+-   _mesa_hash_table_u64_destroy(virgl_fence_table,
+-                                virgl_fence_table_cleanup_cb);
++   call_once(&virgl_fence_table_lock_once, virgl_fence_table_lock_init);
+ 
+-   virgl_fence_table = NULL;
++   mtx_lock(&virgl_fence_table_lock);
+ 
+-   mtx_destroy(&virgl_fence_table_lock);
++   if (virgl_fence_table_owners && !--virgl_fence_table_owners) {
++      _mesa_hash_table_u64_destroy(virgl_fence_table,
++                                   virgl_fence_table_cleanup_cb);
+ 
+-   if (last_signalled_fence.fd >= 0)
+-      close(last_signalled_fence.fd);
++      virgl_fence_table = NULL;
++
++      if (last_signalled_fence.fd >= 0) {
++         close(last_signalled_fence.fd);
++         last_signalled_fence.fd = -1;
++      }
++   }
++
++   mtx_unlock(&virgl_fence_table_lock);
+ }
+ 
++/*
++ * Take a reference to the table, creating it for the first owner.  Every
++ * successful call must be paired with virgl_fence_table_cleanup().
++ */
+ int
+ virgl_fence_table_init(void)
+ {
+-   virgl_fence_table = _mesa_hash_table_u64_create(NULL);
+-   if (!virgl_fence_table)
+-      return -ENOMEM;
++   call_once(&virgl_fence_table_lock_once, virgl_fence_table_lock_init);
+ 
+-   mtx_init(&virgl_fence_table_lock, mtx_plain);
++   mtx_lock(&virgl_fence_table_lock);
++
++   if (!virgl_fence_table_owners) {
++      virgl_fence_table = _mesa_hash_table_u64_create(NULL);
++      if (!virgl_fence_table) {
++         mtx_unlock(&virgl_fence_table_lock);
++         return -ENOMEM;
++      }
+ 
+-   last_signalled_fence.id = 0;
+-   last_signalled_fence.fd = -1;
++      last_signalled_fence.id = 0;
++      last_signalled_fence.fd = -1;
++   }
++
++   virgl_fence_table_owners++;
++
++   mtx_unlock(&virgl_fence_table_lock);
+ 
+    return 0;
+ }
+diff --git a/src/virgl_fence.h b/src/virgl_fence.h
+index 9a91e7fadf10640e3c2fc65c16b689e9b39df5f5..8a92fd0867540c9ff60ee50c71c85c7d2ec4c78a 100644
+--- a/src/virgl_fence.h
++++ b/src/virgl_fence.h
+@@ -6,6 +6,14 @@
+ #include <stdint.h>
+ #include <unistd.h>
+ 
++/*
++ * The fence table is one process-global singleton, and an address space can
++ * hold more than one owner of it -- the VMM side takes it for the life of the
++ * renderer, and a same-process render server takes it for as long as it has
++ * contexts.  These are reference counts, not construction and destruction:
++ * every successful init must be paired with one cleanup, and the table and
++ * its registered fds live until the last owner releases it.
++ */
+ int virgl_fence_table_init(void);
+ void virgl_fence_table_cleanup(void);
+ int virgl_fence_set_fd(uint64_t fence_id, int fd);

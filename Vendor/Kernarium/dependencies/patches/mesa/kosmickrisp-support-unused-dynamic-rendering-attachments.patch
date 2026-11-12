@@ -1,0 +1,1523 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:04:40 +0900
+Subject: [PATCH] kosmickrisp: support unused dynamic-rendering attachments
+
+---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |   1 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 230 ++++---
+ src/kosmickrisp/vulkan/kk_physical_device.c   |  10 +
+ src/kosmickrisp/vulkan/kk_shader.c            | 267 +++++++--
+ src/kosmickrisp/vulkan/kk_shader.h            |  22 +
+ src/kosmickrisp/vulkan/meson.build            |  14 +
+ .../tests/test_unused_attachment_gaps.cpp     | 567 ++++++++++++++++++
+ .../unused_attachment_shaders/generate.sh     |   7 +
+ .../unused_attachment_shaders/unused_att.frag |  14 +
+ .../unused_att.frag.h                         |  37 ++
+ .../unused_attachment_shaders/unused_att.vert |  10 +
+ .../unused_att.vert.h                         |  57 ++
+ 12 files changed, 1097 insertions(+), 139 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_unused_attachment_gaps.cpp
+ create mode 100755 src/kosmickrisp/vulkan/tests/unused_attachment_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert.h
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index ec8458e698a2d312506bd862f916f7c74f64a74a..7d061bd1220e2de5b0bf950737641bddf69fd23d 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -133,6 +133,7 @@ struct kk_rendering_state {
+    uint32_t color_att_count;
+    struct kk_attachment color_att[KK_MAX_RTS];
+    uint8_t color_map[KK_MAX_RTS];
++   uint16_t bound_attachments;
+    struct kk_attachment depth_att;
+    struct kk_attachment stencil_att;
+    struct kk_attachment fsr_att;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index ca3da5b0a25edf85b9f500e77f579a47be66faa1..5d4477e7c02505debc89d885489276f567695a0e 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -186,6 +186,7 @@ static void
+ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
+                          struct kk_rendering_state *render,
+                          const struct vk_dynamic_graphics_state *dyn,
++                         uint16_t bound_attachments,
+                          bool force_attachment_load)
+ {
+    for (uint32_t i = 0; i < ARRAY_SIZE(render->color_att); i++) {
+@@ -199,7 +200,8 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
+       uint8_t logical_index = dyn->cal.color_map[i];
+       render->color_map[i] = logical_index;
+ 
+-      if (!iview || logical_index == MESA_VK_ATTACHMENT_UNUSED) {
++      if (!iview || logical_index == MESA_VK_ATTACHMENT_UNUSED ||
++          !(bound_attachments & BITFIELD_BIT(logical_index))) {
+          continue;
+       }
+       mtl_render_pass_attachment_descriptor *attachment_descriptor =
+@@ -223,6 +225,83 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
+    }
+ }
+ 
++static void
++kk_set_depth_stencil_attachments(
++   mtl_render_pass_descriptor *pass_descriptor,
++   struct kk_rendering_state *render, uint16_t bound_attachments,
++   bool force_attachment_load)
++{
++   mtl_render_pass_attachment_descriptor *depth_descriptor =
++      mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
++   kk_clear_common_attachment_description(depth_descriptor);
++   if (render->depth_att.iview &&
++       (bound_attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT)) {
++      const struct kk_image_view *iview = render->depth_att.iview;
++      const struct kk_image *image =
++         container_of(iview->vk.image, struct kk_image, vk);
++      render->samples = image->vk.samples;
++
++      kk_fill_common_attachment_description(
++         depth_descriptor, &render->depth_att, force_attachment_load);
++
++      /* Metal validation rejects invalid clear-depth values even if the load
++       * action does not clear the attachment. */
++      if (render->depth_att.load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
++         mtl_render_pass_attachment_descriptor_set_clear_depth(
++            depth_descriptor, render->depth_att.clear_value.depthStencil.depth);
++   }
++
++   mtl_render_pass_attachment_descriptor *stencil_descriptor =
++      mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
++   kk_clear_common_attachment_description(stencil_descriptor);
++   if (render->stencil_att.iview &&
++       (bound_attachments & MESA_VK_RP_ATTACHMENT_STENCIL_BIT)) {
++      const struct kk_image_view *iview = render->stencil_att.iview;
++      const struct kk_image *image =
++         container_of(iview->vk.image, struct kk_image, vk);
++      render->samples = image->vk.samples;
++
++      kk_fill_common_attachment_description(
++         stencil_descriptor, &render->stencil_att, force_attachment_load);
++      mtl_render_pass_attachment_descriptor_set_clear_stencil(
++         stencil_descriptor,
++         render->stencil_att.clear_value.depthStencil.stencil);
++   }
++}
++
++static uint16_t
++kk_rendering_attachment_mask(const struct kk_rendering_state *render,
++                             const struct vk_dynamic_graphics_state *dyn)
++{
++   uint16_t mask = 0;
++   for (uint32_t i = 0; i < render->color_att_count; i++) {
++      const uint8_t logical_index = dyn->cal.color_map[i];
++      if (render->color_att[i].iview &&
++          logical_index != MESA_VK_ATTACHMENT_UNUSED)
++         mask |= BITFIELD_BIT(logical_index);
++   }
++
++   if (render->depth_att.iview)
++      mask |= MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
++   if (render->stencil_att.iview)
++      mask |= MESA_VK_RP_ATTACHMENT_STENCIL_BIT;
++
++   return mask;
++}
++
++static uint16_t
++kk_pipeline_attachment_mask(const struct kk_shader *vs)
++{
++   uint16_t mask = kk_shader_color_attachment_mask(vs);
++
++   if (vs->info.vs.d_format != MTL_PIXEL_FORMAT_INVALID)
++      mask |= MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
++   if (vs->info.vs.s_format != MTL_PIXEL_FORMAT_INVALID)
++      mask |= MESA_VK_RP_ATTACHMENT_STENCIL_BIT;
++
++   return mask;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                      const VkRenderingInfo *pRenderingInfo)
+@@ -301,13 +380,15 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    if (no_framebuffer) {
+       framebuffer_extent.width = render->area.extent.width;
+       framebuffer_extent.height = render->area.extent.height;
+-      mtl_render_pass_descriptor_set_render_target_width(
+-         pass_descriptor, framebuffer_extent.width);
+-      mtl_render_pass_descriptor_set_render_target_height(
+-         pass_descriptor, framebuffer_extent.height);
+-      mtl_render_pass_descriptor_set_default_raster_sample_count(
+-         pass_descriptor, 1u);
+    }
++   /* A later pipeline may mask every attachment (for example, static
++    * rasterizer discard). Its restarted Metal pass still needs an extent. */
++   mtl_render_pass_descriptor_set_render_target_width(
++      pass_descriptor, framebuffer_extent.width);
++   mtl_render_pass_descriptor_set_render_target_height(
++      pass_descriptor, framebuffer_extent.height);
++   mtl_render_pass_descriptor_set_default_raster_sample_count(
++      pass_descriptor, 1u);
+ 
+    /* Check if we are rendering to the whole framebuffer. Required to understand
+     * if we need to load to avoid clearing all attachment when loading.
+@@ -341,43 +422,12 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       (!is_whole_framebuffer && does_any_attachment_clear) ||
+       (render->flags & VK_RENDERING_RESUMING_BIT);
+ 
++   render->bound_attachments = kk_rendering_attachment_mask(render, dyn);
+    kk_set_color_attachments(pass_descriptor, render, dyn,
+-                            force_attachment_load);
+-
+-   if (render->depth_att.iview) {
+-      const struct kk_image_view *iview = render->depth_att.iview;
+-      const struct kk_image *image =
+-         container_of(iview->vk.image, struct kk_image, vk);
+-      render->samples = image->vk.samples;
+-
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
+-      kk_fill_common_attachment_description(
+-         attachment_descriptor, &render->depth_att, force_attachment_load);
+-
+-      /* clearValue.depthStencil.depth could have invalid values such as NaN
+-       * which will trigger a Metal validation error. Ensure we only use this
+-       * value if the attachment is actually cleared. */
+-      if (pRenderingInfo->pDepthAttachment->loadOp ==
+-          VK_ATTACHMENT_LOAD_OP_CLEAR)
+-         mtl_render_pass_attachment_descriptor_set_clear_depth(
+-            attachment_descriptor,
+-            pRenderingInfo->pDepthAttachment->clearValue.depthStencil.depth);
+-   }
+-   if (render->stencil_att.iview) {
+-      const struct kk_image_view *iview = render->stencil_att.iview;
+-      const struct kk_image *image =
+-         container_of(iview->vk.image, struct kk_image, vk);
+-      render->samples = image->vk.samples;
+-
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
+-      kk_fill_common_attachment_description(
+-         attachment_descriptor, &render->stencil_att, force_attachment_load);
+-      mtl_render_pass_attachment_descriptor_set_clear_stencil(
+-         attachment_descriptor,
+-         pRenderingInfo->pStencilAttachment->clearValue.depthStencil.stencil);
+-   }
++                            render->bound_attachments, force_attachment_load);
++   kk_set_depth_stencil_attachments(
++      pass_descriptor, render, render->bound_attachments,
++      force_attachment_load);
+ 
+    /* Render targets are always arrays */
+    mtl_render_pass_descriptor_set_render_target_array_length(
+@@ -396,29 +446,12 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    if (!no_framebuffer)
+       cs_start_render(cmd);
+ 
+-   /* Store descriptor in case we need to restart the pass at pipeline barrier,
+-    * but force loads */
+-   for (uint32_t i = 0; i < render->color_att_count; i++) {
+-      const struct kk_image_view *iview = render->color_att[i].iview;
+-      if (!iview)
+-         continue;
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
+-      mtl_render_pass_attachment_descriptor_set_load_action(
+-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+-   }
+-   if (render->depth_att.iview) {
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
+-      mtl_render_pass_attachment_descriptor_set_load_action(
+-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+-   }
+-   if (render->stencil_att.iview) {
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
+-      mtl_render_pass_attachment_descriptor_set_load_action(
+-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+-   }
++   /* Metal consumes the initial load actions when the encoder starts. Keep a
++    * load-only descriptor for later pipeline-mask and barrier restarts. */
++   kk_set_color_attachments(pass_descriptor, render, dyn,
++                            render->bound_attachments, true);
++   kk_set_depth_stencil_attachments(pass_descriptor, render,
++                                    render->bound_attachments, true);
+    cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
+ 
+    kk_cmd_buffer_dirty_all_gfx(cmd);
+@@ -864,22 +897,27 @@ kk_force_attachment_load(struct kk_cmd_buffer *cmd)
+    struct kk_rendering_state *render = &cmd->state.gfx.render;
+ 
+    for (uint32_t i = 0; i < render->color_att_count; i++) {
+-      if (render->color_att[i].iview) {
++      const uint8_t logical_index = render->color_map[i];
++      if (render->color_att[i].iview &&
++          logical_index != MESA_VK_ATTACHMENT_UNUSED &&
++          (render->bound_attachments & BITFIELD_BIT(logical_index))) {
+          mtl_render_pass_attachment_descriptor *att =
+             mtl_render_pass_descriptor_get_color_attachment(
+-               cmd->state.gfx.render_pass_descriptor, i);
++               cmd->state.gfx.render_pass_descriptor, logical_index);
+          mtl_render_pass_attachment_descriptor_set_load_action(
+             att, MTL_LOAD_ACTION_LOAD);
+       }
+    }
+-   if (render->depth_att.iview) {
++   if (render->depth_att.iview &&
++       (render->bound_attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT)) {
+       mtl_render_pass_attachment_descriptor *att =
+          mtl_render_pass_descriptor_get_depth_attachment(
+             cmd->state.gfx.render_pass_descriptor);
+       mtl_render_pass_attachment_descriptor_set_load_action(
+          att, MTL_LOAD_ACTION_LOAD);
+    }
+-   if (render->stencil_att.iview) {
++   if (render->stencil_att.iview &&
++       (render->bound_attachments & MESA_VK_RP_ATTACHMENT_STENCIL_BIT)) {
+       mtl_render_pass_attachment_descriptor *att =
+          mtl_render_pass_descriptor_get_stencil_attachment(
+             cmd->state.gfx.render_pass_descriptor);
+@@ -891,31 +929,52 @@ kk_force_attachment_load(struct kk_cmd_buffer *cmd)
+ static void
+ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+ {
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+-   struct kk_rendering_state *render = &cmd->state.gfx.render;
++   struct kk_rendering_state *render = &gfx->render;
+    bool needs_restart = kk_flush_sample_locations(cmd);
++   bool color_map_changed = false;
+ 
+    if (IS_DIRTY(COLOR_ATTACHMENT_MAP)) {
+-      if (memcmp(render->color_map, dyn->cal.color_map,
+-                 render->color_att_count * sizeof(render->color_map[0])) != 0) {
+-         assert(cmd->state.gfx.render_pass_descriptor);
+-         kk_set_color_attachments(cmd->state.gfx.render_pass_descriptor, render,
+-                                  dyn, true);
+-         needs_restart = true;
+-      }
++      color_map_changed =
++         memcmp(render->color_map, dyn->cal.color_map,
++                render->color_att_count * sizeof(render->color_map[0])) != 0;
+    }
++
++   const struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   uint16_t bound_attachments = kk_rendering_attachment_mask(render, dyn);
++   if (vs)
++      bound_attachments &= kk_pipeline_attachment_mask(vs);
++
++   bool attachments_changed =
++      color_map_changed || bound_attachments != render->bound_attachments;
++   needs_restart |= attachments_changed;
++
+    /* If render pass state changes and the pass is currently active, end the
+     * current encoder and prepare to restart it */
+    bool active_render = cmd->gfx.encoder != NULL;
+    if (needs_restart && active_render) {
+       cs_end(cmd);
+       kk_cmd_buffer_dirty_all_gfx(cmd);
+-      cmd->state.gfx.need_to_start_render_pass = true;
++   }
++
++   if (attachments_changed) {
++      assert(gfx->render_pass_descriptor);
++      kk_set_color_attachments(gfx->render_pass_descriptor, render, dyn,
++                               bound_attachments, true);
++      kk_set_depth_stencil_attachments(gfx->render_pass_descriptor, render,
++                                       bound_attachments, true);
++      render->bound_attachments = bound_attachments;
++   }
++
++   if (needs_restart) {
++      gfx->need_to_start_render_pass = true;
+ 
+       /* Override load action to prevent data loss between encoders.
+        * TODO_KOSMICKRISP: Handle store action if we stop always setting it to
+        * STORE. Metal allows it to be encoded later. */
+-      kk_force_attachment_load(cmd);
++      if (!attachments_changed)
++         kk_force_attachment_load(cmd);
+    }
+ }
+ 
+@@ -945,7 +1004,16 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+ 
+    if (IS_SHADER_DIRTY(VERTEX)) {
+       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
++      /* The render pass may have left some of the pipeline's colour
++       * attachments unbound, which needs its own Metal render pipeline. */
++      mtl_render_pipeline_state *render = kk_shader_render_pipeline(
++         device, vs,
++         gfx->render.bound_attachments & BITFIELD_MASK(MAX_DRAW_BUFFERS));
++      if (unlikely(render == NULL)) {
++         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
++         return;
++      }
++      mtl_render_set_pipeline_state(enc, render);
+       if (gfx->depth_stencil_state)
+          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 0c11b757d1e2436617c73cd802f53a0da5b873bc..628b8e8bdb3411697499a8207ea0f13d97580fd8 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -167,6 +167,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_custom_resolve = true,
+       .EXT_debug_marker = true,
+       .EXT_depth_clip_control = true,
++      .EXT_dynamic_rendering_unused_attachments = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_metal = true,
+       .EXT_external_memory_host = true,
+@@ -433,6 +434,15 @@ kk_get_device_features(
+       /* VK_EXT_depth_clip_control */
+       .depthClipControl = true,
+ 
++      /* VK_EXT_dynamic_rendering_unused_attachments
++       *
++       * A render pass may leave some of the pipeline's colour attachments
++       * unbound. A Metal render pipeline must describe the attachments the
++       * pass binds, so such a draw uses one created for the bound colour
++       * mask; see kk_shader_render_pipeline().
++       */
++      .dynamicRenderingUnusedAttachments = true,
++
+       /* VK_EXT_extended_dynamic_state3 */
+       .extendedDynamicState3DepthClampEnable = true,
+       .extendedDynamicState3DepthClipNegativeOneToOne = true,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index fc2bb0a0e5e09869b8a3727cd56d9f8c09620f0a..4f27d90b90c088abe8dad9b6ee5fa6e1aeeff41a 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -425,6 +425,32 @@ kk_get_logical_color_att_index(const struct vk_graphics_pipeline_state *state,
+    return (state->cal) ? state->cal->color_map[i] : i;
+ }
+ 
++static bool
++kk_nir_remove_undeclared_fs_output(nir_builder *b,
++                                   nir_intrinsic_instr *intrin, void *data)
++{
++   if (intrin->intrinsic != nir_intrinsic_store_output)
++      return false;
++
++   const nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
++   if (io.location < FRAG_RESULT_DATA0 || io.location > FRAG_RESULT_DATA7)
++      return false;
++
++   const struct vk_graphics_pipeline_state *state = data;
++   const uint8_t logical_index = io.location - FRAG_RESULT_DATA0;
++
++   for (uint32_t i = 0; i < state->rp->color_attachment_count; i++) {
++      if (state->rp->color_attachment_formats[i] != VK_FORMAT_UNDEFINED &&
++          kk_get_logical_color_att_index(state, i) == logical_index)
++         return false;
++   }
++
++   nir_instr_remove(&intrin->instr);
++   b->shader->info.outputs_written &= ~BITFIELD64_BIT(io.location);
++
++   return true;
++}
++
+ static void
+ kk_lower_fs_blend(nir_shader *nir,
+                   const struct vk_graphics_pipeline_state *state)
+@@ -503,6 +529,14 @@ static void
+ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+             const struct vk_graphics_pipeline_state *state)
+ {
++   /* Metal pipelines must not expose fragment outputs for attachments that
++    * were not declared by the Vulkan pipeline.  In particular, an extra
++    * attachment supplied by VkRenderingInfo must still get its render-pass
++    * load/store operations without becoming a shader output. */
++   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
++            kk_nir_remove_undeclared_fs_output, nir_metadata_control_flow,
++            (void *)state);
++
+    nir->info.fs.uses_sample_shading |=
+       state->ms && state->ms->sample_shading_enable;
+ 
+@@ -739,6 +773,11 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+       pipe->gfx.render = NULL;
+       pipe->gfx.ds_handle = NULL;
+ 
++      util_dynarray_foreach(&shader->attachment_variants,
++                            struct kk_attachment_variant, variant)
++         mtl_release(variant->state);
++      util_dynarray_fini(&shader->attachment_variants);
++
+       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i)
+          mtl_release(pipe->gfx.pre_render[i]);
+ 
+@@ -1847,60 +1886,53 @@ gather_graphics_pipeline_create_info(
+    }
+ }
+ 
+-static VkResult
+-kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+-{
+-   VkResult result = VK_SUCCESS;
+-   struct kk_pipeline_handles *pipe = &vs->pipeline;
+-   mesa_shader_stage vs_stage = MESA_SHADER_VERTEX;
++/* Guards every shader's Metal render pipelines trimmed to the colour
++ * attachments a render pass bound.  Nothing but
++ * VK_EXT_dynamic_rendering_unused_attachments reaches it, and Metal never
++ * compiles while it is held. */
++static simple_mtx_t attachment_variants_lock = SIMPLE_MTX_INITIALIZER;
+ 
+-   /* When tessellation or geometry shaders are present, the pair that will be
+-    * used for the Metal render pipeline will be the fragment shader and the
+-    * previous stage. This means that any shader before that needs to be a
+-    * compute pipeline to be launched before the render pipeline. */
+-   uint32_t stages_bits = vs->info.vs.additional_stages_bits;
+-   pipe->gfx.pre_render_count = util_bitcount(stages_bits) - 1u;
+-   for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i) {
+-      uint32_t local_thread_size =
+-         vs_stage == MESA_SHADER_TESS_CTRL
+-            ? vs->info.vs.tess_local_thread_size
+-            : 64u;
+-      result = kk_compile_compute_pipeline(device, &vs->msl_data[vs_stage],
+-                                           local_thread_size,
+-                                           &pipe->gfx.pre_render[i]);
+-
+-      if (result != VK_SUCCESS)
+-         return VK_ERROR_INVALID_SHADER_NV;
+-      vs_stage = u_bit_scan(&stages_bits);
++uint16_t
++kk_shader_color_attachment_mask(const struct kk_shader *vs)
++{
++   uint16_t mask = 0u;
++   for (uint32_t i = 0u; i < MAX_DRAW_BUFFERS; ++i) {
++      if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID)
++         mask |= BITFIELD_BIT(i);
+    }
+ 
+-   if (vs->info.vs.transform_feedback_emulation) {
+-      result = kk_compile_compute_pipeline(
+-         device, &vs->transform_feedback_pre_gs_msl, 1,
+-         &pipe->gfx.transform_feedback_pre_gs);
+-      if (result != VK_SUCCESS)
+-         return VK_ERROR_INVALID_SHADER_NV;
+-   }
++   return mask;
++}
+ 
+-   if (vs->info.vs.geometry_shader_emulation) {
+-      result = kk_compile_compute_pipeline(device, &vs->geometry_main_msl, 64,
+-                                           &pipe->gfx.geometry_main);
+-      if (result != VK_SUCCESS)
+-         return VK_ERROR_INVALID_SHADER_NV;
++/* The last stage that survives as a native vertex function: every earlier
++ * stage a pipeline emulates runs as a compute pipeline before the render
++ * pass. */
++static mesa_shader_stage
++kk_render_pipeline_vertex_stage(const struct kk_shader *vs)
++{
++   uint32_t stages_bits = vs->info.vs.additional_stages_bits;
++   const uint32_t pre_render_count = util_bitcount(stages_bits) - 1u;
++   mesa_shader_stage stage = MESA_SHADER_VERTEX;
+ 
+-      if (vs->info.vs.geometry.count_words > 0) {
+-         result = kk_compile_compute_pipeline(
+-            device, &vs->geometry_count_msl, 64,
+-            &pipe->gfx.geometry_count);
+-         if (result != VK_SUCCESS)
+-            return VK_ERROR_INVALID_SHADER_NV;
+-      }
++   for (uint32_t i = 0u; i < pre_render_count; ++i)
++      stage = u_bit_scan(&stages_bits);
+ 
+-      result = kk_compile_compute_pipeline(device, &vs->geometry_pre_gs_msl,
+-                                           1, &pipe->gfx.geometry_pre_gs);
+-      if (result != VK_SUCCESS)
+-         return VK_ERROR_INVALID_SHADER_NV;
+-   }
++   return stage;
++}
++
++/* Metal derives a render pipeline's per-pixel render target layout from the
++ * colour attachment array the pipeline declares, and the render pass derives
++ * its own from the attachments it binds.  An attachment that only one of them
++ * describes shifts every later fragment output into the wrong attachment, so
++ * the declared array is limited to color_mask, the attachments the render
++ * pass actually bound. */
++static VkResult
++kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
++                             uint16_t color_mask,
++                             mtl_render_pipeline_state **state_out)
++{
++   VkResult result = VK_SUCCESS;
++   const mesa_shader_stage vs_stage = kk_render_pipeline_vertex_stage(vs);
+ 
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+    mtl_library *vertex_library = mtl_new_library(
+@@ -1940,14 +1972,10 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+     * in the array so need to check them all, not just first
+     * color_attachment_count entries.
+     */
+-   for (uint8_t i = 0; i < MAX_DRAW_BUFFERS; ++i) {
+-      if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID)
+-         mtl_render_pipeline_descriptor_set_color_attachment_format(
+-            pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+-   }
+-
+-   if (vs->info.vs.has_ds) {
+-      pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
++   u_foreach_bit(i, color_mask) {
++      assert(vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID);
++      mtl_render_pipeline_descriptor_set_color_attachment_format(
++         pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+    }
+ 
+    if (vs->info.vs.view_mask) {
+@@ -1965,9 +1993,9 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+          pipeline_descriptor, vs->info.vs.has_alpha_to_one_enabled);
+    }
+ 
+-   pipe->gfx.render =
++   *state_out =
+       mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
+-   if (pipe->gfx.render == NULL)
++   if (*state_out == NULL)
+       result = VK_ERROR_INVALID_SHADER_NV;
+ 
+    mtl_release(pipeline_descriptor);
+@@ -1980,6 +2008,129 @@ destroy_vertex:
+    return result;
+ }
+ 
++static VkResult
++kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
++{
++   VkResult result = VK_SUCCESS;
++   struct kk_pipeline_handles *pipe = &vs->pipeline;
++   mesa_shader_stage vs_stage = MESA_SHADER_VERTEX;
++
++   /* When tessellation or geometry shaders are present, the pair that will be
++    * used for the Metal render pipeline will be the fragment shader and the
++    * previous stage. This means that any shader before that needs to be a
++    * compute pipeline to be launched before the render pipeline. */
++   uint32_t stages_bits = vs->info.vs.additional_stages_bits;
++   pipe->gfx.pre_render_count = util_bitcount(stages_bits) - 1u;
++   for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i) {
++      uint32_t local_thread_size =
++         vs_stage == MESA_SHADER_TESS_CTRL
++            ? vs->info.vs.tess_local_thread_size
++            : 64u;
++      result = kk_compile_compute_pipeline(device, &vs->msl_data[vs_stage],
++                                           local_thread_size,
++                                           &pipe->gfx.pre_render[i]);
++
++      if (result != VK_SUCCESS)
++         return VK_ERROR_INVALID_SHADER_NV;
++      vs_stage = u_bit_scan(&stages_bits);
++   }
++
++   if (vs->info.vs.transform_feedback_emulation) {
++      result = kk_compile_compute_pipeline(
++         device, &vs->transform_feedback_pre_gs_msl, 1,
++         &pipe->gfx.transform_feedback_pre_gs);
++      if (result != VK_SUCCESS)
++         return VK_ERROR_INVALID_SHADER_NV;
++   }
++
++   if (vs->info.vs.geometry_shader_emulation) {
++      result = kk_compile_compute_pipeline(device, &vs->geometry_main_msl, 64,
++                                           &pipe->gfx.geometry_main);
++      if (result != VK_SUCCESS)
++         return VK_ERROR_INVALID_SHADER_NV;
++
++      if (vs->info.vs.geometry.count_words > 0) {
++         result = kk_compile_compute_pipeline(
++            device, &vs->geometry_count_msl, 64,
++            &pipe->gfx.geometry_count);
++         if (result != VK_SUCCESS)
++            return VK_ERROR_INVALID_SHADER_NV;
++      }
++
++      result = kk_compile_compute_pipeline(device, &vs->geometry_pre_gs_msl,
++                                           1, &pipe->gfx.geometry_pre_gs);
++      if (result != VK_SUCCESS)
++         return VK_ERROR_INVALID_SHADER_NV;
++   }
++
++   assert(vs_stage == kk_render_pipeline_vertex_stage(vs));
++
++   if (vs->info.vs.has_ds)
++      pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
++
++   return kk_new_render_pipeline_state(device, vs,
++                                       kk_shader_color_attachment_mask(vs),
++                                       &pipe->gfx.render);
++}
++
++mtl_render_pipeline_state *
++kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
++                          uint16_t bound_color_mask)
++{
++   const uint16_t declared = kk_shader_color_attachment_mask(vs);
++
++   /* A render pass binds every attachment the pipeline declares unless the
++    * application uses VK_EXT_dynamic_rendering_unused_attachments, so the
++    * pipeline compiled with the shader is almost always the right one. */
++   if (likely(bound_color_mask == declared))
++      return vs->pipeline.gfx.render;
++
++   assert((bound_color_mask & ~declared) == 0);
++
++   simple_mtx_lock(&attachment_variants_lock);
++   util_dynarray_foreach(&vs->attachment_variants,
++                         struct kk_attachment_variant, variant) {
++      if (variant->color_mask == bound_color_mask) {
++         mtl_render_pipeline_state *state = variant->state;
++         simple_mtx_unlock(&attachment_variants_lock);
++         return state;
++      }
++   }
++   simple_mtx_unlock(&attachment_variants_lock);
++
++   /* Metal compiles outside the lock: command buffers recorded concurrently
++    * for different attachment masks must not serialize on it. */
++   mtl_render_pipeline_state *state = NULL;
++   VkResult result =
++      kk_new_render_pipeline_state(dev, vs, bound_color_mask, &state);
++   if (result != VK_SUCCESS)
++      return NULL;
++
++   simple_mtx_lock(&attachment_variants_lock);
++   util_dynarray_foreach(&vs->attachment_variants,
++                         struct kk_attachment_variant, variant) {
++      if (variant->color_mask == bound_color_mask) {
++         /* A concurrent recorder won the race for this mask. */
++         mtl_release(state);
++         state = variant->state;
++         simple_mtx_unlock(&attachment_variants_lock);
++         return state;
++      }
++   }
++   struct kk_attachment_variant *slot = util_dynarray_grow(
++      &vs->attachment_variants, struct kk_attachment_variant, 1);
++   if (slot == NULL) {
++      simple_mtx_unlock(&attachment_variants_lock);
++      mtl_release(state);
++      return NULL;
++   }
++   slot->color_mask = bound_color_mask;
++   slot->state = state;
++   simple_mtx_unlock(&attachment_variants_lock);
++
++   return state;
++}
++
+ static VkResult
+ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                    struct vk_shader_compile_info *infos,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index e16fb1986b75e96894487112796b5bd1286a8487..c14ac9789877ffc1fe6b8b4253c51e83a72a2017 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -19,6 +19,8 @@
+ 
+ #include "poly/nir/poly_nir.h"
+ 
++#include "util/u_dynarray.h"
++
+ struct kk_cmd_buffer;
+ 
+ enum kk_texture_flags {
+@@ -146,10 +148,20 @@ struct msl_compile_data {
+    char *entrypoint_name;
+ };
+ 
++/* A Metal render pipeline trimmed to the colour attachments a render pass
++ * bound.  Only VK_EXT_dynamic_rendering_unused_attachments can bind fewer
++ * attachments than the Vulkan pipeline declares. */
++struct kk_attachment_variant {
++   uint16_t color_mask;
++   mtl_render_pipeline_state *state;
++};
++
+ struct kk_shader {
+    struct vk_shader vk;
+ 
+    struct kk_pipeline_handles pipeline;
++   /* struct kk_attachment_variant, owned by this shader. */
++   struct util_dynarray attachment_variants;
+    struct kk_shader_info info;
+    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+    struct msl_compile_data transform_feedback_pre_gs_msl;
+@@ -205,6 +217,16 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+                                const VkAllocationCallbacks *alloc,
+                                struct kk_shader **shader_out);
+ 
++/* Colour attachments the Vulkan pipeline declared, by logical index. */
++uint16_t kk_shader_color_attachment_mask(const struct kk_shader *vs);
++
++/* The Metal render pipeline to bind for a render pass that bound exactly
++ * bound_color_mask, which must be a subset of the declared attachments.
++ * Returns NULL when Metal refuses to build the variant. */
++mtl_render_pipeline_state *
++kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
++                          uint16_t bound_color_mask);
++
+ void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
+                                 struct kk_shader *shader);
+ 
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 763133196c0b4a77042a2820253e60c485680f98..5393a11d97e820f617860e3f8281bb61f4e5e141 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -211,6 +211,20 @@ if with_tests
+   ]
+ 
+   if host_machine.system() == 'darwin'
++    test(
++      'kosmickrisp_unused_attachment_gaps',
++      executable(
++        'test_kosmickrisp_unused_attachment_gaps',
++        files('tests/test_unused_attachment_gaps.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_geometry_setup_gpu',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_unused_attachment_gaps.cpp b/src/kosmickrisp/vulkan/tests/test_unused_attachment_gaps.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a0bfe1b3a271cd0151f9e9fabd7027e3b5214da
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_unused_attachment_gaps.cpp
+@@ -0,0 +1,567 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* VK_EXT_dynamic_rendering_unused_attachments lets a pipeline declare a colour
++ * attachment that the render pass leaves at VK_NULL_HANDLE, and lets the
++ * pipeline declare more colour attachments than the render pass provides.  A
++ * Metal render pipeline whose colour attachment array still describes those
++ * unbound slots disagrees with the render pass about the per-pixel render
++ * target layout, so a bound attachment stores the wrong fragment output.  Each
++ * case here leaves a gap in the middle of the bound attachments, which is the
++ * shape the conformance suite renders.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "unused_attachment_shaders/unused_att.vert.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "unused_attachment_shaders/unused_att.frag.h"
++;
++
++/* The render pass always provides this many colour attachments. */
++static constexpr uint32_t kRenderAttachments = 4;
++/* An "extra attachment" pipeline declares this many. */
++static constexpr uint32_t kMaxPipelineAttachments = 8;
++
++static constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UINT;
++/* The format a pipeline is allowed to declare for an attachment the render
++ * pass leaves unbound.  Its size differs from kColorFormat on purpose. */
++static constexpr VkFormat kUnboundFormat = VK_FORMAT_R32G32B32A32_UINT;
++
++struct Case {
++   const char *name;
++   uint32_t pipeline_attachment_count;
++   VkFormat pipeline_formats[kMaxPipelineAttachments];
++   /* Bit i is set when colour attachment i has a real image view. */
++   uint32_t bound_views;
++};
++
++int main()
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "unused-attachment-gaps";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count",
++           result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count,
++                                       physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   /* The conformance cases this reproduces render a single pixel. */
++   constexpr uint32_t extent = 1;
++
++   const Case cases[] = {
++      /* A pipeline format that names an unbound attachment, taken from
++       * renderpasses.dynamic_rendering.*.unused_attachments.bad_formats. */
++      {"bad_formats views 0,2",
++       kRenderAttachments,
++       {kColorFormat, kUnboundFormat, kColorFormat, kUnboundFormat},
++       0x5u},
++      {"bad_formats views 1,3",
++       kRenderAttachments,
++       {kUnboundFormat, kColorFormat, kUnboundFormat, kColorFormat},
++       0xau},
++      /* A pipeline attachment the render pass simply left unbound, taken from
++       * renderpasses.dynamic_rendering.*.unused_attachments.comb. */
++      {"unbound views 0,2",
++       kRenderAttachments,
++       {kColorFormat, kColorFormat, kColorFormat, kColorFormat},
++       0x5u},
++      /* Nothing bound at all: every output is dropped and the pipeline still
++       * has to render. */
++      {"unbound all",
++       kRenderAttachments,
++       {kColorFormat, kColorFormat, kColorFormat, kColorFormat},
++       0x0u},
++      /* More pipeline attachments than the render pass provides, taken from
++       * renderpasses.dynamic_rendering.*.unused_attachments.extra_att. */
++      {"extra_att views 0,2",
++       kMaxPipelineAttachments,
++       {kColorFormat, kColorFormat, kColorFormat, kColorFormat, kUnboundFormat,
++        kUnboundFormat, kUnboundFormat, kUnboundFormat},
++       0x5u},
++      {"extra_att views 1,3",
++       kMaxPipelineAttachments,
++       {kColorFormat, kColorFormat, kColorFormat, kColorFormat, kUnboundFormat,
++        kUnboundFormat, kUnboundFormat, kUnboundFormat},
++       0xau},
++   };
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceProperties properties{};
++      vkGetPhysicalDeviceProperties(physical, &properties);
++      require(properties.limits.maxColorAttachments >= kRenderAttachments &&
++                 properties.limits.maxFragmentOutputAttachments >=
++                    kMaxPipelineAttachments,
++              "eight fragment output attachments");
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
++                                               queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count &&
++             !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{
++         VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT};
++      unused.dynamicRenderingUnusedAttachments = VK_TRUE;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.dynamicRendering = VK_TRUE;
++      features13.pNext = &unused;
++      const char *device_extensions[] = {
++         VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME};
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      device_info.enabledExtensionCount = 1;
++      device_info.ppEnabledExtensionNames = device_extensions;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkResetCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkCmdClearColorImage);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkCreateFence);
++      LOAD_D(vkDestroyFence);
++      LOAD_D(vkWaitForFences);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      VkQueue device_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &device_queue);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto pick_memory = [&](uint32_t bits, VkMemoryPropertyFlags flags) {
++         uint32_t type = 0;
++         while (type < memory_properties.memoryTypeCount &&
++                (!(bits & (1u << type)) ||
++                 (memory_properties.memoryTypes[type].propertyFlags & flags) !=
++                    flags))
++            ++type;
++         require(type < memory_properties.memoryTypeCount, "memory type");
++         return type;
++      };
++
++      struct Attachment {
++         VkImage image = VK_NULL_HANDLE;
++         VkImageView view = VK_NULL_HANDLE;
++         VkDeviceMemory memory = VK_NULL_HANDLE;
++      };
++      auto make_attachment = [&]() {
++         Attachment attachment;
++         VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++         image_info.imageType = VK_IMAGE_TYPE_2D;
++         image_info.format = kColorFormat;
++         image_info.extent = {extent, extent, 1};
++         image_info.mipLevels = 1;
++         image_info.arrayLayers = 1;
++         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++         image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++         result = vkCreateImage(device, &image_info, nullptr, &attachment.image);
++         require(result == VK_SUCCESS, "create image", result);
++         VkMemoryRequirements requirements{};
++         vkGetImageMemoryRequirements(device, attachment.image, &requirements);
++         VkMemoryAllocateInfo memory_info{
++            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++         memory_info.allocationSize = requirements.size;
++         memory_info.memoryTypeIndex = pick_memory(requirements.memoryTypeBits, 0);
++         result =
++            vkAllocateMemory(device, &memory_info, nullptr, &attachment.memory);
++         require(result == VK_SUCCESS, "allocate image", result);
++         result =
++            vkBindImageMemory(device, attachment.image, attachment.memory, 0);
++         require(result == VK_SUCCESS, "bind image", result);
++         VkImageViewCreateInfo view_info{
++            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++         view_info.image = attachment.image;
++         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++         view_info.format = kColorFormat;
++         view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++         result =
++            vkCreateImageView(device, &view_info, nullptr, &attachment.view);
++         require(result == VK_SUCCESS, "create view", result);
++         return attachment;
++      };
++
++      Attachment colors[kRenderAttachments];
++      for (Attachment &attachment : colors)
++         attachment = make_attachment();
++
++      const VkDeviceSize pixel_size = 4;
++      const VkDeviceSize image_size = VkDeviceSize(extent) * extent * pixel_size;
++      const VkDeviceSize readback_size = image_size * kRenderAttachments;
++      VkBufferCreateInfo readback_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      readback_info.size = readback_size;
++      readback_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      VkBuffer readback = VK_NULL_HANDLE;
++      result = vkCreateBuffer(device, &readback_info, nullptr, &readback);
++      require(result == VK_SUCCESS, "create readback buffer", result);
++      VkMemoryRequirements readback_requirements{};
++      vkGetBufferMemoryRequirements(device, readback, &readback_requirements);
++      VkMemoryAllocateInfo readback_memory_info{
++         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      readback_memory_info.allocationSize = readback_requirements.size;
++      readback_memory_info.memoryTypeIndex =
++         pick_memory(readback_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &readback_memory_info, nullptr,
++                                &readback_memory);
++      require(result == VK_SUCCESS, "allocate readback memory", result);
++      result = vkBindBufferMemory(device, readback, readback_memory, 0);
++      require(result == VK_SUCCESS, "bind readback buffer", result);
++      void *readback_data = nullptr;
++      result = vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0,
++                           &readback_data);
++      require(result == VK_SUCCESS, "map readback buffer", result);
++
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "create layout", result);
++
++      VkShaderModule modules[2] = {};
++      const uint32_t *sources[2] = {vertex_spirv, fragment_spirv};
++      const size_t sizes[2] = {sizeof(vertex_spirv), sizeof(fragment_spirv)};
++      for (unsigned i = 0; i < 2; ++i) {
++         VkShaderModuleCreateInfo module_info{
++            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++         module_info.codeSize = sizes[i];
++         module_info.pCode = sources[i];
++         result =
++            vkCreateShaderModule(device, &module_info, nullptr, &modules[i]);
++         require(result == VK_SUCCESS, "create module", result);
++      }
++
++      const VkViewport viewport{0.0f, 0.0f, float(extent), float(extent),
++                                0.0f, 1.0f};
++      const VkRect2D scissor{{0, 0}, {extent, extent}};
++
++      auto make_pipeline = [&](const Case &test) {
++         VkPipelineShaderStageCreateInfo stages[2]{};
++         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++         stages[0].module = modules[0];
++         stages[0].pName = "main";
++         stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++         stages[1].module = modules[1];
++         stages[1].pName = "main";
++
++         VkPipelineVertexInputStateCreateInfo vi{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         VkPipelineInputAssemblyStateCreateInfo ia{
++            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++         ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++         VkPipelineViewportStateCreateInfo vp{
++            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++         vp.viewportCount = 1;
++         vp.pViewports = &viewport;
++         vp.scissorCount = 1;
++         vp.pScissors = &scissor;
++         VkPipelineRasterizationStateCreateInfo rs{
++            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++         rs.polygonMode = VK_POLYGON_MODE_FILL;
++         rs.cullMode = VK_CULL_MODE_NONE;
++         rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++         rs.lineWidth = 1.0f;
++         VkPipelineMultisampleStateCreateInfo ms{
++            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++         VkPipelineDepthStencilStateCreateInfo ds{
++            VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++         VkPipelineColorBlendAttachmentState
++            blend_attachments[kMaxPipelineAttachments]{};
++         for (VkPipelineColorBlendAttachmentState &attachment :
++              blend_attachments)
++            attachment.colorWriteMask = 0xf;
++         VkPipelineColorBlendStateCreateInfo blend{
++            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++         blend.attachmentCount = test.pipeline_attachment_count;
++         blend.pAttachments = blend_attachments;
++         VkPipelineRenderingCreateInfo rendering{
++            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++         rendering.colorAttachmentCount = test.pipeline_attachment_count;
++         rendering.pColorAttachmentFormats = test.pipeline_formats;
++         VkGraphicsPipelineCreateInfo pipeline_info{
++            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++         pipeline_info.pNext = &rendering;
++         pipeline_info.stageCount = 2;
++         pipeline_info.pStages = stages;
++         pipeline_info.pVertexInputState = &vi;
++         pipeline_info.pInputAssemblyState = &ia;
++         pipeline_info.pViewportState = &vp;
++         pipeline_info.pRasterizationState = &rs;
++         pipeline_info.pMultisampleState = &ms;
++         pipeline_info.pDepthStencilState = &ds;
++         pipeline_info.pColorBlendState = &blend;
++         pipeline_info.layout = layout;
++         VkPipeline pipeline = VK_NULL_HANDLE;
++         result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                            &pipeline_info, nullptr, &pipeline);
++         require(result == VK_SUCCESS, "create pipeline", result);
++         return pipeline;
++      };
++
++      VkCommandPoolCreateInfo pool_info{
++         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "create command pool", result);
++      VkCommandBufferAllocateInfo allocate{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      allocate.commandPool = pool;
++      allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      allocate.commandBufferCount = 1;
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &allocate, &command);
++      require(result == VK_SUCCESS, "allocate command", result);
++
++      /* Renders one case and leaves every colour attachment in the readback
++       * buffer, one image after the other. */
++      auto render = [&](const Case &test, VkPipeline pipeline) {
++         result = vkResetCommandPool(device, pool, 0);
++         require(result == VK_SUCCESS, "reset command pool", result);
++         VkCommandBufferBeginInfo begin{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++         result = vkBeginCommandBuffer(command, &begin);
++         require(result == VK_SUCCESS, "begin command", result);
++
++         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                                             1};
++         VkImageMemoryBarrier barriers[kRenderAttachments]{};
++         for (uint32_t i = 0; i < kRenderAttachments; ++i) {
++            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++            barriers[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            barriers[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            barriers[i].image = colors[i].image;
++            barriers[i].subresourceRange = range;
++         }
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, kRenderAttachments, barriers);
++
++         /* Every attachment starts at zero so an unwritten one is
++          * recognisable. */
++         VkClearColorValue clear{};
++         for (uint32_t i = 0; i < kRenderAttachments; ++i)
++            vkCmdClearColorImage(command, colors[i].image,
++                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1,
++                                 &range);
++
++         for (uint32_t i = 0; i < kRenderAttachments; ++i) {
++            barriers[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            barriers[i].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++            barriers[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            barriers[i].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         }
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                              0, nullptr, 0, nullptr, kRenderAttachments,
++                              barriers);
++
++         VkRenderingAttachmentInfo attachments[kRenderAttachments]{};
++         for (uint32_t i = 0; i < kRenderAttachments; ++i) {
++            attachments[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++            attachments[i].imageView =
++               (test.bound_views & (1u << i)) ? colors[i].view : VK_NULL_HANDLE;
++            attachments[i].imageLayout =
++               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++            attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++         }
++         VkRenderingInfo render_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++         render_info.renderArea = scissor;
++         render_info.layerCount = 1;
++         render_info.colorAttachmentCount = kRenderAttachments;
++         render_info.pColorAttachments = attachments;
++         vkCmdBeginRendering(command, &render_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         vkCmdEndRendering(command);
++
++         for (uint32_t i = 0; i < kRenderAttachments; ++i) {
++            barriers[i].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++            barriers[i].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            barriers[i].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            barriers[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++         }
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, kRenderAttachments, barriers);
++
++         for (uint32_t i = 0; i < kRenderAttachments; ++i) {
++            VkBufferImageCopy region{};
++            region.bufferOffset = image_size * i;
++            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            region.imageExtent = {extent, extent, 1};
++            vkCmdCopyImageToBuffer(command, colors[i].image,
++                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                   readback, 1, &region);
++         }
++         result = vkEndCommandBuffer(command);
++         require(result == VK_SUCCESS, "end command", result);
++
++         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++         VkFence fence = VK_NULL_HANDLE;
++         result = vkCreateFence(device, &fence_info, nullptr, &fence);
++         require(result == VK_SUCCESS, "create fence", result);
++         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         submit.commandBufferCount = 1;
++         submit.pCommandBuffers = &command;
++         result = vkQueueSubmit(device_queue, 1, &submit, fence);
++         require(result == VK_SUCCESS, "submit command", result);
++         result = vkWaitForFences(device, 1, &fence, VK_TRUE, 20000000000ull);
++         require(result == VK_SUCCESS, "draw retired", result);
++         vkDestroyFence(device, fence, nullptr);
++      };
++
++      bool failed = false;
++      for (const Case &test : cases) {
++         VkPipeline pipeline = make_pipeline(test);
++         render(test, pipeline);
++         vkDestroyPipeline(device, pipeline, nullptr);
++
++         const auto *pixels = static_cast<const uint8_t *>(readback_data);
++         for (uint32_t i = 0; i < kRenderAttachments; ++i) {
++            /* An attachment is written when the render pass binds a view and
++             * the pipeline declares the attachment's own format for it. */
++            const bool written = (test.bound_views & (1u << i)) &&
++                                 test.pipeline_formats[i] == kColorFormat;
++            const uint8_t expected[4] = {0, uint8_t(written ? 255 : 0),
++                                         uint8_t(written ? i : 0),
++                                         uint8_t(written ? 255 : 0)};
++            const uint8_t *got = pixels + image_size * i;
++            if (std::memcmp(expected, got, 4) != 0) {
++               std::printf(
++                  "%s: attachment %u is (%u, %u, %u, %u), expected (%u, %u, "
++                  "%u, %u)\n",
++                  test.name, i, got[0], got[1], got[2], got[3], expected[0],
++                  expected[1], expected[2], expected[3]);
++               failed = true;
++            }
++         }
++         std::printf("%s: checked %u attachments\n", test.name,
++                     kRenderAttachments);
++      }
++      require(!failed, "unused dynamic-rendering attachments leave gaps");
++      std::printf("every bound attachment stores its own fragment output\n");
++
++      vkDestroyCommandPool(device, pool, nullptr);
++      for (VkShaderModule module : modules)
++         vkDestroyShaderModule(device, module, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      for (const Attachment &attachment : colors) {
++         vkDestroyImageView(device, attachment.view, nullptr);
++         vkDestroyImage(device, attachment.image, nullptr);
++         vkFreeMemory(device, attachment.memory, nullptr);
++      }
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..53e208e320c208a3d78a777d6f4dc8e1c22ef27e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in unused_att.vert unused_att.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e2d589df8860818eecee59439eb63e98b83c943
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag
+@@ -0,0 +1,14 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++/* Every output carries its own location in the blue channel so a value that
++ * lands in the wrong colour attachment names the output it came from. */
++layout (location=0) out uvec4 color0;
++layout (location=1) out uvec4 color1;
++layout (location=2) out uvec4 color2;
++layout (location=3) out uvec4 color3;
++void main (void) {
++    color0 = uvec4(0u, 255u, 0u, 255u);
++    color1 = uvec4(0u, 255u, 1u, 255u);
++    color2 = uvec4(0u, 255u, 2u, 255u);
++    color3 = uvec4(0u, 255u, 3u, 255u);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag.h b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..69adafbd0c90b8bc2b99fb81f3ad6baf71f44e0a
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.frag.h
+@@ -0,0 +1,37 @@
++{0x07230203,0x00010600,0x000d000b,0x00000016,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000d,0x00000010,
++0x00000013,0x00030010,0x00000004,0x00000007,
++0x00040047,0x00000009,0x0000001e,0x00000000,
++0x00040047,0x0000000d,0x0000001e,0x00000001,
++0x00040047,0x00000010,0x0000001e,0x00000002,
++0x00040047,0x00000013,0x0000001e,0x00000003,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000000,0x00040017,0x00000007,0x00000006,
++0x00000004,0x00040020,0x00000008,0x00000003,
++0x00000007,0x0004003b,0x00000008,0x00000009,
++0x00000003,0x0004002b,0x00000006,0x0000000a,
++0x00000000,0x0004002b,0x00000006,0x0000000b,
++0x000000ff,0x0007002c,0x00000007,0x0000000c,
++0x0000000a,0x0000000b,0x0000000a,0x0000000b,
++0x0004003b,0x00000008,0x0000000d,0x00000003,
++0x0004002b,0x00000006,0x0000000e,0x00000001,
++0x0007002c,0x00000007,0x0000000f,0x0000000a,
++0x0000000b,0x0000000e,0x0000000b,0x0004003b,
++0x00000008,0x00000010,0x00000003,0x0004002b,
++0x00000006,0x00000011,0x00000002,0x0007002c,
++0x00000007,0x00000012,0x0000000a,0x0000000b,
++0x00000011,0x0000000b,0x0004003b,0x00000008,
++0x00000013,0x00000003,0x0004002b,0x00000006,
++0x00000014,0x00000003,0x0007002c,0x00000007,
++0x00000015,0x0000000a,0x0000000b,0x00000014,
++0x0000000b,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0003003e,0x00000009,0x0000000c,0x0003003e,
++0x0000000d,0x0000000f,0x0003003e,0x00000010,
++0x00000012,0x0003003e,0x00000013,0x00000015,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..168e8f0b20d16446c16623a842515d9252dfab43
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert
+@@ -0,0 +1,10 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++vec2 positions[3] = vec2[](
++    vec2(-1.0, -1.0),
++    vec2(-1.0, 3.0),
++    vec2(3.0, -1.0)
++);
++void main (void) {
++    gl_Position = vec4(positions[gl_VertexIndex % 3], 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert.h b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a588d424a5aa66c2c956314a0ac6ebdc452b730c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/unused_attachment_shaders/unused_att.vert.h
+@@ -0,0 +1,57 @@
++{0x07230203,0x00010600,0x000d000b,0x0000002c,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x00000018,0x0000001c,0x00030047,
++0x00000016,0x00000002,0x00050048,0x00000016,
++0x00000000,0x0000000b,0x00000000,0x00050048,
++0x00000016,0x00000001,0x0000000b,0x00000001,
++0x00050048,0x00000016,0x00000002,0x0000000b,
++0x00000003,0x00050048,0x00000016,0x00000003,
++0x0000000b,0x00000004,0x00040047,0x0000001c,
++0x0000000b,0x0000002a,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000002,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000003,0x0004001c,0x0000000a,
++0x00000007,0x00000009,0x0004002b,0x00000006,
++0x0000000d,0xbf800000,0x0005002c,0x00000007,
++0x0000000e,0x0000000d,0x0000000d,0x0004002b,
++0x00000006,0x0000000f,0x40400000,0x0005002c,
++0x00000007,0x00000010,0x0000000d,0x0000000f,
++0x0005002c,0x00000007,0x00000011,0x0000000f,
++0x0000000d,0x0006002c,0x0000000a,0x00000012,
++0x0000000e,0x00000010,0x00000011,0x00040017,
++0x00000013,0x00000006,0x00000004,0x0004002b,
++0x00000008,0x00000014,0x00000001,0x0004001c,
++0x00000015,0x00000006,0x00000014,0x0006001e,
++0x00000016,0x00000013,0x00000006,0x00000015,
++0x00000015,0x00040020,0x00000017,0x00000003,
++0x00000016,0x0004003b,0x00000017,0x00000018,
++0x00000003,0x00040015,0x00000019,0x00000020,
++0x00000001,0x0004002b,0x00000019,0x0000001a,
++0x00000000,0x00040020,0x0000001b,0x00000001,
++0x00000019,0x0004003b,0x0000001b,0x0000001c,
++0x00000001,0x0004002b,0x00000019,0x0000001e,
++0x00000003,0x0004002b,0x00000006,0x00000023,
++0x00000000,0x0004002b,0x00000006,0x00000024,
++0x3f800000,0x00040020,0x00000028,0x00000003,
++0x00000013,0x00040020,0x0000002a,0x00000007,
++0x0000000a,0x00040020,0x0000002b,0x00000007,
++0x00000007,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003b,0x0000002a,0x0000000c,0x00000007,
++0x0003003e,0x0000000c,0x00000012,0x0004003d,
++0x00000019,0x0000001d,0x0000001c,0x0005008b,
++0x00000019,0x0000001f,0x0000001d,0x0000001e,
++0x00050041,0x0000002b,0x00000021,0x0000000c,
++0x0000001f,0x0004003d,0x00000007,0x00000022,
++0x00000021,0x00050051,0x00000006,0x00000025,
++0x00000022,0x00000000,0x00050051,0x00000006,
++0x00000026,0x00000022,0x00000001,0x00070050,
++0x00000013,0x00000027,0x00000025,0x00000026,
++0x00000023,0x00000024,0x00050041,0x00000028,
++0x00000029,0x00000018,0x0000001a,0x0003003e,
++0x00000029,0x00000027,0x000100fd,0x00010038}

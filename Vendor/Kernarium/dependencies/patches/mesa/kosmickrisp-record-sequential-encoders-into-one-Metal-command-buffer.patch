@@ -1,0 +1,1796 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 01:29:06 +0900
+Subject: [PATCH] kosmickrisp: record sequential encoders into one Metal
+ command buffer
+
+Every render pass and every run of compute or copy work outside a render
+pass began a Metal command buffer of its own, and the recording kept all
+of them until its submission completed. A Metal 4 command buffer's first
+render encoder takes about 2.5 MiB of command allocator storage and its
+first compute encoder about 0.7 MiB, while each further encoder in the
+same command buffer takes about 0.28 MiB. Zink ends its render pass for
+every texture upload, so a burst of glyph uploads alternates copies and
+render passes: a Plasma desktop's first frame recorded 904 command
+buffers into one submission, about 1.5 GiB of command storage at those
+costs, of which the footprint charges the pages the encoders wrote. On an
+iPad the app's footprint rose from 1.78 to 2.81 GiB within a second of that
+frame, and the system killed it.
+
+Render encoders, and compute encoders opened while no render encoder is
+open, now share one main command buffer on the gfx allocator. The 904
+encoders of that recording become one command buffer. Compute that must
+run before or after a whole render pass keeps a command buffer of its
+own. It is appended before the main one, which is sound only while the
+render encoder is the main one's first. When it is not, the pass is split
+there, and a pass that needed such compute begins its next encoder in a
+new main command buffer. Post-render compute ends the main command buffer
+with the pass.
+
+A split during a draw flushes the draw's state into the resumed encoder.
+A split anywhere else leaves that to the next draw, because the state need
+not be complete yet: flushing it at a transform feedback begin, before a
+dynamic vertex input was set, made Metal abort creating the render
+encoder.
+
+KK_WORKAROUND_18 depended on a restarted render encoder starting a new
+command buffer: a second render encoder in the same command buffer drops
+another layer's primitives exactly as a second draw does. Every render
+encoder of a layered or multiview pass therefore starts a command buffer.
+
+Even then, Metal loses leading 1984-vertex batches of a layer-selecting
+draw whose command buffer starts while the previous encoder's is still
+running and is ordered behind it only by a barrier: a 16384-point second
+layer after a 1048576-point first one lost points in 20 of 20 fresh
+processes, and a standalone Metal 4 program without Mesa loses them the
+same way. Letting the earlier command buffer complete first avoids it, so
+a command buffer that begins a layered or multiview encoder now goes to
+Metal in a commit of its own, behind a queue-level signal of, and a wait
+for, the queue's own shared event. The signal is recorded with the
+queue's Vulkan signals, so a killed submission cannot leave the wait
+holding the queue. Each such encoder costs a Metal commit and a queue
+wait, about 10 to 13 microseconds, or 2.5 to 3.5 percent of a pass whose
+every draw switches layers. kosmickrisp_layered_draw_sequence now draws
+16384 points into its second layer, which catches that loss in nearly
+every fresh process.
+
+A pool may now be destroyed with a command buffer still recording without
+leaking its open command buffers.
+kosmickrisp_query_pool_lifetime throws such a recording away, and resets,
+begins or frees one, after destroying the timestamp query pool it wrote to:
+closing its encoders must not reach the pool's released Metal objects.
+---
+ docs/drivers/kosmickrisp/workarounds.rst      |  37 +-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        | 183 ++++--
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  39 ++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  36 +-
+ src/kosmickrisp/vulkan/kk_queue.c             | 135 +++--
+ src/kosmickrisp/vulkan/kk_queue.h             |   4 +
+ src/kosmickrisp/vulkan/meson.build            |  33 ++
+ .../tests/command_buffer_shaders/color.frag   |   7 +
+ .../tests/command_buffer_shaders/color.frag.h |  20 +
+ .../tests/command_buffer_shaders/color.vert   |   9 +
+ .../tests/command_buffer_shaders/color.vert.h |  47 ++
+ .../tests/command_buffer_shaders/generate.sh  |   7 +
+ .../tests/test_command_buffer_consolidation.c | 526 ++++++++++++++++++
+ .../tests/test_layered_draw_sequence.cpp      |  29 +-
+ .../vulkan/tests/test_query_pool_lifetime.c   | 224 ++++++++
+ 15 files changed, 1236 insertions(+), 100 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/command_buffer_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_command_buffer_consolidation.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_query_pool_lifetime.c
+
+diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
+index d159845738a21e4c650d6e297393e06316794f8c..de77d672211eafd60665deccd1f9c8bbab741420 100644
+--- a/docs/drivers/kosmickrisp/workarounds.rst
++++ b/docs/drivers/kosmickrisp/workarounds.rst
+@@ -128,7 +128,9 @@ the documented requirements for layered rendering are unmet. Neither an
+ encoder-scope nor a queue-scope barrier between the draws helps, and neither
+ does dropping the single-view ``setVertexAmplificationCount`` call or clearing
+ ``allowGPUOptimizedContents``. Only ending the render command encoder and
+-starting a new one restores the dropped primitives.
++starting a new one at the start of a Metal command buffer restores the dropped
++primitives: a new encoder that follows another in the same command buffer loses
++them just the same.
+ 
+ Splitting the draws into smaller ones does not avoid the loss either: 1048576
+ points issued as four draws of 262144 still lose 653984 of them, so there is no
+@@ -140,7 +142,10 @@ draw that is not the first in the current encoder, whenever the pass is layered
+ and the stage that feeds the rasterizer writes the layer: the emulated geometry
+ shader's raster draw, else the tessellation evaluation shader, else the vertex
+ shader. Each entry of a multi-draw is a Metal draw of its own, so every entry
+-after the first restarts the encoder as a separate draw call would. Restarting reuses the existing
++after the first restarts the encoder as a separate draw call would. Every
++render encoder of a layered or multiview pass also starts a command buffer of
++its own, which the queue starts only once everything before it has completed.
++Restarting reuses the existing
+ render-pass flush path, so the attachments are reloaded and nothing is lost.
+ The cost is one attachment load and store per such draw; a pass that never
+ writes the layer, or is not layered, is untouched. The
+@@ -150,6 +155,32 @@ workaround, and ``kosmickrisp_layered_draw_multi_draw`` and
+ through a geometry shader's layer: without the per-draw restart and the
+ raster-stage check, each loses the same 908672 points.
+ 
++The restart alone does not remove the loss. A restarted encoder whose command
++buffer starts while the one before it is still running occasionally loses
++whole 1984-vertex batches from the start of its layer-selecting draw, and a
++standalone Metal 4 program without Mesa loses them the same way. The loss
++needs an encoder that draws into a different layer than the encoder before it,
++is ordered after that encoder only by a barrier or a fence, and follows one
++that drew many primitives without clearing the attachment: a 16384-point draw
++after a 1048576-point one loses points in nearly every fresh process, and a
++second 1048576-point draw in one to five in a hundred. Load ops, barrier forms,
++fences, extra encoders, private storage, a hazard-tracked attachment outside a
++heap and residency changes all leave it, while letting the earlier command
++buffer complete first removes it, whether by a CPU wait, a queue-level event
++wait or a second command queue.
++
++A command buffer that begins a layered or multiview pass's encoder is
++therefore committed on its own: the queue first signals a shared event of its
++own and waits for that value, so the command buffer starts only once
++everything committed before it has completed. The signal is recorded with the
++queue's Vulkan signals, so a submission Metal kills cannot leave the wait
++holding the queue. The cost is a Metal commit and a queue wait per such
++encoder, about 10 to 13 microseconds each on an Apple silicon Mac, or 2.5 to
++3.5 percent of a pass whose every draw switches layers; other passes are
++untouched. ``kosmickrisp_layered_draw_sequence`` draws only 16384 points into
++its second layer, which loses points in nearly every fresh process without the
++wait.
++
+ Restarting an encoder mid-pass has to preserve everything the open encoder
+ was carrying. Vertex amplification was the one piece that did not survive:
+ ``vkCmdClearAttachments`` turns amplification off because the meta clear
+@@ -162,6 +193,8 @@ encoder start, and ``kosmickrisp_multiview_clear_attachments`` covers it.
+ 
+ | Log:
+ | 2026-09-12: Workaround implemented
++| 2026-09-29: Residual loss after a restart reproduced without Mesa
++| 2026-09-29: Queue wait before every layered encoder's command buffer
+ 
+ KK_WORKAROUND_17
+ ----------------
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index 684b2e0e12c067bbc42bbe6cc08f3ce4f43256de..bbe6df540b4edc5ace683dd9b078dd9b06fbf437 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -50,6 +50,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+       mtl_release(*cmd_buf);
+    }
+    util_dynarray_clear(&cmd->submit_cmd_bufs);
++   util_dynarray_clear(&cmd->queue_waits);
+ 
+    /* Release all BOs used as descriptor buffers for submissions */
+    util_dynarray_foreach(&cmd->large_bos, struct kk_bo *, bo) {
+@@ -97,6 +98,9 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+       container_of(vk_cmd_buffer, struct kk_cmd_buffer, vk);
+    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+ 
++   /* A pool may be destroyed with its command buffers still recording. */
++   cs_flush(cmd);
++
+    mtl_release(cmd->argument_table);
+    kk_destroy_encoder_state(&cmd->cmp[0]);
+    kk_destroy_encoder_state(&cmd->cmp[1]);
+@@ -108,6 +112,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    kk_cmd_release_resources(dev, cmd);
+    util_dynarray_fini(&cmd->statistics_queries);
+    util_dynarray_fini(&cmd->submit_cmd_bufs);
++   util_dynarray_fini(&cmd->queue_waits);
+    util_dynarray_fini(&cmd->large_bos);
+    util_dynarray_fini(&cmd->pinned_heaps);
+ 
+@@ -191,6 +196,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+ 
+    cmd->statistics_queries = UTIL_DYNARRAY_INIT;
+    cmd->submit_cmd_bufs = UTIL_DYNARRAY_INIT;
++   cmd->queue_waits = UTIL_DYNARRAY_INIT;
+    cmd->large_bos = UTIL_DYNARRAY_INIT;
+    cmd->pinned_heaps = UTIL_DYNARRAY_INIT;
+ 
+@@ -228,10 +234,8 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+-   /* If the command buffer was not ended, we may have lingering encoders.
+-    * Call twice since post_gfx will be moved to pre_gfx but not ended. */
+-   cs_end(cmd);
+-   cs_end(cmd);
++   /* If the command buffer was not ended, we may have lingering encoders. */
++   cs_flush(cmd);
+    kk_cmd_release_resources(dev, cmd);
+ 
+    kk_reset_encoder_state(cmd->pre_gfx);
+@@ -242,6 +246,7 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+    cmd->uploader.offset = 0;
+ 
+    memset(&cmd->state, 0, sizeof(cmd->state));
++   cmd->main.render_needed_pre = false;
+    cmd->heap = NULL;
+    cmd->heap_demand_B = 0;
+ }
+@@ -317,9 +322,7 @@ kk_EndCommandBuffer(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+ 
+-   /* Call twice since post_gfx will be moved to pre_gfx but not ended. */
+-   cs_end(cmd);
+-   cs_end(cmd);
++   cs_flush(cmd);
+ 
+    return vk_command_buffer_end(&cmd->vk);
+ }
+@@ -336,16 +339,74 @@ kk_can_ignore_barrier(VkAccessFlags2 access, VkPipelineStageFlags2 stage)
+    return (!(access ^ ignore_access)) || (!(stage ^ ignore_stage));
+ }
+ 
++static void kk_stop_encoder(struct kk_cmd_buffer *cmd,
++                            struct kk_encoder_state *es);
++
++static mtl_command_buffer *
++cs_open_main(struct kk_cmd_buffer *cmd)
++{
++   if (!cmd->main.cmd_buf) {
++      struct kk_device *dev = kk_cmd_buffer_device(cmd);
++      cmd->main.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
++      mtl_begin_command_buffer(cmd->main.cmd_buf, cmd->gfx.allocator);
++   }
++   return cmd->main.cmd_buf;
++}
++
++/* Appends the main command buffer, so that command buffers appended from now
++ * on run after everything recorded into it. */
++static void
++cs_end_main(struct kk_cmd_buffer *cmd)
++{
++   assert(cmd->gfx.encoder == NULL);
++   assert(!cmd->pre_gfx->in_main && !cmd->post_gfx->in_main);
++   if (!cmd->main.cmd_buf)
++      return;
++
++   mtl_end_command_buffer(cmd->main.cmd_buf);
++   if (cmd->main.queue_wait) {
++      uint32_t index = util_dynarray_num_elements(&cmd->submit_cmd_bufs,
++                                                  mtl_command_buffer *);
++      util_dynarray_append(&cmd->queue_waits, index);
++   }
++   util_dynarray_append(&cmd->submit_cmd_bufs, cmd->main.cmd_buf);
++   cmd->main.cmd_buf = NULL;
++   cmd->main.queue_wait = false;
++}
++
+ void
+ cs_start_render(struct kk_cmd_buffer *cmd)
+ {
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct kk_graphics_state *state = &cmd->state.gfx;
+    uint32_t view_mask = state->render.view_mask;
+    assert(state->render_pass_descriptor);
+ 
+-   cmd->gfx.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
+-   mtl_begin_command_buffer(cmd->gfx.cmd_buf, cmd->gfx.allocator);
++   /* The main command buffer holds one open encoder at a time. */
++   if (cmd->pre_gfx->encoder && cmd->pre_gfx->in_main)
++      kk_stop_encoder(cmd, cmd->pre_gfx);
++
++   /* A pass that needed compute before it will likely need it again after a
++    * restart. Begin it at the start of a main command buffer, where that
++    * compute can precede it without splitting the pass.
++    *
++    * KK_WORKAROUND_18: a render encoder that follows other encoders in its
++    * command buffer drops the primitives of a draw that selects another
++    * layer, just as a later draw in one encoder does. Every encoder of a
++    * layered or multiview pass therefore starts a command buffer, and the
++    * queue runs that command buffer only once everything before it has
++    * completed: a barrier or fence alone still lets Metal lose leading
++    * vertex batches of the encoder's draw. */
++   const bool layered =
++      state->render.layer_count > 1u || state->render.view_mask != 0u;
++   if (cmd->main.render_needed_pre || layered)
++      cs_end_main(cmd);
++   cmd->main.render_needed_pre = false;
++
++   cmd->main.render_follows_work = cmd->main.cmd_buf != NULL;
++   cmd->gfx.cmd_buf = cs_open_main(cmd);
++   if (layered)
++      cmd->main.queue_wait = true;
++   cmd->gfx.in_main = true;
+    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
+       cmd->gfx.cmd_buf, state->render_pass_descriptor);
+ 
+@@ -408,38 +469,67 @@ cs_get_render(struct kk_cmd_buffer *cmd)
+ }
+ 
+ static void
+-kk_start_compute_encoder(struct kk_encoder_state *es, mtl_device *handle,
+-                         mtl_argument_table *argument_table)
++kk_start_compute_encoder(struct kk_cmd_buffer *cmd,
++                         struct kk_encoder_state *es, bool in_main)
+ {
+-   es->cmd_buf = mtl_new_command_buffer(handle);
+-   mtl_begin_command_buffer(es->cmd_buf, es->allocator);
++   if (in_main) {
++      es->cmd_buf = cs_open_main(cmd);
++   } else {
++      struct kk_device *dev = kk_cmd_buffer_device(cmd);
++      es->cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
++      mtl_begin_command_buffer(es->cmd_buf, es->allocator);
++   }
++   es->in_main = in_main;
+    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
+ 
+    /* Argument table won't ever change */
+-   mtl_compute_set_argument_table(es->encoder, argument_table);
++   mtl_compute_set_argument_table(es->encoder, cmd->argument_table);
++}
++
++/* Compute that must precede a render encoder that other work in the main
++ * command buffer precedes: close the pass there and resume it at the start of
++ * a new main command buffer, which that compute can then precede. The pass
++ * descriptor loads every attachment once the pass has begun. */
++static void
++cs_split_render(struct kk_cmd_buffer *cmd)
++{
++   kk_stop_encoder(cmd, &cmd->gfx);
++   cs_end_main(cmd);
++   cs_start_render(cmd);
++   /* A draw being recorded flushed its state into the closed encoder and
++    * needs it in this one. Outside a draw the state need not be complete
++    * yet, a dynamic vertex input for one, and starting the encoder has
++    * marked all of it dirty for the next draw to flush. */
++   if (cmd->state.gfx.draw_state_flushed)
++      kk_flush_gfx_state(cmd);
+ }
+ 
+ mtl_compute_encoder *
+ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
+ {
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   mtl_compute_encoder *encoder;
+-   /* If we are not inside a render, we can just take pre_gfx. */
+-   if (!cmd->gfx.encoder || pre_gfx) {
++   /* Outside a render encoder, compute runs in recording order: in the open
++    * pre-render encoder, or in the main command buffer. */
++   if (!cmd->gfx.encoder) {
++      if (!cmd->pre_gfx->encoder)
++         kk_start_compute_encoder(cmd, cmd->pre_gfx, true);
++      return cmd->pre_gfx->encoder;
++   }
++
++   if (pre_gfx) {
+       if (!cmd->pre_gfx->encoder) {
+-         kk_start_compute_encoder(cmd->pre_gfx, dev->mtl_handle,
+-                                  cmd->argument_table);
++         /* Its own command buffer runs before the whole main one, which is
++          * sound only while the render encoder is the main one's first. */
++         if (cmd->main.render_follows_work)
++            cs_split_render(cmd);
++         kk_start_compute_encoder(cmd, cmd->pre_gfx, false);
+       }
+-      encoder = cmd->pre_gfx->encoder;
+-   } else {
+-      if (!cmd->post_gfx->encoder) {
+-         kk_start_compute_encoder(cmd->post_gfx, dev->mtl_handle,
+-                                  cmd->argument_table);
+-      }
+-      encoder = cmd->post_gfx->encoder;
++      cmd->main.render_needed_pre = true;
++      return cmd->pre_gfx->encoder;
+    }
+ 
+-   return encoder;
++   if (!cmd->post_gfx->encoder)
++      kk_start_compute_encoder(cmd, cmd->post_gfx, false);
++   return cmd->post_gfx->encoder;
+ }
+ 
+ static void
+@@ -506,9 +596,12 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+ 
+    kk_encoder_state_clear_timestamps(es);
+ 
+-   mtl_end_command_buffer(es->cmd_buf);
+-
+-   util_dynarray_append(&cmd->submit_cmd_bufs, es->cmd_buf);
++   /* The main command buffer stays open for the encoders after this one. */
++   if (!es->in_main) {
++      mtl_end_command_buffer(es->cmd_buf);
++      util_dynarray_append(&cmd->submit_cmd_bufs, es->cmd_buf);
++   }
++   es->in_main = false;
+    es->cmd_buf = NULL;
+ }
+ 
+@@ -518,27 +611,39 @@ cs_end(struct kk_cmd_buffer *cmd)
+    assert(cmd);
+ 
+    if (cmd->pre_gfx->encoder) {
+-      /* Submit pre_gfx now that its encoder is closed. Command buffers are
+-       * appended here (rather than at creation) so submit_cmd_bufs stays in
+-       * encode order: pre_gfx first, then gfx below. post_gfx is promoted into
+-       * the pre_gfx slot with its encoder still open, so it is submitted by a
+-       * later cs_end() and therefore always ends up after gfx. This is why
+-       * every flush site calls cs_end() twice. */
++      /* Close pre_gfx. A command buffer of its own is appended now, before
++       * the main one, which is still open. post_gfx is promoted into the
++       * pre_gfx slot with its encoder still open, so it is submitted by a
++       * later cs_end() and therefore always ends up after the pass. */
+       kk_stop_encoder(cmd, cmd->pre_gfx);
+ 
+       SWAP(cmd->pre_gfx, cmd->post_gfx);
+    } else if (cmd->post_gfx->encoder) {
+       /* No pre_gfx, but a post_gfx exists (e.g. compute issued during a render
+        * pass). Promote it so a later cs_end() closes and submits it after the
+-       * gfx command buffer appended below. */
++       * pass. */
+       SWAP(cmd->pre_gfx, cmd->post_gfx);
+    }
+ 
+    if (cmd->gfx.encoder) {
+       kk_stop_encoder(cmd, &cmd->gfx);
++      /* Promoted post-render work follows the pass and precedes whatever is
++       * recorded next, so the pass's main command buffer ends here. */
++      if (cmd->pre_gfx->encoder)
++         cs_end_main(cmd);
+    }
+ }
+ 
++/* Closes every encoder and command buffer, in submission order. */
++void
++cs_flush(struct kk_cmd_buffer *cmd)
++{
++   /* Twice: the first promotes post-render work, the second closes it. */
++   cs_end(cmd);
++   cs_end(cmd);
++   cs_end_main(cmd);
++}
++
+ void
+ kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd, uint64_t addr)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 3f05efbb0b72b5b5ca7564475f4eac175d8f75b0..af62d43c89cfbd9ca95503ec6dae7ad435a3b223 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -214,6 +214,11 @@ struct kk_graphics_state {
+    bool is_cull_front_and_back;
+    bool need_to_start_render_pass;
+ 
++   /* Set while a draw records the work that follows flushing its state into
++    * the render encoder. A render pass split then flushes that state into
++    * the encoder that resumes the pass. */
++   bool draw_state_flushed;
++
+    /* Draws issued into the render encoder that is currently open. Reset every
+     * time a render encoder starts. KK_WORKAROUND_18 uses it. */
+    uint32_t draws_since_encoder_start;
+@@ -343,6 +348,9 @@ struct kk_encoder_state {
+    mtl_fence *ts_fences[2];
+    /* Render-stage timestamp samples (struct kk_ts_sample). */
+    struct util_dynarray ts_samples;
++   /* The open encoder records into the command buffer's main Metal command
++    * buffer rather than one of its own. */
++   bool in_main;
+ };
+ 
+ struct kk_cmd_buffer {
+@@ -354,6 +362,29 @@ struct kk_cmd_buffer {
+    struct kk_encoder_state *pre_gfx;
+    struct kk_encoder_state *post_gfx;
+ 
++   /* Work that runs in recording order shares one Metal command buffer on
++    * the gfx allocator: every render encoder, and every compute encoder opened
++    * while no render encoder is. Metal charges a command buffer's first render
++    * encoder megabytes of allocator storage, so a recording that alternates
++    * copies and render passes must not open a command buffer per encoder.
++    * Only compute that must run before or after a whole render pass gets a
++    * command buffer of its own.
++    *
++    * submit_cmd_bufs is in submission order, and a command buffer appended
++    * while the main one is open runs before everything in it. The main
++    * command buffer therefore ends whenever later work has to follow what it
++    * holds; see cs_end_main. */
++   struct {
++      mtl_command_buffer *cmd_buf;
++      /* The open render encoder follows other encoders in cmd_buf. */
++      bool render_follows_work;
++      /* The last render encoder needed compute before its pass. */
++      bool render_needed_pre;
++      /* cmd_buf begins an encoder of a layered or multiview pass, so the
++       * queue has to finish everything before it first. KK_WORKAROUND_18. */
++      bool queue_wait;
++   } main;
++
+    void *drawable;
+    mtl_argument_table *argument_table;
+ 
+@@ -382,6 +413,10 @@ struct kk_cmd_buffer {
+    struct kk_uploader uploader;
+ 
+    struct util_dynarray submit_cmd_bufs;
++   /* Ascending indices into submit_cmd_bufs of the command buffers the queue
++    * may start only once everything committed before them has completed.
++    * KK_WORKAROUND_18. */
++   struct util_dynarray queue_waits;
+ 
+    /* Owned large BOs */
+    struct util_dynarray large_bos;
+@@ -447,6 +482,10 @@ void kk_cmd_buffer_set_vertex_amplification(struct kk_cmd_buffer *cmd,
+                                             uint32_t count);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx);
+ void cs_end(struct kk_cmd_buffer *cmd);
++void cs_flush(struct kk_cmd_buffer *cmd);
++/* Re-emits the graphics state of the draw being recorded into a render
++ * encoder that restarted after the draw flushed it. */
++void kk_flush_gfx_state(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index dee753c51689efdd6341e640adbddef2274ef0e8..82b6c1c1746ec4f16514704347f6aa7d27021090 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -2177,7 +2177,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ }
+ 
+-static void
++void
+ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
+ {
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+@@ -3788,20 +3788,8 @@ kk_tess_heap_bound(struct kk_cmd_buffer *cmd, const struct kk_draw_data *draw)
+ }
+ 
+ static void
+-kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++kk_draw_flushed(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+-   if (unlikely(cmd->state.dynamic_vertex_input_pipeline != NULL)) {
+-      VkResult result = kk_resolve_dynamic_vertex_input_pipeline(cmd);
+-      if (result != VK_SUCCESS) {
+-         vk_command_buffer_set_error(&cmd->vk, result);
+-         return;
+-      }
+-   }
+-
+-   kk_cmd_select_line_raster_variant(cmd);
+-   data->upload_mask = build_per_draw_upload_mask(cmd);
+-   kk_flush_gfx_state(cmd);
+-
+    data->restart = cmd->vk.dynamic_graphics_state.ia.primitive_restart_enable;
+    data->restart_index =
+       cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
+@@ -3967,6 +3955,26 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    }
+ }
+ 
++static void
++kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++{
++   if (unlikely(cmd->state.dynamic_vertex_input_pipeline != NULL)) {
++      VkResult result = kk_resolve_dynamic_vertex_input_pipeline(cmd);
++      if (result != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd->vk, result);
++         return;
++      }
++   }
++
++   kk_cmd_select_line_raster_variant(cmd);
++   data->upload_mask = build_per_draw_upload_mask(cmd);
++   kk_flush_gfx_state(cmd);
++
++   cmd->state.gfx.draw_state_flushed = true;
++   kk_draw_flushed(cmd, data);
++   cmd->state.gfx.draw_state_flushed = false;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+            uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index ed0a65c9d0fa19e8a439d473f052b2d6362998f1..7dabd36bae5bafd9b696402c716f16d6102dca9d 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -570,6 +570,7 @@ kk_detach_completed_recording(struct kk_cmd_buffer *cmd,
+    recording->queue = mtl_retain(queue);
+    recording->allocator_cache = kk_command_allocator_cache_ref(
+       kk_cmd_buffer_device(cmd)->allocator_cache);
++   assert(cmd->main.cmd_buf == NULL);
+    recording->command_buffers = cmd->submit_cmd_bufs;
+    cmd->submit_cmd_bufs = UTIL_DYNARRAY_INIT;
+ 
+@@ -592,13 +593,47 @@ rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
+    vk_cmd_queue_execute(&cmd->vk.cmd_queue, kk_cmd_buffer_to_handle(cmd),
+                         &dev->vk.dispatch_table);
+ 
+-   cs_end(cmd);
+-   cs_end(cmd);
++   cs_flush(cmd);
+ 
+    /* Need to ensure the new buffers allocated at record are resident. */
+    kk_device_make_resources_resident(dev);
+ }
+ 
++/* KK_WORKAROUND_18: everything committed after this runs only once
++ * everything committed before it has completed. The signal is recorded like a
++ * Vulkan one, so a failure that destroys it is made good and the wait behind it
++ * cannot hold the queue. */
++static void
++kk_queue_order_behind_committed(struct kk_queue *queue)
++{
++   const uint64_t value = ++queue->layer_order_value;
++   kk_queue_record_signal(queue->feedback, queue->layer_order_event, value);
++   mtl_signal_event(queue->mtl_handle, queue->layer_order_event, value);
++   mtl_wait_for_event(queue->mtl_handle, queue->layer_order_event, value);
++}
++
++/* What one Metal commit of a command buffer's parts needs. */
++struct kk_commit_part {
++   mtl_commit_options *options;
++   struct kk_queue_submission *submission;
++};
++
++static void
++kk_commit_parts_free(struct kk_commit_part *parts, uint32_t count)
++{
++   if (!parts)
++      return;
++   for (uint32_t p = 0u; p < count; ++p) {
++      if (parts[p].options)
++         mtl_release(parts[p].options);
++      if (parts[p].submission) {
++         kk_queue_feedback_unref(parts[p].submission->feedback);
++         free(parts[p].submission);
++      }
++   }
++   free(parts);
++}
++
+ static VkResult
+ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+ {
+@@ -642,48 +677,72 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+       uint32_t count = util_dynarray_num_elements(&cmd_buffer->submit_cmd_bufs,
+                                                   mtl_command_buffer *);
+ 
++      const uint32_t *waits = util_dynarray_begin(&cmd_buffer->queue_waits);
++      const uint32_t wait_count =
++         util_dynarray_num_elements(&cmd_buffer->queue_waits, uint32_t);
++
+       /* Metal complains with empty submissions. */
+       if (count > 0u) {
+-         /* Feedback handlers may be consumed by commit. Fresh options avoid
++         /* KK_WORKAROUND_18: the queue has to finish everything before each
++          * command buffer queue_waits names, and a queue wait sits only
++          * between commits, so the command buffers go to Metal in parts, each
++          * ending before such a command buffer. Every part is a submission
++          * with a serial of its own; the last one reports the recording.
++          *
++          * Feedback handlers may be consumed by commit. Fresh options avoid
+           * both losing later notifications and accumulating old handlers.
+-          */
+-         mtl_commit_options *options = mtl_new_commit_options();
+-         if (!options)
+-            /* Earlier waits or command buffers may already be queued. */
+-            return vk_queue_set_lost(&queue->vk,
+-                                     "Failed to allocate Metal commit options");
+-
+-         /* One queue submits from one thread and nothing else reserves a
+-          * serial, so this submission's number is still the one Metal is
+-          * about to receive. A failure reported against it then names
+-          * exactly the signals ordered behind it. */
+-         struct kk_queue_submission *submission = kk_queue_submission_new(
+-            queue->feedback, kk_queue_reserve_serial(queue->feedback));
+-         if (!submission) {
+-            mtl_release(options);
+-            return vk_queue_set_lost(&queue->vk,
+-                                     "Failed to allocate Metal submission feedback");
++          * Everything the parts need is allocated before any of them is
++          * committed. */
++         uint32_t part_count = 1u;
++         for (uint32_t w = 0u; w < wait_count; ++w)
++            part_count += waits[w] > 0u;
++         struct kk_commit_part *parts = calloc(part_count, sizeof(*parts));
++         bool allocated = parts != NULL;
++         for (uint32_t p = 0u; allocated && p < part_count; ++p) {
++            parts[p].options = mtl_new_commit_options();
++            parts[p].submission = kk_queue_submission_new(queue->feedback, 0u);
++            allocated = parts[p].options && parts[p].submission;
+          }
+-
+          struct kk_completed_recording *recording = NULL;
+-         if (cmd_buffer->one_time_submit) {
++         if (allocated && cmd_buffer->one_time_submit) {
+             recording = kk_detach_completed_recording(cmd_buffer,
+                                                       queue->mtl_handle);
+-            if (!recording) {
+-               mtl_release(options);
+-               kk_queue_feedback_unref(submission->feedback);
+-               free(submission);
+-               return vk_queue_set_lost(&queue->vk,
+-                                        "Failed to allocate Metal completion storage");
++            allocated = recording != NULL;
++         }
++         if (!allocated) {
++            kk_commit_parts_free(parts, part_count);
++            /* Earlier waits or command buffers may already be queued. */
++            return vk_queue_set_lost(&queue->vk,
++                                     "Failed to allocate Metal submission state");
++         }
++
++         uint32_t start = 0u, w = 0u;
++         for (uint32_t p = 0u; p < part_count; ++p) {
++            if (w < wait_count && waits[w] == start) {
++               kk_queue_order_behind_committed(queue);
++               ++w;
+             }
++            const uint32_t end = w < wait_count ? waits[w] : count;
++
++            /* One queue submits from one thread and nothing else reserves a
++             * serial, so this part's number is still the one Metal is about
++             * to receive. A failure reported against it then names exactly
++             * the signals ordered behind it. */
++            struct kk_queue_submission *submission = parts[p].submission;
++            submission->serial = kk_queue_reserve_serial(queue->feedback);
++            if (recording && p + 1u == part_count)
++               mtl_commit_options_add_feedback_handler(
++                  parts[p].options, kk_completed_recording_callback,
++                  recording);
+             mtl_commit_options_add_feedback_handler(
+-               options, kk_completed_recording_callback, recording);
++               parts[p].options, queue->feedback_callback, submission);
++            kk_device_commit_to_queue(dev, queue->mtl_handle, cmds + start,
++                                      end - start, parts[p].options);
++            mtl_release(parts[p].options);
++            start = end;
+          }
+-         mtl_commit_options_add_feedback_handler(
+-            options, queue->feedback_callback, submission);
+-         kk_device_commit_to_queue(dev, queue->mtl_handle, cmds, count,
+-                                   options);
+-         mtl_release(options);
++         assert(start == count && w == wait_count);
++         free(parts);
+          if (recording)
+             kk_completed_recording_unref(recording);
+       }
+@@ -785,8 +844,13 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+    queue->feedback->submit_timing = KK_DEBUG(SUBMIT_TIMING);
+    queue->feedback_callback = commit_callback;
+ 
++   queue->layer_order_event = mtl_new_shared_event(dev->mtl_handle);
+    queue->mtl_handle = mtl_new_command_queue(dev->mtl_handle);
+-   if (!queue->mtl_handle) {
++   if (!queue->mtl_handle || !queue->layer_order_event) {
++      if (queue->mtl_handle)
++         mtl_release(queue->mtl_handle);
++      if (queue->layer_order_event)
++         mtl_release(queue->layer_order_event);
+       mtx_destroy(&queue->submit_mutex);
+       kk_queue_feedback_unref(queue->feedback);
+       vk_queue_finish(&queue->vk);
+@@ -818,5 +882,6 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+    mtl_command_queue_remove_residency_set(queue->mtl_handle,
+                                           dev->residency_set.handle);
+    mtl_release(queue->mtl_handle);
++   mtl_release(queue->layer_order_event);
+    mtx_destroy(&queue->submit_mutex);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index 2db571e81f8dbbeb9dbe032215dd5bdb9aa4a886..ce5aa43bac0921d9001d5cf72ae2fbae3b1ec82e 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -84,6 +84,10 @@ struct kk_queue {
+    struct mtl_command_queue *mtl_handle;
+    mtl_feedback_handler_callback feedback_callback;
+    struct kk_queue_feedback *feedback;
++   /* KK_WORKAROUND_18: the queue signals this and waits for the value before
++    * a command buffer that begins a layered or multiview pass's encoder. */
++   mtl_shared_event *layer_order_event;
++   uint64_t layer_order_value;
+ };
+ 
+ static inline struct kk_device *
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 34a1c315eb79ed07db4d1ef8d620c2fe0c920545..b7ac08ca99af70683277d4e16e1d3e55b1f711c8 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1120,6 +1120,39 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true', 'MTL_SHADER_VALIDATION=1'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_command_buffer_consolidation',
++      executable(
++        'test_kosmickrisp_command_buffer_consolidation',
++        files('tests/test_command_buffer_consolidation.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
++    test(
++      'kosmickrisp_query_pool_lifetime',
++      executable(
++        'test_kosmickrisp_query_pool_lifetime',
++        files('tests/test_query_pool_lifetime.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true', 'NSZombieEnabled=YES'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..53ed99cbd701118c43dd9b9d6f9d8087b0ec064f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag
+@@ -0,0 +1,7 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (location=0) in vec4 inColor;
++layout (location=0) out vec4 outColor;
++void main (void) {
++    outColor = inColor;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag.h b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..50544d69c37b4e3889a931f38533262b813a6160
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.frag.h
+@@ -0,0 +1,20 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000b,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00040047,0x0000000b,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000007,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x0000000c,
++0x0000000b,0x0003003e,0x00000009,0x0000000c,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..2225060b57d374f0af2de5141975e57e964aa6e2
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert
+@@ -0,0 +1,9 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (location=0) in vec4 inColor;
++layout (location=1) in vec2 inPosition;
++layout (location=0) out vec4 outColor;
++void main (void) {
++    gl_Position = vec4(inPosition, 0.0, 1.0);
++    outColor = inColor;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert.h b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8a7921b2e63f60479c796f3acba0b24522f6e5b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/color.vert.h
+@@ -0,0 +1,47 @@
++{0x07230203,0x00010600,0x000d000b,0x0000001f,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000012,0x0000001b,
++0x0000001d,0x00030047,0x0000000b,0x00000002,
++0x00050048,0x0000000b,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x0000000b,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x0000000b,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x0000000b,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000012,0x0000001e,0x00000001,
++0x00040047,0x0000001b,0x0000001e,0x00000000,
++0x00040047,0x0000001d,0x0000001e,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00030016,0x00000006,0x00000020,
++0x00040017,0x00000007,0x00000006,0x00000004,
++0x00040015,0x00000008,0x00000020,0x00000000,
++0x0004002b,0x00000008,0x00000009,0x00000001,
++0x0004001c,0x0000000a,0x00000006,0x00000009,
++0x0006001e,0x0000000b,0x00000007,0x00000006,
++0x0000000a,0x0000000a,0x00040020,0x0000000c,
++0x00000003,0x0000000b,0x0004003b,0x0000000c,
++0x0000000d,0x00000003,0x00040015,0x0000000e,
++0x00000020,0x00000001,0x0004002b,0x0000000e,
++0x0000000f,0x00000000,0x00040017,0x00000010,
++0x00000006,0x00000002,0x00040020,0x00000011,
++0x00000001,0x00000010,0x0004003b,0x00000011,
++0x00000012,0x00000001,0x0004002b,0x00000006,
++0x00000014,0x00000000,0x0004002b,0x00000006,
++0x00000015,0x3f800000,0x00040020,0x00000019,
++0x00000003,0x00000007,0x0004003b,0x00000019,
++0x0000001b,0x00000003,0x00040020,0x0000001c,
++0x00000001,0x00000007,0x0004003b,0x0000001c,
++0x0000001d,0x00000001,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000010,0x00000013,
++0x00000012,0x00050051,0x00000006,0x00000016,
++0x00000013,0x00000000,0x00050051,0x00000006,
++0x00000017,0x00000013,0x00000001,0x00070050,
++0x00000007,0x00000018,0x00000016,0x00000017,
++0x00000014,0x00000015,0x00050041,0x00000019,
++0x0000001a,0x0000000d,0x0000000f,0x0003003e,
++0x0000001a,0x00000018,0x0004003d,0x00000007,
++0x0000001e,0x0000001d,0x0003003e,0x0000001b,
++0x0000001e,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/command_buffer_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..9c3cf1f1530c590e84948987cfa6ade1d73c8b48
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/command_buffer_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in color.vert color.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_buffer_consolidation.c b/src/kosmickrisp/vulkan/tests/test_command_buffer_consolidation.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0068732d8539535fee40f6adab9e5adbc12bca78
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_command_buffer_consolidation.c
+@@ -0,0 +1,526 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A recording that alternates transfers and render passes, as Zink's texture
++ * uploads between draws do, must not open a Metal command buffer per encoder:
++ * each command buffer's first render encoder costs megabytes of allocator
++ * storage until the submission completes, and a few hundred glyph uploads then
++ * exhaust an iOS app's memory limit.
++ *
++ * The first recording alternates a fill of the draw's vertex color with a
++ * render pass that adds that color, so every pass must see its own fill and
++ * the result of the passes before it. It must record into at most two Metal
++ * command buffers.
++ *
++ * The second recording writes a triangle fan's indices and then draws the fan
++ * in a cleared pass. Compute that must run before the pass unrolls the fan
++ * from those indices, but the index write already precedes the pass in the
++ * shared command buffer, so the pass is split there. The unroll must see the
++ * written indices, the clear must survive where the fan does not reach, and
++ * the fan must land.
++ */
++
++#define VK_NO_PROTOTYPES
++#include "kosmickrisp/vulkan/kk_cmd_buffer.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++#define CHECK(x)                                                               \
++   do {                                                                        \
++      if (!(x)) {                                                              \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);               \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++#define LOAD_I(name)                                                           \
++   PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name);       \
++   CHECK(name)
++#define LOAD_D(name)                                                           \
++   PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name);           \
++   CHECK(name)
++
++static const uint32_t vertex_spirv[] =
++#include "command_buffer_shaders/color.vert.h"
++   ;
++static const uint32_t fragment_spirv[] =
++#include "command_buffer_shaders/color.frag.h"
++   ;
++
++#define EXTENT       64u
++#define PASSES       64u
++#define COLOR_STRIDE 16u
++
++static unsigned
++metal_command_buffers(VkCommandBuffer commands)
++{
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(commands);
++   return util_dynarray_num_elements(&cmd->submit_cmd_bufs,
++                                     mtl_command_buffer *);
++}
++
++static uint32_t
++float_bits(float value)
++{
++   uint32_t bits;
++   memcpy(&bits, &value, sizeof(bits));
++   return bits;
++}
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++                               .pApplicationInfo = &app};
++   CHECK(vkCreateInstance(&ici, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++   CHECK(count == 1);
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++   CHECK(families);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++   uint32_t family = 0;
++   while (family < family_count &&
++          !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++      family++;
++   CHECK(family < family_count);
++   free(families);
++
++   float priority = 1;
++   VkDeviceQueueCreateInfo qci = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = family,
++      .queueCount = 1,
++      .pQueuePriorities = &priority};
++   VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .dynamicRendering = VK_TRUE};
++   VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++                             .pNext = &features13,
++                             .queueCreateInfoCount = 1,
++                             .pQueueCreateInfos = &qci};
++   VkDevice device;
++   CHECK(vkCreateDevice(physical, &dci, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateShaderModule);
++   LOAD_D(vkDestroyShaderModule);
++   LOAD_D(vkCreatePipelineLayout);
++   LOAD_D(vkDestroyPipelineLayout);
++   LOAD_D(vkCreateGraphicsPipelines);
++   LOAD_D(vkDestroyPipeline);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkMapMemory);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdBeginRendering);
++   LOAD_D(vkCmdEndRendering);
++   LOAD_D(vkCmdBindPipeline);
++   LOAD_D(vkCmdBindVertexBuffers);
++   LOAD_D(vkCmdBindIndexBuffer);
++   LOAD_D(vkCmdDraw);
++   LOAD_D(vkCmdDrawIndexed);
++   LOAD_D(vkCmdFillBuffer);
++   LOAD_D(vkCmdUpdateBuffer);
++   LOAD_D(vkCmdPipelineBarrier);
++   LOAD_D(vkCmdCopyImageToBuffer);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++
++   VkQueue queue;
++   vkGetDeviceQueue(device, family, 0, &queue);
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++
++#define FIND_MEMORY(bits, want)                                                \
++   ({                                                                          \
++      uint32_t found_ = UINT32_MAX;                                            \
++      for (uint32_t i_ = 0; i_ < memory_properties.memoryTypeCount; i_++) {   \
++         if (((bits) & (1u << i_)) &&                                          \
++             (memory_properties.memoryTypes[i_].propertyFlags & (want)) ==    \
++                (want)) {                                                      \
++            found_ = i_;                                                       \
++            break;                                                             \
++         }                                                                     \
++      }                                                                        \
++      CHECK(found_ != UINT32_MAX);                                             \
++      found_;                                                                  \
++   })
++
++   /* Render target. */
++   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = {EXTENT, EXTENT, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
++   VkImage image;
++   CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++   VkMemoryRequirements image_requirements;
++   vkGetImageMemoryRequirements(device, image, &image_requirements);
++   VkMemoryAllocateInfo image_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = image_requirements.size,
++      .memoryTypeIndex = FIND_MEMORY(image_requirements.memoryTypeBits,
++                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
++   VkDeviceMemory image_memory;
++   CHECK(vkAllocateMemory(device, &image_allocate, NULL, &image_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindImageMemory(device, image, image_memory, 0) == VK_SUCCESS);
++   VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = format,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++   VkImageView view;
++   CHECK(vkCreateImageView(device, &view_info, NULL, &view) == VK_SUCCESS);
++
++   /* One host-visible buffer: per-pass vertex colors, vertex positions, fan
++    * indices, then the readback. */
++   const VkDeviceSize color_bytes = PASSES * COLOR_STRIDE;
++   const VkDeviceSize position_offset = color_bytes;
++   const VkDeviceSize position_bytes = 8 * 2 * sizeof(float);
++   const VkDeviceSize index_offset = position_offset + position_bytes;
++   const uint32_t fan_indices[4] = {0, 1, 2, 3};
++   const VkDeviceSize readback_offset = index_offset + sizeof(fan_indices);
++   const VkDeviceSize readback_bytes = EXTENT * EXTENT * 4;
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = readback_offset + readback_bytes,
++      .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
++               VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++               VK_BUFFER_USAGE_TRANSFER_DST_BIT};
++   VkBuffer buffer;
++   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
++   VkMemoryRequirements buffer_requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &buffer_requirements);
++   VkMemoryAllocateInfo buffer_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = buffer_requirements.size,
++      .memoryTypeIndex = FIND_MEMORY(buffer_requirements.memoryTypeBits,
++                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
++   VkDeviceMemory buffer_memory;
++   CHECK(vkAllocateMemory(device, &buffer_allocate, NULL, &buffer_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, buffer, buffer_memory, 0) == VK_SUCCESS);
++   uint8_t *mapped;
++   CHECK(vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0,
++                     (void **)&mapped) == VK_SUCCESS);
++   memset(mapped, 0, (size_t)buffer_info.size);
++   /* A triangle covering the target, then a fan over its left half. */
++   const float positions[8][2] = {
++      {-1, -1}, {3, -1}, {-1, 3}, {0, 0},
++      {-1, -1}, {0, -1}, {0, 1},  {-1, 1},
++   };
++   memcpy(mapped + position_offset, positions, sizeof(positions));
++
++   /* Pipelines: an additive triangle list and a replacing triangle fan. */
++   VkShaderModuleCreateInfo module_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(vertex_spirv),
++      .pCode = vertex_spirv};
++   VkShaderModule vertex_module, fragment_module;
++   CHECK(vkCreateShaderModule(device, &module_info, NULL, &vertex_module) ==
++         VK_SUCCESS);
++   module_info.codeSize = sizeof(fragment_spirv);
++   module_info.pCode = fragment_spirv;
++   CHECK(vkCreateShaderModule(device, &module_info, NULL, &fragment_module) ==
++         VK_SUCCESS);
++   VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   VkPipelineLayout layout;
++   CHECK(vkCreatePipelineLayout(device, &layout_info, NULL, &layout) ==
++         VK_SUCCESS);
++
++   VkPipelineShaderStageCreateInfo stages[2] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .stage = VK_SHADER_STAGE_VERTEX_BIT,
++       .module = vertex_module,
++       .pName = "main"},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
++       .module = fragment_module,
++       .pName = "main"},
++   };
++   VkVertexInputBindingDescription bindings[2] = {
++      {0, COLOR_STRIDE, VK_VERTEX_INPUT_RATE_INSTANCE},
++      {1, 2 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX},
++   };
++   VkVertexInputAttributeDescription attributes[2] = {
++      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0},
++      {1, 1, VK_FORMAT_R32G32_SFLOAT, 0},
++   };
++   VkPipelineVertexInputStateCreateInfo vertex_input = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
++      .vertexBindingDescriptionCount = 2,
++      .pVertexBindingDescriptions = bindings,
++      .vertexAttributeDescriptionCount = 2,
++      .pVertexAttributeDescriptions = attributes};
++   VkPipelineInputAssemblyStateCreateInfo assembly = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
++   VkViewport viewport = {0, 0, EXTENT, EXTENT, 0, 1};
++   VkRect2D scissor = {{0, 0}, {EXTENT, EXTENT}};
++   VkPipelineViewportStateCreateInfo viewport_state = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1,
++      .pViewports = &viewport,
++      .scissorCount = 1,
++      .pScissors = &scissor};
++   VkPipelineRasterizationStateCreateInfo raster = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL,
++      .cullMode = VK_CULL_MODE_NONE,
++      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
++      .lineWidth = 1};
++   VkPipelineMultisampleStateCreateInfo multisample = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
++   VkPipelineColorBlendAttachmentState blend_attachment = {
++      .blendEnable = VK_TRUE,
++      .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
++      .dstColorBlendFactor = VK_BLEND_FACTOR_ONE,
++      .colorBlendOp = VK_BLEND_OP_ADD,
++      .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
++      .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
++      .alphaBlendOp = VK_BLEND_OP_ADD,
++      .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
++   VkPipelineColorBlendStateCreateInfo blend = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .attachmentCount = 1,
++      .pAttachments = &blend_attachment};
++   VkPipelineRenderingCreateInfo rendering_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1,
++      .pColorAttachmentFormats = &format};
++   VkGraphicsPipelineCreateInfo pipeline_info = {
++      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++      .pNext = &rendering_info,
++      .stageCount = 2,
++      .pStages = stages,
++      .pVertexInputState = &vertex_input,
++      .pInputAssemblyState = &assembly,
++      .pViewportState = &viewport_state,
++      .pRasterizationState = &raster,
++      .pMultisampleState = &multisample,
++      .pColorBlendState = &blend,
++      .layout = layout};
++   VkPipeline additive, fan;
++   CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                   NULL, &additive) == VK_SUCCESS);
++   assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
++   blend_attachment.blendEnable = VK_FALSE;
++   CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                   NULL, &fan) == VK_SUCCESS);
++
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = family};
++   VkCommandPool pool;
++   CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool) == VK_SUCCESS);
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 2};
++   VkCommandBuffer commands[2];
++   CHECK(vkAllocateCommandBuffers(device, &command_info, commands) ==
++         VK_SUCCESS);
++   VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++
++   VkMemoryBarrier fill_to_vertex = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
++                       VK_ACCESS_INDEX_READ_BIT};
++   VkImageMemoryBarrier to_transfer = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++   VkBufferImageCopy copy = {
++      .bufferOffset = readback_offset,
++      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .imageExtent = {EXTENT, EXTENT, 1}};
++   VkRenderingAttachmentInfo color_attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
++   VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = scissor,
++      .layerCount = 1,
++      .colorAttachmentCount = 1,
++      .pColorAttachments = &color_attachment};
++   VkBuffer vertex_buffers[2] = {buffer, buffer};
++
++   /* Alternate a fill of pass i's color with pass i adding it. */
++   CHECK(vkBeginCommandBuffer(commands[0], &begin) == VK_SUCCESS);
++   for (uint32_t pass = 0; pass < PASSES; pass++) {
++      vkCmdFillBuffer(commands[0], buffer, pass * COLOR_STRIDE, COLOR_STRIDE,
++                      float_bits(1.0f / 255.0f));
++      vkCmdPipelineBarrier(commands[0], VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1,
++                           &fill_to_vertex, 0, NULL, 0, NULL);
++      color_attachment.loadOp =
++         pass ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
++      vkCmdBeginRendering(commands[0], &rendering);
++      vkCmdBindPipeline(commands[0], VK_PIPELINE_BIND_POINT_GRAPHICS, additive);
++      VkDeviceSize offsets[2] = {pass * COLOR_STRIDE, position_offset};
++      vkCmdBindVertexBuffers(commands[0], 0, 2, vertex_buffers, offsets);
++      vkCmdDraw(commands[0], 3, 1, 0, 0);
++      vkCmdEndRendering(commands[0]);
++   }
++   vkCmdPipelineBarrier(commands[0],
++                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
++                        &to_transfer);
++   vkCmdCopyImageToBuffer(commands[0], image,
++                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
++                          &copy);
++   CHECK(vkEndCommandBuffer(commands[0]) == VK_SUCCESS);
++   const unsigned alternating = metal_command_buffers(commands[0]);
++   printf("%u fills and render passes recorded into %u Metal command "
++          "buffers\n",
++          PASSES, alternating);
++   CHECK(alternating <= 2);
++
++   VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                          .commandBufferCount = 1,
++                          .pCommandBuffers = &commands[0]};
++   CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++   CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++   for (uint32_t texel = 0; texel < EXTENT * EXTENT; texel++) {
++      const uint8_t *rgba = mapped + readback_offset + texel * 4;
++      if (rgba[0] != PASSES || rgba[1] != PASSES || rgba[2] != PASSES ||
++          rgba[3] != PASSES) {
++         fprintf(stderr, "texel %u is %u %u %u %u, not %u from each pass\n",
++                 texel, rgba[0], rgba[1], rgba[2], rgba[3], PASSES);
++         abort();
++      }
++   }
++
++   /* Index and color writes, then a cleared pass whose fan needs compute
++    * before the pass. The indices are zero until the recording writes them. */
++   memset(mapped + readback_offset, 0, (size_t)readback_bytes);
++   CHECK(vkBeginCommandBuffer(commands[1], &begin) == VK_SUCCESS);
++   vkCmdUpdateBuffer(commands[1], buffer, index_offset, sizeof(fan_indices),
++                     fan_indices);
++   vkCmdFillBuffer(commands[1], buffer, 0, COLOR_STRIDE, float_bits(1.0f));
++   vkCmdPipelineBarrier(commands[1], VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1,
++                        &fill_to_vertex, 0, NULL, 0, NULL);
++   color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++   color_attachment.clearValue.color = (VkClearColorValue){{0, 0, 1, 1}};
++   to_transfer.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   VkImageMemoryBarrier to_attachment = to_transfer;
++   to_attachment.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++   to_attachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++   to_attachment.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   to_attachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   vkCmdPipelineBarrier(commands[1], VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                        NULL, 0, NULL, 1, &to_attachment);
++   vkCmdBeginRendering(commands[1], &rendering);
++   vkCmdBindPipeline(commands[1], VK_PIPELINE_BIND_POINT_GRAPHICS, fan);
++   VkDeviceSize fan_offsets[2] = {0, position_offset + 4 * 2 * sizeof(float)};
++   vkCmdBindVertexBuffers(commands[1], 0, 2, vertex_buffers, fan_offsets);
++   vkCmdBindIndexBuffer(commands[1], buffer, index_offset,
++                        VK_INDEX_TYPE_UINT32);
++   vkCmdDrawIndexed(commands[1], 4, 1, 0, 0, 0);
++   vkCmdDrawIndexed(commands[1], 4, 1, 0, 0, 0);
++   vkCmdEndRendering(commands[1]);
++   to_transfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   vkCmdPipelineBarrier(commands[1],
++                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
++                        &to_transfer);
++   vkCmdCopyImageToBuffer(commands[1], image,
++                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
++                          &copy);
++   CHECK(vkEndCommandBuffer(commands[1]) == VK_SUCCESS);
++   printf("an index write and a fan pass recorded into %u Metal command "
++          "buffers\n",
++          metal_command_buffers(commands[1]));
++
++   submit.pCommandBuffers = &commands[1];
++   CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++   CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++   for (uint32_t y = 0; y < EXTENT; y++) {
++      for (uint32_t x = 0; x < EXTENT; x++) {
++         const uint8_t *rgba = mapped + readback_offset + (y * EXTENT + x) * 4;
++         const uint8_t expected[4] = {x < EXTENT / 2 ? 255 : 0,
++                                      x < EXTENT / 2 ? 255 : 0, 255, 255};
++         if (memcmp(rgba, expected, 4)) {
++            fprintf(stderr, "texel %u,%u is %u %u %u %u, not %u %u %u %u\n", x,
++                    y, rgba[0], rgba[1], rgba[2], rgba[3], expected[0],
++                    expected[1], expected[2], expected[3]);
++            abort();
++         }
++      }
++   }
++
++   vkDestroyCommandPool(device, pool, NULL);
++   vkDestroyPipeline(device, fan, NULL);
++   vkDestroyPipeline(device, additive, NULL);
++   vkDestroyPipelineLayout(device, layout, NULL);
++   vkDestroyShaderModule(device, fragment_module, NULL);
++   vkDestroyShaderModule(device, vertex_module, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, buffer_memory, NULL);
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, image_memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("command buffer consolidation ok\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp b/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp
+index 49abc983536d7bff19b40e827768e37e649d7445..782d1f97a94fc6312d868fe24258634fea33eadf 100644
+--- a/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp
++++ b/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp
+@@ -4,13 +4,18 @@
+ 
+ /* KK_WORKAROUND_18: a render command encoder that already ran one draw drops
+  * most of the primitives of a later draw that selects a different
+- * render_target_array_index. Draw one point per texel into each layer of a
+- * two-layer attachment with one draw per layer, then require every texel of
+- * every layer to carry the value its own layer's draw writes.
++ * render_target_array_index. Draw one point per texel into layer 0 of a
++ * two-layer attachment and then one point per texel of its first 16 rows into
++ * layer 1, one draw per layer, and require every texel each draw covers to
++ * carry the value its own layer's draw writes.
+  *
+  * The attachment size, the layered point draws and the DONT_CARE load op all
+- * matter: without the workaround the second draw loses its first 908672
+- * points, but a CLEAR load op on the same pass renders correctly.
++ * matter: without the workaround the second draw loses its leading points,
++ * but a CLEAR load op on the same pass renders correctly. The short second
++ * draw also catches the rest of the workaround: a restarted encoder ordered
++ * behind the first only by a barrier still loses leading 1984-point batches
++ * of it in most fresh processes, unless the queue finishes the first encoder
++ * before starting the second.
+  */
+ #define VK_NO_PROTOTYPES
+ #include <vulkan/vulkan.h>
+@@ -49,9 +54,11 @@ static const uint32_t fragment_spirv[] =
+ #include "layered_draw_shaders/points.frag.h"
+ ;
+ 
+-/* Large enough to lose primitives without the workaround: a 1024x1024 layer
+- * loses 908672 of its 1048576 points on the first affected pass. */
++/* Large enough to lose primitives without the workaround: after a
++ * 1048576-point draw into a 1024x1024 layer, a later layer's draw loses its
++ * leading points on the first affected pass of a process. */
+ static const uint32_t kExtent = 1024u;
++static const uint32_t kLaterPoints = 16384u;
+ static const uint32_t kLayers = 2u;
+ static const uint32_t kTexelBytes = 16u;
+ 
+@@ -363,7 +370,8 @@ int main()
+          PushConstants push{int32_t(layer), int32_t(kExtent)};
+          vkCmdPushConstants(commands, layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
+                             sizeof(push), &push);
+-         vkCmdDraw(commands, kExtent * kExtent, 1u, 0u, 0u);
++         vkCmdDraw(commands, layer ? kLaterPoints : kExtent * kExtent, 1u, 0u,
++                   0u);
+       }
+       vkCmdEndRendering(commands);
+ 
+@@ -398,9 +406,10 @@ int main()
+       const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
+       for (uint32_t layer = 0u; layer < kLayers; ++layer) {
+          const float expected = float(layer + 1u);
++         const uint64_t drawn = layer ? kLaterPoints : uint64_t(kExtent) * kExtent;
+          uint64_t wrong = 0u;
+          int64_t first_wrong = -1;
+-         for (uint64_t texel = 0u; texel < uint64_t(kExtent) * kExtent; ++texel) {
++         for (uint64_t texel = 0u; texel < drawn; ++texel) {
+             float value[4];
+             std::memcpy(value, bytes + layer * layer_bytes + texel * kTexelBytes,
+                         sizeof(value));
+@@ -421,7 +430,7 @@ int main()
+                          "layer %u: %llu of %llu texels were not drawn by their "
+                          "own layer's draw, first at %lld (got %f %f %f %f)\n",
+                          layer, static_cast<unsigned long long>(wrong),
+-                         static_cast<unsigned long long>(uint64_t(kExtent) * kExtent),
++                         static_cast<unsigned long long>(drawn),
+                          static_cast<long long>(first_wrong), double(value[0]),
+                          double(value[1]), double(value[2]), double(value[3]));
+             std::exit(1);
+diff --git a/src/kosmickrisp/vulkan/tests/test_query_pool_lifetime.c b/src/kosmickrisp/vulkan/tests/test_query_pool_lifetime.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9bcbd944cc487f8f5fa32a8567119ff796fffd5
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_query_pool_lifetime.c
+@@ -0,0 +1,224 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A command buffer may still be recording when the application destroys a
++ * timestamp query pool it wrote to: the buffer becomes invalid, and resetting,
++ * beginning or freeing it is what is left to do with it.  The recording's
++ * open encoders still carry the pool's pending resolves, and closing them
++ * names the pool's counter heap and availability buffer.  Those must still be
++ * alive then.  Meson runs this with NSZombieEnabled, so a message to a
++ * released Metal object aborts instead of reading freed memory silently. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++   CHECK(families);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++   uint32_t family = 0;
++   while (family < family_count &&
++          !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++      family++;
++   CHECK(family < family_count);
++   CHECK(families[family].timestampValidBits > 0);
++   free(families);
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = family,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .dynamicRendering = VK_TRUE,
++      .synchronization2 = VK_TRUE,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features13,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkCreateQueryPool);
++   LOAD_D(vkDestroyQueryPool);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkFreeCommandBuffers);
++   LOAD_D(vkResetCommandBuffer);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdWriteTimestamp2);
++   LOAD_D(vkCmdBeginRendering);
++   LOAD_D(vkCmdEndRendering);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++
++   /* A render pass, so a timestamp can also take the render-stage path. */
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {8, 8, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++   VkMemoryRequirements requirements;
++   vkGetImageMemoryRequirements(device, image, &requirements);
++   VkPhysicalDeviceMemoryProperties properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &properties);
++   uint32_t type = 0;
++   while (type < properties.memoryTypeCount &&
++          !(requirements.memoryTypeBits & (1u << type)))
++      type++;
++   CHECK(type < properties.memoryTypeCount);
++   VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = requirements.size,
++      .memoryTypeIndex = type,
++   };
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &memory_info, NULL, &memory) == VK_SUCCESS);
++   CHECK(vkBindImageMemory(device, image, memory, 0) == VK_SUCCESS);
++   VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = image_info.format,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   VkImageView view = VK_NULL_HANDLE;
++   CHECK(vkCreateImageView(device, &view_info, NULL, &view) == VK_SUCCESS);
++   VkRenderingAttachmentInfo attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++   };
++   VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = {{0, 0}, {8, 8}},
++      .layerCount = 1,
++      .colorAttachmentCount = 1,
++      .pColorAttachments = &attachment,
++   };
++
++   VkQueryPoolCreateInfo query_info = {
++      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++      .queryType = VK_QUERY_TYPE_TIMESTAMP,
++      .queryCount = 4,
++   };
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = family,
++   };
++   VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++   };
++
++   /* How the recording is thrown away after its query pool is gone: reset,
++    * begun again, freed, or freed with its command pool. */
++   for (unsigned way = 0; way < 4; way++) {
++      VkCommandPool pool = VK_NULL_HANDLE;
++      CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool) == VK_SUCCESS);
++      VkCommandBufferAllocateInfo allocate = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++         .commandPool = pool,
++         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++         .commandBufferCount = 1,
++      };
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      CHECK(vkAllocateCommandBuffers(device, &allocate, &command) ==
++            VK_SUCCESS);
++      VkQueryPool queries = VK_NULL_HANDLE;
++      CHECK(vkCreateQueryPool(device, &query_info, NULL, &queries) ==
++            VK_SUCCESS);
++
++      CHECK(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS);
++      /* Outside a render pass: a compute-lane sample. */
++      vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
++                           queries, 0);
++      /* Inside one: a render-stage sample and a bottom-of-pipe one. */
++      vkCmdBeginRendering(command, &rendering);
++      vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
++                           queries, 1);
++      vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
++                           queries, 2);
++      /* Left open: the recording is abandoned inside its render pass. */
++
++      vkDestroyQueryPool(device, queries, NULL);
++
++      switch (way) {
++      case 0:
++         CHECK(vkResetCommandBuffer(command, 0) == VK_SUCCESS);
++         break;
++      case 1:
++         CHECK(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS);
++         CHECK(vkEndCommandBuffer(command) == VK_SUCCESS);
++         break;
++      case 2:
++         vkFreeCommandBuffers(device, pool, 1, &command);
++         break;
++      default:
++         break;
++      }
++      vkDestroyCommandPool(device, pool, NULL);
++   }
++
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("recordings outlive the timestamp query pools they wrote to\n");
++   return 0;
++}

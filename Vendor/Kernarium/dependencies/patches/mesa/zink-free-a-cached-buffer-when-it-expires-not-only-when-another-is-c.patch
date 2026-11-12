@@ -1,0 +1,824 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 04:50:38 +0900
+Subject: [PATCH] zink: free a cached buffer when it expires, not only when
+ another is cached
+
+pb_cache frees an expired buffer in two places only: pb_cache_add_buffer()
+frees the expired buffers of every bucket, and pb_cache_reclaim_buffer()
+those of its own bucket.  A client that frees buffers and then stops
+allocating therefore leaves every one of them cached for as long as it stays
+idle, although Zink asks for them to expire after 500 ms.  On a KosmicKrisp
+host an idle Android guest was measured holding 25 to 30 MiB of Zink
+dedicated heaps this way, and about 75 MiB for the seconds after its apps
+closed; the same run with the cache limit set to zero held none of it.
+
+pb_cache gains the two entry points an idle cache lacks.
+pb_cache_release_expired() frees what has expired in every bucket, and
+pb_cache_next_expiry_ms() reports the time until the earliest expiry (0 when
+a buffer already has, -1 when the cache holds none).  A bucket keeps its
+buffers in the order they were added, which is the order they expire in, so
+the first buffer of each bucket is enough.  Both take the cache's mutex like
+the paths that exist.  pb_cache_add_buffer() also asserts that the cache
+holds no more than its limit after an addition.
+
+pb_cache_reaper is the thread that uses them: it sleeps until the earliest
+expiry and frees what has expired, and with an empty cache it sleeps with no
+deadline until pb_cache_reaper_wake() reports an addition.  The wake is a
+load of one flag unless the thread sleeps without a deadline, because a
+buffer added while it waits for a deadline expires after the buffer that set
+it.  The thread sets the flag under its lock, looks at the cache once more
+and then waits, while an addition is in the cache before it reads the flag,
+so one of the two always sees the other; the cache's mutex orders them.  A
+non-empty cache costs one wake-up per expiry, up to two a second at Zink's
+500 ms, and an empty one nothing.  Another driver that calls neither entry
+point is unaffected.
+
+Zink starts one reaper per screen in zink_bo_init() and signals it from
+bo_destroy_or_cache() once a buffer is in the cache.  zink_bo_deinit()
+stops it after the slabs are released, since releasing a slab's buffer adds
+it to the cache, and before the cache is destroyed.  A screen whose reaper
+could not start behaves as it did.
+
+src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c checks the expiry
+arithmetic across buckets, that the reaper frees a buffer within a second of
+its last addition with nothing added or reclaimed, that a reaper asleep with
+an empty cache wakes for every new buffer, that a reclaimed buffer is never
+freed behind its owner, that stopping a reaper does not wait for a distant
+expiry, and that four threads adding and reclaiming against a reaper and a
+small cache destroy every buffer exactly once and never hold more than the
+limit.  It is built into the gallium suite with -Dbuild-tests=true and
+-Db_ndebug=false, and runs under -Db_sanitize=thread.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/meson.build             |  17 +
+ src/gallium/auxiliary/pipebuffer/pb_cache.c   |  68 ++++
+ src/gallium/auxiliary/pipebuffer/pb_cache.h   |   2 +
+ .../auxiliary/pipebuffer/pb_cache_reaper.c    | 139 +++++++
+ .../auxiliary/pipebuffer/pb_cache_reaper.h    |  58 +++
+ .../pipebuffer/pb_cache_reaper_test.c         | 345 ++++++++++++++++++
+ src/gallium/drivers/zink/zink_bo.c            |  15 +-
+ src/gallium/drivers/zink/zink_types.h         |   2 +
+ 8 files changed, 644 insertions(+), 2 deletions(-)
+ create mode 100644 src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c
+ create mode 100644 src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h
+ create mode 100644 src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c
+
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index d6730a9715aa550350cce6213287cbc18ea95915..56f8b4bbb2a703fb186d8329c18910f3f66a207e 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -14,6 +14,8 @@ files_libgallium = files(
+   'pipebuffer/pb_bufmgr_slab.c',
+   'pipebuffer/pb_cache.c',
+   'pipebuffer/pb_cache.h',
++  'pipebuffer/pb_cache_reaper.c',
++  'pipebuffer/pb_cache_reaper.h',
+   'pipebuffer/pb_validate.c',
+   'pipebuffer/pb_validate.h',
+   'util/u_async_debug.h',
+@@ -524,6 +526,21 @@ libgallium = static_library(
+ )
+ 
+ if with_tests
++  test('gallium-pb-cache',
++    executable(
++      'gallium-pb-cache',
++      [
++        'pipebuffer/pb_cache.c',
++        'pipebuffer/pb_cache_reaper.c',
++        'pipebuffer/pb_cache_reaper_test.c',
++      ],
++      include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
++      dependencies : [idep_mesautil, dep_thread],
++    ),
++    suite : 'gallium',
++    timeout : 120,
++  )
++
+   test('gallium-aux',
+     executable(
+       'gallium-aux',
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache.c b/src/gallium/auxiliary/pipebuffer/pb_cache.c
+index 7fcb13b709916b87ce1e257b80db52544f990951..4345ae4ad547313fee550ca687f63d321442e2cc 100644
+--- a/src/gallium/auxiliary/pipebuffer/pb_cache.c
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache.c
+@@ -133,6 +133,7 @@ pb_cache_add_buffer(struct pb_cache *mgr, struct pb_cache_entry *entry)
+    list_addtail(&entry->head, cache);
+    ++mgr->num_buffers;
+    mgr->cache_size += buf->size;
++   assert(mgr->cache_size <= mgr->max_cache_size);
+    simple_mtx_unlock(&mgr->mutex);
+ }
+ 
+@@ -273,6 +274,73 @@ pb_cache_release_all_buffers(struct pb_cache *mgr)
+    return num_reclaims;
+ }
+ 
++/**
++ * Free every cached buffer whose time has run out, in every bucket.
++ *
++ * pb_cache_add_buffer() and pb_cache_reclaim_buffer() are the only other
++ * places that free expired buffers, so a cache that nothing adds to or
++ * reclaims from keeps them for good. A caller that wants them gone once they
++ * expire calls this when pb_cache_next_expiry_ms() says one has.
++ *
++ * \return the number of buffers destroyed
++ */
++unsigned
++pb_cache_release_expired(struct pb_cache *mgr)
++{
++   unsigned released;
++
++   simple_mtx_lock(&mgr->mutex);
++   const unsigned before = mgr->num_buffers;
++   const unsigned current_time_ms = time_get_ms(mgr);
++
++   for (unsigned i = 0; i < mgr->num_heaps; i++)
++      release_expired_buffers_locked(mgr, &mgr->buckets[i], current_time_ms);
++
++   released = before - mgr->num_buffers;
++   simple_mtx_unlock(&mgr->mutex);
++   return released;
++}
++
++/**
++ * The time until the first cached buffer expires.
++ *
++ * A bucket holds its buffers in the order they were added, which is the order
++ * they expire in, so its first buffer is its earliest.
++ *
++ * \return the milliseconds left before the earliest expiry, 0 when a buffer
++ *         has already expired (the next pb_cache_release_expired() frees it),
++ *         and -1 when the cache holds no buffer
++ */
++int64_t
++pb_cache_next_expiry_ms(struct pb_cache *mgr)
++{
++   int64_t next = -1;
++
++   simple_mtx_lock(&mgr->mutex);
++   const unsigned current_time_ms = time_get_ms(mgr);
++
++   for (unsigned i = 0; i < mgr->num_heaps; i++) {
++      struct list_head *cache = &mgr->buckets[i];
++
++      if (list_is_empty(cache))
++         continue;
++
++      struct pb_cache_entry *entry =
++         list_first_entry(cache, struct pb_cache_entry, head);
++      /* Unsigned, like time_timeout_ms(): a counter that wrapped reads as
++       * the time that passed since the buffer was added. */
++      const unsigned elapsed_ms = current_time_ms - entry->start_ms;
++      const int64_t left_ms =
++         elapsed_ms >= mgr->msecs ? 0 : mgr->msecs - elapsed_ms;
++
++      if (next < 0 || left_ms < next)
++         next = left_ms;
++   }
++
++   simple_mtx_unlock(&mgr->mutex);
++   return next;
++}
++
+ void
+ pb_cache_init_entry(struct pb_cache *mgr, struct pb_cache_entry *entry,
+                     struct pb_buffer_lean *buf, unsigned bucket_index)
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache.h b/src/gallium/auxiliary/pipebuffer/pb_cache.h
+index 2fa50e1a20f535d162cdf0b5cedb8c5b7971b24e..32d3fb780af7cfa468c22df8983d6ee109a4c79a 100644
+--- a/src/gallium/auxiliary/pipebuffer/pb_cache.h
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache.h
+@@ -72,6 +72,8 @@ struct pb_buffer_lean *pb_cache_reclaim_buffer(struct pb_cache *mgr, pb_size siz
+                                           unsigned alignment, unsigned usage,
+                                           unsigned bucket_index);
+ unsigned pb_cache_release_all_buffers(struct pb_cache *mgr);
++unsigned pb_cache_release_expired(struct pb_cache *mgr);
++int64_t pb_cache_next_expiry_ms(struct pb_cache *mgr);
+ void pb_cache_init_entry(struct pb_cache *mgr, struct pb_cache_entry *entry,
+                          struct pb_buffer_lean *buf, unsigned bucket_index);
+ void pb_cache_init(struct pb_cache *mgr, unsigned num_heaps,
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ec9753fb7848c3fd0fd3a01c829bee42c83002a
+--- /dev/null
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c
+@@ -0,0 +1,139 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "pb_cache_reaper.h"
++
++#include "c11/time.h"
++#include "util/cnd_monotonic.h"
++#include "util/u_atomic.h"
++#include "util/u_memory.h"
++#include "util/u_thread.h"
++
++#include <stdio.h>
++
++struct pb_cache_reaper {
++   struct pb_cache *cache;
++   thrd_t thread;
++
++   /* Guards stop and orders a wake-up after the thread's decision to sleep. */
++   mtx_t lock;
++   struct u_cnd_monotonic wake;
++   bool stop;
++
++   /* Whether the thread is waiting with no deadline because the cache was
++    * empty.  Set under lock before the thread looks at the cache once more
++    * and waits; read by pb_cache_reaper_wake() after the addition it reports,
++    * which the cache's own mutex orders against that second look.  An
++    * addition that comes first is seen by the second look, and one that comes
++    * later finds the flag set. */
++   int sleeping;
++
++   char name[32];
++};
++
++static void
++deadline_after_ms(struct timespec *deadline, int64_t ms)
++{
++   timespec_get(deadline, TIME_MONOTONIC);
++   deadline->tv_sec += ms / 1000;
++   deadline->tv_nsec += (ms % 1000) * 1000000;
++   if (deadline->tv_nsec >= 1000000000) {
++      deadline->tv_nsec -= 1000000000;
++      deadline->tv_sec++;
++   }
++}
++
++static int
++reaper_thread(void *data)
++{
++   struct pb_cache_reaper *reaper = data;
++
++   u_thread_setname(reaper->name);
++
++   mtx_lock(&reaper->lock);
++   while (!reaper->stop) {
++      const int64_t left_ms = pb_cache_next_expiry_ms(reaper->cache);
++
++      if (left_ms == 0) {
++         /* Freeing a buffer hands device memory back, which can take a
++          * while; nobody who wants the lock should wait for it. */
++         mtx_unlock(&reaper->lock);
++         pb_cache_release_expired(reaper->cache);
++         mtx_lock(&reaper->lock);
++      } else if (left_ms > 0) {
++         /* A buffer added meanwhile expires after this one, so only the
++          * deadline, or the end of the reaper, needs to wake us. */
++         struct timespec deadline;
++         deadline_after_ms(&deadline, left_ms);
++         u_cnd_monotonic_timedwait(&reaper->wake, &reaper->lock, &deadline);
++      } else {
++         p_atomic_set(&reaper->sleeping, 1);
++         /* An addition that did not see the flag is in the cache by now. */
++         if (pb_cache_next_expiry_ms(reaper->cache) < 0 && !reaper->stop)
++            u_cnd_monotonic_wait(&reaper->wake, &reaper->lock);
++         p_atomic_set(&reaper->sleeping, 0);
++      }
++   }
++   mtx_unlock(&reaper->lock);
++
++   return 0;
++}
++
++struct pb_cache_reaper *
++pb_cache_reaper_create(struct pb_cache *cache, const char *name)
++{
++   struct pb_cache_reaper *reaper = CALLOC_STRUCT(pb_cache_reaper);
++   if (!reaper)
++      return NULL;
++
++   reaper->cache = cache;
++   snprintf(reaper->name, sizeof(reaper->name), "%s", name ? name : "pb-cache");
++   if (mtx_init(&reaper->lock, mtx_plain) != thrd_success)
++      goto fail_alloc;
++   if (u_cnd_monotonic_init(&reaper->wake) != thrd_success)
++      goto fail_mutex;
++   if (u_thread_create(&reaper->thread, reaper_thread, reaper) != thrd_success)
++      goto fail_cond;
++
++   return reaper;
++
++fail_cond:
++   u_cnd_monotonic_destroy(&reaper->wake);
++fail_mutex:
++   mtx_destroy(&reaper->lock);
++fail_alloc:
++   FREE(reaper);
++   return NULL;
++}
++
++void
++pb_cache_reaper_wake(struct pb_cache_reaper *reaper)
++{
++   if (!reaper || !p_atomic_read(&reaper->sleeping))
++      return;
++
++   /* The thread holds the lock from setting the flag until it waits, so this
++    * signal cannot fall between the two. */
++   mtx_lock(&reaper->lock);
++   u_cnd_monotonic_signal(&reaper->wake);
++   mtx_unlock(&reaper->lock);
++}
++
++void
++pb_cache_reaper_destroy(struct pb_cache_reaper *reaper)
++{
++   if (!reaper)
++      return;
++
++   mtx_lock(&reaper->lock);
++   reaper->stop = true;
++   u_cnd_monotonic_signal(&reaper->wake);
++   mtx_unlock(&reaper->lock);
++
++   thrd_join(reaper->thread, NULL);
++
++   u_cnd_monotonic_destroy(&reaper->wake);
++   mtx_destroy(&reaper->lock);
++   FREE(reaper);
++}
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c48a44935698b7e3913e7785bb61fc74aaf7812
+--- /dev/null
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h
+@@ -0,0 +1,58 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef PB_CACHE_REAPER_H
++#define PB_CACHE_REAPER_H
++
++#include "pb_cache.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * A thread that frees a pb_cache's buffers once they expire.
++ *
++ * A pb_cache frees an expired buffer only when another buffer is added to it
++ * or reclaimed from it, so a client that stops allocating leaves every buffer
++ * it freed cached, however long ago, and the cache holds that memory for as
++ * long as the client stays idle.  The reaper waits for the earliest expiry
++ * and frees what has expired.  A cache that nothing has added to costs it
++ * nothing but the thread: it sleeps without a deadline until
++ * pb_cache_reaper_wake() reports an addition, and while the cache is
++ * non-empty it wakes once per expiry, at most every `usecs` microseconds the
++ * cache was created with.
++ */
++struct pb_cache_reaper;
++
++/**
++ * Starts a reaper for \p cache, whose thread is named \p name.  The cache
++ * must outlive the reaper.  Returns NULL when the thread cannot be created,
++ * and the cache then behaves as it does without one.
++ */
++struct pb_cache_reaper *
++pb_cache_reaper_create(struct pb_cache *cache, const char *name);
++
++/**
++ * Tells the reaper that a buffer was added to its cache, after
++ * pb_cache_add_buffer() returned.  Cheap unless the reaper is asleep with
++ * nothing to wait for.  Accepts NULL, so a caller whose reaper could not be
++ * created needs no test.
++ */
++void
++pb_cache_reaper_wake(struct pb_cache_reaper *reaper);
++
++/**
++ * Stops the reaper and waits for its thread.  A caller destroys it before
++ * pb_cache_deinit(), and after the last thread that can add a buffer has
++ * finished adding.  Accepts NULL.
++ */
++void
++pb_cache_reaper_destroy(struct pb_cache_reaper *reaper);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6a3eebe72c5dec96e74f34af99cc7010d3e8368
+--- /dev/null
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c
+@@ -0,0 +1,345 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* pb_cache_release_expired(), pb_cache_next_expiry_ms() and the reaper that
++ * frees a cache's expired buffers while nothing is added.  The buffers are
++ * heap blocks the cache destroys with free(); every check aborts, so the
++ * test fails in a build without assertions as well.  Built with
++ * -Db_sanitize=thread it covers the reaper's thread against the paths that
++ * add, reclaim and release buffers. */
++
++#include "c11/threads.h"
++#include "pipebuffer/pb_cache.h"
++#include "pipebuffer/pb_cache_reaper.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition)                                                       \
++   do {                                                                        \
++      if (!(condition)) {                                                      \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,      \
++                 #condition);                                                  \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++
++#define BUCKETS      3
++#define BUFFER_SIZE  (64u * 1024u)
++#define WAIT_LIMIT_MS 5000
++
++struct test_bo {
++   struct pb_buffer_lean base;
++   struct pb_cache_entry entry;
++};
++
++struct world {
++   struct pb_cache cache;
++   struct pb_cache_reaper *reaper;
++   int created;
++   int destroyed;
++};
++
++static void
++destroy_bo(void *winsys, struct pb_buffer_lean *buf)
++{
++   struct world *world = winsys;
++
++   /* The cache calls this with its mutex held, after taking the buffer out of
++    * its accounting: what it still holds never exceeds what it may. */
++   CHECK(world->cache.cache_size <= world->cache.max_cache_size);
++   p_atomic_inc(&world->destroyed);
++   free(buf);
++}
++
++static bool
++can_reclaim_bo(void *winsys, struct pb_buffer_lean *buf)
++{
++   (void)winsys;
++   (void)buf;
++   return true;
++}
++
++static void
++world_init(struct world *world, unsigned usecs, uint64_t max_cache_size)
++{
++   *world = (struct world){0};
++   pb_cache_init(&world->cache, BUCKETS, usecs, 1.5f, 0, max_cache_size,
++                 offsetof(struct test_bo, entry), world, destroy_bo,
++                 can_reclaim_bo);
++   CHECK(world->cache.buckets);
++}
++
++static struct test_bo *
++new_bo(struct world *world, unsigned bucket)
++{
++   struct test_bo *bo = calloc(1, sizeof(*bo));
++   CHECK(bo);
++   bo->base.size = BUFFER_SIZE;
++   bo->base.alignment_log2 = 12;
++   pipe_reference_init(&bo->base.reference, 1);
++   pb_cache_init_entry(&world->cache, &bo->entry, &bo->base, bucket);
++   p_atomic_inc(&world->created);
++   return bo;
++}
++
++/* What bo_destroy_or_cache() does when the last reference goes. */
++static void
++release_bo(struct world *world, struct test_bo *bo)
++{
++   pipe_reference_init(&bo->base.reference, 0);
++   pb_cache_add_buffer(&world->cache, &bo->entry);
++   pb_cache_reaper_wake(world->reaper);
++}
++
++static int64_t
++now_ms(void)
++{
++   return os_time_get_nano() / 1000000;
++}
++
++static void
++sleep_ms(unsigned ms)
++{
++   os_time_sleep((int64_t)ms * 1000);
++}
++
++/* Waits until the world has destroyed `count` buffers, and returns when. */
++static int64_t
++wait_destroyed(struct world *world, int count)
++{
++   const int64_t start = now_ms();
++   while (p_atomic_read(&world->destroyed) < count) {
++      CHECK(now_ms() - start < WAIT_LIMIT_MS);
++      sleep_ms(2);
++   }
++   return now_ms();
++}
++
++static void
++wait_empty(struct world *world)
++{
++   const int64_t start = now_ms();
++   while (pb_cache_next_expiry_ms(&world->cache) >= 0) {
++      CHECK(now_ms() - start < WAIT_LIMIT_MS);
++      sleep_ms(2);
++   }
++}
++
++/* Without a reaper nothing frees an expired buffer; the two entry points do. */
++static void
++test_expiry_entry_points(void)
++{
++   struct world world;
++   world_init(&world, 50000, UINT64_MAX);
++
++   CHECK(pb_cache_next_expiry_ms(&world.cache) == -1);
++   CHECK(pb_cache_release_expired(&world.cache) == 0);
++
++   release_bo(&world, new_bo(&world, 0));
++   int64_t left = pb_cache_next_expiry_ms(&world.cache);
++   CHECK(left >= 0 && left <= 50);
++
++   /* Past its expiry the buffer is still cached: this is the gap. */
++   sleep_ms(80);
++   CHECK(p_atomic_read(&world.destroyed) == 0);
++   CHECK(pb_cache_next_expiry_ms(&world.cache) == 0);
++   CHECK(pb_cache_release_expired(&world.cache) == 1);
++   CHECK(p_atomic_read(&world.destroyed) == 1);
++   CHECK(pb_cache_next_expiry_ms(&world.cache) == -1);
++
++   /* The earliest buffer of any bucket decides, not the first bucket's. */
++   release_bo(&world, new_bo(&world, 0));
++   sleep_ms(30);
++   release_bo(&world, new_bo(&world, 2));
++   left = pb_cache_next_expiry_ms(&world.cache);
++   CHECK(left >= 0 && left <= 40);
++
++   /* The first has expired by now and the second has not; a stall can only
++    * expire the second as well. */
++   sleep_ms(30);
++   CHECK(pb_cache_release_expired(&world.cache) >= 1);
++   CHECK(p_atomic_read(&world.destroyed) >= 2);
++   sleep_ms(60);
++   (void)pb_cache_release_expired(&world.cache);
++   CHECK(p_atomic_read(&world.destroyed) == p_atomic_read(&world.created));
++   CHECK(pb_cache_next_expiry_ms(&world.cache) == -1);
++
++   pb_cache_deinit(&world.cache);
++}
++
++/* The reaper frees every buffer soon after it expires, with no later addition
++ * and no reclaim, and sleeps again once the cache is empty. */
++static void
++test_reaper_frees_expired(void)
++{
++   struct world world;
++   world_init(&world, 20000, UINT64_MAX);
++   world.reaper = pb_cache_reaper_create(&world.cache, "pb-cache-test");
++   CHECK(world.reaper);
++
++   release_bo(&world, new_bo(&world, 0));
++   release_bo(&world, new_bo(&world, 1));
++   release_bo(&world, new_bo(&world, 2));
++   release_bo(&world, new_bo(&world, 1));
++   const int64_t last_add = now_ms();
++   const int64_t done = wait_destroyed(&world, 4);
++   /* 20 ms to expire, well under the second the memory budget names. */
++   CHECK(done - last_add < 1000);
++   wait_empty(&world);
++
++   /* A reaper asleep with nothing to wait for wakes for every new buffer. */
++   for (int i = 0; i < 40; i++) {
++      sleep_ms(i % 3 == 0 ? 30 : 1);
++      release_bo(&world, new_bo(&world, i % BUCKETS));
++      wait_destroyed(&world, 5 + i);
++   }
++   wait_empty(&world);
++
++   pb_cache_reaper_destroy(world.reaper);
++   CHECK(p_atomic_read(&world.destroyed) == p_atomic_read(&world.created));
++   pb_cache_deinit(&world.cache);
++}
++
++/* A buffer that is reclaimed before it expires is never freed behind the
++ * client's back. */
++static void
++test_reaper_leaves_reclaimed(void)
++{
++   struct world world;
++   world_init(&world, 300000, UINT64_MAX);
++   world.reaper = pb_cache_reaper_create(&world.cache, "pb-cache-test");
++   CHECK(world.reaper);
++
++   struct test_bo *bo = new_bo(&world, 1);
++   release_bo(&world, bo);
++   struct pb_buffer_lean *again = pb_cache_reclaim_buffer(
++      &world.cache, BUFFER_SIZE, 1, 0, 1);
++   CHECK(again == &bo->base);
++   CHECK(pipe_is_referenced(&bo->base.reference));
++   sleep_ms(500);
++   CHECK(p_atomic_read(&world.destroyed) == 0);
++   CHECK(pb_cache_next_expiry_ms(&world.cache) == -1);
++
++   release_bo(&world, bo);
++   wait_destroyed(&world, 1);
++
++   pb_cache_reaper_destroy(world.reaper);
++   pb_cache_deinit(&world.cache);
++}
++
++/* Ending a reaper that waits for a distant expiry does not wait for it. */
++static void
++test_reaper_destroy_is_prompt(void)
++{
++   struct world world;
++   world_init(&world, 60u * 1000000u, UINT64_MAX);
++   world.reaper = pb_cache_reaper_create(&world.cache, "pb-cache-test");
++   CHECK(world.reaper);
++   for (int i = 0; i < 3; i++)
++      release_bo(&world, new_bo(&world, i));
++
++   const int64_t start = now_ms();
++   pb_cache_reaper_destroy(world.reaper);
++   CHECK(now_ms() - start < 1000);
++   CHECK(p_atomic_read(&world.destroyed) == 0);
++   CHECK(pb_cache_release_all_buffers(&world.cache) == 3);
++   CHECK(p_atomic_read(&world.destroyed) == 3);
++   pb_cache_deinit(&world.cache);
++
++   /* Starting and ending reapers, with the first addition racing the thread's
++    * first look at the cache. */
++   for (int i = 0; i < 100; i++) {
++      world_init(&world, 1000, UINT64_MAX);
++      world.reaper = pb_cache_reaper_create(&world.cache, "pb-cache-test");
++      CHECK(world.reaper);
++      if (i % 2)
++         release_bo(&world, new_bo(&world, i % BUCKETS));
++      pb_cache_reaper_destroy(world.reaper);
++      world.reaper = NULL;
++      pb_cache_deinit(&world.cache);
++      CHECK(p_atomic_read(&world.destroyed) == p_atomic_read(&world.created));
++   }
++}
++
++/* Threads that add and reclaim as fast as they can, against the reaper and a
++ * cache that holds only a few buffers.  Every buffer is destroyed exactly
++ * once, and the cache never holds more than its limit. */
++#define WORKERS     4
++#define ITERATIONS  3000
++#define CACHE_LIMIT (8u * BUFFER_SIZE)
++
++struct worker {
++   struct world *world;
++   unsigned seed;
++};
++
++static int
++worker_main(void *data)
++{
++   struct worker *worker = data;
++   struct world *world = worker->world;
++   struct test_bo *held[4] = {0};
++
++   for (int i = 0; i < ITERATIONS; i++) {
++      worker->seed = worker->seed * 1664525u + 1013904223u;
++      const unsigned pick = (worker->seed >> 16) % 4;
++      const unsigned bucket = (worker->seed >> 8) % BUCKETS;
++
++      if (held[pick]) {
++         release_bo(world, held[pick]);
++         held[pick] = NULL;
++      } else {
++         struct pb_buffer_lean *buf = pb_cache_reclaim_buffer(
++            &world->cache, BUFFER_SIZE, 1, 0, bucket);
++         held[pick] = buf ? (struct test_bo *)buf : new_bo(world, bucket);
++      }
++      /* Now and then outlast the 1 ms expiry, so the reaper has work. */
++      if ((worker->seed & 0xff) == 0)
++         sleep_ms(2);
++   }
++   for (int i = 0; i < 4; i++)
++      if (held[i])
++         release_bo(world, held[i]);
++   return 0;
++}
++
++static void
++test_concurrent_add_reclaim_reap(void)
++{
++   struct world world;
++   world_init(&world, 1000, CACHE_LIMIT);
++   world.reaper = pb_cache_reaper_create(&world.cache, "pb-cache-test");
++   CHECK(world.reaper);
++
++   thrd_t threads[WORKERS];
++   struct worker workers[WORKERS];
++   for (int i = 0; i < WORKERS; i++) {
++      workers[i] = (struct worker){&world, 12345u + 7919u * i};
++      CHECK(thrd_create(&threads[i], worker_main, &workers[i]) ==
++            thrd_success);
++   }
++   for (int i = 0; i < WORKERS; i++)
++      CHECK(thrd_join(threads[i], NULL) == thrd_success);
++
++   wait_empty(&world);
++   pb_cache_reaper_destroy(world.reaper);
++   CHECK(p_atomic_read(&world.destroyed) == p_atomic_read(&world.created));
++   pb_cache_deinit(&world.cache);
++}
++
++int
++main(void)
++{
++   test_expiry_entry_points();
++   test_reaper_frees_expired();
++   test_reaper_leaves_reclaimed();
++   test_reaper_destroy_is_prompt();
++   test_concurrent_add_reclaim_reap();
++   printf("the reaper frees every expired buffer and no other\n");
++   return 0;
++}
+diff --git a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
+index a2bbc8e27ed0400f3b78a9ccef0e2a47e671e0e8..77dda0f4f862f8252cb2b7a5f557af34e6fb5875 100644
+--- a/src/gallium/drivers/zink/zink_bo.c
++++ b/src/gallium/drivers/zink/zink_bo.c
+@@ -214,10 +214,14 @@ bo_destroy_or_cache(struct zink_screen *screen, struct zink_bo *bo)
+    bo->reads.u = NULL;
+    bo->writes.u = NULL;
+ 
+-   if (bo->u.real.use_reusable_pool)
++   if (bo->u.real.use_reusable_pool) {
+       pb_cache_add_buffer(&screen->pb.bo_cache, bo->cache_entry);
+-   else
++      /* The cache frees what has expired only when something is added to it
++       * or reclaimed from it; the reaper frees it while nothing is. */
++      pb_cache_reaper_wake(screen->pb.bo_reaper);
++   } else {
+       bo_destroy(screen, bo);
++   }
+ }
+ 
+ static struct zink_bo *
+@@ -1371,6 +1375,9 @@ zink_bo_init(struct zink_screen *screen)
+                  500000, 1.5f, 0,
+                  total_mem / 8, offsetof(struct zink_bo, cache_entry), screen,
+                  (void*)bo_destroy, (void*)bo_can_reclaim);
++   /* Not having a reaper only costs memory a client that stopped allocating
++    * leaves cached. */
++   screen->pb.bo_reaper = pb_cache_reaper_create(&screen->pb.bo_cache, "zink-bo-cache");
+ 
+    if (!pb_slabs_init(&screen->pb.bo_slabs,
+                         MIN_SLAB_ORDER, 20,
+@@ -1387,7 +1394,11 @@ zink_bo_init(struct zink_screen *screen)
+ void
+ zink_bo_deinit(struct zink_screen *screen)
+ {
++   /* Freeing the slabs' buffers adds them to the cache, so the reaper stops
++    * after the slabs and before the cache. */
+    if (screen->pb.bo_slabs.groups)
+       pb_slabs_deinit(&screen->pb.bo_slabs);
++   pb_cache_reaper_destroy(screen->pb.bo_reaper);
++   screen->pb.bo_reaper = NULL;
+    pb_cache_deinit(&screen->pb.bo_cache);
+ }
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index 3bf10e877ee28a6150e0f4e9bd010de636d39948..c75722ef54053b8fcada835fe104be97f20d4562 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -37,6 +37,7 @@
+ #include "pipe/p_state.h"
+ 
+ #include "pipebuffer/pb_cache.h"
++#include "pipebuffer/pb_cache_reaper.h"
+ #include "util/pb_slab.h"
+ 
+ #include "util/blob.h"
+@@ -1459,6 +1460,7 @@ struct zink_screen {
+ 
+    struct {
+       struct pb_cache bo_cache;
++      struct pb_cache_reaper *bo_reaper;
+       struct pb_slabs bo_slabs;
+       uint32_t next_bo_unique_id;
+    } pb;

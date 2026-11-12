@@ -1,0 +1,789 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 07:42:42 +0900
+Subject: [PATCH] x87: FSIN, FCOS, FPTAN, F2XM1, FYL2X and FYL2XP1 follow an
+ Intel core
+
+The soft-float transcendental instructions called the cephes 128-bit
+functions on the operand and rounded the result to 80 bits. An Intel
+core (a Xeon Platinum 8581C decided every row) differs in these ways,
+which the new cephes/X87Math.cpp reproduces for both the FEXCore
+interpreter fallbacks and the gadget engine that links the library:
+
+- FSIN, FCOS and FPTAN reduce a finite operand below 2^63 by pi/2 to 66
+  bits, not by the full constant: the remainder is exact, and the
+  quadrant picks the function (the tangent is -1/tan(r) in an odd
+  quadrant). A magnitude below 2^-68 is returned as it is (sine and
+  tangent) or as one (cosine). A sine, cosine or tangent that rounds to
+  its argument or to one is stepped one place toward zero first, so the
+  80-bit rounding sees an inexact result in the direction x86 reports
+  (FPTAN of a remainder between 2^-68 and 2^-34 that is not a power of
+  two falls short of it too).
+- F2XM1 outside [-1, 1] returns the operand with PE, as x86 does not
+  compute there; a tiny operand keeps its full precision through a
+  series; zero and the infinities return their x86 values.
+- FYL2X and the new FYL2XP1 handle zero, infinities, negative operands
+  and NaNs as x86 does (a NaN takes precedence over a denormal), keep
+  the precision of log2(1 + x) for a tiny x, and short the logarithm of
+  a power of two below one by one place.
+- PE is set for every computed result, exact or not.
+- A pseudo-denormal operand converts as its significand with exponent 1.
+
+The microcode's own rounding noise (about 9% of F2XM1, FYL2X and
+FYL2XP1 results one place off, about 4% of FPTAN, under 2% of FSIN and
+FCOS, and about 1% of results differing only in C1) is not a function of
+the operand that can be reproduced and remains.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ External/cephes/CMakeLists.txt                |   5 +-
+ External/cephes/include/cephes_128bit.h       |  25 +
+ External/cephes/src/128bit/X87Math.cpp        | 464 ++++++++++++++++++
+ FEXCore/Source/Common/SoftFloat.h             | 111 ++---
+ .../Core/Interpreter/Fallbacks/F80Fallbacks.h |  21 +-
+ 5 files changed, 541 insertions(+), 85 deletions(-)
+ create mode 100644 External/cephes/src/128bit/X87Math.cpp
+
+diff --git a/External/cephes/CMakeLists.txt b/External/cephes/CMakeLists.txt
+index 796bb177f97c92c2a0fba7d8ba7d179ad24ad72f..737435016af88ef2de6f7a14a95124d8f1900dad 100644
+--- a/External/cephes/CMakeLists.txt
++++ b/External/cephes/CMakeLists.txt
+@@ -8,9 +8,12 @@ add_library(cephes_128bit STATIC
+   src/128bit/mtherr.c
+   src/128bit/polevll.c
+   src/128bit/sinll.c
+-  src/128bit/tanll.c)
++  src/128bit/tanll.c
++  src/128bit/X87Math.cpp)
+ 
+ # 128-bit library
+ target_link_libraries(cephes_128bit softfloat_3e)
+ target_include_directories(cephes_128bit PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+ target_compile_options(cephes_128bit PRIVATE -fno-builtin)
++# X87Math.cpp uses C++20 (std::bit_cast and <bit>).
++target_compile_features(cephes_128bit PRIVATE cxx_std_20)
+diff --git a/External/cephes/include/cephes_128bit.h b/External/cephes/include/cephes_128bit.h
+index 2e654210d0311ecfeda3b9b5fc5ce5f09e1f4132..3b9823ef633fb499eb40836e5a64f95b9e7afab5 100644
+--- a/External/cephes/include/cephes_128bit.h
++++ b/External/cephes/include/cephes_128bit.h
+@@ -12,4 +12,29 @@ namespace FEXCore::cephes_128bit {
+   float128_t log2l(float128_t x);
+   float128_t sinl(float128_t x);
+   float128_t tanl(float128_t x);
++
++  // The functions of Intel's x87 FSIN, FCOS, FPTAN and FSINCOS for a finite
++  // operand of magnitude below 2^63: the reduction takes pi/2 to 66 bits.
++  float128_t x87_sinl(float128_t x);
++  float128_t x87_cosl(float128_t x);
++  float128_t x87_tanl(float128_t x);
++  void x87_sincosl(float128_t x, float128_t* sine, float128_t* cosine);
++
++  // 2^x - 1, y * log2(x) and y * log2(1 + x) for a finite nonzero x, as x86
++  // computes them: x87_f2xm1l and x87_fyl2xp1l keep their full precision for a
++  // tiny x.
++  float128_t x87_f2xm1l(float128_t x);
++  float128_t x87_fyl2xl(float128_t x, float128_t y);
++  float128_t x87_fyl2xp1l(float128_t x, float128_t y);
++
++  // The transcendental x87 instructions on extended-precision operands, as
++  // Intel's hardware computes them, for a finite operand of magnitude below
++  // 2^63 in the trigonometric ones. They raise their exceptions in the
++  // state, which must round to 80 bits; the denormal-operand exception is
++  // the caller's.
++  extFloat80_t x87_fsin(softfloat_state* state, extFloat80_t x);
++  extFloat80_t x87_fcos(softfloat_state* state, extFloat80_t x);
++  extFloat80_t x87_ftan(softfloat_state* state, extFloat80_t x);
++  extFloat80_t x87_f2xm1(softfloat_state* state, extFloat80_t x);
++  extFloat80_t x87_fyl2x(softfloat_state* state, extFloat80_t x, extFloat80_t y, bool plus_one);
+ }
+diff --git a/External/cephes/src/128bit/X87Math.cpp b/External/cephes/src/128bit/X87Math.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6b46444bfac5d5b010f744d312594a759b1e799
+--- /dev/null
++++ b/External/cephes/src/128bit/X87Math.cpp
+@@ -0,0 +1,464 @@
++// SPDX-License-Identifier: MIT
++// The transcendental x87 instructions as Intel's hardware performs them, on
++// top of the 128-bit functions; the arithmetic is in this file, the
++// instruction's stack and status handling in the engines.
++//
++// Intel's x87 FSIN, FCOS, FPTAN and FSINCOS reduce an operand below 2^63 by
++// multiples of pi/2, and they take pi/2 to 66 significant bits. A result is
++// therefore the exact function of the operand's remainder from a slightly
++// wrong pi: of the 128-bit function, nothing else differs.
++//
++// F2XM1 and FYL2XP1 keep their full precision for a tiny operand, where
++// 2^x - 1 and log2(1 + x) lose all but the operand's own bits to a subtraction
++// or an addition in 128 bits; a series gives them back.
++//
++// The logarithm of a power of two below one comes out of x86 slightly short of
++// its exact value, so that a result which is exact in 64 bits is rounded up in
++// magnitude, or rounded down in a directed mode; that of one above one is
++// exact.
++#include "cephes_128bit.h"
++
++#include <bit>
++#include <cstdint>
++
++namespace FEXCore::cephes_128bit {
++namespace {
++
++using u128 = unsigned __int128;
++
++// pi/2 to 66 significant bits, as an integer scaled by 2^-65.
++constexpr u128 PiOver2Scaled = ((static_cast<u128>(0xC90FDAA22168C234ULL) << 64) | 0xC4C6628B80DC1CD1ULL) >> 62;
++constexpr int FractionBits = 112;
++constexpr u128 FractionMask = (static_cast<u128>(1) << FractionBits) - 1;
++
++float128_t FromBits(u128 Bits) {
++  return std::bit_cast<float128_t>(Bits);
++}
++
++u128 ToBits(float128_t Value) {
++  return std::bit_cast<u128>(Value);
++}
++
++float128_t Negate(float128_t Value) {
++  return FromBits(ToBits(Value) ^ (static_cast<u128>(1) << 127));
++}
++
++struct Reduction {
++  float128_t Reduced;
++  unsigned Quadrant;
++  bool Negative;
++  // A magnitude below 2^-68: the sine and tangent are the operand, the
++  // cosine one, with no sign of how they were rounded.
++  bool Tiny;
++};
++
++// Reduces an operand of magnitude below 2^63 to the remainder after the
++// nearest multiple of pi/2, whose count modulo 4 is the quadrant. The
++// operand has at most 64 significant bits, so the remainder is exact. A
++// smaller one than 1/2 is already reduced; a larger one, an infinity or a NaN
++// goes to the 128-bit function as it is.
++Reduction Reduce(float128_t X) {
++  const u128 Bits = ToBits(X);
++  const bool Negative = (Bits >> 127) != 0;
++  const int Exponent = static_cast<int>((Bits >> FractionBits) & 0x7FFF) - 0x3FFF;
++  if (Exponent < -68) {
++    return {X, 0, false, true};
++  }
++  if (Exponent < -1 || Exponent >= 63) {
++    return {X, 0, false, false};
++  }
++
++  // The magnitude, scaled by 2^65 to an integer below 2^128.
++  const u128 Significand = (Bits & FractionMask) | (static_cast<u128>(1) << FractionBits);
++  const int Shift = Exponent - FractionBits + 65;
++  const u128 Scaled = Shift >= 0 ? Significand << Shift : Significand >> -Shift;
++
++  u128 Quotient = Scaled / PiOver2Scaled;
++  u128 Remainder = Scaled % PiOver2Scaled;
++  bool RemainderNegative = false;
++  // pi/2 is odd at this scale, so no remainder is exactly half of it.
++  if (Remainder * 2 > PiOver2Scaled) {
++    ++Quotient;
++    Remainder = PiOver2Scaled - Remainder;
++    RemainderNegative = true;
++  }
++
++  float128_t Reduced {};
++  if (Remainder != 0) {
++    const int Top = 127 - std::countl_zero(Remainder);
++    const u128 Fraction = (Remainder << (FractionBits - Top)) & FractionMask;
++    const u128 Biased = static_cast<u128>(Top - 65 + 0x3FFF);
++    Reduced = FromBits((static_cast<u128>(RemainderNegative) << 127) | (Biased << FractionBits) | Fraction);
++  }
++  return {Reduced, static_cast<unsigned>(Quotient & 3), Negative, false};
++}
++
++// The 128-bit sine and cosine of a small remainder may round to the remainder
++// or to one, where x86 knows that the function lies below it. Step one place
++// that way, so that rounding to 64 bits sees an inexact result and its
++// direction.
++float128_t Nudge(float128_t Value, bool TowardZero) {
++  const u128 Sign = ToBits(Value) & (static_cast<u128>(1) << 127);
++  const u128 Magnitude = ToBits(Value) ^ Sign;
++  return FromBits(Sign | (TowardZero ? Magnitude - 1 : Magnitude + 1));
++}
++
++float128_t SinOfRemainder(float128_t R) {
++  const float128_t Result = sinl(R);
++  return ToBits(Result) == ToBits(R) ? Nudge(Result, true) : Result;
++}
++
++float128_t CosOfRemainder(float128_t R) {
++  const float128_t Result = cosl(R);
++  constexpr float128_t One {0, 0x3FFF000000000000ULL};
++  return ToBits(Result) == ToBits(One) ? Nudge(Result, true) : Result;
++}
++
++// The tangent of a remainder of magnitude below 2^-33 is not above it, as it
++// is, but just below, unless the remainder is a power of two: x86 treats it
++// like the sine there, one place short, so rounding sees the direction.
++float128_t TanOfRemainder(float128_t R) {
++  const u128 Bits = ToBits(R);
++  const int Exponent = static_cast<int>((Bits >> FractionBits) & 0x7FFF) - 0x3FFF;
++  if (Exponent <= -34 && Exponent >= -68 && (Bits & FractionMask) != 0) {
++    return Nudge(R, true);
++  }
++  return tanl(R);
++}
++
++float128_t SineOf(const Reduction& R) {
++  if (R.Tiny) {
++    return R.Reduced;
++  }
++  float128_t Result = (R.Quadrant & 1) ? CosOfRemainder(R.Reduced) : SinOfRemainder(R.Reduced);
++  if (R.Quadrant & 2) {
++    Result = Negate(Result);
++  }
++  return R.Negative ? Negate(Result) : Result;
++}
++
++float128_t CosineOf(const Reduction& R) {
++  if (R.Tiny) {
++    return float128_t {0, 0x3FFF000000000000ULL};
++  }
++  float128_t Result = (R.Quadrant & 1) ? SinOfRemainder(R.Reduced) : CosOfRemainder(R.Reduced);
++  if (R.Quadrant == 1 || R.Quadrant == 2) {
++    Result = Negate(Result);
++  }
++  return Result;
++}
++
++} // namespace
++
++float128_t x87_sinl(float128_t x) {
++  return SineOf(Reduce(x));
++}
++
++float128_t x87_cosl(float128_t x) {
++  return CosineOf(Reduce(x));
++}
++
++float128_t x87_tanl(float128_t x) {
++  const Reduction R = Reduce(x);
++  if (R.Tiny) {
++    return R.Reduced;
++  }
++  float128_t Result = TanOfRemainder(R.Reduced);
++  if (R.Quadrant & 1) {
++    // tan is -cot an odd quadrant on.
++    softfloat_state State {};
++    const float128_t One {0, 0x3FFF000000000000ULL};
++    Result = Negate(f128_div(&State, One, Result));
++  }
++  return R.Negative ? Negate(Result) : Result;
++}
++
++void x87_sincosl(float128_t x, float128_t* Sine, float128_t* Cosine) {
++  const Reduction R = Reduce(x);
++  *Sine = SineOf(R);
++  *Cosine = CosineOf(R);
++}
++
++namespace {
++
++// ln 2 and log2(e) to 128 bits.
++constexpr float128_t Ln2 {0xF35793C7673007E6ULL, 0x3FFE62E42FEFA39EULL};
++constexpr float128_t Log2E {0xE1777D0FFDA0D23AULL, 0x3FFF71547652B82FULL};
++constexpr float128_t One {0, 0x3FFF000000000000ULL};
++
++// Below 2^-20 a handful of terms give 113 bits.
++bool IsTiny(float128_t X) {
++  const int Exponent = static_cast<int>((ToBits(X) >> FractionBits) & 0x7FFF) - 0x3FFF;
++  return Exponent < -20;
++}
++
++// A small positive integer.
++float128_t Small(unsigned N) {
++  const int Top = 31 - std::countl_zero(N);
++  const u128 Fraction = static_cast<u128>(N & ((1U << Top) - 1)) << (FractionBits - Top);
++  return FromBits((static_cast<u128>(0x3FFF + Top) << FractionBits) | Fraction);
++}
++
++// A power of two below one, whose logarithm x86 does not return exactly.
++bool IsPowerOfTwoBelowOne(float128_t X) {
++  const u128 Bits = ToBits(X);
++  const u128 Fraction = Bits & FractionMask;
++  const int Exponent = static_cast<int>((Bits >> FractionBits) & 0x7FFF) - 0x3FFF;
++  if ((Bits >> 127) != 0 || Exponent >= 0) {
++    return false;
++  }
++  // A denormal is a power of two when one bit of it is set.
++  return Exponent == -0x3FFF ? std::popcount(static_cast<uint64_t>(Fraction)) + std::popcount(static_cast<uint64_t>(Fraction >> 64)) == 1 : Fraction == 0;
++}
++
++// Multiplies a factor by a logarithm; when the logarithm is that of a power
++// of two below one and the product is exact in 64 bits, a hair short of it.
++float128_t Scaled(float128_t Y, float128_t Log, bool ShortLog) {
++  softfloat_state State {};
++  const float128_t Product = f128_mul(&State, Y, Log);
++  constexpr u128 BelowExtended = (static_cast<u128>(1) << 49) - 1;
++  if (ShortLog && (ToBits(Product) & BelowExtended) == 0 && (ToBits(Product) & ~(static_cast<u128>(1) << 127)) != 0) {
++    return Nudge(Product, true);
++  }
++  return Product;
++}
++
++} // namespace
++
++float128_t x87_fyl2xl(float128_t x, float128_t y) {
++  return Scaled(y, log2l(x), IsPowerOfTwoBelowOne(x));
++}
++
++float128_t x87_f2xm1l(float128_t x) {
++  softfloat_state State {};
++  if (!IsTiny(x)) {
++    return f128_sub(&State, exp2l(x), One);
++  }
++  // 2^x - 1 = y (1 + y/2 (1 + y/3 (... (1 + y/7)))) for y = x ln 2.
++  const float128_t Y = f128_mul(&State, x, Ln2);
++  float128_t Sum = One;
++  for (unsigned K = 7; K >= 2; --K) {
++    Sum = f128_add(&State, One, f128_mul(&State, f128_div(&State, Y, Small(K)), Sum));
++  }
++  return f128_mul(&State, Y, Sum);
++}
++
++float128_t x87_fyl2xp1l(float128_t x, float128_t y) {
++  softfloat_state State {};
++  if (!IsTiny(x)) {
++    const float128_t Argument = f128_add(&State, x, One);
++    return Scaled(y, log2l(Argument), IsPowerOfTwoBelowOne(Argument));
++  }
++  // ln(1 + x) = x (1 - x (1/2 - x (1/3 - ... - x/7))).
++  float128_t Sum = f128_div(&State, One, Small(7));
++  for (unsigned K = 6; K >= 1; --K) {
++    Sum = f128_sub(&State, f128_div(&State, One, Small(K)), f128_mul(&State, x, Sum));
++  }
++  const float128_t Log2 = f128_mul(&State, f128_mul(&State, x, Sum), Log2E);
++  return f128_mul(&State, y, Log2);
++}
++
++namespace {
++
++constexpr extFloat80_t Indefinite {0xC000000000000000ULL, 0xFFFF};
++
++bool IsZero(extFloat80_t X) {
++  return (X.signExp & 0x7FFF) == 0 && X.signif == 0;
++}
++
++bool IsInfinity(extFloat80_t X) {
++  return (X.signExp & 0x7FFF) == 0x7FFF && X.signif == 0x8000000000000000ULL;
++}
++
++bool IsNaN(extFloat80_t X) {
++  return (X.signExp & 0x7FFF) == 0x7FFF && (X.signif & 0x7FFFFFFFFFFFFFFFULL) != 0;
++}
++
++// A pseudo-infinity, pseudo-NaN or unnormal: an encoding x86 does not accept.
++bool IsUnsupported(extFloat80_t X) {
++  return (X.signExp & 0x7FFF) != 0 && (X.signif >> 63) == 0;
++}
++
++extFloat80_t Infinity(bool Negative) {
++  return {0x8000000000000000ULL, static_cast<uint16_t>(Negative ? 0xFFFF : 0x7FFF)};
++}
++
++extFloat80_t Zero(bool Negative) {
++  return {0, static_cast<uint16_t>(Negative ? 0x8000 : 0)};
++}
++
++float128_t ToFloat128(softfloat_state* State, extFloat80_t X) {
++  // A pseudo-denormal has the value its significand has with exponent 1.
++  if ((X.signExp & 0x7FFF) == 0 && (X.signif >> 63) != 0) {
++    X.signExp |= 1;
++  }
++  return extF80_to_f128(State, X);
++}
++
++// Rounds a result to 80 bits and raises precision for it, though it may be
++// exact in 128 bits, or round to the operand itself or to one: x86 returns an
++// inexact result for every nonzero operand. Underflow comes with it for a
++// denormal result.
++extFloat80_t InexactResult(softfloat_state* State, float128_t Value) {
++  const auto Before = State->exceptionFlags;
++  State->exceptionFlags &= ~softfloat_flag_inexact;
++  const extFloat80_t Result = f128_to_extF80(State, Value);
++  if ((State->exceptionFlags & softfloat_flag_inexact) == 0) {
++    State->exceptionFlags |= softfloat_flag_inexact;
++    if ((Result.signExp & 0x7FFF) == 0 && Result.signif != 0) {
++      State->exceptionFlags |= softfloat_flag_underflow;
++    }
++  }
++  State->exceptionFlags |= Before;
++  return Result;
++}
++
++// An operand with no function value of its own: an unsupported encoding
++// raises invalid and gives the indefinite; a NaN comes back quiet, and a
++// signaling one raises invalid.
++bool SpecialOperand(softfloat_state* State, extFloat80_t X, extFloat80_t* Result) {
++  if (IsUnsupported(X)) {
++    State->exceptionFlags |= softfloat_flag_invalid;
++    *Result = Indefinite;
++    return true;
++  }
++  if (IsNaN(X)) {
++    *Result = X;
++    if ((X.signif & 0x4000000000000000ULL) == 0) {
++      State->exceptionFlags |= softfloat_flag_invalid;
++      Result->signif |= 0x4000000000000000ULL;
++    }
++    return true;
++  }
++  return false;
++}
++
++extFloat80_t Trigonometric(softfloat_state* State, extFloat80_t X, float128_t (*Function)(float128_t), bool CosineOfZero) {
++  extFloat80_t Special;
++  if (SpecialOperand(State, X, &Special)) {
++    return Special;
++  }
++  if (IsInfinity(X)) {
++    State->exceptionFlags |= softfloat_flag_invalid;
++    return Indefinite;
++  }
++  if (IsZero(X)) {
++    // The sine and tangent of zero are the zero, sign included; the cosine is
++    // one. All are exact.
++    return CosineOfZero ? extFloat80_t {0x8000000000000000ULL, 0x3FFF} : X;
++  }
++  return InexactResult(State, Function(ToFloat128(State, X)));
++}
++
++} // namespace
++
++extFloat80_t x87_fsin(softfloat_state* State, extFloat80_t X) {
++  return Trigonometric(State, X, x87_sinl, false);
++}
++
++extFloat80_t x87_fcos(softfloat_state* State, extFloat80_t X) {
++  return Trigonometric(State, X, x87_cosl, true);
++}
++
++extFloat80_t x87_ftan(softfloat_state* State, extFloat80_t X) {
++  return Trigonometric(State, X, x87_tanl, false);
++}
++
++extFloat80_t x87_f2xm1(softfloat_state* State, extFloat80_t X) {
++  extFloat80_t Special;
++  if (SpecialOperand(State, X, &Special)) {
++    return Special;
++  }
++  if (IsInfinity(X)) {
++    // 2^+inf - 1 is +inf, and 2^-inf - 1 is -1.
++    return (X.signExp & 0x8000) ? extFloat80_t {0x8000000000000000ULL, 0xBFFF} : X;
++  }
++  if (IsZero(X)) {
++    return X;
++  }
++  // Beyond one the function is undefined: x86 leaves the operand as it is,
++  // and raises precision.
++  const unsigned Exponent = X.signExp & 0x7FFF;
++  if (Exponent > 0x3FFF || (Exponent == 0x3FFF && (X.signif << 1) != 0)) {
++    State->exceptionFlags |= softfloat_flag_inexact;
++    return X;
++  }
++  return InexactResult(State, x87_f2xm1l(ToFloat128(State, X)));
++}
++
++extFloat80_t x87_fyl2x(softfloat_state* State, extFloat80_t X, extFloat80_t Y, bool PlusOne) {
++  if (IsUnsupported(X) || IsUnsupported(Y)) {
++    State->exceptionFlags |= softfloat_flag_invalid;
++    return Indefinite;
++  }
++  if (IsNaN(X) || IsNaN(Y)) {
++    // As a multiplication propagates them.
++    return extF80_mul(State, Y, X);
++  }
++  const bool Negative = X.signExp & 0x8000;
++  const bool YNegative = Y.signExp & 0x8000;
++  const unsigned Exponent = X.signExp & 0x7FFF;
++  bool LogNegative = false;
++  const auto Invalid = [&]() {
++    State->exceptionFlags |= softfloat_flag_invalid;
++    return Indefinite;
++  };
++  if (PlusOne) {
++    if (Negative && IsInfinity(X)) {
++      return Invalid();
++    }
++    if (Negative && !IsZero(X) && Exponent >= 0x3FFF) {
++      // 1 + x is not above zero: a zero or infinite factor gives the zero or
++      // infinity of the sign the logarithm has, any other leaves the
++      // operand, inexact.
++      if (IsZero(Y)) {
++        return Zero(!YNegative);
++      }
++      if (IsInfinity(Y)) {
++        return Infinity(!YNegative);
++      }
++      State->exceptionFlags |= softfloat_flag_inexact;
++      return X;
++    }
++    if (IsZero(X)) {
++      return IsInfinity(Y) ? Invalid() : Zero(Negative != YNegative);
++    }
++    if (IsInfinity(X)) {
++      return IsZero(Y) ? Invalid() : Infinity(YNegative);
++    }
++    LogNegative = Negative;
++  } else {
++    if (IsZero(X)) {
++      // log2 of zero is -infinity.
++      if (IsZero(Y)) {
++        return Invalid();
++      }
++      if (!IsInfinity(Y)) {
++        State->exceptionFlags |= softfloat_flag_infinite;
++      }
++      return Infinity(!YNegative);
++    }
++    if (Negative) {
++      return Invalid();
++    }
++    if (IsInfinity(X)) {
++      return IsZero(Y) ? Invalid() : Infinity(YNegative);
++    }
++    if (Exponent == 0x3FFF && (X.signif << 1) == 0) {
++      // log2 of one is +0.
++      return IsInfinity(Y) ? Invalid() : Zero(YNegative);
++    }
++    LogNegative = Exponent < 0x3FFF;
++  }
++  if (IsZero(Y)) {
++    return Zero(LogNegative != YNegative);
++  }
++  if (IsInfinity(Y)) {
++    return Infinity(LogNegative != YNegative);
++  }
++  const float128_t Operand = ToFloat128(State, X);
++  const float128_t Factor = ToFloat128(State, Y);
++  return InexactResult(State, PlusOne ? x87_fyl2xp1l(Operand, Factor) : x87_fyl2xl(Operand, Factor));
++}
++
++} // namespace FEXCore::cephes_128bit
+diff --git a/FEXCore/Source/Common/SoftFloat.h b/FEXCore/Source/Common/SoftFloat.h
+index 2a0c23ec7386999d230d1b95a9b0a09cc656c71a..0916bca5531bf1225b688b7d10c332ad0a71dd3c 100644
+--- a/FEXCore/Source/Common/SoftFloat.h
++++ b/FEXCore/Source/Common/SoftFloat.h
+@@ -352,11 +352,7 @@ struct FEX_PACKED X80SoftFloat {
+ 
+     return Result;
+ #else
+-    auto Src1_d = lhs.ToFMax(state);
+-    auto Result = FEXCore::cephes_128bit::exp2l(Src1_d);
+-
+-    static const float128_t one {0x0ULL, 0x3fff000000000000ULL};
+-    return X80SoftFloat(state, f128_sub(state, Result, one));
++    return FEXCore::cephes_128bit::x87_f2xm1(state, lhs);
+ #endif
+   }
+ 
+@@ -376,32 +372,27 @@ struct FEX_PACKED X80SoftFloat {
+ 
+     return Result;
+ #else
+-    // log2 of zero is an infinity, of which a finite nonzero factor raises
+-    // division by zero; a zero factor of it and a logarithm of a negative
+-    // number are invalid.
+-    const auto IsNaN = [](const X80SoftFloat& Value) {
+-      return Value.Top.Exponent == 0x7FFF && (Value.Significand & 0x7FFF'FFFF'FFFF'FFFFULL) != 0;
+-    };
+-    if (!IsNaN(lhs) && !IsNaN(rhs)) {
+-      const bool XZero = lhs.Top.Exponent == 0 && lhs.Significand == 0;
+-      const bool YZero = rhs.Top.Exponent == 0 && rhs.Significand == 0;
+-      const bool YInfinite = rhs.Top.Exponent == 0x7FFF;
+-      if ((XZero && YZero) || (lhs.Top.Sign && !XZero)) {
+-        softfloat_raiseFlags(state, softfloat_flag_invalid);
+-        return X80SoftFloat(1, 0x7FFF, 0xC000'0000'0000'0000ULL);
+-      }
+-      if (XZero) {
+-        if (!YInfinite) {
+-          softfloat_raiseFlags(state, softfloat_flag_infinite);
+-        }
+-        return X80SoftFloat(rhs.Top.Sign ^ 1, 0x7FFF, 0x8000'0000'0000'0000ULL);
+-      }
+-    }
+-    auto Src1_d = lhs.ToFMax(state);
+-    auto Src2_d = rhs.ToFMax(state);
++    return FEXCore::cephes_128bit::x87_fyl2x(state, lhs, rhs, false);
++#endif
++  }
+ 
+-    auto Tmp = f128_mul(state, Src2_d, FEXCore::cephes_128bit::log2l(Src1_d));
+-    return X80SoftFloat(state, Tmp);
++  FEXCORE_PRESERVE_ALL_ATTR static X80SoftFloat FYL2XP1(softfloat_state* state, const X80SoftFloat& lhs, const X80SoftFloat& rhs) {
++#ifdef DEBUG_X86_FLOAT
++    BIGFLOAT Result;
++    asm(R"(
++    fninit;
++    fldt %[rhs]; # st(1)
++    fldt %[lhs]; # st(0)
++    fyl2xp1; # st(1) * log2l(st(0) + 1)
++    fstpt %[result];
++    )"
++        : [result] "=m"(Result)
++        : [lhs] "m"(lhs), [rhs] "m"(rhs)
++        : "st", "st(1)");
++
++    return Result;
++#else
++    return FEXCore::cephes_128bit::x87_fyl2x(state, lhs, rhs, true);
+ #endif
+   }
+ 
+@@ -445,19 +436,7 @@ struct FEX_PACKED X80SoftFloat {
+ 
+     return Result;
+ #else
+-    X80SoftFloat result;
+-    if (HandleInfinityOp(state, lhs, result)) {
+-      return result;
+-    }
+-    // A zero operand comes back unchanged, sign included; the 128-bit
+-    // routine does not keep a negative zero's sign.
+-    if (lhs.Top.Exponent == 0 && lhs.Significand == 0) {
+-      return lhs;
+-    }
+-
+-    BIGFLOAT Src_d = lhs.ToFMax(state);
+-    Src_d = FEXCore::cephes_128bit::tanl(Src_d);
+-    return InexactResult(state, Src_d, FiniteNonzero(lhs));
++    return FEXCore::cephes_128bit::x87_ftan(state, lhs);
+ #endif
+   }
+ 
+@@ -476,19 +455,7 @@ struct FEX_PACKED X80SoftFloat {
+ 
+     return Result;
+ #else
+-    X80SoftFloat result;
+-    if (HandleInfinityOp(state, lhs, result)) {
+-      return result;
+-    }
+-    // A zero operand comes back unchanged, sign included; the 128-bit
+-    // routine does not keep a negative zero's sign.
+-    if (lhs.Top.Exponent == 0 && lhs.Significand == 0) {
+-      return lhs;
+-    }
+-
+-    BIGFLOAT Src_d = lhs.ToFMax(state);
+-    Src_d = FEXCore::cephes_128bit::sinl(Src_d);
+-    return InexactResult(state, Src_d, FiniteNonzero(lhs));
++    return FEXCore::cephes_128bit::x87_fsin(state, lhs);
+ #endif
+   }
+ 
+@@ -507,14 +474,7 @@ struct FEX_PACKED X80SoftFloat {
+ 
+     return Result;
+ #else
+-    X80SoftFloat result;
+-    if (HandleInfinityOp(state, lhs, result)) {
+-      return result;
+-    }
+-
+-    BIGFLOAT Src_d = lhs.ToFMax(state);
+-    Src_d = FEXCore::cephes_128bit::cosl(Src_d);
+-    return InexactResult(state, Src_d, FiniteNonzero(lhs));
++    return FEXCore::cephes_128bit::x87_fcos(state, lhs);
+ #endif
+   }
+ 
+@@ -555,7 +515,12 @@ struct FEX_PACKED X80SoftFloat {
+ 
+   BIGFLOAT ToFMax(softfloat_state* state) const {
+ #if BIGFLOATSIZE == 16
+-    const float128_t Result = extF80_to_f128(state, *this);
++    // A pseudo-denormal has the value of the same significand with exponent 1.
++    X80SoftFloat Value = *this;
++    if (Value.Top.Exponent == 0 && (Value.Significand & IntegerBit)) {
++      Value.Top.Exponent = 1;
++    }
++    const float128_t Result = extF80_to_f128(state, Value);
+     return std::bit_cast<BIGFLOAT>(Result);
+ #else
+     BIGFLOAT result {};
+@@ -673,8 +638,6 @@ private:
+   static constexpr uint64_t Bottom62Significand = ((1ULL << 62) - 1);
+   static constexpr uint32_t ExponentBias = 16383;
+ 
+-  // Helper function to check for infinity and set invalid operation flag.
+-  // Returns true if infinity is dealt with, false otherwise.
+   // A transcendental result that is not exact, though its 128-bit value may
+   // round to the operand itself or to 1, as for a tiny operand: x86 raises
+   // precision for it, and underflow for a denormal one. Inexact says the
+@@ -697,22 +660,10 @@ private:
+     return Result;
+   }
+ 
+-  // Finite and nonzero: a sine, cosine or tangent of it is inexact.
++  // Finite and nonzero: an arctangent of it is inexact.
+   FEXCORE_PRESERVE_ALL_ATTR static bool FiniteNonzero(const X80SoftFloat& Value) {
+     return Value.Top.Exponent != 0x7FFF && (Value.Top.Exponent != 0 || Value.Significand != 0);
+   }
+-
+-  FEXCORE_PRESERVE_ALL_ATTR static bool HandleInfinityOp(softfloat_state* state, const X80SoftFloat& arg, X80SoftFloat& result) {
+-    if (arg.Top.Exponent == 0x7FFF && arg.Significand == 0x8000000000000000ULL) {
+-      state->exceptionFlags |= softfloat_flag_invalid;
+-      // Return QNaN.
+-      result.Top.Sign = 0;
+-      result.Top.Exponent = 0x7FFF;
+-      result.Significand = 0xC000000000000000ULL;
+-      return true;
+-    }
+-    return false;
+-  }
+ };
+ 
+ static_assert(sizeof(X80SoftFloat) == 10, "tword must be 10bytes in size");
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+index 2c426b37cbd95cb426004715052a87d13ce4e994..ef5128b23e43660abcad722d4009cdc286e9de21 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+@@ -108,6 +108,14 @@ FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state&
+   }
+ }
+ 
++// Whether either operand is a NaN, of any payload.
++FEXCORE_PRESERVE_ALL_ATTR static bool HasNaN(const X80SoftFloat& A, const X80SoftFloat& B) {
++  const auto IsNaN = [](const X80SoftFloat& Value) {
++    return Value.Top.Exponent == 0x7FFF && (Value.Significand & 0x7FFF'FFFF'FFFF'FFFFULL) != 0;
++  };
++  return IsNaN(A) || IsNaN(B);
++}
++
+ // Wrapper for SoftFloat state to handle X87 exceptions
+ class ScopedSoftFloatState {
+ public:
+@@ -432,7 +440,10 @@ struct OpHandlers<IR::OP_F80FYL2X> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame, true};
+-    State.Operands(Src1, Src2);
++    // A NaN takes precedence over a denormal operand.
++    if (!HasNaN(Src1, Src2)) {
++      State.Operands(Src1, Src2);
++    }
+     return X80SoftFloat::FYL2X(&State.State, Src1, Src2);
+   }
+ };
+@@ -442,9 +453,11 @@ struct OpHandlers<IR::OP_F80FYL2XP1> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame, true};
+-    State.Operands(Src1, Src2);
+-    const X80SoftFloat One {&State.State, 1.0};
+-    return X80SoftFloat::FYL2X(&State.State, X80SoftFloat::FADD(&State.State, Src1, One), Src2);
++    // A NaN takes precedence over a denormal operand.
++    if (!HasNaN(Src1, Src2)) {
++      State.Operands(Src1, Src2);
++    }
++    return X80SoftFloat::FYL2XP1(&State.State, Src1, Src2);
+   }
+ };
+ 

@@ -1,0 +1,1009 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 13:31:43 +0900
+Subject: [PATCH] kosmickrisp: charge the geometry heap to a pool its device's
+ creator shares
+
+A Venus host grants a guest's GPU a share of memory and refuses a guest
+allocation that would take the process past it, and a refused allocation is
+fatal to the guest's application. The geometry heap is memory the driver
+allocates for itself, so nothing charged it to that share: it grew to
+128 MiB, 240 MiB at once with the heaps a recording still held, however
+little of the share was left, and a guest allocation made while it grew
+could pass the same check and take the process past the share together
+with it.
+
+A device can now be created with a device-memory pool, a driver-private
+structure chained to VkDeviceCreateInfo and declared in
+kk_device_memory_pool.h: callbacks that reserve bytes, release a
+reservation, and report the pool's headroom. A pooled device reserves a
+heap's size before creating the heap and releases the reservation once
+Metal counts the heap, so a heap and allocations charged to the same pool
+never pass its limit together. Its heaps:
+
+- take at most half of the pool's headroom, so the host's conservative
+  bound, which overstates a draw at levels the TCS computes by up to 4096
+  times, never leaves the guest nothing; a device's first heap may take
+  1 MiB whatever is left, so its draws record and the GPU reports their
+  need;
+- grow on a bound no further than the 128 MiB cap, but on what the GPU
+  counted draws were refused as far as the pool allows, up to 4095 MiB and
+  the largest Metal buffer, where a device without a pool keeps the cap;
+- when the pool refuses one, leave the device the heap it has, or none until
+  the pool has room, instead of stopping its growth as Metal's refusal does;
+- are freed when no recording holds them, they grew past the starting size
+  and the pool's headroom has fallen below half their size, and the next
+  draw that needs a heap creates one at what it then needs.
+
+A device created without a pool behaves as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 220 ++++++++--
+ src/kosmickrisp/vulkan/kk_device.c            |   8 +
+ src/kosmickrisp/vulkan/kk_device.h            |  22 +-
+ .../vulkan/kk_device_memory_pool.h            |  54 +++
+ src/kosmickrisp/vulkan/meson.build            |   2 +-
+ .../vulkan/tests/test_heap_growth.c           | 392 +++++++++++++++++-
+ 6 files changed, 641 insertions(+), 57 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_device_memory_pool.h
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 82b6c1c1746ec4f16514704347f6aa7d27021090..94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -18,6 +18,7 @@
+ #include "kk_raster_edge.h"
+ #include "kk_tess_bound.h"
+ #include "kk_logic_op.h"
++#include "kk_physical_device.h"
+ #include "kk_query_pool.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+@@ -1159,9 +1160,34 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+  *
+  * MESA_KK_HEAP_SIZE_MIB sets the starting size. The header's size is 32-bit,
+  * so only 1 to 4095 MiB is honoured, and any other value keeps 16 MiB. The cap
+- * is 128 MiB or the starting size, whichever is larger. */
++ * is 128 MiB or the starting size, whichever is larger.
++ *
++ * A device created with a device-memory pool (kk_device_memory_pool.h), as a
++ * Venus renderer creates the devices it serves a guest from, charges every
++ * heap to it: it reserves a heap's size before creating the heap and never
++ * creates one the pool refuses, so the heap never takes the pool past its
++ * limit. A heap takes at most half of what the pool can still hold, except
++ * that a device's first heap may take 1 MiB of it. The host's bound can
++ * overstate a draw's need, by up to 4096 times for levels the TCS computes,
++ * so a bound grows the heap no further than the cap; refusals the GPU
++ * counted, which are what draws needed, grow it as far as the pool allows,
++ * up to what the header and a Metal buffer can hold. A heap the pool refuses
++ * leaves the device with the one it has, or with none until the pool has
++ * room, and a draw that finds no heap fails its command buffer as when Metal
++ * refuses one. When the recording reset, freed or re-recorded holds none of
++ * them, a pooled device frees a heap that grew past the starting size once
++ * the pool's headroom has fallen below half its size, and the next draw that
++ * needs a heap creates one at what it then needs and the pool leaves it.
++ * Heaps that a device replaced are freed when the last recording holding
++ * them is, with or without a pool. */
+ #define KK_HEAP_START_MIB   16u
+ #define KK_HEAP_MIN_CAP_MIB 128u
++/* A pooled device's first heap may take this much of the pool's headroom
++ * however little is left, so that its draws record and the GPU reports what
++ * they need. */
++#define KK_HEAP_POOL_FLOOR_B (1ull << 20)
++/* Heaps sized to what the pool leaves are rounded down to this. */
++#define KK_HEAP_POOL_ALIGN_B (64ull << 10)
+ 
+ static uint64_t
+ kk_heap_start_B(void)
+@@ -1176,17 +1202,51 @@ kk_heap_start_B(void)
+    return mib << 20;
+ }
+ 
++static bool
++kk_heap_pooled(const struct kk_device *dev)
++{
++   return dev->memory_pool.pfnReserve != NULL;
++}
++
++/* The most a heap may take of the device's pool, half of what the pool can
++ * still hold, or no limit without a pool. */
++static uint64_t
++kk_heap_pool_share_B(const struct kk_device *dev)
++{
++   if (!kk_heap_pooled(dev))
++      return UINT64_MAX;
++
++   const uint64_t headroom_B =
++      dev->memory_pool.pfnHeadroom(dev->memory_pool.pUserData);
++   return (headroom_B / 2u) & ~(KK_HEAP_POOL_ALIGN_B - 1u);
++}
++
++/* Creates a heap of size_B, charged to the device's pool when it has one.
++ * Returns NULL, with *pool_refused set, when the pool cannot hold it, and
++ * NULL when Metal refuses it. */
+ static struct kk_geometry_heap *
+-kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B)
++kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
++                        bool *pool_refused)
+ {
+-   struct kk_geometry_heap *heap = calloc(1, sizeof(*heap));
+-   if (heap == NULL)
++   *pool_refused = false;
++   const bool pooled = kk_heap_pooled(dev);
++   if (pooled &&
++       !dev->memory_pool.pfnReserve(dev->memory_pool.pUserData, size_B)) {
++      *pool_refused = true;
+       return NULL;
++   }
+ 
+-   if (kk_alloc_bo(dev, &dev->vk.base, size_B, 0, &heap->bo) != VK_SUCCESS) {
++   struct kk_geometry_heap *heap = calloc(1, sizeof(*heap));
++   if (heap != NULL &&
++       kk_alloc_bo(dev, &dev->vk.base, size_B, 0, &heap->bo) != VK_SUCCESS) {
+       free(heap);
+-      return NULL;
++      heap = NULL;
+    }
++   /* Metal counts the heap now, or it was refused. */
++   if (pooled)
++      dev->memory_pool.pfnRelease(dev->memory_pool.pUserData, size_B);
++   if (heap == NULL)
++      return NULL;
+ 
+    heap->usable_B = size_B - sizeof(struct poly_heap);
+    heap->refcount = 1;
+@@ -1255,62 +1315,103 @@ kk_heap_observe_locked(struct kk_device *dev, struct kk_geometry_heap *heap)
+ 
+    if (!dev->heap_loss_reported) {
+       dev->heap_loss_reported = true;
+-      fprintf(stderr,
+-              "KosmicKrisp's %u MiB geometry heap refused a reservation, and "
+-              "the draw that made it lost its output; later command buffers "
+-              "get a heap of up to %u MiB, which MESA_KK_HEAP_SIZE_MIB "
+-              "raises\n",
+-              (unsigned)((heap->usable_B + sizeof(struct poly_heap)) >> 20),
+-              (unsigned)(dev->heap_cap_B >> 20));
++      const unsigned size_MiB =
++         (unsigned)((heap->usable_B + sizeof(struct poly_heap)) >> 20);
++      if (kk_heap_pooled(dev)) {
++         fprintf(stderr,
++                 "KosmicKrisp's %u MiB geometry heap refused a reservation, "
++                 "and the draw that made it lost its output; later command "
++                 "buffers get a heap that holds it where the device-memory "
++                 "pool has room\n",
++                 size_MiB);
++      } else {
++         fprintf(stderr,
++                 "KosmicKrisp's %u MiB geometry heap refused a reservation, "
++                 "and the draw that made it lost its output; later command "
++                 "buffers get a heap of up to %u MiB, which "
++                 "MESA_KK_HEAP_SIZE_MIB raises\n",
++                 size_MiB, (unsigned)(dev->heap_cap_B >> 20));
++      }
+    }
+ }
+ 
+-/* The size of a heap whose usable size exceeds want_B, in one step however
+- * far that is, at least floor_B and at most the cap. */
++/* The size of a heap whose usable size exceeds bound_B, the most the draws
++ * about to be recorded are known to reserve, and the device's measured
++ * need, in one step however far that is: at least floor_B, at most the cap
++ * for the bound and at most the measured cap for the need. */
+ static uint64_t
+ kk_heap_size_for(const struct kk_device *dev, uint64_t floor_B,
+-                 uint64_t want_B)
++                 uint64_t bound_B)
+ {
+    /* The GPU grants a reservation only if it ends before the usable size. */
+-   const uint64_t size_B =
+-      MAX2(floor_B,
+-           util_next_power_of_two64(want_B + sizeof(struct poly_heap) + 16u));
+-   return MIN2(size_B, dev->heap_cap_B);
++   const uint64_t header_B = sizeof(struct poly_heap) + 16u;
++   const uint64_t bound_size_B =
++      MIN2(MAX2(floor_B, util_next_power_of_two64(bound_B + header_B)),
++           dev->heap_cap_B);
++   const uint64_t measured_size_B =
++      dev->heap_wanted_B == 0
++         ? 0
++         : MIN2(util_next_power_of_two64(dev->heap_wanted_B + header_B),
++                dev->heap_measured_cap_B);
++   return MAX2(bound_size_B, measured_size_B);
+ }
+ 
+ /* Creates the device's first heap, at the starting size or, when the draw
+- * that asks for it already needs more, at the size that holds it. Called
+- * with heap_lock held. */
++ * that asks for it already needs more, at the size that holds it, and no
++ * more than the pool's share. Called with heap_lock held. */
+ static void
+-kk_heap_create_first_locked(struct kk_device *dev, uint64_t want_B)
++kk_heap_create_first_locked(struct kk_device *dev, uint64_t bound_B)
+ {
+-   dev->heap_attempted = true;
+    const uint64_t start_B = kk_heap_start_B();
++   dev->heap_start_B = start_B;
+    dev->heap_cap_B = MAX2(start_B, (uint64_t)KK_HEAP_MIN_CAP_MIB << 20);
++   /* The header's size is 32-bit, and the heap is one Metal buffer. */
++   dev->heap_measured_cap_B =
++      kk_heap_pooled(dev)
++         ? MIN2(4095ull << 20,
++                kk_device_physical(dev)->info.max_buffer_size)
++         : dev->heap_cap_B;
+ 
+-   const uint64_t size_B = kk_heap_size_for(dev, start_B, want_B);
+-   dev->heap = kk_geometry_heap_create(dev, size_B);
+-   if (dev->heap == NULL && size_B > start_B)
+-      dev->heap = kk_geometry_heap_create(dev, start_B);
++   const uint64_t size_B =
++      MIN2(kk_heap_size_for(dev, start_B, bound_B),
++           MAX2(kk_heap_pool_share_B(dev), KK_HEAP_POOL_FLOOR_B));
++   bool pool_refused;
++   dev->heap = kk_geometry_heap_create(dev, size_B, &pool_refused);
++   if (dev->heap == NULL && !pool_refused && size_B > start_B)
++      dev->heap = kk_geometry_heap_create(dev, start_B, &pool_refused);
++   /* Metal's refusal is final; the pool's lasts until the pool has room. */
++   dev->heap_attempted = dev->heap != NULL || !pool_refused;
+ }
+ 
+-/* Replaces the device's heap with one whose usable size exceeds want_B, at
+- * least twice the old size and at most the cap, and returns the old heap when
+- * nothing else holds it, for the caller to free once it has unlocked. When
+- * Metal refuses the larger heap the device keeps the one it has and stops
++/* Replaces the device's heap with one whose usable size exceeds bound_B and
++ * the measured need, at least twice the old size, within the caps and the
++ * pool's share, and returns the old heap when nothing else holds it, for the
++ * caller to free once it has unlocked. A heap the pool's share cannot make
++ * larger, or the pool refuses, leaves the one the device has. When Metal
++ * refuses the larger heap the device keeps the one it has and stops
+  * growing. Called with heap_lock held. */
+ static struct kk_geometry_heap *
+-kk_heap_grow_locked(struct kk_device *dev, uint64_t want_B)
++kk_heap_grow_locked(struct kk_device *dev, uint64_t bound_B)
+ {
+    struct kk_geometry_heap *old = dev->heap;
+    const uint64_t old_B = old->usable_B + sizeof(struct poly_heap);
+-   if (want_B < old->usable_B || old_B >= dev->heap_cap_B)
++   if (MAX2(bound_B, dev->heap_wanted_B) < old->usable_B ||
++       old_B >= MAX2(dev->heap_cap_B, dev->heap_measured_cap_B))
+       return NULL;
+ 
+-   const uint64_t size_B = kk_heap_size_for(dev, old_B * 2u, want_B);
+-   struct kk_geometry_heap *heap = kk_geometry_heap_create(dev, size_B);
++   uint64_t size_B = kk_heap_size_for(dev, old_B * 2u, bound_B);
++   if (size_B <= old_B)
++      return NULL;
++   size_B = MIN2(size_B, kk_heap_pool_share_B(dev));
++   if (size_B <= old_B)
++      return NULL;
++
++   bool pool_refused;
++   struct kk_geometry_heap *heap =
++      kk_geometry_heap_create(dev, size_B, &pool_refused);
+    if (heap == NULL) {
+-      dev->heap_cap_B = old_B;
++      if (!pool_refused)
++         dev->heap_cap_B = dev->heap_measured_cap_B = old_B;
+       return NULL;
+    }
+ 
+@@ -1341,7 +1442,7 @@ kk_heap_prepare(struct kk_cmd_buffer *cmd, uint64_t direct_B)
+ 
+    simple_mtx_lock(&dev->heap_lock);
+    if (!dev->heap_attempted)
+-      kk_heap_create_first_locked(dev, MAX2(dev->heap_wanted_B, direct_B));
++      kk_heap_create_first_locked(dev, direct_B);
+    if (dev->heap == NULL) {
+       simple_mtx_unlock(&dev->heap_lock);
+       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+@@ -1354,8 +1455,7 @@ kk_heap_prepare(struct kk_cmd_buffer *cmd, uint64_t direct_B)
+    const uint64_t need_B = cmd->heap_in_segment && cmd->heap == dev->heap
+                               ? cmd->heap_demand_B + direct_B
+                               : direct_B;
+-   struct kk_geometry_heap *retired =
+-      kk_heap_grow_locked(dev, MAX2(dev->heap_wanted_B, need_B));
++   struct kk_geometry_heap *retired = kk_heap_grow_locked(dev, need_B);
+ 
+    struct kk_geometry_heap *heap =
+       direct_B == 0 && cmd->heap != NULL ? cmd->heap : dev->heap;
+@@ -1414,12 +1514,12 @@ kk_heap_expect(struct kk_cmd_buffer *cmd, uint64_t total_B)
+    simple_mtx_lock(&dev->heap_lock);
+    struct kk_geometry_heap *retired = NULL;
+    if (!dev->heap_attempted) {
+-      kk_heap_create_first_locked(dev, MAX2(dev->heap_wanted_B, total_B));
++      kk_heap_create_first_locked(dev, total_B);
+    } else if (dev->heap != NULL) {
+       const uint64_t need_B = cmd->heap_in_segment && cmd->heap == dev->heap
+                                  ? cmd->heap_demand_B + total_B
+                                  : total_B;
+-      retired = kk_heap_grow_locked(dev, MAX2(dev->heap_wanted_B, need_B));
++      retired = kk_heap_grow_locked(dev, need_B);
+    }
+    simple_mtx_unlock(&dev->heap_lock);
+ 
+@@ -1427,6 +1527,37 @@ kk_heap_expect(struct kk_cmd_buffer *cmd, uint64_t total_B)
+       kk_geometry_heap_free(dev, retired);
+ }
+ 
++/* Frees the device's heap when it is charged to a pool whose headroom has
++ * fallen below half its size, it grew past the starting size and no
++ * recording holds it. The next draw that needs a heap creates one. A heap is
++ * created at no more than half the headroom, so a steady workload finds the
++ * pool with as much room left as its heap holds and keeps it. */
++static void
++kk_heap_return_idle(struct kk_device *dev)
++{
++   if (!kk_heap_pooled(dev) ||
++       p_atomic_read(&dev->heap_live_B) <= dev->heap_start_B)
++      return;
++
++   struct kk_geometry_heap *idle = NULL;
++   simple_mtx_lock(&dev->heap_lock);
++   struct kk_geometry_heap *heap = dev->heap;
++   if (heap != NULL && heap->refcount == 1 &&
++       heap->bo->size_B > dev->heap_start_B &&
++       dev->memory_pool.pfnHeadroom(dev->memory_pool.pUserData) <
++          heap->bo->size_B / 2u) {
++      kk_heap_observe_locked(dev, heap);
++      heap->refcount = 0;
++      idle = heap;
++      dev->heap = NULL;
++      dev->heap_attempted = false;
++   }
++   simple_mtx_unlock(&dev->heap_lock);
++
++   if (idle != NULL)
++      kk_geometry_heap_free(dev, idle);
++}
++
+ void
+ kk_cmd_release_heaps(struct kk_cmd_buffer *cmd)
+ {
+@@ -1437,8 +1568,10 @@ kk_cmd_release_heaps(struct kk_cmd_buffer *cmd)
+    cmd->heap = NULL;
+    cmd->heap_in_segment = false;
+    cmd->heap_demand_B = 0;
+-   if (count == 0)
++   if (count == 0) {
++      kk_heap_return_idle(dev);
+       return;
++   }
+ 
+    /* Vulkan forbids resetting or freeing a pending command buffer, and a
+     * re-record waits for the last submission, so the work that used these
+@@ -1456,6 +1589,7 @@ kk_cmd_release_heaps(struct kk_cmd_buffer *cmd)
+    for (unsigned i = 0; i < unused; ++i)
+       kk_geometry_heap_free(dev, heaps[i]);
+    util_dynarray_clear(&cmd->pinned_heaps);
++   kk_heap_return_idle(dev);
+ }
+ 
+ /* The pinned heap's GPU address, for a stage about to reserve from it. A
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 610112f6a98e84c25f2252a6d02adcbb4cabab47..8e6416d1168b1776aa2fdc99bf21520911900cfe 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -390,6 +390,14 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    dev->vk.shader_ops = &kk_device_shader_ops;
+    dev->mtl_handle = pdev->mtl_dev_handle;
++
++   const VkDeviceMemoryPoolCreateInfoKK *memory_pool = vk_find_struct_const(
++      pCreateInfo->pNext, DEVICE_MEMORY_POOL_CREATE_INFO_KK);
++   if (memory_pool != NULL && memory_pool->pfnReserve != NULL &&
++       memory_pool->pfnRelease != NULL && memory_pool->pfnHeadroom != NULL) {
++      dev->memory_pool = *memory_pool;
++      dev->memory_pool.pNext = NULL;
++   }
+    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
+    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
+    dev->vk.get_timestamp = kk_get_timestamp;
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 69da569a5d8e0287165eb5e303a608406fba4c8d..cb7f1868b1c3a4edfdadf492d0eba972a111be0d 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -8,6 +8,7 @@
+ #ifndef KK_DEVICE_H
+ #define KK_DEVICE_H 1
+ 
++#include "kk_device_memory_pool.h"
+ #include "kk_private.h"
+ 
+ #include "kk_query_table.h"
+@@ -191,25 +192,38 @@ struct kk_device {
+     * fields after it. */
+    simple_mtx_t heap_lock;
+    struct kk_geometry_heap *heap;
+-   /* Whether the first heap was attempted: a device Metal refused it keeps
+-    * none. */
++   /* Whether the device has a heap or Metal refused it one, which leaves it
++    * none. A pool that refuses the device a heap, or takes back an idle one,
++    * leaves it unset, and the next draw that needs a heap creates one. */
+    bool heap_attempted;
+    bool heap_loss_reported;
+-   /* The largest the heap may grow to, and the usable size refusals the GPU
+-    * counted ask the next pin to grow it to. */
++   /* The largest a bound the host computed may grow the heap to, the largest
++    * refusals the GPU counted may grow it to, and the usable size those
++    * refusals ask the next pin to grow it to. */
+    uint64_t heap_cap_B;
++   uint64_t heap_measured_cap_B;
+    uint64_t heap_wanted_B;
++   /* The starting size the first heap was created from. */
++   uint64_t heap_start_B;
+    /* The bytes of every geometry heap alive, the current one and those
+     * recordings still pin, and the most there have been. */
+    uint64_t heap_live_B;
+    uint64_t heap_peak_B;
+ 
++   /* The device-memory pool the device's creator shares with it, which the
++    * geometry heap is charged to, or all zero; see kk_device_memory_pool.h. */
++   VkDeviceMemoryPoolCreateInfoKK memory_pool;
++
+    uint64_t disabled_workarounds;
+    bool gpu_capture_enabled;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ 
++/* For vk_find_struct(). */
++#define VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK_cast                 \
++   VkDeviceMemoryPoolCreateInfoKK
++
+ static inline struct kk_physical_device *
+ kk_device_physical(const struct kk_device *dev)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d53a32784c40172e8d95777ef3e033f88f8e11b4
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -0,0 +1,54 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A device-memory pool the creator of a KosmicKrisp device shares with it.
++ *
++ * Chained to VkDeviceCreateInfo, it makes the device charge the memory it
++ * allocates for itself, which no application allocation accounts for, to a
++ * pool that its creator charges its own allocations to as well, so that
++ * together they stay within the pool's limit. Before such an allocation the
++ * device reserves its size, and a refused reservation means the device does
++ * without that memory. The device releases the reservation once the
++ * allocation exists, when the pool's usage counts it, or has failed.
++ *
++ * The device charges its geometry heap this way. A heap it creates or grows
++ * takes at most half of the pool's headroom, and one that no recording holds
++ * is freed when the headroom has fallen below half its size. A device
++ * created without a pool bounds its heap by a fixed size instead.
++ *
++ * The callbacks may be called from any thread, with device locks held, so
++ * they must not call back into the device. The structure is copied when the
++ * device is created; pUserData must outlive the device. */
++
++#pragma once
++
++#include <vulkan/vulkan_core.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* In the VK_EXT_memory_budget namespace, at an offset the extension does not
++ * use, following Mesa's internal structures. */
++#define VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK                    \
++   ((VkStructureType)1000237900)
++
++typedef struct VkDeviceMemoryPoolCreateInfoKK {
++   VkStructureType sType;
++   const void *pNext;
++   void *pUserData;
++   /* Charges size bytes to the pool, or returns VK_FALSE and charges nothing
++    * when the pool cannot hold them. */
++   VkBool32(VKAPI_PTR *pfnReserve)(void *pUserData, VkDeviceSize size);
++   /* Returns a reservation of size bytes. */
++   void(VKAPI_PTR *pfnRelease)(void *pUserData, VkDeviceSize size);
++   /* What the pool can still hold: its limit less everything allocated and
++    * reserved. */
++   VkDeviceSize(VKAPI_PTR *pfnHeadroom)(void *pUserData);
++} VkDeviceMemoryPoolCreateInfoKK;
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 6e93ab6515937713b39694cdc4d54e54e518e158..76c613fa4b392c41dcef031ec3dc727e490fb127 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -378,7 +378,7 @@ if with_tests
+       ['pipeline_statistics_gpu', 120, []],
+       ['owed_signal_bound', 60, []],
+       ['heap_size_override', 60, []],
+-      ['heap_growth', 120, []],
++      ['heap_growth', 120, [dep_thread]],
+       ['command_resubmit', 60, [dep_thread]],
+     ]
+       test(
+diff --git a/src/kosmickrisp/vulkan/tests/test_heap_growth.c b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+index 5c6b177f2ce0435acc4724f1e3409e299c6abb68..fe39c707ef440cd4321026ac363958558aa89643 100644
+--- a/src/kosmickrisp/vulkan/tests/test_heap_growth.c
++++ b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+@@ -10,15 +10,27 @@
+  * reports, and a later submission of the same command buffer renders whole.
+  * Each case runs on a device of its own at the default 16 MiB and reports the
+  * heap it leaves and the most heap memory it held at once. A device that
+- * never draws through the heap has none. */
++ * never draws through the heap has none.
++ *
++ * A device created with a device-memory pool, as a Venus renderer creates
++ * the devices it serves a guest from, charges its heaps to the pool: they
++ * take at most half of what the pool can still hold, so the heap and a guest
++ * allocation on another thread never take it past its limit, and a guest
++ * allocation that fits what the pool has left is not refused. */
+ 
+ #define VK_NO_PROTOTYPES
+ #include "kk_bo.h"
+ #include "kk_device.h"
++#include "kk_device_memory_pool.h"
++
++#include "kosmickrisp/bridge/mtl_device.h"
+ 
++#include <errno.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #include "kk_test.h"
+ 
+@@ -69,6 +81,167 @@ static const char *const kind_names[] = {
+    "list", "fan", "tess", "tess level 1", "tess dynamic 64", "tess dynamic 1",
+ };
+ 
++enum guest_order {
++   /* No guest allocation. */
++   NO_GUEST,
++   /* The guest reserves its allocation before the heap is created, and
++    * allocates it once the heap has reserved. */
++   GUEST_FIRST,
++   /* The guest reserves its allocation after the heap has reserved and
++    * before the heap is created. */
++   HEAP_FIRST,
++};
++
++/* A device-memory pool like the one a Venus renderer shares with the devices
++ * it creates: what Metal has allocated for the process and the reservations
++ * it does not count yet, within a limit. Reservations are charged in the
++ * 16 KiB pages Metal counts. */
++struct test_pool {
++   /* The room the pool leaves above what the device holds before it
++    * records, and a guest allocation of guest_B on another thread in the
++    * given order to the heap's creation. */
++   uint64_t room_B, guest_B;
++   enum guest_order guest;
++   /* After the draws: whether to allocate, through the pool, what it has
++    * left, and the room to leave, if not zero, before the recording is
++    * freed. */
++   bool fill;
++   uint64_t shrink_room_B;
++
++   pthread_mutex_t mutex;
++   pthread_cond_t cond;
++   mtl_device *mtl;
++   uint64_t limit_B, reserved_B;
++   /* 1 once the first of the heap and the guest has reserved, 2 once the
++    * other has. */
++   unsigned stage;
++   bool guest_admitted, guest_allocated, fill_admitted;
++   uint64_t fill_B;
++   unsigned heap_reservations, heap_refusals;
++};
++
++static uint64_t
++pool_charge_B(VkDeviceSize size)
++{
++   return (size + 16383u) & ~(uint64_t)16383u;
++}
++
++static uint64_t
++pool_headroom_locked(const struct test_pool *pool)
++{
++   const uint64_t used_B =
++      mtl_device_current_allocated_size(pool->mtl) + pool->reserved_B;
++   return used_B < pool->limit_B ? pool->limit_B - used_B : 0u;
++}
++
++static bool
++pool_reserve_locked(struct test_pool *pool, VkDeviceSize size)
++{
++   const uint64_t charge_B = pool_charge_B(size);
++   if (charge_B > pool_headroom_locked(pool))
++      return false;
++   pool->reserved_B += charge_B;
++   return true;
++}
++
++static VkBool32 VKAPI_PTR
++pool_reserve(void *data, VkDeviceSize size)
++{
++   struct test_pool *pool = data;
++   pthread_mutex_lock(&pool->mutex);
++   const bool admitted = pool_reserve_locked(pool, size);
++   pool->heap_reservations++;
++   pool->heap_refusals += !admitted;
++   /* The guest's turn: after the heap has reserved, and, in HEAP_FIRST,
++    * before the heap exists. */
++   if (pool->guest != NO_GUEST && pool->stage < 2u) {
++      const bool wait = pool->guest == HEAP_FIRST;
++      pool->stage++;
++      pthread_cond_broadcast(&pool->cond);
++      struct timespec deadline;
++      clock_gettime(CLOCK_REALTIME, &deadline);
++      deadline.tv_sec += 10;
++      while (wait && pool->stage < 2u &&
++             pthread_cond_timedwait(&pool->cond, &pool->mutex, &deadline) !=
++                ETIMEDOUT)
++         ;
++   }
++   pthread_mutex_unlock(&pool->mutex);
++   return admitted;
++}
++
++static void VKAPI_PTR
++pool_release(void *data, VkDeviceSize size)
++{
++   struct test_pool *pool = data;
++   pthread_mutex_lock(&pool->mutex);
++   CHECK(pool->reserved_B >= pool_charge_B(size));
++   pool->reserved_B -= pool_charge_B(size);
++   pthread_mutex_unlock(&pool->mutex);
++}
++
++static VkDeviceSize VKAPI_PTR
++pool_headroom(void *data)
++{
++   struct test_pool *pool = data;
++   pthread_mutex_lock(&pool->mutex);
++   const uint64_t headroom_B = pool_headroom_locked(pool);
++   pthread_mutex_unlock(&pool->mutex);
++   return headroom_B;
++}
++
++/* Waits, for at most ten seconds, for the pool's stage to reach stage. Called
++ * with the pool's mutex held. */
++static void
++pool_wait_locked(struct test_pool *pool, unsigned stage)
++{
++   struct timespec deadline;
++   clock_gettime(CLOCK_REALTIME, &deadline);
++   deadline.tv_sec += 10;
++   while (pool->stage < stage &&
++          pthread_cond_timedwait(&pool->cond, &pool->mutex, &deadline) !=
++             ETIMEDOUT)
++      ;
++}
++
++struct guest {
++   struct test_pool *pool;
++   VkDevice device;
++   PFN_vkAllocateMemory allocate;
++   uint32_t type;
++   VkDeviceMemory memory;
++};
++
++/* Makes the guest allocation through the pool, as a Venus renderer admits
++ * one, in its turn. */
++static void *
++guest_main(void *data)
++{
++   struct guest *guest = data;
++   struct test_pool *pool = guest->pool;
++   pthread_mutex_lock(&pool->mutex);
++   if (pool->guest == HEAP_FIRST)
++      pool_wait_locked(pool, 1u);
++   pool->guest_admitted = pool_reserve_locked(pool, pool->guest_B);
++   pool->stage++;
++   pthread_cond_broadcast(&pool->cond);
++   if (pool->guest == GUEST_FIRST)
++      pool_wait_locked(pool, 2u);
++   pthread_mutex_unlock(&pool->mutex);
++
++   if (pool->guest_admitted) {
++      VkMemoryAllocateInfo info = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++         .allocationSize = pool->guest_B,
++         .memoryTypeIndex = guest->type,
++      };
++      pool->guest_allocated = guest->allocate(guest->device, &info, NULL,
++                                              &guest->memory) == VK_SUCCESS;
++      pool_release(pool, pool->guest_B);
++   }
++   return NULL;
++}
++
+ struct draw_case {
+    enum draw_kind kind;
+    /* Draws count vertices, draws times, and then second more when it is not
+@@ -78,12 +251,18 @@ struct draw_case {
+    bool indirect, multi;
+    /* How many times the command buffer is submitted. */
+    unsigned submissions;
++   /* The device-memory pool the device is created with, or NULL. */
++   struct test_pool *pool;
+ };
+ 
+ struct outcome {
+    uint32_t red[2];
+    uint64_t heap_B, peak_B;
+    bool loss_reported;
++   /* With a pool: how far the heaps and the guest allocation together went
++    * past the room the pool left them, and the heap bytes left once the
++    * recording is freed. */
++   uint64_t over_B, live_after_B;
+ };
+ 
+ static struct outcome
+@@ -107,8 +286,19 @@ run(struct kk_test_device *t, const struct draw_case *c)
+       .tessellationShader = tess,
+    };
+    const char *const extensions[] = {VK_EXT_MULTI_DRAW_EXTENSION_NAME};
+-   kk_test_create_device(t, &features13,
++   struct test_pool *pool = c->pool;
++   VkDeviceMemoryPoolCreateInfoKK pool_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK,
++      .pNext = &features13,
++      .pUserData = pool,
++      .pfnReserve = pool_reserve,
++      .pfnRelease = pool_release,
++      .pfnHeadroom = pool_headroom,
++   };
++   kk_test_create_device(t, pool ? (const void *)&pool_info : &features13,
+                          &features, c->multi ? 1 : 0, extensions);
++   if (pool != NULL)
++      pool->mtl = kk_device_from_handle(t->device)->mtl_handle;
+    KK_LOAD_DEVICE_FUNCTIONS(*t);
+    LOAD_D(vkCmdDrawIndirect);
+    PFN_vkCmdDrawMultiEXT vkCmdDrawMultiEXT =
+@@ -276,13 +466,37 @@ run(struct kk_test_device *t, const struct draw_case *c)
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                       &pipeline_info, NULL, &pipeline));
+ 
+-   VkCommandPool pool = VK_NULL_HANDLE;
++   VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+-   kk_test_command_buffer(t, 0, &pool, &commands);
++   kk_test_command_buffer(t, 0, &command_pool, &commands);
+    /* Not one-time: a second submission records the commands again. */
+    VkCommandBufferBeginInfo begin = {
+       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    };
++
++   /* The pool leaves the heap and the guest room_B above what the device
++    * holds now. */
++   pthread_t guest_thread;
++   struct guest guest = {
++      .pool = pool,
++      .device = device,
++      .allocate = vkAllocateMemory,
++      .type = image_type,
++   };
++   if (pool != NULL) {
++      pthread_mutex_lock(&pool->mutex);
++      pool->limit_B = mtl_device_current_allocated_size(pool->mtl) +
++                      pool->reserved_B + pool->room_B;
++      pthread_mutex_unlock(&pool->mutex);
++      if (pool->guest != NO_GUEST)
++         CHECK(pthread_create(&guest_thread, NULL, guest_main, &guest) == 0);
++      if (pool->guest == GUEST_FIRST) {
++         pthread_mutex_lock(&pool->mutex);
++         pool_wait_locked(pool, 1u);
++         pthread_mutex_unlock(&pool->mutex);
++      }
++   }
++
+    VK_CHECK(vkBeginCommandBuffer(commands, &begin));
+    VkRenderingAttachmentInfo color_attachment = {
+       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+@@ -357,12 +571,58 @@ run(struct kk_test_device *t, const struct draw_case *c)
+       }
+    }
+ 
+-   /* Freeing the command buffer reads the refusals of the last submission. */
+-   vkDestroyCommandPool(device, pool, NULL);
+    struct kk_device *dev = kk_device_from_handle(device);
++   if (pool != NULL) {
++      if (pool->guest != NO_GUEST)
++         CHECK(pthread_join(guest_thread, NULL) == 0);
++      /* The most the heaps held at once, with the guest allocation beside
++       * them all along. */
++      const uint64_t charged_B =
++         dev->heap_peak_B +
++         (pool->guest_allocated ? pool_charge_B(pool->guest_B) : 0u);
++      outcome.over_B =
++         charged_B > pool->room_B ? charged_B - pool->room_B : 0u;
++
++      if (pool->fill) {
++         pthread_mutex_lock(&pool->mutex);
++         const uint64_t headroom_B = pool_headroom_locked(pool);
++         pool->fill_B = headroom_B > (64u << 10)
++                           ? (headroom_B - (64u << 10)) & ~(uint64_t)16383u
++                           : 0u;
++         const bool admitted =
++            pool->fill_B != 0u && pool_reserve_locked(pool, pool->fill_B);
++         pthread_mutex_unlock(&pool->mutex);
++         if (admitted) {
++            VkMemoryAllocateInfo fill_info = {
++               .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++               .allocationSize = pool->fill_B,
++               .memoryTypeIndex = image_type,
++            };
++            VkDeviceMemory fill = VK_NULL_HANDLE;
++            pool->fill_admitted =
++               vkAllocateMemory(device, &fill_info, NULL, &fill) ==
++               VK_SUCCESS;
++            pool_release(pool, pool->fill_B);
++            if (fill != VK_NULL_HANDLE)
++               vkFreeMemory(device, fill, NULL);
++         }
++      }
++      if (guest.memory != VK_NULL_HANDLE)
++         vkFreeMemory(device, guest.memory, NULL);
++      if (pool->shrink_room_B != 0u) {
++         pthread_mutex_lock(&pool->mutex);
++         pool->limit_B = mtl_device_current_allocated_size(pool->mtl) +
++                         pool->reserved_B + pool->shrink_room_B;
++         pthread_mutex_unlock(&pool->mutex);
++      }
++   }
++
++   /* Freeing the command buffer reads the refusals of the last submission. */
++   vkDestroyCommandPool(device, command_pool, NULL);
+    outcome.heap_B = dev->heap ? dev->heap->bo->size_B : 0u;
+    outcome.peak_B = dev->heap_peak_B;
+    outcome.loss_reported = dev->heap_loss_reported;
++   outcome.live_after_B = dev->heap_live_B;
+ 
+    vkDestroyPipeline(device, pipeline, NULL);
+    vkDestroyPipelineLayout(device, layout, NULL);
+@@ -392,13 +652,51 @@ report(struct kk_test_device *t, const struct draw_case *c)
+    printf(":");
+    for (unsigned s = 0u; s < c->submissions; s++)
+       printf(" submission %u %u red,", s + 1u, outcome.red[s]);
+-   printf(" heap %llu MiB, at most %llu MiB%s\n",
+-          (unsigned long long)(outcome.heap_B >> 20),
+-          (unsigned long long)(outcome.peak_B >> 20),
++   printf(" heap %.1f MiB, at most %.1f MiB%s", outcome.heap_B / 1048576.0,
++          outcome.peak_B / 1048576.0,
+           outcome.loss_reported ? ", loss reported" : "");
++   const struct test_pool *pool = c->pool;
++   if (pool != NULL) {
++      printf("; pool room %llu MiB", (unsigned long long)(pool->room_B >> 20));
++      if (pool->guest != NO_GUEST)
++         printf(", guest %llu MiB %s the heap %s",
++                (unsigned long long)(pool->guest_B >> 20),
++                pool->guest == GUEST_FIRST ? "before" : "after",
++                pool->guest_allocated ? "allocated" : "refused");
++      printf(", %u heap reservations, %u refused, %.1f MiB past the room",
++             pool->heap_reservations, pool->heap_refusals,
++             outcome.over_B / 1048576.0);
++      if (pool->fill)
++         printf(", %.1f MiB left %s", pool->fill_B / 1048576.0,
++                pool->fill_admitted ? "allocated" : "refused");
++      printf(", %.1f MiB of heap after the recording is freed",
++             outcome.live_after_B / 1048576.0);
++   }
++   printf("\n");
+    return outcome;
+ }
+ 
++static struct test_pool *
++new_pool(uint64_t room_B, enum guest_order guest, uint64_t guest_B)
++{
++   struct test_pool *pool = calloc(1, sizeof(*pool));
++   CHECK(pool != NULL);
++   pool->room_B = room_B;
++   pool->guest = guest;
++   pool->guest_B = guest_B;
++   CHECK(pthread_mutex_init(&pool->mutex, NULL) == 0);
++   CHECK(pthread_cond_init(&pool->cond, NULL) == 0);
++   return pool;
++}
++
++static void
++free_pool(struct test_pool *pool)
++{
++   pthread_cond_destroy(&pool->cond);
++   pthread_mutex_destroy(&pool->mutex);
++   free(pool);
++}
++
+ #define MIB(n) ((uint64_t)(n) << 20)
+ 
+ int
+@@ -498,6 +796,82 @@ main(void)
+    CHECK(o.red[0] == 64u * TILE_TEXELS && o.heap_B == MIB(128) &&
+          o.peak_B == MIB(16 + 32 + 64 + 128) && !o.loss_reported);
+ 
++   /* With a pool, the 256 level-64 patches' 33.8 MB bound asks for 64 MiB.
++    * Where the pool leaves 48 MiB, the heap takes half of it and loses part
++    * of the draw on both submissions rather than take the pool past its
++    * limit, and a guest allocation of what is left is not refused. */
++   const uint32_t tiles256 = 256u * TILE_TEXELS;
++   struct test_pool *pool = new_pool(MIB(48), NO_GUEST, 0u);
++   pool->fill = true;
++   o = report(&t,
++              &(struct draw_case){TESS, 256u, 1, 0, false, false, 2, pool});
++   CHECK(o.red[0] < tiles256 && o.red[1] < tiles256 && o.loss_reported &&
++         o.heap_B <= MIB(24) && o.over_B == 0u && pool->heap_reservations &&
++         pool->fill_admitted && pool->fill_B >= MIB(12));
++   free_pool(pool);
++
++   /* Where it leaves 96 MiB and a guest on another thread reserves 64 MiB
++    * of it first, the heap takes half of the 32 MiB left. Where the heap
++    * reserves first, it takes 48 MiB, and the guest's reservation, which the
++    * pool alone could hold, is refused before the heap exists. Neither order
++    * takes the pool past its limit, and the heap stays, since the pool has
++    * more room left than half the heap. */
++   pool = new_pool(MIB(96), GUEST_FIRST, MIB(64));
++   o = report(&t,
++              &(struct draw_case){TESS, 256u, 1, 0, false, false, 1, pool});
++   CHECK(pool->guest_allocated && o.heap_B <= MIB(16) && o.over_B == 0u &&
++         o.red[0] < tiles256 && o.loss_reported && pool->heap_reservations);
++   free_pool(pool);
++   pool = new_pool(MIB(96), HEAP_FIRST, MIB(64));
++   o = report(&t,
++              &(struct draw_case){TESS, 256u, 1, 0, false, false, 1, pool});
++   CHECK(!pool->guest_admitted && o.heap_B > MIB(40) &&
++         o.heap_B <= MIB(48) && o.over_B == 0u && o.red[0] == tiles256 &&
++         !o.loss_reported && pool->heap_reservations == 1u &&
++         o.live_after_B == o.heap_B);
++   free_pool(pool);
++
++   /* The 500 draws of 64 patches at a computed level grow the heap as far as
++    * the pool lets them: further where it leaves 256 MiB than 64 MiB, and
++    * never, with every heap the recording held, past it. */
++   uint64_t heaps[2];
++   const uint64_t rooms[2] = {MIB(64), MIB(256)};
++   for (unsigned i = 0u; i < 2u; i++) {
++      pool = new_pool(rooms[i], NO_GUEST, 0u);
++      o = report(&t,
++                 &(struct draw_case){TESS_DYNAMIC1, 64u, 500, 0, false, false,
++                                     1, pool});
++      CHECK(o.red[0] == 64u * TILE_TEXELS && o.over_B == 0u &&
++            o.heap_B <= MIB(128));
++      heaps[i] = o.heap_B;
++      free_pool(pool);
++   }
++   CHECK(heaps[0] < heaps[1]);
++
++   /* 1200 indirect patches at level 64 need 151 MiB, past the 128 MiB a
++    * bound may grow the heap to. Without a pool the heap stops there and the
++    * draw keeps losing its output; with a pool that has room, what the GPU
++    * counted grows it past, and the second submission renders whole. */
++   o = report(&t,
++              &(struct draw_case){TESS, 1200u, 1, 0, true, false, 2});
++   CHECK(o.red[1] < full && o.heap_B == MIB(128) && o.loss_reported);
++   pool = new_pool(MIB(1024), NO_GUEST, 0u);
++   o = report(&t,
++              &(struct draw_case){TESS, 1200u, 1, 0, true, false, 2, pool});
++   CHECK(o.red[0] < full && o.red[1] == full && o.heap_B == MIB(256) &&
++         o.loss_reported && o.over_B == 0u);
++   free_pool(pool);
++
++   /* A heap that grew past the starting size is freed with the recording
++    * that held it once the pool has less room left than half of it. */
++   pool = new_pool(MIB(256), NO_GUEST, 0u);
++   pool->shrink_room_B = MIB(16);
++   o = report(&t,
++              &(struct draw_case){TESS, 256u, 1, 0, false, false, 1, pool});
++   CHECK(o.red[0] == tiles256 && o.peak_B == MIB(64) && o.heap_B == 0u &&
++         o.live_after_B == 0u && o.over_B == 0u);
++   free_pool(pool);
++
+    kk_test_destroy(&t);
+    printf("the geometry heap grows for the draws that need it\n");
+    return 0;

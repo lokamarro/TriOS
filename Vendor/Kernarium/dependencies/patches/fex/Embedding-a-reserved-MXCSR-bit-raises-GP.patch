@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:28:28 +0900
+Subject: [PATCH] Embedding: a reserved MXCSR bit raises #GP
+
+MXCSR_MASK is 0xFFFF, and LDMXCSR, VLDMXCSR and FXRSTOR raise #GP(0)
+for an image or operand with a bit above it set, before they change
+anything. Embedded, they masked the bits off and loaded the rest. A new
+EmbedderRaiseGP op leaves the dispatch with #GP(0) at the instruction
+when its operand is not zero, with the stack pointer, registers and
+flags as the instruction found them; FXRSTOR checks the MXCSR it would
+load once it has read the whole image.
+---
+ .../Interface/Core/JIT/EmbedderMemory.cpp     | 20 +++++++++++++++++++
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  4 ++++
+ .../Core/OpcodeDispatcher/Vector.cpp          | 17 ++++++++++++++--
+ FEXCore/Source/Interface/IR/IR.json           |  7 +++++++
+ .../IR/Passes/RegisterAllocationPass.cpp      |  1 +
+ 5 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+index 8fa607a4c13b9ffcbcc855f712664bb10e7e710b..e35ee124dc8ee4e55c6003c69a944372b93da5ed 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+@@ -128,6 +128,26 @@ DEF_OP(EmbedderProbe) {
+   (void)EmbedderTranslate(TMP4, 1, 0);
+ }
+ 
++DEF_OP(EmbedderRaiseGP) {
++  const auto Op = IROp->C<IR::IROp_EmbedderRaiseGP>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderRaiseGP outside embedding");
++  auto Site = fextl::make_unique<EmbedderBudgetSite>();
++  Site->GuestRIP = EmbedderCurrentRIP;
++  Site->ExitReason = Core::EMBEDDER_EXIT_BREAK;
++  Site->Unretired = EmbedderUnretired(false);
++  const Core::CpuStateFrame::SynchronousFaultDataStruct Fault = {
++    .FaultToTopAndGeneratedException = 1,
++    .Signal = Core::FAULT_SIGSEGV,
++    .TrapNo = X86State::X86_TRAPNO_GP,
++    .si_code = 0x80,
++    .err_code = 0,
++  };
++  memcpy(&Site->FaultData, &Fault, sizeof(Fault));
++  auto* Entry = &Site->Entry;
++  EmbedderBudgetSites.push_back(std::move(Site));
++  cbnz_OrRestart(ARMEmitter::Size::i32Bit, GetReg(Op->Value), Entry);
++}
++
+ void Arm64JITCore::EmbedderAtomic(ARMEmitter::Register Address, uint32_t Size, std::function<void(ARMEmitter::Register)> Op) {
+   const auto Host = EmbedderTranslate(Address, Size, Core::EMBEDDER_ACCESS_ATOMIC);
+   auto* Site = EmbedderColdSites.back().get();
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index d6113ab814c36f2b7996a4c6bdd7316c2e4e9473..f671e645f184563f890ed7d28b89619e79e23abd 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1545,6 +1545,10 @@ private:
+   // Alignment, as FXSAVE, FXRSTOR, XSAVE and XRSTOR do for their image. It
+   // ends the block, so the caller computes its values after it.
+   void EmbedderRequireAlignment(OpcodeArgs, Ref Addr, uint32_t Alignment);
++  // Embedded: raises #GP(0), with nothing changed, when MXCSR has a reserved
++  // bit set, as LDMXCSR, FXRSTOR and XRSTOR do. Selected, if given, is 1 when
++  // the instruction loads MXCSR at all and 0 when it does not.
++  void EmbedderCheckMXCSR(Ref MXCSR, Ref Selected = nullptr);
+   // Embedded: faults as a read of the byte at Addr, as CLFLUSH, CLFLUSHOPT and CLWB do.
+   void EmbedderCacheLineProbe(Ref Addr);
+   // Embedded, while the x87 control word unmasks an exception: x87 checks.
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index 642d51856b85527db8d53a64269fc9da3cf07dbe..3b609f25fe324633371aa58f9ea447285bf5840d 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -844,6 +844,17 @@ void OpDispatchBuilder::EmbedderRequireAlignment(OpcodeArgs, Ref Addr, uint32_t
+   StartNewBlock();
+ }
+ 
++void OpDispatchBuilder::EmbedderCheckMXCSR(Ref MXCSR, Ref Selected) {
++  if (!CTX->Embedded) {
++    return;
++  }
++  Ref Reserved = _And(OpSize::i32Bit, MXCSR, Constant(~MXCSRMask()));
++  if (Selected) {
++    Reserved = _And(OpSize::i32Bit, Reserved, _Sub(OpSize::i32Bit, Constant(0), Selected));
++  }
++  _EmbedderRaiseGP(Reserved);
++}
++
+ Ref OpDispatchBuilder::EmbedderFPResult(Ref Result, uint32_t Descriptor, Ref Source1, Ref Source2, Ref Source3) {
+   if (!EmbedderFPChecks(static_cast<Core::EmbedderFPKind>(Descriptor & 0xFF))) {
+     return Result;
+@@ -3516,10 +3527,11 @@ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
+     _EmbedderProbe(Mem, 512);
+   }
+ 
++  Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Mem, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
++  EmbedderCheckMXCSR(MXCSR);
++
+   RestoreX87State(Mem);
+   RestoreSSEState(Mem);
+-
+-  Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Mem, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
+   RestoreMXCSRState(MXCSR);
+   EmbedderFPModeCheck(Op);
+ }
+@@ -3760,6 +3772,7 @@ void OpDispatchBuilder::UCOMISxOp(OpcodeArgs, IR::OpSize ElementSize) {
+ 
+ void OpDispatchBuilder::LDMXCSR(OpcodeArgs) {
+   Ref Dest = LoadSourceGPR_WithOpSize(Op, Op->Dest, OpSize::i32Bit, Op->Flags);
++  EmbedderCheckMXCSR(Dest);
+   RestoreMXCSRState(Dest);
+   EmbedderFPModeCheck(Op);
+ }
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 5c664b079685f49230ce48b4250542cb21b0e840..1b61f8c36c760cfc90c79a999b6372b0480835cc 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -787,6 +787,13 @@
+         "HasSideEffects": true
+       },
+ 
++      "EmbedderRaiseGP GPR:$Value": {
++        "Desc": ["Embedded only: raises #GP(0) at the instruction, with nothing changed, when Value is",
++                 "not zero, as LDMXCSR, FXRSTOR and XRSTOR do for a reserved MXCSR bit."
++                ],
++        "HasSideEffects": true
++      },
++
+       "CacheLineClear GPR:$Addr, i1:$Serialize": {
+         "Desc": ["Does a 64 byte cacheline clear at the address specified",
+                  "Only clears the data cachelines. Doesn't do any zeroing",
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index c69b8bb07ab1ce660d1d042aa2709e54b5f3a623..1bc414ec390a1ded63abe8d1a18e0c17022e10ce 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -101,6 +101,7 @@ private:
+     case OP_POP:
+     case OP_POPTWO:
+     case OP_EMBEDDERPROBE:
++    case OP_EMBEDDERRAISEGP:
+     case OP_EMBEDDERFPCHECK:
+     case OP_EMBEDDERFPMODECHECK:
+     case OP_CACHELINEZERO:

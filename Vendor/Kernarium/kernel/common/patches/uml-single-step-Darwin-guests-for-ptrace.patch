@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 17:37:25 +0900
+Subject: [PATCH] uml: single-step Darwin guests for ptrace
+
+PTRACE_SINGLESTEP set TIF_SINGLESTEP, but only syscall exit honoured it,
+so a stepped task ran on until its next system call. gdb resumes past
+every breakpoint by stepping one instruction, so the tracee crashed or
+hung on the first continue, and a dynamically linked program crashed
+under a plain run.
+
+Set PSTATE.SS in the entry registers while the task is being stepped.
+The host engine then retires one instruction, as after an eret with
+PSTATE.SS set, and reports the software-step exception class, which is
+delivered as SIGTRAP with TRAP_TRACE at the next PC. The bit is cleared
+on return so no saved or traced register carries it.
+---
+ arch/um/os-Darwin/skas/process.c | 35 +++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 7734bb4843add9f185d0d909944e3b91fd6f09c1..d31df98a9c15506c163f3de731285a2dd7ca7491 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -67,6 +67,31 @@ _Static_assert(UML_ARM64_FAULT_PAGE == DARWIN_UML_FAULT_PAGE,
+ #define DARWIN_GUEST_FPE_FLTRES 6
+ #define DARWIN_GUEST_FPE_FLTINV 7
+ #define DARWIN_GUEST_FPE_FLTUNK 14
++/* PSTATE.SS, and the ESR exception class of the software-step exception it
++ * raises: the engine retires one instruction and reports that class. */
++#define DARWIN_GUEST_PSTATE_SS (1UL << 21)
++#define DARWIN_GUEST_SOFTWARE_STEP 0x32
++
++/*
++ * PTRACE_SINGLESTEP asks for one instruction, like an eret with PSTATE.SS
++ * set.  The bit exists only for the entry: rt_sigreturn and a tracer's
++ * register writes clear it through uml_arm64_valid_user_pstate(), as native
++ * valid_user_regs() does, so saved, traced and signal-frame registers never
++ * carry it.  Returns whether the bit was set for this entry.
++ */
++static int begin_guest_step(struct uml_pt_regs *regs)
++{
++	if (!singlestepping())
++		return 0;
++	UPT_PSTATE(regs) |= DARWIN_GUEST_PSTATE_SS;
++	return 1;
++}
++
++static void end_guest_step(struct uml_pt_regs *regs, int stepping)
++{
++	if (stepping)
++		UPT_PSTATE(regs) &= ~DARWIN_GUEST_PSTATE_SS;
++}
+ 
+ static pthread_mutex_t shutdown_lock = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t shutdown_condition = PTHREAD_COND_INITIALIZER;
+@@ -341,6 +366,7 @@ void userspace(struct uml_pt_regs *registers)
+ 		const unsigned int *guest_ipi_sequence;
+ 		unsigned int guest_ipi_snapshot;
+ 		int event;
++		int stepping;
+ 		int snapshots_mm;
+ 
+ 		/*
+@@ -384,12 +410,14 @@ void userspace(struct uml_pt_regs *registers)
+ 		if (darwin_uml_static_guest_interrupt_sequence(
+ 			guest_ipi_sequence, guest_ipi_snapshot) < 0)
+ 			fatal_userspace(registers, "interrupt registration", -1);
++		stepping = begin_guest_step(registers);
+ 		darwin_ipi_guest_begin();
+ 		event = darwin_uml_enter_guest(registers, registers->fp,
+ 				host_fp_size,
+ 				mm_id == NULL ? 0 : mm_id->darwin_generation,
+ 				&guest_tls);
+ 		darwin_ipi_guest_end();
++		end_guest_step(registers, stepping);
+ 		if (event == DARWIN_UML_EVENT_STOP)
+ 			darwin_host_stop();
+ 		/*
+@@ -626,12 +654,17 @@ void userspace(struct uml_pt_regs *registers)
+ 		{
+ 			siginfo_t signal_info = { 0 };
+ 
++			/* A completed single step is the software-step exception,
++			 * which native arm64 reports as TRAP_TRACE at the next PC. */
++			int stepped = registers->faultinfo.trap_no ==
++				DARWIN_GUEST_SOFTWARE_STEP;
++
+ 			registers->faultinfo.error_code = 0;
+ 			registers->faultinfo.cr2 = UPT_IP(registers);
+ 			registers->faultinfo.trap_no = 0;
+ 			signal_info.si_signo = SIGTRAP;
+ 			signal_info.si_errno = 0;
+-			signal_info.si_code = TRAP_BRKPT;
++			signal_info.si_code = stepped ? TRAP_TRACE : TRAP_BRKPT;
+ 			signal_info.si_addr = (void *)UPT_IP(registers);
+ 			registers->is_user = 1;
+ 			block_signals_trace();

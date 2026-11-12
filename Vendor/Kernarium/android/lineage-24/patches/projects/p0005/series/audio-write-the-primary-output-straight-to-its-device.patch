@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 07:59:42 +0000
+Subject: [PATCH] audio: write the primary output straight to its device
+
+The primary stream hands its output to a pipe that an I/O thread
+drains into ALSA. The pipe does not block its writer, so a buffer that
+finds it full is dropped. The stream also paces its writer by the wall
+clock, and a writer that falls behind the clock skips its next buffer,
+which is discarded unplayed. The pipe adds its buffer to the latency.
+
+The Virtio sound device takes its output in real time. Let the output
+write each buffer to its ALSA stream from transfer(), as StreamAlsa
+does for USB devices, so that the blocking write paces it. A stream
+built on StreamAlsaMonoPipe chooses this with outputUsesPipe(); the
+primary output does, and the pacing and skipping stay with its input.
+Every frame the client writes now reaches the device.
+
+The writer keeps the device fed only if it runs as soon as AudioFlinger
+hands it a buffer. AudioFlinger asks for the HAL thread of an output
+with a fast mixer to run at SCHED_FIFO priority 3, and leaves that to
+an AIDL HAL, which raises only the workers of FAST streams. Let the
+primary output's writer raise itself to that priority on its first
+transfer, as the HAL raises a FAST worker, and log a refusal.
+---
+ .../aidl/default/alsa/StreamAlsaMonoPipe.cpp  | 13 ++++++++++++
+ .../include/core-impl/StreamAlsaMonoPipe.h    |  6 ++++++
+ .../default/include/core-impl/StreamPrimary.h |  4 ++++
+ audio/aidl/default/primary/StreamPrimary.cpp  | 21 +++++++++++++++++++
+ 4 files changed, 44 insertions(+)
+
+diff --git a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+index 3738f3056f6ffb60a9de4899d8b2cd2cc265494b..625c51d6c7cf76e03fef67ec2016681b1a822b77 100644
+--- a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
++++ b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+@@ -78,6 +78,10 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+         status != ::android::OK) {
+         return status;
+     }
++    if (!mIsInput && !outputUsesPipe()) {
++        mAlsaDeviceProxies = std::move(alsaDeviceProxies);
++        return ::android::OK;
++    }
+     for (size_t i = 0; i < alsaDeviceProxies.size(); ++i) {
+         auto sink = makeSink(mIsInput);  // Do not block the writer when it is on our thread.
+         if (sink != nullptr) {
+@@ -127,6 +131,15 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+     } else {
+         alsa::applyGain(buffer, mGain, bytesToTransfer, mConfig.value().format, mConfig->channels);
+         for (size_t i = 0; i < mAlsaDeviceProxies.size(); ++i) {
++            if (!outputUsesPipe()) {
++                if (int ret = proxy_write_with_retries(mAlsaDeviceProxies[i].get(), buffer,
++                                                       bytesToTransfer, mReadWriteRetries);
++                    ret != 0) {
++                    LOG(WARNING) << __func__ << ": write failed for device " << i << ": " << ret;
++                }
++                maxLatency = std::max(maxLatency, proxy_get_latency(mAlsaDeviceProxies[i].get()));
++                continue;
++            }
+             LOG(VERBOSE) << __func__ << ": writing into sink " << i;
+             ssize_t framesWritten = mSinks[i]->write(buffer, frameCount);
+             LOG_IF(FATAL, framesWritten < 0) << "Error writing into the pipe: " << framesWritten;
+diff --git a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+index 98f4d3bd1b0bab35a075d807738ea468e89ef6c4..aaa6b881b90a020dfb011477024221edb33f2885 100644
+--- a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
++++ b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+@@ -43,6 +43,12 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+                                  int32_t* latencyMs) override;
+     void shutdown() override;
+ 
++  protected:
++    // Whether the output goes through the pipe and an I/O thread. An output whose device
++    // takes data in real time may instead write to it from 'transfer', which then blocks
++    // until the ALSA ring has room.
++    virtual bool outputUsesPipe() const { return true; }
++
+   private:
+     ::android::NBAIO_Format getPipeFormat() const;
+     ::android::sp<::android::MonoPipe> makeSink(bool writeCanBlock);
+diff --git a/audio/aidl/default/include/core-impl/StreamPrimary.h b/audio/aidl/default/include/core-impl/StreamPrimary.h
+index 87dcc3b166c15c35133b934b8248c53f4806eba7..e9c06b1d7ac659cfe39ef9b4e03a972be9b68468 100644
+--- a/audio/aidl/default/include/core-impl/StreamPrimary.h
++++ b/audio/aidl/default/include/core-impl/StreamPrimary.h
+@@ -49,9 +49,13 @@ class StreamPrimary : public StreamAlsaMonoPipe {
+   protected:
+     std::vector<alsa::DeviceProfile> getDeviceProfiles() override;
+     bool isStubStream();
++    // The output writes to its device from 'transfer'.
++    bool outputUsesPipe() const override { return false; }
+ 
+     const bool mIsAsynchronous;
+     int64_t mStartTimeNs = 0;
++    // Whether the output's writer has asked for its real-time priority (see 'transfer').
++    bool mWriterPriorityRequested = false;
+     long mFramesSinceStart = 0;
+     bool mSkipNextTransfer = false;
+ 
+diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+index ac0d3020c75d30059c794d5807f431e509b470da..43a99a4b828344ed1c669c34045e4aa3ff285e79 100644
+--- a/audio/aidl/default/primary/StreamPrimary.cpp
++++ b/audio/aidl/default/primary/StreamPrimary.cpp
+@@ -16,6 +16,8 @@
+ 
+ #define LOG_TAG "AHAL_StreamPrimary"
+ 
++#include <sched.h>
++
+ #include <cstdio>
+ 
+ #include <Log.h>
+@@ -97,6 +99,25 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+     if (isStubStreamOnWorker()) {
+         return mStubDriver.transfer(buffer, frameCount, actualFrameCount, latencyMs);
+     }
++    if (!mIsInput) {
++        // The Virtio sound device takes the output in real time: the blocking write into the
++        // ALSA ring paces the output, and every frame reaches the device.
++        if (!mWriterPriorityRequested) {
++            mWriterPriorityRequested = true;
++            // The writer keeps the device fed only if it runs as soon as AudioFlinger hands it a
++            // buffer. AudioFlinger asks for the HAL thread of an output with a fast mixer to run
++            // at FIFO priority 3 and leaves that to the HAL, which raises only FAST workers
++            // itself (see 'setWorkerThreadPriority'). The writer is the calling thread.
++            constexpr int kWriterPriority = 3;
++            struct sched_param param = {
++                    .sched_priority = kWriterPriority,
++            };
++            if (sched_setscheduler(0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param) != 0) {
++                PLOG(WARNING) << __func__ << ": failed to set FIFO scheduler and priority";
++            }
++        }
++        return StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs);
++    }
+     // This is a workaround for the emulator implementation which has a host-side buffer
+     // and is not being able to achieve real-time behavior similar to ADSPs (b/302587331).
+     if (!mSkipNextTransfer) {

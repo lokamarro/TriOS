@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:22:55 +0900
+Subject: [PATCH] tell the host how an emulated YUV buffer is laid out
+
+An emulated NV12, NV21 or YV12 buffer exists on the host as an R8 image, which a
+shader samples as a single plane. A host that can keep a texture for each plane
+of such an image takes the layout and the picture's width in the resource
+flags, and says so in the v2 capability bits.
+
+Send the layout when the host has the capability, and nothing when it has not:
+an older host refuses a flag it does not know. Bring the copy of the protocol
+header up to the host's for the capability word and the resource flags.
+---
+ external/virgl_hw.h | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ virtgpu_virgl.c     | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/external/virgl_hw.h b/external/virgl_hw.h
+index 4527ced258d7aa84cb9f29e1b4e06dd4cf840a3a..c515989b2b9ae47e1650658eee30b78247ba006d 100644
+--- a/external/virgl_hw.h
++++ b/external/virgl_hw.h
+@@ -269,6 +269,33 @@ enum virgl_formats {
+ #define VIRGL_CAP_APP_TWEAK_SUPPORT    (1 << 28)
+ #define VIRGL_CAP_BGRA_SRGB_IS_EMULATED  (1 << 29)
+ 
++/* These are used by the capability_bits_v2 field in virgl_caps_v2. */
++#define VIRGL_CAP_V2_BLEND_EQUATION       (1u << 0)
++#define VIRGL_CAP_V2_UNTYPED_RESOURCE     (1u << 1)
++#define VIRGL_CAP_V2_VIDEO_MEMORY         (1u << 2)
++#define VIRGL_CAP_V2_MEMINFO              (1u << 3)
++#define VIRGL_CAP_V2_STRING_MARKER        (1u << 4)
++#define VIRGL_CAP_V2_DIFFERENT_GPU        (1u << 5)
++#define VIRGL_CAP_V2_IMPLICIT_MSAA        (1u << 6)
++#define VIRGL_CAP_V2_COPY_TRANSFER_BOTH_DIRECTIONS (1u << 7)
++#define VIRGL_CAP_V2_SCANOUT_USES_GBM     (1u << 8)
++#define VIRGL_CAP_V2_SSO                  (1u << 9)
++#define VIRGL_CAP_V2_TEXTURE_SHADOW_LOD   (1u << 10)
++#define VIRGL_CAP_V2_VS_VERTEX_LAYER      (1u << 11)
++#define VIRGL_CAP_V2_VS_VIEWPORT_INDEX    (1u << 12)
++#define VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY (1u << 13)
++#define VIRGL_CAP_V2_DRAW_PARAMETERS      (1u << 14)
++#define VIRGL_CAP_V2_GROUP_VOTE           (1u << 15)
++#define VIRGL_CAP_V2_MIRROR_CLAMP_TO_EDGE (1u << 16)
++#define VIRGL_CAP_V2_MIRROR_CLAMP         (1u << 17)
++#define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1u << 18)
++#define VIRGL_CAP_V2_QUERY_FORMAT_MODIFIER (1u << 19)
++/* The renderer samples the planes of a picture kept in one R8 image: it
++ * accepts VIRGL_RESOURCE_FLAG_YUV_BIPLANAR and VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR
++ * when a resource is created.
++ */
++#define VIRGL_CAP_V2_PACKED_YUV           (1u << 20)
++
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+  */
+@@ -419,6 +446,7 @@ struct virgl_caps_v2 {
+         uint32_t host_feature_check_version;
+         struct virgl_supported_format_mask supported_readback_formats;
+         struct virgl_supported_format_mask scanout;
++        uint32_t capability_bits_v2;
+ };
+ 
+ union virgl_caps {
+@@ -447,4 +475,20 @@ enum virgl_ctx_errors {
+ };
+ 
+ #define VIRGL_RESOURCE_Y_0_TOP (1 << 0)
++#define VIRGL_RESOURCE_FLAG_MAP_PERSISTENT (1 << 1)
++#define VIRGL_RESOURCE_FLAG_MAP_COHERENT   (1 << 2)
++/* The resource is an R8 image that holds a YUV 4:2:0 picture the way a guest
++ * allocator without host support lays it out, and the host also keeps one
++ * texture per plane for sampling. The image is as wide as one luma row
++ * (stride bytes) and as tall as the luma and chroma rows together. BIPLANAR
++ * is the luma rows followed by the interleaved chroma rows (NV12, NV21).
++ * TRIPLANAR is the luma rows followed by two planes of ceil(height / 2) rows
++ * of stride / 2 bytes each (YV12), the V plane first. The bits above
++ * VIRGL_RESOURCE_YUV_WIDTH_SHIFT carry the picture's width in pixels, which
++ * the luma stride may exceed. Only for VIRGL_CAP_V2_PACKED_YUV; the other
++ * flag bits stay clear.
++ */
++#define VIRGL_RESOURCE_FLAG_YUV_BIPLANAR   (1 << 8)
++#define VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR  (1 << 9)
++#define VIRGL_RESOURCE_YUV_WIDTH_SHIFT     16
+ #endif
+diff --git a/virtgpu_virgl.c b/virtgpu_virgl.c
+index df3b50217540c8aaf9281a6cac37e35531c058f5..f799aabcf78a4b5daa4c6ef72f0a3b615db4f48f 100644
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -628,6 +628,37 @@ static bool virgl_rows_are_padded(const struct bo *bo)
+ 	       bo->meta.strides[0] != drv_stride_from_format(bo->meta.format, bo->meta.width, 0);
+ }
+ 
++// A host that keeps a texture for each plane of an emulated YUV buffer, so that a shader samples
++// luma and chroma rather than the bytes of one R8 image, is told how the image is laid out. The
++// resource flags carry the layout and the picture's width in pixels, which the padded luma stride
++// hides, and the host says in its capabilities whether it knows them. A host that does not is not
++// sent them: it would refuse the resource.
++static uint32_t virgl_packed_yuv_flags(struct driver *drv, uint32_t drm_format, uint32_t width)
++{
++	struct virgl_priv *priv = (struct virgl_priv *)drv->priv;
++	uint32_t layout;
++
++	if (!priv->caps_is_v2 || !(priv->caps.v2.capability_bits_v2 & VIRGL_CAP_V2_PACKED_YUV))
++		return 0;
++	if (width == 0 || width > 0xffff)
++		return 0;
++
++	switch (drm_format) {
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++		layout = VIRGL_RESOURCE_FLAG_YUV_BIPLANAR;
++		break;
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YVU420_ANDROID:
++		layout = VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR;
++		break;
++	default:
++		return 0;
++	}
++
++	return layout | (width << VIRGL_RESOURCE_YUV_WIDTH_SHIFT);
++}
++
+ static int virgl_3d_bo_create(struct bo *bo, uint32_t width, uint32_t height, uint32_t format,
+ 			      uint64_t use_flags)
+ {
+@@ -645,6 +676,8 @@ static int virgl_3d_bo_create(struct bo *bo, uint32_t width, uint32_t height, ui
+ 
+ 		virgl_get_emulated_metadata(bo, &emulated_metadata);
+ 
++		res_create.flags = virgl_packed_yuv_flags(bo->drv, bo->meta.format, bo->meta.width);
++
+ 		format = emulated_metadata.format;
+ 		width = emulated_metadata.width;
+ 		height = emulated_metadata.height;

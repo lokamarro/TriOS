@@ -1,0 +1,688 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 20:45:53 +0900
+Subject: [PATCH] kosmickrisp: lower clip/cull outputs after software stages
+
+Keep compact clip/cull varyings intact while materializing software vertex and tessellation stages. Raster-only clip-distance intrinsics otherwise become invalid compute outputs, while separated cull varyings no longer match the raw transform-feedback interface.
+
+Lower the final Metal vertex/fragment interface only after software-stage conversion. Add native clip, cull, and mixed transform-feedback regressions for ordinary and device-address bindings, negative values, nonzero ranges, and untouched range guards.
+---
+ src/kosmickrisp/vulkan/kk_shader.c            |  14 +-
+ src/kosmickrisp/vulkan/meson.build            |  14 +
+ .../test_transform_feedback_builtins.cpp      | 333 ++++++++++++++++++
+ .../xfb_builtin_shaders/builtins-0.vert.h     |  59 ++++
+ .../xfb_builtin_shaders/builtins-1.vert.h     |  59 ++++
+ .../xfb_builtin_shaders/builtins-2.vert.h     |  77 ++++
+ .../tests/xfb_builtin_shaders/builtins.vert   |  34 ++
+ .../tests/xfb_builtin_shaders/generate.sh     |   8 +
+ 8 files changed, 594 insertions(+), 4 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_transform_feedback_builtins.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-0.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-1.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-2.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/generate.sh
+
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index eef5df8c536f110b24844c369551666188d11d14..0377cb8f26162bdd3841689fa367b5ed9b2e14fb 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1170,10 +1170,6 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+    gather_shader_info(shader, nir, state);
+    shader->info.stage = logical_stage;
+ 
+-   unsigned num_cull_distances =
+-      prev_stage ? prev_stage->info.num_cull_distances : 0;
+-   msl_nir_lower_clip_cull_distance(nir, num_cull_distances);
+-
+    /* When using poly to emulate tessellation, vertex and tess control shaders
+     * are turned to compute shaders that will be dispatched before the draw
+     * call. Tess evalutaion shaders are turned into vertex shaders. */
+@@ -1225,6 +1221,16 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+       }
+    }
+ 
++   /* Software stages exchange compact clip/cull varyings, including the raw
++    * values captured by transform feedback.  Separate that interface and emit
++    * Metal raster outputs only after software-stage materialization. */
++   if (nir->info.stage == MESA_SHADER_VERTEX ||
++       nir->info.stage == MESA_SHADER_FRAGMENT) {
++      unsigned num_cull_distances =
++         prev_stage ? prev_stage->info.num_cull_distances : 0;
++      msl_nir_lower_clip_cull_distance(nir, num_cull_distances);
++   }
++
+    NIR_PASS(_, nir, kk_nir_lower_poly, pipeline_statistics);
+ 
+    msl_optimize_nir(nir);
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index a1624c1f33577d927e0a5acab8b399722994e27a..f7192afb69cdfa026e439e51567fd1fbabd039e2 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -368,6 +368,20 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_transform_feedback_builtins',
++      executable(
++        'test_kosmickrisp_transform_feedback_builtins',
++        files('tests/test_transform_feedback_builtins.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_pipeline_statistics_gpu',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_transform_feedback_builtins.cpp b/src/kosmickrisp/vulkan/tests/test_transform_feedback_builtins.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcb08a5b453ddef28374687c9b1ebb1c65796903
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_transform_feedback_builtins.cpp
+@@ -0,0 +1,333 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <span>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name) \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t clip_spirv[] =
++#include "xfb_builtin_shaders/builtins-0.vert.h"
++;
++static const uint32_t cull_spirv[] =
++#include "xfb_builtin_shaders/builtins-1.vert.h"
++;
++static const uint32_t mixed_spirv[] =
++#include "xfb_builtin_shaders/builtins-2.vert.h"
++;
++
++int main()
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "transform-feedback-builtins";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++   for (VkPhysicalDevice physical : physicals) {
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count && !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR address_features{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_ADDRESS_COMMANDS_FEATURES_KHR};
++      address_features.deviceAddressCommands = VK_TRUE;
++      VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb_features{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
++      xfb_features.pNext = &address_features;
++      xfb_features.transformFeedback = VK_TRUE;
++      VkPhysicalDeviceVulkan12Features features12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      features12.pNext = &xfb_features;
++      features12.bufferDeviceAddress = VK_TRUE;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.pNext = &features12;
++      features13.dynamicRendering = VK_TRUE;
++      VkPhysicalDeviceFeatures features{};
++      features.shaderClipDistance = VK_TRUE;
++      features.shaderCullDistance = VK_TRUE;
++      const char *extensions[] = {
++         VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
++         VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME};
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      device_info.enabledExtensionCount = 2;
++      device_info.ppEnabledExtensionNames = extensions;
++      device_info.pEnabledFeatures = &features;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkResetCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkGetBufferDeviceAddress);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkUnmapMemory);
++      LOAD_D(vkCmdBindTransformFeedbackBuffersEXT);
++      LOAD_D(vkCmdBeginTransformFeedbackEXT);
++      LOAD_D(vkCmdEndTransformFeedbackEXT);
++      LOAD_D(vkCmdBindTransformFeedbackBuffers2EXT);
++      LOAD_D(vkCmdBeginTransformFeedback2EXT);
++      LOAD_D(vkCmdEndTransformFeedback2EXT);
++      LOAD_D(vkCmdPipelineBarrier);
++      VkQueue device_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &device_queue);
++
++      const VkPushConstantRange push_range{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float)};
++      VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      layout_info.pushConstantRangeCount = 1;
++      layout_info.pPushConstantRanges = &push_range;
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "create layout", result);
++      VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++      VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      rs.rasterizerDiscardEnable = VK_TRUE;
++      rs.lineWidth = 1.0f;
++      VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      pipeline_info.pNext = &rendering;
++      pipeline_info.pVertexInputState = &vi;
++      pipeline_info.pInputAssemblyState = &ia;
++      pipeline_info.pRasterizationState = &rs;
++      pipeline_info.layout = layout;
++      const std::span<const uint32_t> sources[] = {clip_spirv, cull_spirv, mixed_spirv};
++      std::array<VkPipeline, 3> pipelines{};
++      for (uint32_t kind = 0; kind < pipelines.size(); ++kind) {
++         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++         module_info.codeSize = sources[kind].size_bytes();
++         module_info.pCode = sources[kind].data();
++         VkShaderModule module = VK_NULL_HANDLE;
++         result = vkCreateShaderModule(device, &module_info, nullptr, &module);
++         require(result == VK_SUCCESS, "create module", result);
++         VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++         stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
++         stage.module = module;
++         stage.pName = "main";
++         pipeline_info.stageCount = 1;
++         pipeline_info.pStages = &stage;
++         result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                            nullptr, &pipelines[kind]);
++         require(result == VK_SUCCESS, "create XFB builtin pipeline", result);
++         vkDestroyShaderModule(device, module, nullptr);
++      }
++
++      /* Two 256-byte ranges of one buffer mirror the nonzero binding and
++       * address offset used by the CTS simple clip/cull distance tests. */
++      constexpr VkDeviceSize range_size = 256;
++      constexpr uint32_t range_words = range_size / sizeof(float);
++      constexpr float sentinel = -1000.0f;
++      VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      buffer_info.size = 2 * range_size;
++      buffer_info.usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
++                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++      VkBuffer capture = VK_NULL_HANDLE;
++      result = vkCreateBuffer(device, &buffer_info, nullptr, &capture);
++      require(result == VK_SUCCESS, "create capture", result);
++      VkMemoryRequirements requirements{};
++      vkGetBufferMemoryRequirements(device, capture, &requirements);
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      uint32_t memory_type = 0;
++      const VkMemoryPropertyFlags properties =
++         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++      while (memory_type < memory_properties.memoryTypeCount &&
++             (!(requirements.memoryTypeBits & (1u << memory_type)) ||
++              (memory_properties.memoryTypes[memory_type].propertyFlags & properties) != properties))
++         ++memory_type;
++      require(memory_type < memory_properties.memoryTypeCount, "host-coherent memory");
++      VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
++      flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
++      VkMemoryAllocateInfo memory_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      memory_info.pNext = &flags;
++      memory_info.allocationSize = requirements.size;
++      memory_info.memoryTypeIndex = memory_type;
++      VkDeviceMemory memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &memory_info, nullptr, &memory);
++      require(result == VK_SUCCESS, "allocate capture", result);
++      result = vkBindBufferMemory(device, capture, memory, 0);
++      require(result == VK_SUCCESS, "bind capture", result);
++      float *mapped = nullptr;
++      result = vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0,
++                           reinterpret_cast<void **>(&mapped));
++      require(result == VK_SUCCESS, "map capture", result);
++      VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++      address_info.buffer = capture;
++      const auto address = vkGetBufferDeviceAddress(device, &address_info);
++      require(address != 0, "capture address");
++      VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "create command pool", result);
++      VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      allocate.commandPool = pool;
++      allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      allocate.commandBufferCount = 1;
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &allocate, &command);
++      require(result == VK_SUCCESS, "allocate command", result);
++
++      for (unsigned kind = 0; kind < pipelines.size(); ++kind) {
++         const uint32_t words_per_vertex = kind == 2 ? 6 : 8;
++         const uint32_t vertex_count = range_words / words_per_vertex;
++         const uint32_t captured_words = vertex_count * words_per_vertex;
++         for (bool device_address : {false, true}) {
++            for (float bias : {0.0f, -1.0f}) {
++               std::fill_n(mapped, 2 * range_words, sentinel);
++               result = vkResetCommandPool(device, pool, 0);
++               require(result == VK_SUCCESS, "reset command pool", result);
++               VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++               begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++               result = vkBeginCommandBuffer(command, &begin);
++               require(result == VK_SUCCESS, "begin command", result);
++               VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
++               render.renderArea.extent = {8, 8};
++               render.layerCount = 1;
++               vkCmdBeginRendering(command, &render);
++               vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[kind]);
++               vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
++                                  sizeof(bias), &bias);
++               if (device_address) {
++                  VkBindTransformFeedbackBuffer2InfoEXT bindings[2]{};
++                  for (unsigned i = 0; i < 2; ++i) {
++                     bindings[i].sType = VK_STRUCTURE_TYPE_BIND_TRANSFORM_FEEDBACK_BUFFER_2_INFO_EXT;
++                     bindings[i].addressRange = {address + i * range_size, range_size};
++                  }
++                  vkCmdBindTransformFeedbackBuffers2EXT(command, 0, 2, bindings);
++                  vkCmdBeginTransformFeedback2EXT(command, 0, 0, nullptr);
++               } else {
++                  const VkBuffer buffers[] = {capture, capture};
++                  const VkDeviceSize offsets[] = {0, range_size};
++                  const VkDeviceSize sizes[] = {range_size, range_size};
++                  vkCmdBindTransformFeedbackBuffersEXT(command, 0, 2, buffers, offsets, sizes);
++                  vkCmdBeginTransformFeedbackEXT(command, 0, 0, nullptr, nullptr);
++               }
++               vkCmdDraw(command, vertex_count, 1, 0, 0);
++               if (device_address)
++                  vkCmdEndTransformFeedback2EXT(command, 0, 0, nullptr);
++               else
++                  vkCmdEndTransformFeedbackEXT(command, 0, 0, nullptr, nullptr);
++               vkCmdEndRendering(command);
++               VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++               barrier.srcAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT;
++               barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++               vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
++                                    VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier,
++                                    0, nullptr, 0, nullptr);
++               result = vkEndCommandBuffer(command);
++               require(result == VK_SUCCESS, "end command", result);
++               VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++               submit.commandBufferCount = 1;
++               submit.pCommandBuffers = &command;
++               result = vkQueueSubmit(device_queue, 1, &submit, VK_NULL_HANDLE);
++               require(result == VK_SUCCESS, "submit command", result);
++               result = vkQueueWaitIdle(device_queue);
++               require(result == VK_SUCCESS, "wait command", result);
++               for (uint32_t i = 0; i < 2 * range_words; ++i) {
++                  const bool captured = i >= range_words && i < range_words + captured_words;
++                  const float expected = captured ? float(i - range_words) / 32768.0f + bias
++                                                  : sentinel;
++                  if (mapped[i] != expected)
++                     std::fprintf(stderr, "kind=%u address=%u bias=%g word=%u got=%g expected=%g\n",
++                                  kind, device_address, bias, i, mapped[i], expected);
++                  require(mapped[i] == expected, "raw XFB builtins and range guards");
++               }
++               std::printf("kind=%u address=%u bias=%g: %u raw builtin words passed\n",
++                           kind, device_address, bias, captured_words);
++            }
++         }
++      }
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkUnmapMemory(device, memory);
++      vkDestroyBuffer(device, capture, nullptr);
++      vkFreeMemory(device, memory, nullptr);
++      for (VkPipeline pipeline : pipelines)
++         vkDestroyPipeline(device, pipeline, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-0.vert.h b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-0.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..892ed3cc9c8fb09e5608058f0c3344e739ad7467
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-0.vert.h
+@@ -0,0 +1,59 @@
++{0x07230203,0x00010600,0x000d000b,0x00000033,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000020,0x00020011,0x00000035,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x00000019,0x0000001c,0x00000026,
++0x00030010,0x00000004,0x0000000b,0x00030047,
++0x00000017,0x00000002,0x00050048,0x00000017,
++0x00000000,0x0000000b,0x00000003,0x00050048,
++0x00000017,0x00000000,0x00000023,0x00000000,
++0x00040047,0x00000019,0x00000024,0x00000001,
++0x00040047,0x00000019,0x00000025,0x00000020,
++0x00040047,0x0000001c,0x0000000b,0x0000002a,
++0x00030047,0x00000024,0x00000002,0x00050048,
++0x00000024,0x00000000,0x00000023,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x0004002b,0x00000006,0x00000009,
++0x00000000,0x0004002b,0x00000006,0x00000010,
++0x00000008,0x00020014,0x00000011,0x00030016,
++0x00000013,0x00000020,0x00040015,0x00000014,
++0x00000020,0x00000000,0x0004002b,0x00000014,
++0x00000015,0x00000008,0x0004001c,0x00000016,
++0x00000013,0x00000015,0x0003001e,0x00000017,
++0x00000016,0x00040020,0x00000018,0x00000003,
++0x00000017,0x0004003b,0x00000018,0x00000019,
++0x00000003,0x00040020,0x0000001b,0x00000001,
++0x00000006,0x0004003b,0x0000001b,0x0000001c,
++0x00000001,0x0003001e,0x00000024,0x00000013,
++0x00040020,0x00000025,0x00000009,0x00000024,
++0x0004003b,0x00000025,0x00000026,0x00000009,
++0x00040020,0x00000027,0x00000009,0x00000013,
++0x00040020,0x0000002b,0x00000003,0x00000013,
++0x0004002b,0x00000006,0x0000002e,0x00000001,
++0x0004002b,0x00000013,0x00000032,0x38000000,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x000200f9,
++0x0000000a,0x000200f8,0x0000000a,0x000700f5,
++0x00000006,0x00000030,0x00000009,0x00000005,
++0x0000002f,0x0000000b,0x000500b1,0x00000011,
++0x00000012,0x00000030,0x00000010,0x000400f6,
++0x0000000c,0x0000000b,0x00000000,0x000400fa,
++0x00000012,0x0000000b,0x0000000c,0x000200f8,
++0x0000000b,0x0004003d,0x00000006,0x0000001d,
++0x0000001c,0x00050084,0x00000006,0x0000001e,
++0x00000010,0x0000001d,0x00050080,0x00000006,
++0x00000020,0x0000001e,0x00000030,0x0004006f,
++0x00000013,0x00000021,0x00000020,0x00050085,
++0x00000013,0x00000023,0x00000021,0x00000032,
++0x00050041,0x00000027,0x00000028,0x00000026,
++0x00000009,0x0004003d,0x00000013,0x00000029,
++0x00000028,0x00050081,0x00000013,0x0000002a,
++0x00000023,0x00000029,0x00060041,0x0000002b,
++0x0000002c,0x00000019,0x00000009,0x00000030,
++0x0003003e,0x0000002c,0x0000002a,0x00050080,
++0x00000006,0x0000002f,0x00000030,0x0000002e,
++0x000200f9,0x0000000a,0x000200f8,0x0000000c,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-1.vert.h b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-1.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e905c4a933cadb237484f453a402350147d8958
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-1.vert.h
+@@ -0,0 +1,59 @@
++{0x07230203,0x00010600,0x000d000b,0x00000033,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000021,0x00020011,0x00000035,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x00000019,0x0000001c,0x00000026,
++0x00030010,0x00000004,0x0000000b,0x00030047,
++0x00000017,0x00000002,0x00050048,0x00000017,
++0x00000000,0x0000000b,0x00000004,0x00050048,
++0x00000017,0x00000000,0x00000023,0x00000000,
++0x00040047,0x00000019,0x00000024,0x00000001,
++0x00040047,0x00000019,0x00000025,0x00000020,
++0x00040047,0x0000001c,0x0000000b,0x0000002a,
++0x00030047,0x00000024,0x00000002,0x00050048,
++0x00000024,0x00000000,0x00000023,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x0004002b,0x00000006,0x00000009,
++0x00000000,0x0004002b,0x00000006,0x00000010,
++0x00000008,0x00020014,0x00000011,0x00030016,
++0x00000013,0x00000020,0x00040015,0x00000014,
++0x00000020,0x00000000,0x0004002b,0x00000014,
++0x00000015,0x00000008,0x0004001c,0x00000016,
++0x00000013,0x00000015,0x0003001e,0x00000017,
++0x00000016,0x00040020,0x00000018,0x00000003,
++0x00000017,0x0004003b,0x00000018,0x00000019,
++0x00000003,0x00040020,0x0000001b,0x00000001,
++0x00000006,0x0004003b,0x0000001b,0x0000001c,
++0x00000001,0x0003001e,0x00000024,0x00000013,
++0x00040020,0x00000025,0x00000009,0x00000024,
++0x0004003b,0x00000025,0x00000026,0x00000009,
++0x00040020,0x00000027,0x00000009,0x00000013,
++0x00040020,0x0000002b,0x00000003,0x00000013,
++0x0004002b,0x00000006,0x0000002e,0x00000001,
++0x0004002b,0x00000013,0x00000032,0x38000000,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x000200f9,
++0x0000000a,0x000200f8,0x0000000a,0x000700f5,
++0x00000006,0x00000030,0x00000009,0x00000005,
++0x0000002f,0x0000000b,0x000500b1,0x00000011,
++0x00000012,0x00000030,0x00000010,0x000400f6,
++0x0000000c,0x0000000b,0x00000000,0x000400fa,
++0x00000012,0x0000000b,0x0000000c,0x000200f8,
++0x0000000b,0x0004003d,0x00000006,0x0000001d,
++0x0000001c,0x00050084,0x00000006,0x0000001e,
++0x00000010,0x0000001d,0x00050080,0x00000006,
++0x00000020,0x0000001e,0x00000030,0x0004006f,
++0x00000013,0x00000021,0x00000020,0x00050085,
++0x00000013,0x00000023,0x00000021,0x00000032,
++0x00050041,0x00000027,0x00000028,0x00000026,
++0x00000009,0x0004003d,0x00000013,0x00000029,
++0x00000028,0x00050081,0x00000013,0x0000002a,
++0x00000023,0x00000029,0x00060041,0x0000002b,
++0x0000002c,0x00000019,0x00000009,0x00000030,
++0x0003003e,0x0000002c,0x0000002a,0x00050080,
++0x00000006,0x0000002f,0x00000030,0x0000002e,
++0x000200f9,0x0000000a,0x000200f8,0x0000000c,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-2.vert.h b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-2.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3490e319a96178c55479f90a5dd5606f9cab9b2
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins-2.vert.h
+@@ -0,0 +1,77 @@
++{0x07230203,0x00010600,0x000d000b,0x0000003f,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000020,0x00020011,0x00000021,0x00020011,
++0x00000035,0x0006000b,0x00000001,0x4c534c47,
++0x6474732e,0x3035342e,0x00000000,0x0003000e,
++0x00000000,0x00000001,0x0008000f,0x00000000,
++0x00000004,0x6e69616d,0x00000000,0x0000001b,
++0x00000020,0x0000002a,0x00030010,0x00000004,
++0x0000000b,0x00030047,0x00000019,0x00000002,
++0x00050048,0x00000019,0x00000000,0x0000000b,
++0x00000003,0x00050048,0x00000019,0x00000000,
++0x00000023,0x00000014,0x00050048,0x00000019,
++0x00000001,0x0000000b,0x00000004,0x00050048,
++0x00000019,0x00000001,0x00000023,0x00000000,
++0x00040047,0x0000001b,0x00000024,0x00000001,
++0x00040047,0x0000001b,0x00000025,0x00000018,
++0x00040047,0x00000020,0x0000000b,0x0000002a,
++0x00030047,0x00000028,0x00000002,0x00050048,
++0x00000028,0x00000000,0x00000023,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x0004002b,0x00000006,0x00000009,
++0x00000000,0x0004002b,0x00000006,0x00000010,
++0x00000005,0x00020014,0x00000011,0x00030016,
++0x00000013,0x00000020,0x00040015,0x00000014,
++0x00000020,0x00000000,0x0004002b,0x00000014,
++0x00000015,0x00000001,0x0004001c,0x00000016,
++0x00000013,0x00000015,0x0004002b,0x00000014,
++0x00000017,0x00000005,0x0004001c,0x00000018,
++0x00000013,0x00000017,0x0004001e,0x00000019,
++0x00000016,0x00000018,0x00040020,0x0000001a,
++0x00000003,0x00000019,0x0004003b,0x0000001a,
++0x0000001b,0x00000003,0x0004002b,0x00000006,
++0x0000001c,0x00000001,0x0004002b,0x00000006,
++0x0000001e,0x00000006,0x00040020,0x0000001f,
++0x00000001,0x00000006,0x0004003b,0x0000001f,
++0x00000020,0x00000001,0x0003001e,0x00000028,
++0x00000013,0x00040020,0x00000029,0x00000009,
++0x00000028,0x0004003b,0x00000029,0x0000002a,
++0x00000009,0x00040020,0x0000002b,0x00000009,
++0x00000013,0x00040020,0x0000002f,0x00000003,
++0x00000013,0x0004002b,0x00000013,0x0000003e,
++0x38000000,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x000200f9,0x0000000a,0x000200f8,0x0000000a,
++0x000700f5,0x00000006,0x0000003c,0x00000009,
++0x00000005,0x00000032,0x0000000b,0x000500b1,
++0x00000011,0x00000012,0x0000003c,0x00000010,
++0x000400f6,0x0000000c,0x0000000b,0x00000000,
++0x000400fa,0x00000012,0x0000000b,0x0000000c,
++0x000200f8,0x0000000b,0x0004003d,0x00000006,
++0x00000021,0x00000020,0x00050084,0x00000006,
++0x00000022,0x0000001e,0x00000021,0x00050080,
++0x00000006,0x00000024,0x00000022,0x0000003c,
++0x0004006f,0x00000013,0x00000025,0x00000024,
++0x00050085,0x00000013,0x00000027,0x00000025,
++0x0000003e,0x00050041,0x0000002b,0x0000002c,
++0x0000002a,0x00000009,0x0004003d,0x00000013,
++0x0000002d,0x0000002c,0x00050081,0x00000013,
++0x0000002e,0x00000027,0x0000002d,0x00060041,
++0x0000002f,0x00000030,0x0000001b,0x0000001c,
++0x0000003c,0x0003003e,0x00000030,0x0000002e,
++0x00050080,0x00000006,0x00000032,0x0000003c,
++0x0000001c,0x000200f9,0x0000000a,0x000200f8,
++0x0000000c,0x0004003d,0x00000006,0x00000033,
++0x00000020,0x00050084,0x00000006,0x00000034,
++0x0000001e,0x00000033,0x00050080,0x00000006,
++0x00000035,0x00000034,0x00000010,0x0004006f,
++0x00000013,0x00000036,0x00000035,0x00050085,
++0x00000013,0x00000037,0x00000036,0x0000003e,
++0x00050041,0x0000002b,0x00000038,0x0000002a,
++0x00000009,0x0004003d,0x00000013,0x00000039,
++0x00000038,0x00050081,0x00000013,0x0000003a,
++0x00000037,0x00000039,0x00060041,0x0000002f,
++0x0000003b,0x0000001b,0x00000009,0x00000009,
++0x0003003e,0x0000003b,0x0000003a,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins.vert b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..e59989031618b698af00a1b9f80ed7e0a44c02b6
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/builtins.vert
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: MIT
++#version 450
++
++layout(push_constant) uniform Push { float bias; } pc;
++
++#if KIND == 0
++layout(xfb_buffer = 1, xfb_offset = 0) out gl_PerVertex {
++   float gl_ClipDistance[8];
++};
++#elif KIND == 1
++layout(xfb_buffer = 1, xfb_offset = 0) out gl_PerVertex {
++   float gl_CullDistance[8];
++};
++#else
++layout(xfb_buffer = 1, xfb_offset = 0) out gl_PerVertex {
++   float gl_CullDistance[5];
++   float gl_ClipDistance[1];
++};
++#endif
++
++void main()
++{
++#if KIND == 0
++   for (int i = 0; i < 8; ++i)
++      gl_ClipDistance[i] = float(8 * gl_VertexIndex + i) / 32768.0 + pc.bias;
++#elif KIND == 1
++   for (int i = 0; i < 8; ++i)
++      gl_CullDistance[i] = float(8 * gl_VertexIndex + i) / 32768.0 + pc.bias;
++#else
++   for (int i = 0; i < 5; ++i)
++      gl_CullDistance[i] = float(6 * gl_VertexIndex + i) / 32768.0 + pc.bias;
++   gl_ClipDistance[0] = float(6 * gl_VertexIndex + 5) / 32768.0 + pc.bias;
++#endif
++}
+diff --git a/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/generate.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..20f17a654d9e7e8929b900aa5eb4c30043f84014
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/xfb_builtin_shaders/generate.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for kind in 0 1 2; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c -DKIND="$kind" \
++      builtins.vert -o "builtins-$kind.vert.h"
++done

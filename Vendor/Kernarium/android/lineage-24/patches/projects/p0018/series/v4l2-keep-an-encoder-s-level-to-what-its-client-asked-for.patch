@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 01:40:58 +0900
+Subject: [PATCH] v4l2: keep an encoder's level to what its client asked for
+
+Two things made an encoder state a level other than the one its client
+asked for.
+
+The H.264 profile and level setter remembered the lowest level any client
+had asked for in a static shared by every encoder in the process, and
+applied it to the next client that asked for a higher one. The service runs
+every encoder of every app in one process, so an app that recorded at level
+1.3 capped the next stream at 1.3: a stream that needed 2.0 came out as
+1.3 whenever 1.3 had been configured earlier. The record goes; the HEVC
+setter does not have one either.
+
+The setter also raised the requested level to the lowest one that held the
+picture, the frame rate and the bit rate it saw. The framework sets those
+parameters in more than one step, so a setter that ran while the frame rate
+was still its default of 30 left a client that asked for level 1 at 15
+frames per second with level 1.1. The setter now keeps the client's level,
+replacing only one the interface does not offer. getEffectiveLevel() works
+the level out from the final parameters when the device is configured, and
+the component uses it for the level control and for the frame rate limit.
+
+A variable bit rate stream peaks at twice its target, which can pass the
+bit rate its level allows and make the device state a higher level than the
+client asked for. getPeakBitrate() keeps the peak within the level's limit
+and never below the target.
+---
+ components/EncodeComponent.cpp                |   8 +-
+ components/EncodeInterface.cpp                | 163 +++++++++++-------
+ .../v4l2_codec2/components/EncodeInterface.h  |  11 +-
+ v4l2/V4L2EncodeComponent.cpp                  |   6 +-
+ 4 files changed, 119 insertions(+), 69 deletions(-)
+
+diff --git a/components/EncodeComponent.cpp b/components/EncodeComponent.cpp
+index f2f5b6b6935df694579b630cb0f7820e959d5a99..930c6eef1a08106c59c15308e5f3c21fa1cb72d9 100644
+--- a/components/EncodeComponent.cpp
++++ b/components/EncodeComponent.cpp
+@@ -698,10 +698,10 @@ bool EncodeComponent::updateEncodingParameters() {
+         mBitrate = bitrate;
+ 
+         if (mBitrateMode == C2Config::BITRATE_VARIABLE) {
+-            ALOGV("Setting peak bitrate to %u", bitrate * VideoEncoder::kPeakBitrateMultiplier);
++            ALOGV("Setting peak bitrate to %u", mInterface->getPeakBitrate());
+             // TODO(b/190336806): Our stack doesn't support dynamic peak bitrate changes yet, ignore
+             // errors for now.
+-            mEncoder->setPeakBitrate(bitrate * VideoEncoder::kPeakBitrateMultiplier);
++            mEncoder->setPeakBitrate(mInterface->getPeakBitrate());
+         }
+     }
+ 
+@@ -755,11 +755,11 @@ bool EncodeComponent::updateEncodingParameters() {
+ 
+     C2Config::profile_t outputProfile = mInterface->getOutputProfile();
+     if (isH264Profile(outputProfile)) {
+-        C2Config::level_t outputLevel = mInterface->getOutputLevel();
++        C2Config::level_t outputLevel = mInterface->getEffectiveLevel();
+         ui::Size inputSize = mInterface->getInputVisibleSize();
+         mMaxFramerate = maxFramerateForLevelH264(outputLevel, inputSize);
+     } else if (isHEVCProfile(outputProfile)) {
+-        C2Config::level_t outputLevel = mInterface->getOutputLevel();
++        C2Config::level_t outputLevel = mInterface->getEffectiveLevel();
+         ui::Size inputSize = mInterface->getInputVisibleSize();
+         mMaxFramerate = maxFramerateForLevelHEVC(outputLevel, inputSize);
+     }
+diff --git a/components/EncodeInterface.cpp b/components/EncodeInterface.cpp
+index cd2a773bbd1cfdc9bc0bb0ef2a117fd574615ca7..ef72aa43e1c87a1144fde498ca040e5bbf6306fd 100644
+--- a/components/EncodeInterface.cpp
++++ b/components/EncodeInterface.cpp
+@@ -19,6 +19,7 @@
+ #include <v4l2_codec2/common/H264.h>
+ #include <v4l2_codec2/common/HEVC.h>
+ #include <v4l2_codec2/common/VideoTypes.h>
++#include <v4l2_codec2/components/VideoEncoder.h>
+ 
+ namespace android {
+ 
+@@ -119,10 +120,52 @@ std::vector<unsigned int> offeredHEVCLevels(const std::vector<C2Config::level_t>
+     }
+     return levels;
+ }
+-}  // namespace
+ 
+-//static
+-C2Config::level_t EncodeInterface::lowestConfigLevel = C2Config::LEVEL_UNUSED;
++// Returns the highest bitrate |profile| may have at the H.264 level with |levelMaxBR| for its
++// Baseline, Main and Extended profiles (Table A-2).
++uint32_t h264ProfileMaxBitrate(C2Config::profile_t profile, uint32_t levelMaxBR) {
++    // The maximum bit rate for High Profile is 1.25 times that of the Base/Extended/Main
++    // Profiles, 3 times for Hi10P, and 4 times for Hi422P/Hi444PP.
++    if (profile >= C2Config::PROFILE_AVC_HIGH_422) return levelMaxBR * 4;
++    if (profile >= C2Config::PROFILE_AVC_HIGH_10) return levelMaxBR * 3;
++    if (profile >= C2Config::PROFILE_AVC_HIGH) return levelMaxBR * 5.0 / 4.0;
++    return levelMaxBR;
++}
++
++// Returns the lowest of the |offered| H.264 levels whose limits hold a stream of |profile|, |size|,
++// |frameRate| and |bitrate|, or LEVEL_UNUSED when none does.
++C2Config::level_t lowestH264Level(C2Config::profile_t profile, const ui::Size& size,
++                                  float frameRate, uint32_t bitrate,
++                                  const std::vector<C2Config::level_t>& offered) {
++    const uint64_t frameSize = static_cast<uint64_t>((size.width + 15) / 16) *
++                               static_cast<uint64_t>((size.height + 15) / 16);
++    const float macroblockRate = static_cast<float>(frameSize) * frameRate;
++    for (const H264LevelLimits& limit : kH264Limits) {
++        if (std::find(offered.begin(), offered.end(), limit.level) == offered.end()) continue;
++        if (frameSize <= limit.maxFS && macroblockRate <= limit.maxMBPS &&
++            bitrate <= h264ProfileMaxBitrate(profile, limit.maxBR)) {
++            return limit.level;
++        }
++    }
++    return C2Config::LEVEL_UNUSED;
++}
++
++// Returns the lowest of the |offered| HEVC levels whose Main tier limits hold a stream of |size|,
++// |frameRate| and |bitrate|, or LEVEL_UNUSED when none does.
++C2Config::level_t lowestHEVCLevel(const ui::Size& size, float frameRate, uint32_t bitrate,
++                                  const std::vector<C2Config::level_t>& offered) {
++    const uint64_t lumaPs = static_cast<uint64_t>(size.width) * static_cast<uint64_t>(size.height);
++    const double lumaSr = static_cast<double>(lumaPs) * frameRate;
++    for (const HEVCLevelLimits& limit : kHEVCLimits) {
++        if (std::find(offered.begin(), offered.end(), limit.level) == offered.end()) continue;
++        if (lumaPs <= limit.maxLumaPs && lumaSr <= limit.maxLumaSampleRate &&
++            bitrate <= limit.maxBR) {
++            return limit.level;
++        }
++    }
++    return C2Config::LEVEL_UNUSED;
++}
++}  // namespace
+ 
+ // static
+ C2R EncodeInterface::H264ProfileLevelSetter(bool /*mayBlock*/,
+@@ -148,60 +191,30 @@ C2R EncodeInterface::H264ProfileLevelSetter(bool /*mayBlock*/,
+             static_cast<uint64_t>((videoSize.v.width + 15) / 16) * ((videoSize.v.height + 15) / 16);
+     float targetMBPS = static_cast<float>(targetFS) * frameRate.v.value;
+ 
+-    // Try the recorded lowest configed level. This level should become adaptable after input size,
+-    // frame rate, and bitrate are all set.
+-    if (lowestConfigLevel != C2Config::LEVEL_UNUSED && lowestConfigLevel < info.v.level) {
+-        info.set().level = lowestConfigLevel;
+-    }
+-
+-    // Check if the supplied level meets the requirements. If not, update the level with the lowest
+-    // level meeting the requirements.
+-
++    // The level stays the one the client asked for, and getEffectiveLevel() raises it to what the
++    // picture, the frame rate and the bit rate need when the device is configured. The setters run
++    // in the order the client's parameters arrive, so one that ran before the size, the frame rate
++    // or the bit rate and raised the level for the defaults of those would leave it raised. Only a
++    // level the interface does not offer is replaced, by the lowest offered level that holds the
++    // configuration.
++    const bool offered = info.F(info.v.level).supportsAtAll(info.v.level);
+     bool found = false;
+-    bool needsUpdate = !info.F(info.v.level).supportsAtAll(info.v.level);
+     for (const H264LevelLimits& limit : kH264Limits) {
+         if (!info.F(info.v.level).supportsAtAll(limit.level)) {
+             continue;
+         }
+ 
+-        // Table A-2 in spec
+-        // The maximum bit rate for High Profile is 1.25 times that of the Base/Extended/Main
+-        // Profiles, 3 times for Hi10P, and 4 times for Hi422P/Hi444PP.
+-        uint32_t maxBR = limit.maxBR;
+-        if (info.v.profile >= C2Config::PROFILE_AVC_HIGH_422) {
+-            maxBR *= 4;
+-        } else if (info.v.profile >= C2Config::PROFILE_AVC_HIGH_10) {
+-            maxBR *= 3;
+-        } else if (info.v.profile >= C2Config::PROFILE_AVC_HIGH) {
+-            maxBR = maxBR * 5.0 / 4.0;
+-        }
++        const uint32_t maxBR = h264ProfileMaxBitrate(info.v.profile, limit.maxBR);
+ 
+         if (targetFS <= limit.maxFS && targetMBPS <= limit.maxMBPS && bitrate.v.value <= maxBR) {
+-            // This is the lowest level that meets the requirements, and if
+-            // we haven't seen the supplied level yet, that means we don't
+-            // need the update.
+-            if (needsUpdate) {
+-                // Since current config update is sequential, there is an issue when we want to set
+-                // lower level for small input size, frame rate, and bitrate, if we set level first,
+-                // it will be adjusted to a higher one because the default input size or others are
+-                // above the limit. Use lowestConfigLevel to record the level we have tried to
+-                // config (but failed).
+-                // TODO(johnylin): remove this solution after b/140407694 has proper fix.
+-                lowestConfigLevel = info.v.level;
+-
+-                ALOGD("Given level %u does not cover current configuration: "
+-                      "adjusting to %u",
+-                      info.v.level, limit.level);
++            // This is the lowest level that meets the requirements.
++            if (!offered) {
++                ALOGD("Given level %u is not offered: adjusting to %u", info.v.level, limit.level);
+                 info.set().level = limit.level;
+             }
+             found = true;
+             break;
+         }
+-        if (info.v.level <= limit.level) {
+-            // We break out of the loop when the lowest feasible level is found. The fact that we're
+-            // here means that our level doesn't meet the requirement and needs to be updated.
+-            needsUpdate = true;
+-        }
+     }
+     if (!found) {
+         ALOGE("Unable to find proper level with current config, requested level (%u).",
+@@ -235,10 +248,9 @@ C2R EncodeInterface::HEVCProfileLevelSetter(bool /*mayBlock*/,
+     uint64_t targetLumaPs = static_cast<uint64_t>(videoSize.v.width) * videoSize.v.height;
+     double targetLumaSr = static_cast<double>(targetLumaPs) * frameRate.v.value;
+ 
+-    // Check if the supplied level meets the requirements. If not, update the level with the lowest
+-    // level meeting the requirements.
++    // The level stays the one the client asked for and getEffectiveLevel() raises it, as for H.264.
++    const bool offered = info.F(info.v.level).supportsAtAll(info.v.level);
+     bool found = false;
+-    bool needsUpdate = !info.F(info.v.level).supportsAtAll(info.v.level);
+     for (const HEVCLevelLimits& limit : kHEVCLimits) {
+         if (!info.F(info.v.level).supportsAtAll(limit.level)) {
+             continue;
+@@ -246,23 +258,14 @@ C2R EncodeInterface::HEVCProfileLevelSetter(bool /*mayBlock*/,
+ 
+         if (targetLumaPs <= limit.maxLumaPs && targetLumaSr <= limit.maxLumaSampleRate &&
+             bitrate.v.value <= limit.maxBR) {
+-            // This is the lowest level that meets the requirements, and if we haven't seen the
+-            // supplied level yet, that means we don't need the update.
+-            if (needsUpdate) {
+-                ALOGD("Given level %u does not cover current configuration: "
+-                      "adjusting to %u",
+-                      info.v.level, limit.level);
++            // This is the lowest level that meets the requirements.
++            if (!offered) {
++                ALOGD("Given level %u is not offered: adjusting to %u", info.v.level, limit.level);
+                 info.set().level = limit.level;
+             }
+             found = true;
+             break;
+         }
+-        if (info.v.level <= limit.level) {
+-            // We break out of the loop when the lowest feasible level is found. The fact that
+-            // we're here means that our level doesn't meet the requirement and needs to be
+-            // updated.
+-            needsUpdate = true;
+-        }
+     }
+     if (!found) {
+         ALOGE("Unable to find proper level with current config, requested level (%u).",
+@@ -552,6 +555,9 @@ void EncodeInterface::Initialize(const C2String& name, const SupportedCapabiliti
+                 *std::min_element(profiles.begin(), profiles.end()));
+         // The levels the device lists, else the ones this component always offered.
+         std::vector<unsigned int> levels = offeredH264Levels(caps.supportedLevels);
++        for (unsigned int level : levels) {
++            mOfferedLevels.push_back(static_cast<C2Config::level_t>(level));
++        }
+         unsigned int defaultLevel = defaultLevelBelow(levels, C2Config::LEVEL_AVC_4_1);
+         addParameter(DefineParam(mProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+                              .withDefault(new C2StreamProfileLevelInfo::output(
+@@ -566,6 +572,9 @@ void EncodeInterface::Initialize(const C2String& name, const SupportedCapabiliti
+         C2Config::profile_t minProfile = static_cast<C2Config::profile_t>(
+                 *std::min_element(profiles.begin(), profiles.end()));
+         std::vector<unsigned int> levels = offeredHEVCLevels(caps.supportedLevels);
++        for (unsigned int level : levels) {
++            mOfferedLevels.push_back(static_cast<C2Config::level_t>(level));
++        }
+         // Default to Level 4.1 like the H.264 encoder, or the highest level on offer below it.
+         unsigned int defaultLevel = defaultLevelBelow(levels, C2Config::LEVEL_HEVC_MAIN_4_1);
+         addParameter(DefineParam(mProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+@@ -848,6 +857,42 @@ std::optional<std::pair<int32_t, int32_t>> EncodeInterface::getQpBounds() const
+     return std::make_pair(std::min(minQp, maxQp), maxQp);
+ }
+ 
++C2Config::level_t EncodeInterface::getEffectiveLevel() const {
++    const C2Config::level_t requested = getOutputLevel();
++    const ui::Size size = getInputVisibleSize();
++    C2Config::level_t needed = C2Config::LEVEL_UNUSED;
++    if (isHEVCProfile(getOutputProfile())) {
++        needed = lowestHEVCLevel(size, getFramerate(), getBitrate(), mOfferedLevels);
++    } else if (isH264Profile(getOutputProfile())) {
++        needed = lowestH264Level(getOutputProfile(), size, getFramerate(), getBitrate(),
++                                 mOfferedLevels);
++    }
++    return needed != C2Config::LEVEL_UNUSED && needed > requested ? needed : requested;
++}
++
++uint32_t EncodeInterface::getPeakBitrate() const {
++    const uint32_t bitrate = getBitrate();
++    uint64_t peak = static_cast<uint64_t>(bitrate) * VideoEncoder::kPeakBitrateMultiplier;
++
++    // A stream that states a level has to stay within the bitrate the level allows, or the device
++    // states a higher level than the client asked for.
++    const C2Config::level_t level = getEffectiveLevel();
++    uint64_t levelMaxBR = 0;
++    if (isHEVCProfile(getOutputProfile())) {
++        for (const HEVCLevelLimits& limit : kHEVCLimits) {
++            if (limit.level == level) levelMaxBR = limit.maxBR;
++        }
++    } else {
++        for (const H264LevelLimits& limit : kH264Limits) {
++            if (limit.level == level) {
++                levelMaxBR = h264ProfileMaxBitrate(getOutputProfile(), limit.maxBR);
++            }
++        }
++    }
++    if (levelMaxBR > 0) peak = std::min(peak, levelMaxBR);
++    return static_cast<uint32_t>(std::clamp<uint64_t>(peak, bitrate, UINT32_MAX));
++}
++
+ uint32_t EncodeInterface::getMaxBFrames() const {
+     if (!mGop) return 0;
+ 
+diff --git a/components/include/v4l2_codec2/components/EncodeInterface.h b/components/include/v4l2_codec2/components/EncodeInterface.h
+index 2b404e5b7800a1ede9288af6e8b81fe957730277..b96b6245152d75cf82686ee47e87d6192a91b6a3 100644
+--- a/components/include/v4l2_codec2/components/EncodeInterface.h
++++ b/components/include/v4l2_codec2/components/EncodeInterface.h
+@@ -39,6 +39,9 @@ public:
+     const char* getOutputMediaType() const { return mOutputMediaType->m.value; }
+     C2Config::profile_t getOutputProfile() const { return mProfileLevel->profile; }
+     C2Config::level_t getOutputLevel() const { return mProfileLevel->level; }
++    // Get the level to configure the device with: the requested level, or the lowest level on offer
++    // that holds the picture, the frame rate and the bitrate, if that is higher.
++    C2Config::level_t getEffectiveLevel() const;
+     const ui::Size getInputVisibleSize() const {
+         return ui::Size(mInputVisibleSize->width, mInputVisibleSize->height);
+     }
+@@ -50,6 +53,9 @@ public:
+     C2Config::bitrate_mode_t getBitrateMode() const { return mBitrateMode->value; }
+     // Get the requested bitrate.
+     uint32_t getBitrate() const { return mBitrate->value; }
++    // Get the peak bitrate for the variable bitrate mode: a multiple of the requested bitrate,
++    // within what the configured level allows, and not below the requested bitrate.
++    uint32_t getPeakBitrate() const;
+     // Get the requested framerate.
+     float getFramerate() const { return mFrameRate->value; }
+ 
+@@ -115,9 +121,6 @@ protected:
+     static C2R InputDelaySetter(bool mayBlock, C2P<C2PortActualDelayTuning::input>& me,
+                                 const C2P<C2StreamGopTuning::output>& gop);
+ 
+-    // Recorded lowest configured level
+-    // Is static for the need to use H264ProfileLevelSetter as a setter
+-    static C2Config::level_t lowestConfigLevel;
+ 
+     // Constant parameters
+ 
+@@ -191,6 +194,8 @@ protected:
+     std::optional<std::pair<int32_t, int32_t>> mQpRange;
+     uint32_t mMaxBFrames = 0;
+     uint32_t mMaxTemporalLayers = 1;
++    // The levels the interface offers for the codec, which getEffectiveLevel() chooses among.
++    std::vector<C2Config::level_t> mOfferedLevels;
+ 
+     c2_status_t mInitStatus = C2_NO_INIT;
+ };
+diff --git a/v4l2/V4L2EncodeComponent.cpp b/v4l2/V4L2EncodeComponent.cpp
+index 1c395a638f4e43b245246c4a3278e387661467b9..83a36c01aff599620808290ecd2d158f30277c74 100644
+--- a/v4l2/V4L2EncodeComponent.cpp
++++ b/v4l2/V4L2EncodeComponent.cpp
+@@ -75,9 +75,9 @@ bool V4L2EncodeComponent::initializeEncoder() {
+     // The level, as the V4L2 enum value of the codec's level control.
+     std::optional<uint8_t> level;
+     if (isH264Profile(outputProfile)) {
+-        level = c2LevelToV4L2Level(mInterface->getOutputLevel());
++        level = c2LevelToV4L2Level(mInterface->getEffectiveLevel());
+     } else if (isHEVCProfile(outputProfile)) {
+-        level = c2LevelToV4L2HEVCLevel(mInterface->getOutputLevel());
++        level = c2LevelToV4L2HEVCLevel(mInterface->getEffectiveLevel());
+     }
+ 
+     // Main 10 takes 10-bit frames, the other profiles 8-bit ones.
+@@ -135,7 +135,7 @@ bool V4L2EncodeComponent::initializeEncoder() {
+     mEncoder = V4L2Encoder::create(
+             outputProfile, level, mInterface->getInputVisibleSize(), *stride,
+             mInterface->getKeyFramePeriod(), mBitrateMode, mBitrate,
+-            mBitrate * VideoEncoder::kPeakBitrateMultiplier, params,
++            mInterface->getPeakBitrate(), params,
+             ::base::BindRepeating(&V4L2EncodeComponent::fetchOutputBlock, mWeakThis),
+             ::base::BindRepeating(&V4L2EncodeComponent::onInputBufferDone, mWeakThis),
+             ::base::BindRepeating(&V4L2EncodeComponent::onOutputBufferDone, mWeakThis),

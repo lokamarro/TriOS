@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 08:02:38 -0400
+Subject: [PATCH] venus: observe pipeline creation results
+
+Pipeline creation on the primary ring was asynchronous, which reports VK_SUCCESS before the renderer has run the command. Native backends can reject a pipeline for reasons other than allocation failure; retaining a guest handle for an object the renderer never created makes the command stream fatal on first use. Always use the synchronous call so the application receives the real result and failed handles are released locally. This costs one round trip per pipeline-creation call.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/virtio/vulkan/vn_pipeline.c | 96 ++++++++++++---------------------
+ 1 file changed, 34 insertions(+), 62 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_pipeline.c b/src/virtio/vulkan/vn_pipeline.c
+index 0b2dfa12821bdbf963819944c2668d593d1824eb..ded98f36d07d1c1d5c2d58e4008175e212f3b8b2 100644
+--- a/src/virtio/vulkan/vn_pipeline.c
++++ b/src/virtio/vulkan/vn_pipeline.c
+@@ -639,10 +639,6 @@ vn_destroy_failed_pipeline_handles(struct vn_device *dev,
+                                         alloc, true);
+ }
+ 
+-#define VN_PIPELINE_CREATE_SYNC_MASK                                         \
+-   (VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |             \
+-    VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT)
+-
+ static struct vn_graphics_pipeline_fix_tmp *
+ vn_graphics_pipeline_fix_tmp_alloc(const VkAllocationCallbacks *alloc,
+                                    uint32_t info_count,
+@@ -1682,7 +1678,6 @@ vn_CreateGraphicsPipelines(VkDevice device,
+    struct vn_device *dev = vn_device_from_handle(device);
+    const VkAllocationCallbacks *alloc =
+       pAllocator ? pAllocator : &dev->base.vk.alloc;
+-   bool want_sync = false;
+    VkResult result;
+ 
+    /* silence -Wmaybe-uninitialized false alarm on release build with gcc */
+@@ -1704,8 +1699,6 @@ vn_CreateGraphicsPipelines(VkDevice device,
+ 
+       const VkPipelineCreateFlags2 flags2 = vn_pipeline_create_flags2(
+          pCreateInfos[i].pNext, pCreateInfos[i].flags);
+-      if (flags2 & VN_PIPELINE_CREATE_SYNC_MASK)
+-         want_sync = true;
+ 
+       vn_graphics_pipeline_state_fill(&pCreateInfos[i], flags2,
+                                       &pipeline->state, &fix_descs[i]);
+@@ -1741,23 +1734,22 @@ vn_CreateGraphicsPipelines(VkDevice device,
+       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
+-   if (want_sync || target_ring != dev->primary_ring) {
+-      if (target_ring == dev->primary_ring) {
+-         VN_TRACE_SCOPE("want sync");
+-      }
+-
+-      result = vn_call_vkCreateGraphicsPipelines(
+-         target_ring, device, pipelineCache, createInfoCount, pCreateInfos,
+-         NULL, pPipelines);
+-      if (result != VK_SUCCESS)
+-         vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
+-                                            alloc);
+-   } else {
+-      vn_async_vkCreateGraphicsPipelines(target_ring, device, pipelineCache,
+-                                         createInfoCount, pCreateInfos, NULL,
+-                                         pPipelines);
+-      result = VK_SUCCESS;
+-   }
++   /* Always observe the renderer's creation result.
++    *
++    * An asynchronous create reports VK_SUCCESS before the renderer has run it.
++    * When the host driver then fails a pipeline that it cannot lower to the
++    * native API, this driver would hold a pipeline object
++    * the renderer never created. The first command that references it fails
++    * object lookup in the renderer, which marks the command stream fatal, and
++    * the next ring submission aborts the process instead of failing a single
++    * pipeline.
++    */
++   result = vn_call_vkCreateGraphicsPipelines(
++      target_ring, device, pipelineCache, createInfoCount, pCreateInfos, NULL,
++      pPipelines);
++   if (result != VK_SUCCESS)
++      vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
++                                         alloc);
+ 
+    vk_free(alloc, fix_tmp);
+    STACK_ARRAY_FINISH(fix_descs);
+@@ -1775,7 +1767,6 @@ vn_CreateComputePipelines(VkDevice device,
+    struct vn_device *dev = vn_device_from_handle(device);
+    const VkAllocationCallbacks *alloc =
+       pAllocator ? pAllocator : &dev->base.vk.alloc;
+-   bool want_sync = false;
+    VkResult result;
+ 
+    memset(pPipelines, 0, sizeof(*pPipelines) * createInfoCount);
+@@ -1793,11 +1784,6 @@ vn_CreateComputePipelines(VkDevice device,
+          pipeline->layout = vn_pipeline_layout_ref(dev, layout);
+       }
+ 
+-      if (vn_pipeline_create_flags2(pCreateInfos[i].pNext,
+-                                    pCreateInfos[i].flags) &
+-          VN_PIPELINE_CREATE_SYNC_MASK)
+-         want_sync = true;
+-
+       vn_invalidate_pipeline_creation_feedback(
+          (const VkBaseInStructure *)pCreateInfos[i].pNext);
+    }
+@@ -1808,19 +1794,15 @@ vn_CreateComputePipelines(VkDevice device,
+       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
+-   if (want_sync || target_ring != dev->primary_ring) {
+-      result = vn_call_vkCreateComputePipelines(
+-         target_ring, device, pipelineCache, createInfoCount, pCreateInfos,
+-         NULL, pPipelines);
+-      if (result != VK_SUCCESS)
+-         vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
+-                                            alloc);
+-   } else {
+-      vn_async_vkCreateComputePipelines(target_ring, device, pipelineCache,
+-                                        createInfoCount, pCreateInfos, NULL,
+-                                        pPipelines);
+-      result = VK_SUCCESS;
+-   }
++   /* Always observe the renderer's creation result, as in
++    * vn_CreateGraphicsPipelines.
++    */
++   result = vn_call_vkCreateComputePipelines(
++      target_ring, device, pipelineCache, createInfoCount, pCreateInfos, NULL,
++      pPipelines);
++   if (result != VK_SUCCESS)
++      vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
++                                         alloc);
+ 
+    return vn_result(dev->instance, result);
+ }
+@@ -1861,7 +1843,6 @@ vn_CreateRayTracingPipelinesKHR(
+    struct vn_device *dev = vn_device_from_handle(device);
+    const VkAllocationCallbacks *alloc =
+       pAllocator ? pAllocator : &dev->base.vk.alloc;
+-   bool want_sync = false;
+    VkResult result = VK_SUCCESS;
+ 
+    memset(pPipelines, 0, sizeof(*pPipelines) * createInfoCount);
+@@ -1879,11 +1860,6 @@ vn_CreateRayTracingPipelinesKHR(
+          pipeline->layout = vn_pipeline_layout_ref(dev, layout);
+       }
+ 
+-      if (vn_pipeline_create_flags2(pCreateInfos[i].pNext,
+-                                    pCreateInfos[i].flags) &
+-          VN_PIPELINE_CREATE_SYNC_MASK)
+-         want_sync = true;
+-
+       vn_invalidate_pipeline_creation_feedback(
+          (const VkBaseInStructure *)pCreateInfos[i].pNext);
+    }
+@@ -1898,19 +1874,15 @@ vn_CreateRayTracingPipelinesKHR(
+    /* The VUID-VkRayTracingPipelineCreateInfoKHR-* set of VUs have well
+     * validated the create info here. Nothing needs to be done.
+     */
+-   if (want_sync || target_ring != dev->primary_ring) {
+-      result = vn_call_vkCreateRayTracingPipelinesKHR(
+-         target_ring, device, VK_NULL_HANDLE, pipelineCache, createInfoCount,
+-         pCreateInfos, NULL, pPipelines);
+-      if (result != VK_SUCCESS)
+-         vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
+-                                            alloc);
+-   } else {
+-      vn_async_vkCreateRayTracingPipelinesKHR(
+-         target_ring, device, VK_NULL_HANDLE, pipelineCache, createInfoCount,
+-         pCreateInfos, NULL, pPipelines);
+-      result = VK_SUCCESS;
+-   }
++   /* Always observe the renderer's creation result, as in
++    * vn_CreateGraphicsPipelines.
++    */
++   result = vn_call_vkCreateRayTracingPipelinesKHR(
++      target_ring, device, VK_NULL_HANDLE, pipelineCache, createInfoCount,
++      pCreateInfos, NULL, pPipelines);
++   if (result != VK_SUCCESS)
++      vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
++                                         alloc);
+ 
+    if (deferredOperation != VK_NULL_HANDLE)
+       return VK_OPERATION_DEFERRED_KHR;

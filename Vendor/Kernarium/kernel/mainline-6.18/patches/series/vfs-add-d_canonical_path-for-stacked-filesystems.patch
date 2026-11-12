@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Rosenberg <drosen@google.com>
+Date: Tue, 27 Oct 2020 13:24:03 +0000
+Subject: [PATCH] vfs: add d_canonical_path for stacked filesystems
+
+Inotify does not currently know when a filesystem is acting as a wrapper
+around another fs. This means that inotify watchers will miss any
+modifications to the base file, as well as any made in a separate stacked
+fs that points to the same file.
+d_canonical_path solves this problem by allowing the fs to map a dentry to
+a path in the lower fs. Inotify can use it to find the appropriate place to
+watch to be informed of all changes to a file.
+
+Signed-off-by: Daniel Rosenberg <drosen@google.com>
+[astrachan: Folded 34df4102216e ("ANDROID: fsnotify: Notify lower fs of
+            open") into this patch]
+Signed-off-by: Alistair Strachan <astrachan@google.com>
+Signed-off-by: Yongqin Liu <yongqin.liu@linaro.org>
+Signed-off-by: Alessio Balsini <balsini@google.com>
+(cherry picked from commit f37e05049bf8 of the Android common kernel
+android17-6.18, with the -ENOSYS handling that cdbf344d3522 by Paul
+Lawrence adds to it)
+[Adapted to 6.18.54: the new CONFIG_DCACHE_CANONICAL_PATH, which a
+filesystem that implements the operation selects, keys both users, so a
+kernel without one is unchanged. The open of a stacked file is reported
+to the lower file as well, because the open is reported before the
+stacked filesystem reaches the lower one.]
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ fs/Kconfig                       |  5 +++++
+ fs/notify/inotify/inotify_user.c | 19 +++++++++++++++++--
+ include/linux/dcache.h           |  1 +
+ include/linux/fsnotify.h         | 23 +++++++++++++++++++++++
+ 4 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 0bfdaecaa87751e0283b29b8056f316e002e5b3e..3890446aa8894c91ed2fcc05f4aa18a92447c0d0 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -22,6 +22,11 @@ config FS_IOMAP
+ config FS_STACK
+ 	bool
+ 
++# A filesystem that wraps files of another one maps a dentry to the path of the
++# file it wraps, so that inotify watches and open events reach that file.
++config DCACHE_CANONICAL_PATH
++	bool
++
+ config BUFFER_HEAD
+ 	bool
+ 
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 6eaf0d382eec8f1fcaa0158240943191f118767a..48d1cf619f643dc0356dd4644f415776c535f59e 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -720,6 +720,8 @@ SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
+ 	struct fsnotify_group *group;
+ 	struct inode *inode;
+ 	struct path path;
++	struct path alteredpath;
++	struct path *canonical_path = &path;
+ 	int ret;
+ 	unsigned flags = 0;
+ 
+@@ -761,13 +763,26 @@ SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
+ 	if (ret)
+ 		return ret;
+ 
++	/* support stacked filesystems */
++	if (IS_ENABLED(CONFIG_DCACHE_CANONICAL_PATH) && path.dentry->d_op &&
++	    path.dentry->d_op->d_canonical_path) {
++		ret = path.dentry->d_op->d_canonical_path(&path, &alteredpath);
++		if (ret != -ENOSYS) {
++			if (ret)
++				goto path_put_and_out;
++			canonical_path = &alteredpath;
++			path_put(&path);
++		}
++	}
++
+ 	/* inode held in place by reference to path; group by fget on fd */
+-	inode = path.dentry->d_inode;
++	inode = canonical_path->dentry->d_inode;
+ 	group = fd_file(f)->private_data;
+ 
+ 	/* create/update an inode mark */
+ 	ret = inotify_update_watch(group, inode, mask);
+-	path_put(&path);
++path_put_and_out:
++	path_put(canonical_path);
+ 	return ret;
+ }
+ 
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index c83e02b9438940e2cf5c94a0a9aba8d401ee0b77..b691a517606bf070b24d4c698b3baeeb70522452 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -166,6 +166,7 @@ struct dentry_operations {
+ 	struct dentry *(*d_real)(struct dentry *, enum d_real_type type);
+ 	bool (*d_unalias_trylock)(const struct dentry *);
+ 	void (*d_unalias_unlock)(const struct dentry *);
++	int (*d_canonical_path)(const struct path *, struct path *);
+ } ____cacheline_aligned;
+ 
+ /*
+diff --git a/include/linux/fsnotify.h b/include/linux/fsnotify.h
+index 28a9cb13fbfa383d75f511a2de9ceeb87bab4720..4920100506361a7abfa46b97f961cc8f5a60ba04 100644
+--- a/include/linux/fsnotify.h
++++ b/include/linux/fsnotify.h
+@@ -124,6 +124,29 @@ static inline int fsnotify_file(struct file *file, __u32 mask)
+ 	if (FMODE_FSNOTIFY_NONE(file->f_mode))
+ 		return 0;
+ 
++	/*
++	 * Open calls notify early on, so lower file system must be notified
++	 */
++	if (IS_ENABLED(CONFIG_DCACHE_CANONICAL_PATH) && (mask & FS_OPEN) &&
++	    file->f_path.dentry->d_op &&
++	    file->f_path.dentry->d_op->d_canonical_path) {
++		struct path lower_path;
++		int ret;
++
++		ret = file->f_path.dentry->d_op->d_canonical_path(&file->f_path,
++								   &lower_path);
++		if (ret != -ENOSYS) {
++			if (ret)
++				return ret;
++
++			ret = fsnotify_path(&lower_path, mask);
++			path_put(&lower_path);
++
++			if (ret)
++				return ret;
++		}
++	}
++
+ 	return fsnotify_path(&file->f_path, mask);
+ }
+ 

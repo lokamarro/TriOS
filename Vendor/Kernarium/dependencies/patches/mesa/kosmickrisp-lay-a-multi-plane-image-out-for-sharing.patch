@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 23:05:13 +0900
+Subject: [PATCH] kosmickrisp: lay a multi-plane image out for sharing
+
+A video frame crosses this driver as a multi-plane image under
+DRM_FORMAT_MOD_LINEAR: its planes sit in one allocation, each at its own
+offset, and an importer is told where they are through the image's memory
+planes. This driver already lays such an image out that way and binds it that
+way, but could describe only the first of them, so a two-plane frame could not
+be shared at all.
+
+A memory plane is a plane of the modifier's layout. DRM_FORMAT_MOD_LINEAR is
+the only modifier offered here and lays a format's planes out in their own
+order, so memory plane n is format plane n. Say that, instead of refusing
+every plane past the first.
+
+Where a plane sits was recomputed at each use, and the two computations
+disagreed: the reported layout raised every earlier plane to its alignment but
+not the plane being asked about, so it could name an offset below where the
+bind had put it. Decide it once, when the image is created, and read it back
+everywhere else.
+
+Deciding it once also lets an importer decide it instead. A frame that arrives
+as one dma-buf carries both planes in one allocation at offsets the producer
+chose, and an explicit layout is how it says so - yet the layout was accepted
+only when every plane repeated the offset this driver would have picked, which
+for the first plane means zero and for a single-plane image means the whole
+import has to start the allocation. Keep the checks that describe what Metal
+can do, the row pitch it fixes and the alignment a texture may start at, and
+take the offset from the layout.
+
+Nothing in Vulkan bounds that offset, and the memory requirement is the end
+of the last plane, so an offset near 2^64 wrapped the requirement below the
+plane's own size and let a small allocation bind a plane far outside it. A
+plane that ends past the device's largest buffer, which no allocation can
+reach, is refused as an invalid plane layout.
+kosmickrisp_drm_plane_offset creates such layouts on both sides of that
+bound.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_image.c             | 147 ++++++++--------
+ src/kosmickrisp/vulkan/kk_image.h             |  23 ++-
+ src/kosmickrisp/vulkan/meson.build            |  13 ++
+ .../vulkan/tests/test_drm_plane_offset.c      | 158 ++++++++++++++++++
+ 4 files changed, 271 insertions(+), 70 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index af698e9d6772579bf46f056b89fea6dd390ac296..72b1f4c24d3a54cddfdc590480a53cc9bc1fbdbe 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -634,6 +634,25 @@ kk_GetPhysicalDeviceSparseImageFormatProperties2(
+    return;
+ }
+ 
++/* A joined image packs its planes into one allocation, each starting at the
++ * alignment its own layout asks for. A disjoint image binds every plane
++ * separately, so each one starts its own allocation.
++ */
++static uint64_t
++kk_image_packed_plane_offset_B(const struct kk_image *image, uint8_t plane)
++{
++   if (image->disjoint)
++      return 0;
++
++   uint64_t offset_B = 0;
++   for (uint8_t i = 0; i < plane; i++) {
++      offset_B = align64(offset_B, image->planes[i].layout.align_B);
++      offset_B += image->planes[i].layout.size_B;
++   }
++
++   return align64(offset_B, image->planes[plane].layout.align_B);
++}
++
+ static VkResult
+ kk_image_init(struct kk_device *dev, struct kk_image *image,
+               const VkImageCreateInfo *pCreateInfo)
+@@ -734,11 +753,12 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
+       }
+    }
+ 
+-   /* An explicit layout describes memory this driver did not lay out. Metal
+-    * fixes a linear texture's row pitch through its own alignment rule, so
+-    * the only explicit layout that can be bound here is the one this driver
+-    * would have produced; anything else has to be refused rather than
+-    * silently ignored. */
++   /* An explicit layout describes memory this driver did not lay out: an
++    * importer names where each plane already is, which is how one dma-buf
++    * carries a whole multi-plane frame. Metal fixes a linear texture's row
++    * pitch through its own alignment rule and can start one only at a
++    * multiple of that same alignment, so a layout that disagrees with either
++    * has to be refused rather than silently ignored. */
+    if (mod_explicit != NULL) {
+       if (mod_explicit->drmFormatModifierPlaneCount != image->plane_count) {
+          vk_image_finish(&image->vk);
+@@ -752,21 +772,52 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
+          const struct kk_image_layout *layout = &image->planes[plane].layout;
+          const VkSubresourceLayout *given = &mod_explicit->pPlaneLayouts[plane];
+ 
+-         if (given->offset != 0 || given->rowPitch != layout->linear_stride_B ||
+-             (given->size != 0 && given->size != layout->size_B) ||
++         /* The row pitch is Metal's to decide, so a layout that names a
++          * different one describes memory this driver cannot read. The
++          * offset is the importer's to decide - that is the whole point of
++          * an explicit layout - as long as a Metal texture can start there.
++          */
++         if (given->rowPitch != layout->linear_stride_B ||
++             given->offset % layout->align_B != 0 ||
++             (given->size != 0 && given->size < layout->size_B) ||
+              given->arrayPitch != 0 || given->depthPitch != 0) {
+             vk_image_finish(&image->vk);
+             return vk_errorf(
+                dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+-               "plane %u wants offset %llu pitch %llu, Metal lays it out at "
+-               "offset 0 pitch %u",
++               "plane %u wants offset %llu pitch %llu, Metal needs pitch %u "
++               "at an offset that is a multiple of %u",
+                (unsigned)plane, (unsigned long long)given->offset,
+                (unsigned long long)given->rowPitch,
+-               (unsigned)layout->linear_stride_B);
++               (unsigned)layout->linear_stride_B,
++               (unsigned)layout->align_B);
++         }
++
++         /* Nothing Vulkan says bounds the offset, but no allocation is
++          * larger than the device's largest buffer. A plane that ends past
++          * that could only be bound through a memory requirement that
++          * wrapped, and would then sit outside its allocation. */
++         const uint64_t max_B = kk_device_physical(dev)->info.max_buffer_size;
++         if (layout->size_B > max_B || given->offset > max_B - layout->size_B) {
++            vk_image_finish(&image->vk);
++            return vk_errorf(
++               dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
++               "plane %u at offset %llu ends past the largest allocation, "
++               "%llu bytes",
++               (unsigned)plane, (unsigned long long)given->offset,
++               (unsigned long long)max_B);
+          }
+       }
+    }
+ 
++   /* A plane sits where the importer says it does, or, with no importer to
++    * say, packed after the plane before it.
++    */
++   for (uint8_t plane = 0; plane < image->plane_count; plane++) {
++      image->planes[plane].offset_B =
++         mod_explicit != NULL ? mod_explicit->pPlaneLayouts[plane].offset
++                              : kk_image_packed_plane_offset_B(image, plane);
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -783,15 +834,6 @@ kk_GetImageDrmFormatModifierPropertiesEXT(
+    return VK_SUCCESS;
+ }
+ 
+-static void
+-kk_image_plane_size_align_B(struct kk_device *dev, const struct kk_image *image,
+-                            const struct kk_image_plane *plane,
+-                            uint64_t *size_B_out, uint64_t *align_B_out)
+-{
+-   *size_B_out = plane->layout.size_B;
+-   *align_B_out = plane->layout.align_B;
+-}
+-
+ static void
+ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
+                       VkImageCreateFlags create_flags,
+@@ -861,21 +903,6 @@ kk_DestroyImage(VkDevice device, VkImage _image,
+    vk_free2(&dev->vk.alloc, pAllocator, image);
+ }
+ 
+-static void
+-kk_image_plane_add_req(struct kk_device *dev, const struct kk_image *image,
+-                       const struct kk_image_plane *plane, uint64_t *size_B,
+-                       uint32_t *align_B)
+-{
+-   assert(util_is_power_of_two_or_zero64(*align_B));
+-   uint64_t plane_size_B, plane_align_B;
+-   kk_image_plane_size_align_B(dev, image, plane, &plane_size_B,
+-                               &plane_align_B);
+-
+-   *align_B = MAX2(*align_B, plane_align_B);
+-   *size_B = align64(*size_B, plane_align_B);
+-   *size_B += plane_size_B;
+-}
+-
+ static void
+ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+                                  VkImageAspectFlags aspects,
+@@ -897,17 +924,18 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+ 
+    // TODO hope for the best?
+ 
++   /* The requirement has to reach the end of the last plane, wherever the
++    * planes sit: they are packed one after another unless an importer said
++    * otherwise, and then they sit where it said. */
+    uint64_t size_B = 0;
+    uint32_t align_B = 0;
+-   if (image->disjoint) {
+-      uint8_t plane = kk_image_memory_aspects_to_plane(image, aspects);
+-      kk_image_plane_add_req(dev, image, &image->planes[plane], &size_B,
+-                             &align_B);
+-   } else {
+-      for (unsigned plane = 0; plane < image->plane_count; plane++) {
+-         kk_image_plane_add_req(dev, image, &image->planes[plane], &size_B,
+-                                &align_B);
+-      }
++   const uint8_t first =
++      image->disjoint ? kk_image_memory_aspects_to_plane(image, aspects) : 0;
++   const uint8_t last = image->disjoint ? first + 1 : image->plane_count;
++   for (uint8_t plane = first; plane < last; plane++) {
++      const struct kk_image_plane *p = &image->planes[plane];
++      align_B = MAX2(align_B, (uint32_t)p->layout.align_B);
++      size_B = MAX2(size_B, p->offset_B + p->layout.size_B);
+    }
+ 
+    pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_types;
+@@ -998,14 +1026,7 @@ kk_get_image_subresource_layout(struct kk_device *dev, struct kk_image *image,
+    const uint8_t p = kk_image_memory_aspects_to_plane(image, isr->aspectMask);
+    const struct kk_image_plane *plane = &image->planes[p];
+ 
+-   uint64_t offset_B = 0;
+-   if (!image->disjoint) {
+-      uint32_t align_B = 0;
+-      for (unsigned i = 0; i < p; i++) {
+-         kk_image_plane_add_req(dev, image, &image->planes[i], &offset_B,
+-                                &align_B);
+-      }
+-   }
++   const uint64_t offset_B = plane->offset_B;
+ 
+    pLayout->subresourceLayout = (VkSubresourceLayout){
+       .offset = offset_B,
+@@ -1090,13 +1111,8 @@ kk_image_plane_report_address_binding(struct kk_device *dev,
+ static VkResult
+ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+                     struct kk_image_plane *plane, struct kk_device_memory *mem,
+-                    uint64_t *offset_B)
++                    uint64_t offset_B)
+ {
+-   uint64_t plane_size_B, plane_align_B;
+-   kk_image_plane_size_align_B(dev, image, plane, &plane_size_B,
+-                               &plane_align_B);
+-   *offset_B = align64(*offset_B, plane_align_B);
+-
+    if (!plane->layout.linear && !mem->bo->mtl_handle) {
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                        "optimal image memory has no Metal heap");
+@@ -1104,7 +1120,7 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+ 
+    /* Linear textures in Metal need to be allocated through a buffer... */
+    plane->mem = mem;
+-   plane->mem_offset_B = *offset_B;
++   plane->mem_offset_B = offset_B;
+    plane->mtl_handle = kk_image_plane_create_texture(plane, &plane->layout, 0u);
+    if (!plane->mtl_handle) {
+       plane->mem = NULL;
+@@ -1112,7 +1128,7 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                        "Metal refused the image texture");
+    }
+-   plane->addr = mem->bo->gpu + *offset_B;
++   plane->addr = mem->bo->gpu + offset_B;
+ 
+    /* Create auxiliary 2D array texture for 3D images so we can use 2D views of
+     * it */
+@@ -1126,7 +1142,7 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+       array_layout.depth_px = 1u;
+       array_layout.levels = kk_image_layout_array_alias_levels(&plane->layout);
+       plane->mtl_handle_array = mtl_new_texture_with_descriptor(
+-         mem->bo->mtl_handle, &array_layout, *offset_B);
++         mem->bo->mtl_handle, &array_layout, offset_B);
+       if (!plane->mtl_handle_array) {
+          mtl_release(plane->mtl_handle);
+          plane->mtl_handle = NULL;
+@@ -1138,8 +1154,6 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+       }
+    }
+ 
+-   *offset_B += plane_size_B;
+-
+    kk_image_plane_report_address_binding(dev, image, plane,
+                                          VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+    return VK_SUCCESS;
+@@ -1197,20 +1211,21 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
+    }
+ #endif
+ 
+-   uint64_t offset_B = info->memoryOffset;
+    if (image->disjoint) {
+       const VkBindImagePlaneMemoryInfo *plane_info =
+          vk_find_struct_const(info->pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
+       const uint8_t plane =
+          kk_image_memory_aspects_to_plane(image, plane_info->planeAspect);
+-      result =
+-         kk_image_plane_bind(dev, image, &image->planes[plane], mem, &offset_B);
++      result = kk_image_plane_bind(dev, image, &image->planes[plane], mem,
++                                   info->memoryOffset +
++                                      image->planes[plane].offset_B);
+       if (result != VK_SUCCESS)
+          return result;
+    } else {
+       for (unsigned plane = 0; plane < image->plane_count; plane++) {
+          result = kk_image_plane_bind(dev, image, &image->planes[plane], mem,
+-                                      &offset_B);
++                                      info->memoryOffset +
++                                         image->planes[plane].offset_B);
+          if (result != VK_SUCCESS)
+             return result;
+       }
+diff --git a/src/kosmickrisp/vulkan/kk_image.h b/src/kosmickrisp/vulkan/kk_image.h
+index b96eeec993ce569cd356babceec691048608d933..f5a849c8120e591bcfda885f31a8e24b2f82954b 100644
+--- a/src/kosmickrisp/vulkan/kk_image.h
++++ b/src/kosmickrisp/vulkan/kk_image.h
+@@ -32,6 +32,11 @@ uint32_t kk_image_max_dimension(const struct kk_physical_device *pdev,
+ struct kk_image_plane {
+    struct kk_image_layout layout;
+    struct kk_device_memory *mem;
++   /* Where this plane sits inside the memory range the image is bound to:
++    * packed after the plane before it, or, when an importer described memory
++    * it laid out itself, wherever that layout says.
++    */
++   uint64_t offset_B;
+    uint64_t mem_offset_B;
+    // TODO_KOSMICKRISP Only have one handle since we will only create 2D arrays
+    // anyway
+@@ -145,11 +150,21 @@ kk_image_memory_aspects_to_plane(ASSERTED const struct kk_image *image,
+                      VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT |
+                      VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT |
+                      VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT)) {
+-      /* We don't support DRM format modifiers on anything but single-plane
+-       * color at the moment.
++      /* DRM_FORMAT_MOD_LINEAR is the only modifier this driver offers, and it
++       * lays a format's planes out in their own order, so memory plane n is
++       * format plane n.
+        */
+-      assert(aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT);
+-      return 0;
++      switch (aspectMask) {
++      case VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT:
++         assert(image->plane_count > 1);
++         return 1;
++      case VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT:
++         assert(image->plane_count > 2);
++         return 2;
++      default:
++         assert(aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT);
++         return 0;
++      }
+    } else {
+       return kk_image_aspects_to_plane(image, aspectMask);
+    }
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index e84afbe9f311e68f646b729e89d52f64b2685b9e..09f61bcdd8e99c05ee94d93803c8d4e218147801 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1029,6 +1029,19 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_drm_plane_offset',
++      executable(
++        'test_kosmickrisp_drm_plane_offset',
++        files('tests/test_drm_plane_offset.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c b/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3353c15f4c59270f21d7216d95ac90d58161d05
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c
+@@ -0,0 +1,158 @@
++/* SPDX-License-Identifier: MIT */
++
++/* An explicit DRM-modifier layout names where each plane starts, and Vulkan
++ * puts no bound on that offset.  The image's memory requirement is the end of
++ * its last plane, so an offset near 2^64 would wrap that requirement below
++ * the plane's own size: a small allocation would then satisfy the bind rule
++ * and the plane would be bound far outside it.  No allocation is larger than
++ * the device's largest buffer, so a plane that ends past it must be refused
++ * when the image is created, and one inside it must be required whole. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "drm-uapi/drm_fourcc.h"
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++   VkPhysicalDeviceMaintenance4Properties maintenance4 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES,
++   };
++   VkPhysicalDeviceProperties2 properties = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++      .pNext = &maintenance4,
++   };
++   LOAD_I(vkGetPhysicalDeviceProperties2);
++   vkGetPhysicalDeviceProperties2(physical, &properties);
++   const uint64_t max_buffer = maintenance4.maxBufferSize;
++   CHECK(max_buffer > 0);
++
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   const char *extensions[] = {VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = 1,
++      .ppEnabledExtensionNames = extensions,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageSubresourceLayout);
++   LOAD_D(vkGetImageMemoryRequirements);
++
++   /* The plane layout the driver chooses itself, whose row pitch an explicit
++    * layout has to repeat. */
++   const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
++   VkImageDrmFormatModifierListCreateInfoEXT list = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++      .drmFormatModifierCount = 1,
++      .pDrmFormatModifiers = &linear,
++   };
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &list,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {256, 256, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++   };
++   VkImage listed = VK_NULL_HANDLE;
++   CHECK(vkCreateImage(device, &image_info, NULL, &listed) == VK_SUCCESS);
++   const VkImageSubresource plane0 = {
++      .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++   };
++   VkSubresourceLayout layout;
++   vkGetImageSubresourceLayout(device, listed, &plane0, &layout);
++   VkMemoryRequirements listed_requirements;
++   vkGetImageMemoryRequirements(device, listed, &listed_requirements);
++   vkDestroyImage(device, listed, NULL);
++   CHECK(layout.size >= 256u * 256u * 4u);
++
++   /* Every offset below is a multiple of 64 KiB, which is a multiple of any
++    * alignment Metal asks of a linear texture, so only its size can refuse
++    * it. */
++   const uint64_t offsets[] = {
++      /* Inside any allocation the device can make. */
++      UINT64_C(0x40000),
++      /* The end wraps past 2^64 to less than the plane's own size. */
++      UINT64_C(0xffffffffffff0000),
++      /* The end does not wrap but no allocation reaches it. */
++      UINT64_C(0x8000000000000000),
++   };
++   for (unsigned i = 0; i < 3; i++) {
++      const VkSubresourceLayout given = {
++         .offset = offsets[i],
++         .rowPitch = layout.rowPitch,
++      };
++      VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_layout = {
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++         .drmFormatModifierPlaneCount = 1,
++         .pPlaneLayouts = &given,
++      };
++      image_info.pNext = &explicit_layout;
++      VkImage image = VK_NULL_HANDLE;
++      VkResult result = vkCreateImage(device, &image_info, NULL, &image);
++      const int fits = offsets[i] <= max_buffer - layout.size;
++      fprintf(stderr, "offset 0x%llx: vkCreateImage = %d\n",
++              (unsigned long long)offsets[i], result);
++      if (!fits) {
++         CHECK(result == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++         continue;
++      }
++      CHECK(result == VK_SUCCESS);
++      VkMemoryRequirements requirements;
++      vkGetImageMemoryRequirements(device, image, &requirements);
++      CHECK(requirements.size >= offsets[i] + layout.size);
++      CHECK(requirements.size >= listed_requirements.size);
++      vkDestroyImage(device, image, NULL);
++   }
++
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("an explicit DRM plane offset stays inside the largest "
++          "allocation\n");
++   return 0;
++}

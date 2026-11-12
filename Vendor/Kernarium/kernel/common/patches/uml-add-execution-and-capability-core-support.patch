@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 17:24:06 +0900
+Subject: [PATCH] uml: add execution and capability core support
+
+Keep task lifecycle, architecture capability reporting, stack handling, and execution initialization in one reviewable final-state topic.
+---
+ arch/um/kernel/capflags_arm64.c | 17 +++++++++++
+ arch/um/kernel/exec.c           |  9 ++++++
+ arch/um/kernel/ksyms.c          |  4 ++-
+ arch/um/kernel/process.c        | 42 +++++++++++++++++++++++----
+ arch/um/kernel/stacktrace.c     | 13 ++++++++-
+ arch/um/kernel/um_arch.c        | 50 +++++++++++++++++++++++++++++++--
+ 6 files changed, 126 insertions(+), 9 deletions(-)
+ create mode 100644 arch/um/kernel/capflags_arm64.c
+
+diff --git a/arch/um/kernel/capflags_arm64.c b/arch/um/kernel/capflags_arm64.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e1908e0641238096717a8d245a8e1eb854077ac
+--- /dev/null
++++ b/arch/um/kernel/capflags_arm64.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <asm/cpufeatures.h>
++
++/* Kept under the historical name because /proc/cpuinfo UML code shares it. */
++const char * const x86_cap_flags[NCAPINTS * 32] = {
++	[0] = "fp",
++	[1] = "asimd",
++	[2] = "aes",
++	[3] = "pmull",
++	[4] = "sha1",
++	[5] = "sha2",
++	[6] = "crc32",
++	[7] = "sha3",
++	[8] = "sha512",
++	[9] = "atomics",
++};
+diff --git a/arch/um/kernel/exec.c b/arch/um/kernel/exec.c
+index 13812fa97eeea1a8f52646be3b4375fa8cb0ceac..d0f443c195f30b51bd8e011b1dbab1e8b32eaa88 100644
+--- a/arch/um/kernel/exec.c
++++ b/arch/um/kernel/exec.c
+@@ -26,6 +26,15 @@ void flush_thread(void)
+ 
+ 	get_safe_registers(current_pt_regs()->regs.gp,
+ 			   current_pt_regs()->regs.fp);
++#ifdef UML_HOST_DARWIN
++	/* These emulator-only architectural slots are outside both fixed
++	 * user_pt_regs and the FPSIMD image zeroed by get_safe_registers().
++	 */
++	current_pt_regs()->regs.fpmr = 0;
++	current_pt_regs()->regs.svcr = 0;
++	memset(current_pt_regs()->regs.pointer_auth_keys, 0,
++	       sizeof(current_pt_regs()->regs.pointer_auth_keys));
++#endif
+ }
+ 
+ void start_thread(struct pt_regs *regs, unsigned long eip, unsigned long esp)
+diff --git a/arch/um/kernel/ksyms.c b/arch/um/kernel/ksyms.c
+index f2fb77da08cff0be3f34d4d34a9b6e58cbb04562..9449ad05fc7df19b2d2f7e05e4d16d1d18fce8b0 100644
+--- a/arch/um/kernel/ksyms.c
++++ b/arch/um/kernel/ksyms.c
+@@ -6,8 +6,8 @@
+ #include <linux/module.h>
+ #include <os.h>
+ 
++EXPORT_SYMBOL(um_get_signals);
+ EXPORT_SYMBOL(um_set_signals);
+-EXPORT_SYMBOL(signals_enabled);
+ 
+ EXPORT_SYMBOL(os_stat_fd);
+ EXPORT_SYMBOL(os_stat_file);
+@@ -45,4 +45,6 @@ EXPORT_SYMBOL(add_sigio_fd);
+ EXPORT_SYMBOL(ignore_sigio_fd);
+ EXPORT_SYMBOL(sigio_broken);
+ 
++#ifndef UML_HOST_DARWIN
+ EXPORT_SYMBOL(syscall);
++#endif
+diff --git a/arch/um/kernel/process.c b/arch/um/kernel/process.c
+index 13d461712c997288c8274d3b47a101f7efb20b43..838272e9b62f582c94227f216f0b8ca2943ce8a8 100644
+--- a/arch/um/kernel/process.c
++++ b/arch/um/kernel/process.c
+@@ -75,7 +75,12 @@ struct task_struct *__switch_to(struct task_struct *from, struct task_struct *to
+ 	to->thread.prev_sched = from;
+ 	set_current(to);
+ 
++#ifdef UML_HOST_DARWIN
++	switch_threads_dead(&from->thread.switch_buf, &to->thread.switch_buf,
++			    READ_ONCE(from->__state) == TASK_DEAD);
++#else
+ 	switch_threads(&from->thread.switch_buf, &to->thread.switch_buf);
++#endif
+ 	arch_switch_to(current);
+ 
+ 	return current->thread.prev_sched;
+@@ -112,8 +117,19 @@ void new_thread_handler(void)
+ 	int (*fn)(void *);
+ 	void *arg;
+ 
+-	if (current->thread.prev_sched != NULL)
++	if (current->thread.prev_sched != NULL) {
+ 		schedule_tail(current->thread.prev_sched);
++#ifdef UML_HOST_DARWIN
++		/*
++		 * A first-run task has no suspended schedule() frame to perform the
++		 * matching local_irq_enable().  The runqueue lock is gone after
++		 * schedule_tail(), and the task now owns its selected fixed vCPU carrier,
++		 * so it must enter kernel-thread code or userspace with local interrupts
++		 * enabled.
++		 */
++		local_irq_enable();
++#endif
++	}
+ 	current->thread.prev_sched = NULL;
+ 
+ 	fn = current->thread.request.thread.proc;
+@@ -130,6 +146,10 @@ void new_thread_handler(void)
+ static void fork_handler(void)
+ {
+ 	schedule_tail(current->thread.prev_sched);
++#ifdef UML_HOST_DARWIN
++	/* See new_thread_handler(): this is the task's first carrier activation. */
++	local_irq_enable();
++#endif
+ 
+ 	/*
+ 	 * XXX: if interrupt_end() calls schedule, this call to
+@@ -156,6 +176,12 @@ int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)
+ 	if (!args->fn) {
+ 	  	memcpy(&p->thread.regs.regs, current_pt_regs(),
+ 		       sizeof(p->thread.regs.regs));
++		/* The variable-sized FP/SIMD area follows uml_pt_regs and is not
++		 * included in the fixed structure copy above.  Linux preserves it
++		 * across fork just like the general register image.
++		 */
++		memcpy(p->thread.regs.regs.fp,
++		       current_pt_regs()->regs.fp, host_fp_size);
+ 		PT_REGS_SET_SYSCALL_RETURN(&p->thread.regs, 0);
+ 		if (sp != 0)
+ 			REGS_SP(p->thread.regs.regs.gp) = sp;
+@@ -187,11 +213,7 @@ int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)
+ 
+ void initial_thread_cb(void (*proc)(void *), void *arg)
+ {
+-	int save_kmalloc_ok = kmalloc_ok;
+-
+-	kmalloc_ok = 0;
+ 	initial_thread_cb_skas(proc, arg);
+-	kmalloc_ok = save_kmalloc_ok;
+ }
+ 
+ int arch_dup_task_struct(struct task_struct *dst,
+@@ -222,11 +244,21 @@ void arch_cpu_idle(void)
+ 	um_idle_sleep();
+ }
+ 
++void arch_cpu_idle_prepare(void)
++{
++	os_idle_prepare();
++}
++
+ int __uml_cant_sleep(void) {
+ 	return in_atomic() || irqs_disabled() || in_interrupt();
+ 	/* Is in_interrupt() really needed? */
+ }
+ 
++int uml_need_resched(void)
++{
++	return need_resched();
++}
++
+ extern exitcall_t __uml_exitcall_begin, __uml_exitcall_end;
+ 
+ void do_uml_exitcalls(void)
+diff --git a/arch/um/kernel/stacktrace.c b/arch/um/kernel/stacktrace.c
+index fd3b61b3d4d2bd836e354d0e4c42dcc82c1c1c40..f6a76717b89a519f6a69c7b6daec1221b35921e4 100644
+--- a/arch/um/kernel/stacktrace.c
++++ b/arch/um/kernel/stacktrace.c
+@@ -12,6 +12,9 @@
+ #include <linux/module.h>
+ #include <linux/uaccess.h>
+ #include <asm/stacktrace.h>
++#ifdef UML_HOST_DARWIN
++#include <os.h>
++#endif
+ 
+ void dump_trace(struct task_struct *tsk,
+ 		const struct stacktrace_ops *ops,
+@@ -19,6 +22,7 @@ void dump_trace(struct task_struct *tsk,
+ {
+ 	int reliable = 0;
+ 	unsigned long *sp, bp, addr;
++	unsigned long stack_top;
+ 	struct pt_regs *segv_regs = tsk->thread.segv_regs;
+ 	struct stack_frame *frame;
+ 
+@@ -26,7 +30,14 @@ void dump_trace(struct task_struct *tsk,
+ 	sp = get_stack_pointer(tsk, segv_regs);
+ 
+ 	frame = (struct stack_frame *)bp;
+-	while (((long) sp & (THREAD_SIZE-1)) != 0) {
++#ifdef UML_HOST_DARWIN
++	if ((!tsk || tsk == current) && !segv_regs)
++		stack_top = os_current_thread_stack_top();
++	else
++#endif
++		stack_top = ((unsigned long)sp + THREAD_SIZE - 1) &
++			~(THREAD_SIZE - 1);
++	while ((unsigned long)sp < stack_top) {
+ 		addr = READ_ONCE_NOCHECK(*sp);
+ 		if (__kernel_text_address(addr)) {
+ 			reliable = 0;
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+index ed2f67848a50e7d35306d6beda0fe439593e5082..30450cd585995344a780e0f58076f2bfd39de7e1 100644
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -19,6 +19,7 @@
+ #include <linux/kmsg_dump.h>
+ #include <linux/suspend.h>
+ #include <linux/random.h>
++#include <linux/smp-internal.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/cpufeature.h>
+@@ -32,6 +33,7 @@
+ #include <kern_util.h>
+ #include <mem_user.h>
+ #include <os.h>
++#include <skas.h>
+ 
+ #include "um_arch.h"
+ 
+@@ -71,6 +73,12 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
+ 	int i = 0;
+ 
++#if IS_ENABLED(CONFIG_SMP)
++	i = (uintptr_t) v - 1;
++	if (!cpu_online(i))
++		return 0;
++#endif
++
+ 	seq_printf(m, "processor\t: %d\n", i);
+ 	seq_printf(m, "vendor_id\t: User Mode Linux\n");
+ 	seq_printf(m, "model name\t: UML\n");
+@@ -87,13 +95,14 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 		   loops_per_jiffy/(500000/HZ),
+ 		   (loops_per_jiffy/(5000/HZ)) % 100);
+ 
+-
+ 	return 0;
+ }
+ 
+ static void *c_start(struct seq_file *m, loff_t *pos)
+ {
+-	return *pos < nr_cpu_ids ? &boot_cpu_data + *pos : NULL;
++	if (*pos < nr_cpu_ids)
++		return (void *)(uintptr_t)(*pos + 1);
++	return NULL;
+ }
+ 
+ static void *c_next(struct seq_file *m, void *v, loff_t *pos)
+@@ -223,6 +232,10 @@ static void __init uml_postsetup(void)
+ static int panic_exit(struct notifier_block *self, unsigned long unused1,
+ 		      void *unused2)
+ {
++	const char *message = unused2;
++
++	os_warn("Darwin UML panic: %s\n",
++		message == NULL ? "(no panic message)" : message);
+ 	kmsg_dump(KMSG_DUMP_PANIC);
+ 	bust_spinlocks(1);
+ 	bust_spinlocks(0);
+@@ -287,6 +300,15 @@ static void __init parse_cache_line(char *line)
+ 
+ static unsigned long __init get_top_address(char **envp)
+ {
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Darwin places the initial pthread stack near 6 GiB, below the linked
++	 * UML kernel.  Use an explicit free high window for kernel vmalloc; guest
++	 * mappings are capped below the kernel separately.
++	 */
++	(void)envp;
++	return 0x700000000000UL;
++#else
+ 	unsigned long top_addr = (unsigned long) &top_addr;
+ 	int i;
+ 
+@@ -300,6 +322,7 @@ static unsigned long __init get_top_address(char **envp)
+ 	top_addr += UM_KERN_PAGE_SIZE;
+ 
+ 	return top_addr;
++#endif
+ }
+ 
+ int __init linux_main(int argc, char **argv, char **envp)
+@@ -331,6 +354,10 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 
+ 	/* Limit TASK_SIZE to what is addressable by the page table */
+ 	task_size = host_task_size;
++#ifdef UML_HOST_DARWIN
++	/* Keep every same-process guest mapping below the kernel ELF window. */
++	task_size = 0x400000000000UL;
++#endif
+ 	if (task_size > (unsigned long long) PTRS_PER_PGD * PGDIR_SIZE)
+ 		task_size = PTRS_PER_PGD * PGDIR_SIZE;
+ 
+@@ -346,6 +373,10 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 	get_host_cpu_features(parse_host_cpu_flags, parse_cache_line);
+ 
+ 	brk_start = (unsigned long) sbrk(0);
++#ifdef UML_HOST_DARWIN
++	/* libSystem's brk is unrelated to the embedded high-address ELF. */
++	brk_start = UML_ROUND_UP((unsigned long)&_end);
++#endif
+ 
+ 	/*
+ 	 * Increase physical memory size for exec-shield users
+@@ -371,6 +402,9 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 	iomem_size = (iomem_size + PAGE_SIZE - 1) & PAGE_MASK;
+ 
+ 	max_physmem = TASK_SIZE - uml_physmem - iomem_size - MIN_VMALLOC;
++#ifdef UML_HOST_DARWIN
++	max_physmem = host_task_size - uml_physmem - iomem_size - MIN_VMALLOC;
++#endif
+ 	if (physmem_size > max_physmem) {
+ 		physmem_size = max_physmem;
+ 		os_info("Physical memory size shrunk to %llu bytes\n",
+@@ -386,6 +420,9 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 	stack = (unsigned long) argv;
+ 	stack &= ~(1024 * 1024 - 1);
+ 	avail = stack - start_vm;
++#ifdef UML_HOST_DARWIN
++	avail = host_task_size - start_vm;
++#endif
+ 	if (physmem_size > avail)
+ 		virtmem_size = avail;
+ 	end_vm = start_vm + virtmem_size;
+@@ -419,6 +456,7 @@ void __init setup_arch(char **cmdline_p)
+ 	strscpy(boot_command_line, command_line, COMMAND_LINE_SIZE);
+ 	*cmdline_p = command_line;
+ 	setup_hostinfo(host_info, sizeof host_info);
++	prefill_possible_map();
+ 
+ 	if (os_getrandom(rng_seed, sizeof(rng_seed), 0) == sizeof(rng_seed)) {
+ 		add_bootloader_randomness(rng_seed, sizeof(rng_seed));
+@@ -430,6 +468,14 @@ void __init arch_cpu_finalize_init(void)
+ {
+ 	arch_check_bugs();
+ 	os_check_bugs();
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Calibration is the last early-boot user of the process-wide signal
++	 * timer. Switch to guest-boundary polling from UML's architecture hook,
++	 * rather than adding host policy to init/main.c.
++	 */
++	darwin_enable_cooperative_timers();
++#endif
+ }
+ 
+ void apply_seal_endbr(s32 *start, s32 *end)

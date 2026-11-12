@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 22:59:57 +0900
+Subject: [PATCH] gbm: allocate a planar buffer
+
+A video pipeline asks this device for its frames: Chromium's GpuMemoryBuffer
+support for YUV_420_BIPLANAR is exactly gbm_bo_create(GBM_FORMAT_NV12), and a
+decoder that writes into a buffer the compositor later samples needs the same
+allocation. Today every such call fails with EINVAL before it reaches a
+driver, because gbm's visual table lists colour formats only, so
+gbm_format_to_pipe_format() has nothing to return for a planar FourCC.
+
+List the planar formats whose pipe format names them. That is NV12 and P010:
+the three-plane 4:2:0 layouts all share PIPE_FORMAT_IYUV and can only be told
+apart by their FourCC, so a lookup that starts from the pipe format cannot
+serve them and they stay out.
+
+The DRI frontend then has to find the row. Its rows carry both the FourCC an
+importer names and the format an allocator names, and the planar rows were
+written when the second had no value to hold for a whole planar image; it is
+a pipe format now, and the two rows above have one that belongs to them
+alone. Giving it to them lets an allocation name a planar image, and lets
+every later query on that image find its row instead of dereferencing NULL.
+
+A planar FourCC names a memory layout, not a format a driver samples. A
+Vulkan driver has one format for the whole layout only where the API defines
+one, and PIPE_FORMAT_NV12 is not that format: it is the layout's own name,
+which vk_format_from_pipe_format() does not translate. So the allocation path
+would ask whether the driver could render to or sample from a format it had
+never heard of, get no for both, and return NULL - which a caller sees as
+gbm_bo_create() failing with no error at all.
+
+The import path already answers this. A planar dma-buf whose whole-image
+format the driver cannot sample is described there as the images its planes
+really are, one resource per plane, sampled together by the frontend. An
+allocation is the same image: the frames a decoder fills and a compositor
+samples come from here rather than from an importer, and nothing about them
+differs. Allocate them the same way, under the same test that decides it for
+an import.
+
+Such an image then has to report how many planes it has. Asking the driver
+gets the count of one plane's own resource, which is one, and an importer
+that believes it never sees the chroma: the format's planes and the
+modifier's memory planes are different things, and only the image knows which
+it is made of. Answer from the resources when there is more than one, and
+leave every other image to the driver, whose modifier may give it memory
+planes its format does not have.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/frontends/dri/dri2.c        | 62 +++++++++++++++++++------
+ src/gallium/frontends/dri/dri_helpers.c |  9 +++-
+ src/gbm/backends/dri/gbm_dri.c          | 10 ++++
+ 3 files changed, 66 insertions(+), 15 deletions(-)
+
+diff --git a/src/gallium/frontends/dri/dri2.c b/src/gallium/frontends/dri/dri2.c
+index e73807578951ebacfacdc0c62f9520e0188bc2aa..0e06f8c5346d004be9f1165e78465dec8bfc32aa 100644
+--- a/src/gallium/frontends/dri/dri2.c
++++ b/src/gallium/frontends/dri/dri2.c
+@@ -930,6 +930,20 @@ dri_create_image(struct dri_screen *screen,
+                                     PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SAMPLER_VIEW_SUBOPTIMAL))
+       tex_usage |= PIPE_BIND_SAMPLER_VIEW;
+ 
++   /* A planar format names a memory layout, and a driver that has no single
++    * format for that layout describes the image as the images its planes
++    * really are: one per plane, sampled together. That is already how an
++    * imported planar dma-buf is described here, and an allocation made for
++    * one - a video frame a decoder fills and a compositor samples - is the
++    * same image, so allocate it the same way.
++    */
++   bool use_lowered = false;
++   if (!tex_usage && util_format_is_yuv(map->pipe_format) &&
++       dri2_yuv_dma_buf_supported(screen, map)) {
++      use_lowered = true;
++      tex_usage |= PIPE_BIND_SAMPLER_VIEW;
++   }
++
+    if (!tex_usage)
+       return NULL;
+ 
+@@ -963,19 +977,28 @@ dri_create_image(struct dri_screen *screen,
+    templ.depth0 = 1;
+    templ.array_size = 1;
+ 
+-   if (modifiers)
+-      img->texture =
+-         screen->base.screen
+-            ->resource_create_with_modifiers(screen->base.screen,
+-                                             &templ,
+-                                             modifiers,
+-                                             count);
+-   else
+-      img->texture =
+-         screen->base.screen->resource_create(screen->base.screen, &templ);
+-   if (!img->texture) {
+-      FREE(img);
+-      return NULL;
++   for (int plane = (use_lowered ? map->nplanes : 1) - 1; plane >= 0; plane--) {
++      struct pipe_resource *tex;
++
++      if (use_lowered) {
++         templ.next = img->texture;
++         templ.format = map->planes[plane].dri_format;
++         templ.width0 = width >> map->planes[plane].width_shift;
++         templ.height0 = height >> map->planes[plane].height_shift;
++      }
++
++      if (modifiers)
++         tex = pscreen->resource_create_with_modifiers(pscreen, &templ,
++                                                       modifiers, count);
++      else
++         tex = pscreen->resource_create(pscreen, &templ);
++      if (!tex) {
++         pipe_resource_reference(&img->texture, NULL);
++         FREE(img);
++         return NULL;
++      }
++
++      img->texture = tex;
+    }
+ 
+    img->level = 0;
+@@ -1019,6 +1042,19 @@ dri2_query_image_common(struct dri_image *image, int attrib, int *value)
+       else
+          *value = to_dri_compression_rate(image->texture->compression_rate);
+       return true;
++   case __DRI_IMAGE_ATTRIB_NUM_PLANES: {
++      /* An image whose planes are separate resources knows its own count.
++       * Any other image leaves the answer to the driver, whose modifier may
++       * give the image memory planes its format does not have.
++       */
++      unsigned planes = 0;
++      for (struct pipe_resource *tex = image->texture; tex; tex = tex->next)
++         planes++;
++      if (planes < 2)
++         return false;
++      *value = planes;
++      return true;
++   }
+ 
+    default:
+       return false;
+diff --git a/src/gallium/frontends/dri/dri_helpers.c b/src/gallium/frontends/dri/dri_helpers.c
+index 74676652968238cdceb98340e6e4ba8c7a5fcadd..5786bb80097e83e1bc270c28c9745280784a496a 100644
+--- a/src/gallium/frontends/dri/dri_helpers.c
++++ b/src/gallium/frontends/dri/dri_helpers.c
+@@ -583,7 +583,12 @@ static const struct dri2_format_mapping dri2_format_table[] = {
+           { 1, 0, 0, __DRI_IMAGE_FORMAT_R16 },
+           { 2, 0, 0, __DRI_IMAGE_FORMAT_R16 } } },
+ 
+-      { DRM_FORMAT_NV12,          __DRI_IMAGE_FORMAT_NONE,
++      /* A planar row's image format is the format a caller names to allocate
++       * the whole image, and only a row whose pipe format belongs to it alone
++       * can have one: the three-plane rows above all share PIPE_FORMAT_IYUV
++       * and stay without, so that they are told apart by their FourCC.
++       */
++      { DRM_FORMAT_NV12,          PIPE_FORMAT_NV12,
+         PIPE_FORMAT_NV12, 2,
+         { { 0, 0, 0, __DRI_IMAGE_FORMAT_R8 },
+           { 1, 1, 1, __DRI_IMAGE_FORMAT_GR88 } } },
+@@ -604,7 +609,7 @@ static const struct dri2_format_mapping dri2_format_table[] = {
+         { { 0, 0, 0, __DRI_IMAGE_FORMAT_NONE },
+           { 1, 1, 0, __DRI_IMAGE_FORMAT_NONE } } },
+ 
+-      { DRM_FORMAT_P010,          __DRI_IMAGE_FORMAT_NONE,
++      { DRM_FORMAT_P010,          PIPE_FORMAT_P010,
+         PIPE_FORMAT_P010, 2,
+         { { 0, 0, 0, __DRI_IMAGE_FORMAT_R16 },
+           { 1, 1, 1, __DRI_IMAGE_FORMAT_GR1616 } } },
+diff --git a/src/gbm/backends/dri/gbm_dri.c b/src/gbm/backends/dri/gbm_dri.c
+index 6640f16da77cbeb4aa741dcbedfa9c736ba352b1..5bac6b5aa683b76f394ac69f1041b2c6d5189c25 100644
+--- a/src/gbm/backends/dri/gbm_dri.c
++++ b/src/gbm/backends/dri/gbm_dri.c
+@@ -353,6 +353,16 @@ static const struct gbm_dri_visual gbm_dri_visuals_table[] = {
+    { DRM_FORMAT_BGR161616F,    PIPE_FORMAT_R16G16B16_FLOAT },
+    { DRM_FORMAT_BGR323232F,    PIPE_FORMAT_R32G32B32_FLOAT },
+    { DRM_FORMAT_ABGR32323232F, PIPE_FORMAT_R32G32B32A32_FLOAT },
++
++   /* A video pipeline allocates its frames through this device and hands them
++    * on as a dma-buf whose planes sit at their own offsets in one allocation,
++    * so a planar format belongs in this table exactly like a colour format
++    * does. Only a format whose pipe format names it alone can be listed: the
++    * three-plane 4:2:0 layouts all share PIPE_FORMAT_IYUV and are told apart
++    * by their FourCC only.
++    */
++   { DRM_FORMAT_NV12,          PIPE_FORMAT_NV12 },
++   { DRM_FORMAT_P010,          PIPE_FORMAT_P010 },
+ };
+ 
+ static int

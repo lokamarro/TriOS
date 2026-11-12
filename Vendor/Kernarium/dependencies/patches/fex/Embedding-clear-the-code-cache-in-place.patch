@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 01:50:12 +0900
+Subject: [PATCH] Embedding: clear the code cache in place
+
+A host that drops every translation on a code change cannot afford a
+new, larger code buffer each time: the window it serves buffers from
+is finite. ClearCodeCache(Thread, false) kept the buffer but left
+everything else as it was. The cursor stayed, so the buffer filled
+with dead code until a larger one replaced it; the arena that holds
+the block links was never released, so each clear left its links
+behind; the pages' lists of blocks kept naming blocks that were gone;
+and the decoder kept the executable range it last asked the host
+about, so a host that counts the pages holding code was not asked
+again about the page decoded last, whose count it had dropped with
+the code.
+
+It now rewinds the buffer, returns the links' arena, clears the page
+lists and resets the decoder's range. That is correct for a context
+whose buffer only one thread uses, which is what the declaration now
+says.
+
+The arena also had no destructor, so a code buffer that a larger one
+replaced, and every context that was destroyed, left the links of all its
+blocks mapped for the life of the process. It now returns its buffers when
+it dies, and it cannot be copied, which would free them twice.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/CPUBackend.h      |  6 ++++++
+ FEXCore/Source/Interface/Core/Core.cpp          | 10 ++++++++++
+ FEXCore/Source/Interface/Core/LookupCache.cpp   |  7 +++++--
+ FEXCore/include/FEXCore/Core/Context.h          |  3 +++
+ FEXCore/include/FEXCore/fextl/memory_resource.h |  9 +++++++++
+ 5 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 0183694cdf13a78f18e3a4e74f36bc760d31468d..5b6540b4140b36c6e5947ad4781810fd783106d1 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -133,6 +133,12 @@ namespace CPU {
+ 
+     bool IsAddressInCodeBuffer(uintptr_t Address) const;
+ 
++    // Rewinds the code buffer so the next block overwrites the code in it. Only correct once nothing
++    // refers to that code, and only for a buffer that no other thread uses.
++    void ResetCodeBuffer() {
++      CurrentCodeBuffer->Reset();
++    }
++
+     // Updates the CodeBuffer if needed and returns a reference to the old one.
+     // The returned reference should be kept alive carefully to avoid early deletion of resources.
+     [[nodiscard]]
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index f2504e15ee8d30db655a750f39a8870f9ff2b91e..90c386b5a7d19c7e82396aa8b20fb654aedb7670 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -511,6 +511,16 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
+     // Clear L1+L2 cache of this thread, and clear L3 cache across any threads using it
+     auto lk = Thread->LookupCache->AcquireWriteLock();
+     Thread->LookupCache->ClearCache(lk);
++
++    // Nothing refers to the code any more, so the buffer starts over: the next block
++    // overwrites the old ones instead of leaving them behind until the buffer fills
++    // and a larger one replaces it. Only this thread may use the buffer, because another
++    // thread's lookup caches and call stack would still name the code being overwritten.
++    Thread->CPUBackend->ResetCodeBuffer();
++
++    // The decoder remembers the executable range it last asked the host for, and a host
++    // that tracks which pages hold code has dropped that page with the code.
++    Thread->FrontendDecoder->ResetExecutableRangeCache();
+   }
+   Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+ }
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index e7af8fa1bf8ed74c72e2ccfe8b66f99e31292c7b..17bbcc9f34297694da0c78825ce5498766f4d0b7 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -104,10 +104,13 @@ void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {
+ }
+ 
+ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
+-  // Allocate a new pointer from the BlockLinks pma again.
++  // The links are gone with the code. Return the arena they were allocated from
++  // before allocating the map again, or each clear would leave its links behind.
++  BlockLinks_mbr.release();
+   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+-  // All code is gone, clear the block list
++  // All code is gone, clear the block list and the pages that listed it
+   BlockList.clear();
++  CodePages.clear();
+ }
+ 
+ } // namespace FEXCore
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 56f8dc14af2360c375a806ca7aa5571d0c1b682c..4926d177802683fbaa9189e0382dba6c4f07a291 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -181,6 +181,9 @@ public:
+   virtual void SetCodeMapWriter(fextl::unique_ptr<CodeMapWriter>) = 0;
+   virtual void FlushAndCloseCodeMap() = 0;
+ 
++  // Drops every translation. A new code buffer, twice the size of the last up to a limit, is the default.
++  // Without one the translations go and the buffer starts over, which is only correct when no other
++  // thread executes in it or caches its code.
+   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void
+diff --git a/FEXCore/include/FEXCore/fextl/memory_resource.h b/FEXCore/include/FEXCore/fextl/memory_resource.h
+index 686feec9f47941baecb0228c9576dc816da736cb..797b2eac0ea757499e3faf55ac8aea82dc4eb1b7 100644
+--- a/FEXCore/include/FEXCore/fextl/memory_resource.h
++++ b/FEXCore/include/FEXCore/fextl/memory_resource.h
+@@ -38,6 +38,15 @@ namespace pmr {
+     explicit named_monotonic_page_buffer_resource(const char* Name)
+       : Name {Name} {}
+ 
++    // The resource owns its buffers: a copy would free them twice, and a resource
++    // that dies without freeing them leaves them mapped for the life of the process.
++    named_monotonic_page_buffer_resource(const named_monotonic_page_buffer_resource&) = delete;
++    named_monotonic_page_buffer_resource& operator=(const named_monotonic_page_buffer_resource&) = delete;
++
++    ~named_monotonic_page_buffer_resource() override {
++      release();
++    }
++
+     void release() noexcept {
+       for (auto& Iter : Buffers) {
+         FEXCore::Allocator::VirtualFree(Iter.Buffer, Iter.BufferSize);

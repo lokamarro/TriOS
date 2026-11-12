@@ -1,0 +1,1634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 20:36:41 +0900
+Subject: [PATCH] kosmickrisp: compile a pipeline library's stages when it is
+ created
+
+VK_EXT_graphics_pipeline_library promises that linking libraries is cheap
+next to building them, and KosmicKrisp answered its fast-linking property
+with false because every stage was compiled at the link: a library only
+serialized its NIR, and the link lowered it, generated the MSL, built an
+MTLLibrary per stage and then the MTLRenderPipelineState.  Metal's front
+end is the expensive half of that - about 4 ms for one small stage on an
+M1 Ultra against 7 ms for the whole pipeline state - so the conformance
+test's link-time comparison measured a link 230 times the cost of the
+libraries that carried its shaders.
+
+Compile each library's stages when the library is created instead, and
+keep the MTLLibrary Metal builds from each one in a device cache keyed by
+the source text it was built from.  The link regenerates the same MSL and
+finds Metal's compile already done, so it builds only the render pipeline
+state.  Nothing but identical source can share an entry, and an entry
+lives exactly as long as the libraries that registered it.
+
+A library never sees the chain it will be linked into, so it cannot take
+part in cross-stage varying optimization: a fast link optimizes each
+stage on its own, exactly as the libraries did, and leaves the interface
+where the application declared it.  That is what makes the precompiled
+source reusable, and it is also what the extension intends - a link with
+VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT, and every monolithic
+pipeline, still links the whole chain.
+
+Metal is the authority on an interface it has never seen joined: it
+requires every fragment input to be written by the vertex stage under the
+same name and the same type, and Vulkan lets a fragment shader read three
+components of a four-component varying.  A refused fast link therefore
+falls back to linking the chain the way a monolithic pipeline does, which
+narrows the vertex output and matches.  The refusal is expected on that
+path, so the bridge takes a flag that keeps a speculative pipeline build
+from reporting it.
+
+State a library does not own yet is filled with the values that select
+Metal's state-independent path - Metal's own vertex fetch, its
+fixed-function blend, no raster emulation, no multiview, one sample.  A
+link whose real state agrees regenerates exactly that source; a link that
+disagrees produces different source, misses the cache and compiles the
+stage itself.  A wrong guess costs a precompile, never correctness.
+
+The link-time test now seeds each library's specialization constant
+uniquely per run, because Metal keeps a persistent on-disk cache of the
+functions it has already built and reusing the constants measured that
+cache instead of this driver.  It also links and draws a four-component
+varying against a fragment shader reading all four of it and against one
+reading three, which is the interface Metal refuses.  Worst ratio falls
+from 230.35 to 0.63 against a limit of 10, and the narrowed interface
+renders green where it previously failed the link with
+VK_ERROR_INVALID_SHADER_NV.
+
+Keeping each stage's NIR past its serialization moves the duty to free it.
+The compile consumes every input NIR whether or not it succeeds, so a
+deferral that fails part-way frees all of them, including the stages it had
+already serialized, not only the ones it had not reached.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/bridge/mtl_compiler.h         |   6 +-
+ src/kosmickrisp/bridge/mtl_compiler.m         |   5 +-
+ src/kosmickrisp/bridge/stubs/mtl_compiler.c   |   2 +-
+ src/kosmickrisp/vulkan/kk_device.h            |   6 +
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   8 +-
+ src/kosmickrisp/vulkan/kk_shader.c            | 528 ++++++++++++++++--
+ src/kosmickrisp/vulkan/kk_shader.h            |   6 +
+ .../pipeline_library_shaders/generate.sh      |   3 +-
+ .../pipeline_library_shaders/gpl_varying.vert |  10 +
+ .../gpl_varying.vert.h                        |  64 +++
+ .../gpl_varying_narrow.frag                   |   9 +
+ .../gpl_varying_narrow.frag.h                 |  27 +
+ .../gpl_varying_wide.frag                     |   8 +
+ .../gpl_varying_wide.frag.h                   |  26 +
+ .../tests/test_pipeline_library_link_time.cpp | 421 +++++++++++++-
+ 15 files changed, 1054 insertions(+), 75 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag.h
+
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.h b/src/kosmickrisp/bridge/mtl_compiler.h
+index 23238140fcfc5b27fff2ea0409df92e5e50ed5ca..3b645509c44c2588536fc613278cfcfa322fde3b 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.h
++++ b/src/kosmickrisp/bridge/mtl_compiler.h
+@@ -91,9 +91,11 @@ void mtl_render_pipeline_descriptor_set_rasterization_enabled(
+ void mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
+    mtl_render_pipeline_descriptor *descriptor, uint32_t count);
+ 
+-/* Render pipeline */
++/* Render pipeline.  A caller that is only trying a descriptor - a graphics
++ * pipeline library link over separately compiled stages, which Metal is the
++ * first to see joined - passes quiet and reports the refusal itself. */
+ mtl_render_pipeline_state *
+ mtl_new_render_pipeline(mtl_compiler *compiler,
+-                        mtl_render_pass_descriptor *descriptor);
++                        mtl_render_pass_descriptor *descriptor, bool quiet);
+ 
+ #endif /* MTL_COMPILER_H */
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_compiler.m
+index def3b7f6a0708a677444b963341c64ba1c0ac709..f0279d86cdb9ce39330c6a5dab61abd3bb37692a 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -281,7 +281,8 @@
+ 
+ /* Render pipeline */
+ mtl_render_pipeline_state *
+-mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *descriptor)
++mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *descriptor,
++                        bool quiet)
+ {
+    @autoreleasepool {
+       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
+@@ -291,7 +292,7 @@
+       id<MTLRenderPipelineState> pipeline = [comp newRenderPipelineStateWithDescriptor:desc compilerTaskOptions:nil
+                                                                                  error:&error];
+ 
+-      if (pipeline == nil) {
++      if (pipeline == nil && !quiet) {
+          fprintf(stderr, "Failed to create MTLRenderPipelineState: %s\n", [error.localizedDescription UTF8String]);
+       }
+ 
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_compiler.c b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+index debb4d7534a3fb656727cdfce08930c6311c01a7..4e5b3411927b467b6d2271f852fb81d5598ea7e2 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -137,7 +137,7 @@ mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
+ /* Render pipeline */
+ mtl_render_pipeline_state *
+ mtl_new_render_pipeline(mtl_compiler *compiler,
+-                        mtl_render_pass_descriptor *descriptor)
++                        mtl_render_pass_descriptor *descriptor, bool quiet)
+ {
+    return NULL;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 3300cbe5ddd0024dff0ed1a477f4a492b7e2baa0..16ec133e7201e835ec4678e0340a00a572616b12 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -142,6 +142,12 @@ struct kk_device {
+    struct hash_table *linked_graphics_pipelines;
+    simple_mtx_t linked_graphics_pipelines_lock;
+ 
++   /* MTLLibrary objects keyed by the MSL text they were built from, so a
++    * graphics pipeline library pays Metal's front end once, when it is
++    * created, rather than again in every link that consumes it. */
++   struct hash_table *msl_libraries;
++   simple_mtx_t msl_libraries_lock;
++
+    /* Command storage recycled between submissions; see the cache above. */
+    struct kk_command_allocator_cache *allocator_cache;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 50f97c4fb549e15259ad97b1855ed13e8491a75c..d9f4ceb20d7acb3bf7409fa7af6bac4e2ad409ef 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -794,10 +794,12 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
+       .minImportedHostPointerAlignment = os_page_size,
+ 
+       /* VK_EXT_graphics_pipeline_library */
+-      /* Native Metal specialization still measures in milliseconds, not in
+-       * the command-recording latency class required by this property.
++      /* A library compiles the stages it owns into MTLLibrary objects when it
++       * is created, which is where Metal's front end - the expensive half of
++       * building a native pipeline - is paid.  A link over libraries whose
++       * state agrees rebuilds only the render pipeline state.
+        */
+-      .graphicsPipelineLibraryFastLinking = false,
++      .graphicsPipelineLibraryFastLinking = true,
+       .graphicsPipelineLibraryIndependentInterpolationDecoration = true,
+ 
+       /* VK_KHR_line_rasterization */
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 6c3a505a5c1b42cec3d2a8959e8ec7775b08f01e..efa2fc92ec9c62f972a5aaca1f402088329b13e7 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1483,6 +1483,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+ 
+ static const struct vk_shader_ops kk_shader_ops;
+ 
++static void kk_msl_library_unregister(struct kk_device *dev,
++                                      const blake3_hash key);
++
+ static void
+ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+                   const VkAllocationCallbacks *pAllocator)
+@@ -1492,6 +1495,10 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+    if (shader->info.deferred)
+       blob_finish(&shader->deferred_nir);
+ 
++   u_foreach_bit(stage, shader->precompiled_stages)
++      kk_msl_library_unregister(dev, shader->precompiled_keys[stage]);
++   shader->precompiled_stages = 0u;
++
+    struct kk_pipeline_handles *pipe = &shader->pipeline;
+ 
+    if (shader->info.stage == MESA_SHADER_COMPUTE) {
+@@ -4340,6 +4347,131 @@ gather_graphics_pipeline_create_info(
+    }
+ }
+ 
++/* Turning MSL text into an MTLLibrary is Metal's front-end compile, and it is
++ * the single most expensive step of building a native graphics pipeline: about
++ * 4 ms for one small stage on an M1 Ultra, against 7 ms for the whole render
++ * pipeline state built from two such libraries.  The result depends on nothing
++ * but the source text, so a graphics pipeline library compiles the stages it
++ * owns when the library is created and keeps the MTLLibrary here; the link that
++ * combines libraries then regenerates the same MSL and finds the compiled
++ * library instead of paying Metal's front end a second time.
++ *
++ * Entries live exactly as long as the objects that registered them.  The key is
++ * the source text's hash, so nothing but identical MSL can ever share an entry.
++ */
++struct kk_msl_library {
++   blake3_hash key;
++   mtl_library *library;
++   uint32_t refcount;
++};
++
++/* A new reference to the library compiled from code, or NULL when no live
++ * owner has registered one.  The caller releases it like any other handle. */
++static mtl_library *
++kk_msl_library_acquire(struct kk_device *dev, const char *code)
++{
++   if (dev->msl_libraries == NULL || code == NULL)
++      return NULL;
++
++   blake3_hash key;
++   _mesa_blake3_compute(code, strlen(code), key);
++
++   simple_mtx_lock(&dev->msl_libraries_lock);
++   struct hash_entry *entry = _mesa_hash_table_search(dev->msl_libraries, key);
++   mtl_library *library = NULL;
++   if (entry != NULL) {
++      struct kk_msl_library *cached = entry->data;
++      library = mtl_retain(cached->library);
++   }
++   simple_mtx_unlock(&dev->msl_libraries_lock);
++
++   return library;
++}
++
++/* Compiles code unless an equal source is already cached, and keeps the result
++ * reachable until the matching kk_msl_library_unregister.  Failure to compile
++ * is not an error here: the link that needs the library reports it. */
++static bool
++kk_msl_library_register(struct kk_device *dev, const char *code,
++                        blake3_hash key_out)
++{
++   memset(key_out, 0, sizeof(blake3_hash));
++   if (dev->msl_libraries == NULL || code == NULL)
++      return false;
++
++   blake3_hash key;
++   _mesa_blake3_compute(code, strlen(code), key);
++
++   simple_mtx_lock(&dev->msl_libraries_lock);
++   struct hash_entry *entry = _mesa_hash_table_search(dev->msl_libraries, key);
++   if (entry != NULL) {
++      struct kk_msl_library *cached = entry->data;
++      cached->refcount++;
++      simple_mtx_unlock(&dev->msl_libraries_lock);
++      memcpy(key_out, key, sizeof(blake3_hash));
++      return true;
++   }
++   simple_mtx_unlock(&dev->msl_libraries_lock);
++
++   /* Metal compiles outside the lock: concurrent pipeline library creation
++    * must not serialize on it. */
++   mtl_library *library =
++      mtl_new_library(dev->mtl_compiler_handle, code, MTL_MATH_MODE_SAFE,
++                      MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   if (library == NULL)
++      return false;
++
++   struct kk_msl_library *cached =
++      vk_zalloc(&dev->vk.alloc, sizeof(*cached), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (cached == NULL) {
++      mtl_release(library);
++      return false;
++   }
++
++   simple_mtx_lock(&dev->msl_libraries_lock);
++   entry = _mesa_hash_table_search(dev->msl_libraries, key);
++   if (entry != NULL) {
++      /* A concurrent registration won the race for this source. */
++      struct kk_msl_library *winner = entry->data;
++      winner->refcount++;
++      simple_mtx_unlock(&dev->msl_libraries_lock);
++      vk_free(&dev->vk.alloc, cached);
++      mtl_release(library);
++      memcpy(key_out, key, sizeof(blake3_hash));
++      return true;
++   }
++   memcpy(cached->key, key, sizeof(blake3_hash));
++   cached->library = library;
++   cached->refcount = 1;
++   _mesa_hash_table_insert(dev->msl_libraries, cached->key, cached);
++   simple_mtx_unlock(&dev->msl_libraries_lock);
++
++   memcpy(key_out, key, sizeof(blake3_hash));
++   return true;
++}
++
++static void
++kk_msl_library_unregister(struct kk_device *dev, const blake3_hash key)
++{
++   if (dev->msl_libraries == NULL)
++      return;
++
++   simple_mtx_lock(&dev->msl_libraries_lock);
++   struct hash_entry *entry = _mesa_hash_table_search(dev->msl_libraries, key);
++   struct kk_msl_library *cached = entry != NULL ? entry->data : NULL;
++   if (cached != NULL && --cached->refcount == 0)
++      _mesa_hash_table_remove(dev->msl_libraries, entry);
++   else
++      cached = NULL;
++   simple_mtx_unlock(&dev->msl_libraries_lock);
++
++   if (cached != NULL) {
++      mtl_release(cached->library);
++      vk_free(&dev->vk.alloc, cached);
++   }
++}
++
+ /* Guards every shader's Metal render pipelines trimmed to the colour
+  * attachments a render pass bound.  Nothing but
+  * VK_EXT_dynamic_rendering_unused_attachments reaches it, and Metal never
+@@ -4382,16 +4514,19 @@ kk_render_pipeline_vertex_stage(const struct kk_shader *vs)
+  * pass actually bound. */
+ static VkResult
+ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+-                             uint16_t color_mask,
++                             uint16_t color_mask, bool speculative,
+                              mtl_render_pipeline_state **state_out)
+ {
+    VkResult result = VK_SUCCESS;
+    const mesa_shader_stage vs_stage = kk_render_pipeline_vertex_stage(vs);
+ 
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+-   mtl_library *vertex_library = mtl_new_library(
+-      device->mtl_compiler_handle, vs_data->code, MTL_MATH_MODE_SAFE,
+-      MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   mtl_library *vertex_library =
++      kk_msl_library_acquire(device, vs_data->code);
++   if (vertex_library == NULL)
++      vertex_library = mtl_new_library(
++         device->mtl_compiler_handle, vs_data->code, MTL_MATH_MODE_SAFE,
++         MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
+    if (vertex_library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+@@ -4400,9 +4535,12 @@ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+                                           vs_data->entrypoint_name);
+ 
+    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
+-   mtl_library *fragment_library = mtl_new_library(
+-      device->mtl_compiler_handle, fs_data->code, MTL_MATH_MODE_SAFE,
+-      MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   mtl_library *fragment_library =
++      kk_msl_library_acquire(device, fs_data->code);
++   if (fragment_library == NULL)
++      fragment_library = mtl_new_library(
++         device->mtl_compiler_handle, fs_data->code, MTL_MATH_MODE_SAFE,
++         MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
+    if (fragment_library == NULL) {
+       result = VK_ERROR_INVALID_SHADER_NV;
+       goto destroy_vertex;
+@@ -4482,8 +4620,8 @@ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+          pipeline_descriptor, vs->info.vs.has_alpha_to_one_enabled);
+    }
+ 
+-   *state_out =
+-      mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
++   *state_out = mtl_new_render_pipeline(device->mtl_compiler_handle,
++                                        pipeline_descriptor, speculative);
+    if (*state_out == NULL)
+       result = VK_ERROR_INVALID_SHADER_NV;
+ 
+@@ -4497,8 +4635,11 @@ destroy_vertex:
+    return result;
+ }
+ 
++/* speculative: the caller has a slower way to build this pipeline and will use
++ * it if Metal refuses this one, so a refusal is not yet a driver error. */
+ static VkResult
+-kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
++kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs,
++                             bool speculative)
+ {
+    VkResult result = VK_SUCCESS;
+    struct kk_pipeline_handles *pipe = &vs->pipeline;
+@@ -4577,7 +4718,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+ 
+    return kk_new_render_pipeline_state(device, vs,
+                                        kk_shader_color_attachment_mask(vs),
+-                                       &pipe->gfx.render);
++                                       speculative, &pipe->gfx.render);
+ }
+ 
+ static VkResult
+@@ -4634,7 +4775,8 @@ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+    VkResult result = vs->msl_origin != NULL
+       ? kk_new_render_pipeline_state_from_origin(dev, vs, bound_color_mask,
+                                                  &state)
+-      : kk_new_render_pipeline_state(dev, vs, bound_color_mask, &state);
++      : kk_new_render_pipeline_state(dev, vs, bound_color_mask, false,
++                                     &state);
+    if (result != VK_SUCCESS)
+       return NULL;
+ 
+@@ -4663,9 +4805,200 @@ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+    return state;
+ }
+ 
++static VkResult
++kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
++                          struct vk_shader_compile_info *infos,
++                          const struct vk_graphics_pipeline_state *state,
++                          const struct vk_features *enabled_features,
++                          const VkAllocationCallbacks *pAllocator,
++                          struct vk_shader **shaders_out, bool byte_strides,
++                          bool pipeline_statistics, bool fast_link,
++                          bool precompile_only);
++
++/* The substates a graphics pipeline library does not own yet.  Each is filled
++ * with the value that selects Metal's state-independent path - Metal's own
++ * vertex fetch, its fixed-function blend, no raster emulation, no multiview and
++ * one sample - because that is the shape whose MSL does not depend on the
++ * missing state.  A link whose real state agrees regenerates exactly the MSL
++ * precompiled here and reuses Metal's compile; a link that disagrees produces
++ * different MSL, misses the cache and compiles the stage itself.  So nothing
++ * here has to be conservative: a wrong guess costs a precompile, never
++ * correctness.
++ */
++struct kk_precompile_state {
++   struct vk_graphics_pipeline_state state;
++   struct vk_vertex_input_state vi;
++   struct vk_input_assembly_state ia;
++   struct vk_rasterization_state rs;
++   struct vk_multisample_state ms;
++   struct vk_color_blend_state cb;
++   struct vk_multiview_state mv;
++   struct vk_render_pass_state rp;
++};
++
++static void
++kk_precompile_state_init(struct kk_precompile_state *out,
++                         const struct vk_graphics_pipeline_state *state,
++                         uint32_t attribs_read)
++{
++   memset(out, 0, sizeof(*out));
++   if (state != NULL)
++      out->state = *state;
++
++   if (out->state.vi == NULL) {
++      /* One tightly packed four-component float per attribute the shader
++       * reads.  Any Metal-expressible layout generates the same MSL: Metal
++       * converts the fetched format to the type the shader declared, so only
++       * the choice of Metal's fetch over the lowered one is visible here. */
++      u_foreach_bit(location, attribs_read) {
++         out->vi.attributes_valid |= BITFIELD_BIT(location);
++         out->vi.attributes[location].binding = location;
++         out->vi.attributes[location].format = VK_FORMAT_R32G32B32A32_SFLOAT;
++         out->vi.bindings_valid |= BITFIELD_BIT(location);
++         out->vi.bindings[location].stride = 16u;
++         out->vi.bindings[location].input_rate = VK_VERTEX_INPUT_RATE_VERTEX;
++         out->vi.bindings[location].divisor = 1u;
++      }
++      out->state.vi = &out->vi;
++   }
++
++   if (out->state.ia == NULL) {
++      out->ia.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++      out->state.ia = &out->ia;
++   }
++
++   if (out->state.rs == NULL) {
++      out->rs.polygon_mode = VK_POLYGON_MODE_FILL;
++      out->rs.provoking_vertex = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
++      out->rs.line.mode = VK_LINE_RASTERIZATION_MODE_DEFAULT_KHR;
++      out->rs.line.width = 1.0f;
++      out->state.rs = &out->rs;
++   }
++
++   if (out->state.ms == NULL) {
++      out->ms.rasterization_samples = 1u;
++      out->ms.sample_mask = 0xffffu;
++      out->state.ms = &out->ms;
++   }
++
++   if (out->state.cb == NULL) {
++      out->cb.logic_op = VK_LOGIC_OP_COPY;
++      out->state.cb = &out->cb;
++   }
++
++   if (out->state.mv == NULL)
++      out->state.mv = &out->mv;
++
++   /* A pipeline library carries a render pass state whose attachment info is
++    * still unknown.  An empty but valid attachment set keeps every consumer on
++    * the identity path rather than on the unknown-attachment one. */
++   if (out->state.rp != NULL)
++      out->rp = *out->state.rp;
++   if (!vk_render_pass_state_has_attachment_info(&out->rp)) {
++      out->rp.attachments = 0;
++      out->rp.color_attachment_count = 0;
++   }
++   out->state.rp = &out->rp;
++}
++
++/* Compile the stages a graphics pipeline library owns when the library is
++ * created, and keep the MTLLibrary Metal builds from each one in the device
++ * cache.  Metal's front end is the expensive half of building a native
++ * pipeline, so a link that regenerates the same MSL becomes a render pipeline
++ * state build and nothing else.
++ */
++static void
++kk_precompile_library_stages(struct kk_device *dev, uint32_t shader_count,
++                             const struct vk_shader_compile_info *infos,
++                             const struct vk_graphics_pipeline_state *state,
++                             const struct vk_features *enabled_features,
++                             struct vk_shader **deferred)
++{
++   /* Only the plain vertex and fragment halves are precompiled.  Tessellation,
++    * geometry and transform feedback are emulated in compute pipelines whose
++    * decomposition depends on state the library does not own, so their MSL
++    * cannot be known before the link. */
++   uint32_t attribs_read = 0u;
++   for (uint32_t i = 0; i < shader_count; i++) {
++      if (infos[i].stage != MESA_SHADER_VERTEX &&
++          infos[i].stage != MESA_SHADER_FRAGMENT)
++         return;
++      if (infos[i].nir->xfb_info != NULL)
++         return;
++      if (infos[i].stage == MESA_SHADER_VERTEX) {
++         attribs_read = container_of(deferred[i], struct kk_shader, vk)
++                           ->info.vs.attribs_read;
++      }
++   }
++
++   /* The link compiles the lowest raster class its state can reach, and that is
++    * the base class - one native vertex function, one native fragment function,
++    * no generated raster stage - whenever the class is reachable at all.  Only
++    * a state that removes the base class from the reachable set is worth
++    * skipping here; every other library precompiles the base class and either
++    * matches the link or is simply not consulted by it. */
++   if (state != NULL && state->rs != NULL) {
++      const struct vk_rasterization_state *rs = state->rs;
++      if (rs->rasterizer_discard_enable &&
++          !BITSET_TEST(state->dynamic,
++                       MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE))
++         return;
++      if (rs->polygon_mode == VK_POLYGON_MODE_POINT &&
++          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE))
++         return;
++   }
++
++   struct vk_shader_compile_info clones[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] =
++      {0};
++   struct vk_shader *compiled[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] = {0};
++
++   for (uint32_t i = 0; i < shader_count; i++) {
++      clones[i] = infos[i];
++      clones[i].nir = nir_shader_clone(NULL, infos[i].nir);
++      if (clones[i].nir == NULL) {
++         for (uint32_t j = 0; j < i; j++)
++            ralloc_free(clones[j].nir);
++         return;
++      }
++   }
++
++   struct kk_precompile_state precompile;
++   kk_precompile_state_init(&precompile, state, attribs_read);
++
++   /* The link sees a complete pipeline, so it enables the query guards
++    * whenever the feature is on.  Match that, not this library's own
++    * incomplete view of the pipeline. */
++   const bool pipeline_statistics =
++      enabled_features != NULL && enabled_features->pipelineStatisticsQuery;
++
++   VkResult result = kk_compile_shaders_single(
++      &dev->vk, shader_count, clones, &precompile.state, enabled_features,
++      NULL, compiled, false, pipeline_statistics, true, true);
++   if (result != VK_SUCCESS)
++      return;
++
++   for (uint32_t i = 0; i < shader_count; i++) {
++      struct kk_shader *shader =
++         container_of(compiled[i], struct kk_shader, vk);
++      struct kk_shader *owner =
++         container_of(deferred[i], struct kk_shader, vk);
++      const mesa_shader_stage stage = shader->info.stage;
++
++      if (shader->msl_data[stage].code != NULL &&
++          kk_msl_library_register(dev, shader->msl_data[stage].code,
++                                  owner->precompiled_keys[stage]))
++         owner->precompiled_stages |= BITFIELD_BIT(stage);
++
++      kk_shader_destroy(&dev->vk, shader, NULL);
++   }
++}
++
+ static VkResult
+ kk_defer_graphics_shaders(struct kk_device *dev, uint32_t shader_count,
+                           struct vk_shader_compile_info *infos,
++                          const struct vk_graphics_pipeline_state *state,
++                          const struct vk_features *enabled_features,
++                          bool precompile,
+                           const VkAllocationCallbacks *pAllocator,
+                           struct vk_shader **shaders_out)
+ {
+@@ -4688,8 +5021,6 @@ kk_defer_graphics_shaders(struct kk_device *dev, uint32_t shader_count,
+       shader->deferred_robustness = *compile->robustness;
+       blob_init(&shader->deferred_nir);
+       nir_serialize(&shader->deferred_nir, compile->nir, false);
+-      ralloc_free(compile->nir);
+-      compile->nir = NULL;
+ 
+       if (shader->deferred_nir.out_of_memory) {
+          kk_shader_destroy(&dev->vk, shader, pAllocator);
+@@ -4699,10 +5030,22 @@ kk_defer_graphics_shaders(struct kk_device *dev, uint32_t shader_count,
+       shaders_out[shader_index] = &shader->vk;
+    }
+ 
+-   if (shader_index == shader_count)
++   if (shader_index == shader_count) {
++      if (precompile) {
++         kk_precompile_library_stages(dev, shader_count, infos, state,
++                                      enabled_features, shaders_out);
++      }
++
++      for (uint32_t i = 0; i < shader_count; i++) {
++         ralloc_free(infos[i].nir);
++         infos[i].nir = NULL;
++      }
+       return VK_SUCCESS;
++   }
+ 
+-   for (uint32_t i = shader_index; i < shader_count; i++) {
++   /* The compile consumes every input NIR whether it succeeds or not, and a
++    * stage that was already serialized still holds its own. */
++   for (uint32_t i = 0; i < shader_count; i++) {
+       ralloc_free(infos[i].nir);
+       infos[i].nir = NULL;
+    }
+@@ -4781,7 +5124,8 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                         const struct vk_features *enabled_features,
+                         const VkAllocationCallbacks *pAllocator,
+                         struct vk_shader **shaders_out, bool byte_strides,
+-                        bool pipeline_statistics)
++                        bool pipeline_statistics, bool fast_link,
++                        bool precompile_only)
+ {
+    VkResult result = VK_SUCCESS;
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+@@ -4822,7 +5166,13 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+       state ? kk_graphics_raster_primitive(shader_count, infos, state)
+             : MESA_PRIM_POINTS;
+ 
+-   const bool rasterize = state && !state->rs->rasterizer_discard_enable;
++   /* A precompile carries one library's stages and only the state that library
++    * owns, so it always produces the plain program: one native vertex function
++    * and one native fragment function.  A pipeline that turns out to need
++    * generated raster compiles its own stages at link time and simply never
++    * matches the MSL precompiled here. */
++   const bool rasterize =
++      state && !precompile_only && !state->rs->rasterizer_discard_enable;
+    const bool polygon_point_emulation =
+       rasterize && state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
+       u_reduced_prim(line_raster_prim) == MESA_PRIM_TRIANGLES;
+@@ -4928,7 +5278,8 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+     * pipelines, including final GPL links, may therefore need a pass-through
+     * fragment. */
+    uint32_t total_shaders = shader_count;
+-   if (state && infos[shader_count - 1u].stage != MESA_SHADER_FRAGMENT) {
++   if (state && !precompile_only &&
++       infos[shader_count - 1u].stage != MESA_SHADER_FRAGMENT) {
+       nir_shaders[shader_count] =
+          get_empty_nir(dev, MESA_SHADER_FRAGMENT, state);
+       if (line_raster_emulation) {
+@@ -4955,13 +5306,25 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+     * unmatched internal line input to the old final stage would discard it. */
+    uint32_t initial_link_count =
+       generated_raster ? total_shaders - 1u : total_shaders;
+-   nir_opt_varyings_bulk(nir_shaders, initial_link_count, true, UINT32_MAX,
+-                         UINT32_MAX, nir_opts, NULL);
+-   /* Second pass is required because some dEQP-VK.glsl.matrix.sub.dynamic.*
+-    * would fail otherwise due to vertex outputting vec4 while fragments reading
+-    * vec3 when in reality only vec3 is needed. */
+-   nir_opt_varyings_bulk(nir_shaders, initial_link_count, true, UINT32_MAX,
+-                         UINT32_MAX, nir_opts, NULL);
++   /* Cross-stage varying optimization renumbers the interface, so the MSL a
++    * stage compiles to depends on every other stage in the chain.  A graphics
++    * pipeline library must compile the stages it owns before it has seen the
++    * others, so a fast link keeps each stage's interface exactly as the
++    * application declared it and optimizes within the stage only.  Metal then
++    * matches the two halves by name, and the source a library precompiled is
++    * the source the link regenerates.  A link-time-optimized pipeline, and
++    * every monolithic one, still links the whole chain. */
++   const uint32_t link_group = fast_link ? 1u : initial_link_count;
++   for (uint32_t i = 0; i < initial_link_count; i += link_group) {
++      const uint32_t count = MIN2(link_group, initial_link_count - i);
++      nir_opt_varyings_bulk(&nir_shaders[i], count, true, UINT32_MAX,
++                            UINT32_MAX, nir_opts, NULL);
++      /* Second pass is required because some dEQP-VK.glsl.matrix.sub.dynamic.*
++       * would fail otherwise due to vertex outputting vec4 while fragments
++       * reading vec3 when in reality only vec3 is needed. */
++      nir_opt_varyings_bulk(&nir_shaders[i], count, true, UINT32_MAX,
++                            UINT32_MAX, nir_opts, NULL);
++   }
+ 
+    uint32_t line_raster_shader = UINT32_MAX;
+    uint32_t line_raster_materialize_shader = UINT32_MAX;
+@@ -5316,6 +5679,13 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+              sizeof(pre_gs->msl_data[MESA_SHADER_COMPUTE]));
+    }
+ 
++   /* A precompile owns one library's stages, not a pipeline: its product is
++    * the per-stage MSL its caller registers with Metal. */
++   if (precompile_only) {
++      memcpy(shaders_out, shaders, shader_count * sizeof(*shaders_out));
++      return VK_SUCCESS;
++   }
++
+    /* Compile compute directly.  Graphics stages are complete here: GPL
+     * libraries defer this call until the common runtime has linked all state
+     * and shader subsets.
+@@ -5373,7 +5743,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                     BITFIELD_BIT(MESA_SHADER_COMPUTE)) == 0);
+          }
+       }
+-      result = kk_compile_graphics_pipeline(dev, shaders[0]);
++      result = kk_compile_graphics_pipeline(dev, shaders[0], fast_link);
+ 
+       /* Free generated fragment and raster-emulation shaders. Their MSL was
+        * copied into the vertex shader that owns the complete pipeline. */
+@@ -5403,7 +5773,8 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+                         const struct vk_graphics_pipeline_state *state,
+                         const struct vk_features *enabled_features,
+                         const VkAllocationCallbacks *pAllocator,
+-                        struct vk_shader **shaders_out, bool byte_strides)
++                        struct vk_shader **shaders_out, bool byte_strides,
++                        bool fast_link)
+ {
+    /* kk_compile_shaders keeps the NIR of incomplete GPL subsets and dynamic
+     * vertex inputs. Reachable classes are compiled once at complete creation
+@@ -5413,7 +5784,8 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+        infos[0].stage != MESA_SHADER_VERTEX)
+       return kk_compile_shaders_single(device, shader_count, infos, state,
+                                        enabled_features, pAllocator,
+-                                       shaders_out, byte_strides, false);
++                                       shaders_out, byte_strides, false,
++                                       fast_link, false);
+ 
+    /* Query masks and result addresses are draw data. Compile their guards
+     * into the executable once, so beginning or ending a query does not need
+@@ -5492,7 +5864,8 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+       struct vk_shader *compiled[shader_count];
+       result = kk_compile_shaders_single(
+          device, shader_count, variant_infos, &executable, enabled_features,
+-         pAllocator, compiled, byte_strides, pipeline_statistics);
++         pAllocator, compiled, byte_strides, pipeline_statistics, fast_link,
++         false);
+       if (result != VK_SUCCESS)
+          goto fail;
+ 
+@@ -5543,16 +5916,23 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+    /* A pipeline library's stages keep their NIR until the final link, and a
+     * dynamic vertex-input pipeline's until a draw binds its vertex layout. */
++   const bool dynamic_vertex_input =
++      state && BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI);
+    if (shader_count > 0 && infos[0].stage != MESA_SHADER_COMPUTE &&
+-       (infos[0].defer_graphics_pipeline_link ||
+-        (state && BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI)))) {
+-      return kk_defer_graphics_shaders(dev, shader_count, infos, pAllocator,
+-                                       shaders_out);
++       (infos[0].defer_graphics_pipeline_link || dynamic_vertex_input)) {
++      /* Only a pipeline library precompiles: a dynamic vertex-input pipeline
++       * resolves its own variants during command recording, from the concrete
++       * layout the draw binds. */
++      const bool precompile =
++         infos[0].defer_graphics_pipeline_link && !dynamic_vertex_input;
++      return kk_defer_graphics_shaders(dev, shader_count, infos, state,
++                                       enabled_features, precompile,
++                                       pAllocator, shaders_out);
+    }
+ 
+    return kk_compile_shaders_impl(device, shader_count, infos, state,
+                                   enabled_features, pAllocator, shaders_out,
+-                                  false);
++                                  false, false);
+ }
+ 
+ /* The compile infos of a deferred graphics chain, one stage per entry in
+@@ -5673,14 +6053,16 @@ kk_free_linked_graphics_pipeline(
+    vk_free2(&dev->vk.alloc, pAllocator, linked);
+ }
+ 
++/* Both the linked-pipeline and the MSL library tables are keyed by a BLAKE3
++ * hash. */
+ static uint32_t
+-kk_linked_graphics_pipeline_hash(const void *key)
++kk_blake3_key_hash(const void *key)
+ {
+    return _mesa_hash_data(key, sizeof(blake3_hash));
+ }
+ 
+ static bool
+-kk_linked_graphics_pipeline_equal(const void *a, const void *b)
++kk_blake3_key_equal(const void *a, const void *b)
+ {
+    return memcmp(a, b, sizeof(blake3_hash)) == 0;
+ }
+@@ -5749,8 +6131,7 @@ kk_create_dynamic_vertex_input_pipeline(
+    linked->dynamic_vertex_input = true;
+    simple_mtx_init(&linked->dynamic.lock, mtx_plain);
+    linked->dynamic.variants = _mesa_hash_table_create(
+-      NULL, kk_linked_graphics_pipeline_hash,
+-      kk_linked_graphics_pipeline_equal);
++      NULL, kk_blake3_key_hash, kk_blake3_key_equal);
+    if (linked->dynamic.variants == NULL) {
+       simple_mtx_destroy(&linked->dynamic.lock);
+       vk_free(&dev->vk.alloc, linked);
+@@ -5806,12 +6187,22 @@ VkResult
+ kk_linked_graphics_pipeline_cache_init(struct kk_device *dev)
+ {
+    dev->linked_graphics_pipelines = _mesa_hash_table_create(
+-      NULL, kk_linked_graphics_pipeline_hash,
+-      kk_linked_graphics_pipeline_equal);
++      NULL, kk_blake3_key_hash, kk_blake3_key_equal);
+    if (dev->linked_graphics_pipelines == NULL)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    simple_mtx_init(&dev->linked_graphics_pipelines_lock, mtx_plain);
++
++   dev->msl_libraries =
++      _mesa_hash_table_create(NULL, kk_blake3_key_hash, kk_blake3_key_equal);
++   if (dev->msl_libraries == NULL) {
++      _mesa_hash_table_destroy(dev->linked_graphics_pipelines, NULL);
++      dev->linked_graphics_pipelines = NULL;
++      simple_mtx_destroy(&dev->linked_graphics_pipelines_lock);
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++   simple_mtx_init(&dev->msl_libraries_lock, mtx_plain);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -5825,6 +6216,15 @@ kk_linked_graphics_pipeline_cache_finish(struct kk_device *dev)
+    _mesa_hash_table_destroy(dev->linked_graphics_pipelines, NULL);
+    dev->linked_graphics_pipelines = NULL;
+    simple_mtx_destroy(&dev->linked_graphics_pipelines_lock);
++
++   hash_table_foreach(dev->msl_libraries, entry) {
++      struct kk_msl_library *cached = entry->data;
++      mtl_release(cached->library);
++      vk_free(&dev->vk.alloc, cached);
++   }
++   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
++   dev->msl_libraries = NULL;
++   simple_mtx_destroy(&dev->msl_libraries_lock);
+ }
+ 
+ static VkResult
+@@ -5859,7 +6259,8 @@ kk_compile_dynamic_vertex_input_variant(
+    state.vi = vi;
+    result = kk_compile_shaders_impl(
+       &dev->vk, linked->dynamic.shader_count, infos, &state,
+-      &dev->vk.enabled_features, &dev->vk.alloc, compiled, byte_strides);
++      &dev->vk.enabled_features, &dev->vk.alloc, compiled, byte_strides,
++      false);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -5978,7 +6379,7 @@ kk_new_render_pipeline_state_from_origin(struct kk_device *dev,
+ 
+    struct kk_shader *twin = kk_variant_twin(rebuilt, vs);
+    result = twin != NULL
+-      ? kk_new_render_pipeline_state(dev, twin, color_mask, state_out)
++      ? kk_new_render_pipeline_state(dev, twin, color_mask, false, state_out)
+       : VK_ERROR_INVALID_SHADER_NV;
+ 
+    kk_free_linked_graphics_pipeline(&dev->vk, rebuilt, &dev->vk.alloc);
+@@ -6192,6 +6593,18 @@ kk_link_graphics_pipeline(
+       {0};
+    struct vk_shader *compiled[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] = {0};
+ 
++   /* Every library precompiled the stages it owns, each optimized on its own
++    * because a library never sees the chain it will be linked into.  Compiling
++    * the link the same way regenerates that exact MSL and reuses Metal's front
++    * end; linking the whole chain instead would renumber the interface and
++    * compile both stages again.
++    *
++    * Metal is the authority on whether two halves it has never seen together
++    * form a valid interface - it requires every fragment input to be written by
++    * the vertex stage under the same name and type - so a refused fast link
++    * falls back to linking the chain exactly as a monolithic pipeline does.
++    */
++   bool fast_link = true;
+    mesa_shader_stage stages[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
+    const struct vk_pipeline_robustness_state
+       *robustness[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
+@@ -6205,17 +6618,28 @@ kk_link_graphics_pipeline(
+       stages[i] = shader->info.stage;
+       robustness[i] = &shader->deferred_robustness;
+       nir[i] = &shader->deferred_nir;
++      fast_link &= (shader->precompiled_stages &
++                    BITFIELD_BIT(shader->info.stage)) != 0;
+    }
+ 
+-   VkResult result = kk_deserialize_deferred_graphics_shaders(
+-      dev, shader_count, stages, robustness, nir, set_layout_count,
+-      set_layouts, infos);
+-   if (result != VK_SUCCESS)
+-      return result;
++   VkResult result;
++   for (;;) {
++      result = kk_deserialize_deferred_graphics_shaders(
++         dev, shader_count, stages, robustness, nir, set_layout_count,
++         set_layouts, infos);
++      if (result != VK_SUCCESS)
++         return result;
+ 
+-   result = kk_compile_shaders_impl(
+-      vk_dev, shader_count, infos, state, &vk_dev->enabled_features,
+-      &dev->vk.alloc, compiled, false);
++      result = kk_compile_shaders_impl(
++         vk_dev, shader_count, infos, state, &vk_dev->enabled_features,
++         &dev->vk.alloc, compiled, false, fast_link);
++      if (result == VK_SUCCESS || !fast_link)
++         break;
++
++      /* The compile consumed every NIR it was handed; the retry deserializes
++       * the libraries again. */
++      fast_link = false;
++   }
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -6496,7 +6920,7 @@ kk_deserialize_shader_impl(struct vk_device *vk_dev, struct blob_reader *blob,
+          dev, &shader->msl_data[MESA_SHADER_COMPUTE], local_size_threads,
+          false, &shader->pipeline.cs);
+    } else if (info.stage == MESA_SHADER_VERTEX) {
+-      result = kk_compile_graphics_pipeline(dev, shader);
++      result = kk_compile_graphics_pipeline(dev, shader, false);
+    }
+ 
+    if (result != VK_SUCCESS)
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 0b96684ea2019494694cae6be04092fc19fc9055..9f0cd9139b883bc7e3332fff669f08347b3694ff 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -236,6 +236,12 @@ struct kk_shader {
+                                             [MESA_SHADER_STAGES];
+    struct vk_pipeline_robustness_state deferred_robustness;
+    struct blob deferred_nir;
++   /* MSL sources this shader registered in the device's MTLLibrary cache when
++    * it was created as a graphics pipeline library, by stage.  A link that
++    * regenerates the same source finds Metal's front-end compile already done.
++    */
++   blake3_hash precompiled_keys[MESA_SHADER_STAGES];
++   uint32_t precompiled_stages;
+    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+    struct msl_compile_data transform_feedback_pre_gs_msl;
+    struct msl_compile_data line_raster_materialize_msl;
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/generate.sh
+index d142b71b1e7a2ede0767b08430694aeace8ad67a..96775849b3fc5f592cbc86bd273703f31d057bb4 100755
+--- a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/generate.sh
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/generate.sh
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: MIT
+ set -eu
+ cd -- "$(dirname -- "$0")"
+-for shader in gpl.vert gpl.frag; do
++for shader in gpl.vert gpl.frag gpl_varying.vert gpl_varying_wide.frag \
++              gpl_varying_narrow.frag; do
+    glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
+ done
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..785bc92d1dee85e353a960743eebc6192b9c8742
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert
+@@ -0,0 +1,10 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++/* Writes a full four-component varying.  A fragment library compiled without
++ * ever seeing this shader must still agree with it on the interface. */
++vec2 triangle[3] = vec2[](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
++layout (location = 0) out vec4 tint;
++void main (void) {
++    gl_Position = vec4(triangle[gl_VertexIndex % 3], 0.5, 1.0);
++    tint = vec4(0.0, 1.0, 0.0, 0.25);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert.h b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..03fe7b0cbcd5779e46a0023bbc36d9fdbad8e458
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying.vert.h
+@@ -0,0 +1,64 @@
++{0x07230203,0x00010600,0x000d000b,0x00000030,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x00000018,0x0000001c,0x0000002a,
++0x00030047,0x00000016,0x00000002,0x00050048,
++0x00000016,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x00000016,0x00000001,0x0000000b,
++0x00000001,0x00050048,0x00000016,0x00000002,
++0x0000000b,0x00000003,0x00050048,0x00000016,
++0x00000003,0x0000000b,0x00000004,0x00040047,
++0x0000001c,0x0000000b,0x0000002a,0x00040047,
++0x0000002a,0x0000001e,0x00000000,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000002,0x00040015,
++0x00000008,0x00000020,0x00000000,0x0004002b,
++0x00000008,0x00000009,0x00000003,0x0004001c,
++0x0000000a,0x00000007,0x00000009,0x0004002b,
++0x00000006,0x0000000d,0xbf800000,0x0005002c,
++0x00000007,0x0000000e,0x0000000d,0x0000000d,
++0x0004002b,0x00000006,0x0000000f,0x40400000,
++0x0005002c,0x00000007,0x00000010,0x0000000f,
++0x0000000d,0x0005002c,0x00000007,0x00000011,
++0x0000000d,0x0000000f,0x0006002c,0x0000000a,
++0x00000012,0x0000000e,0x00000010,0x00000011,
++0x00040017,0x00000013,0x00000006,0x00000004,
++0x0004002b,0x00000008,0x00000014,0x00000001,
++0x0004001c,0x00000015,0x00000006,0x00000014,
++0x0006001e,0x00000016,0x00000013,0x00000006,
++0x00000015,0x00000015,0x00040020,0x00000017,
++0x00000003,0x00000016,0x0004003b,0x00000017,
++0x00000018,0x00000003,0x00040015,0x00000019,
++0x00000020,0x00000001,0x0004002b,0x00000019,
++0x0000001a,0x00000000,0x00040020,0x0000001b,
++0x00000001,0x00000019,0x0004003b,0x0000001b,
++0x0000001c,0x00000001,0x0004002b,0x00000019,
++0x0000001e,0x00000003,0x0004002b,0x00000006,
++0x00000023,0x3f000000,0x0004002b,0x00000006,
++0x00000024,0x3f800000,0x00040020,0x00000028,
++0x00000003,0x00000013,0x0004003b,0x00000028,
++0x0000002a,0x00000003,0x0004002b,0x00000006,
++0x0000002b,0x00000000,0x0004002b,0x00000006,
++0x0000002c,0x3e800000,0x0007002c,0x00000013,
++0x0000002d,0x0000002b,0x00000024,0x0000002b,
++0x0000002c,0x00040020,0x0000002e,0x00000007,
++0x0000000a,0x00040020,0x0000002f,0x00000007,
++0x00000007,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003b,0x0000002e,0x0000000c,0x00000007,
++0x0003003e,0x0000000c,0x00000012,0x0004003d,
++0x00000019,0x0000001d,0x0000001c,0x0005008b,
++0x00000019,0x0000001f,0x0000001d,0x0000001e,
++0x00050041,0x0000002f,0x00000021,0x0000000c,
++0x0000001f,0x0004003d,0x00000007,0x00000022,
++0x00000021,0x00050051,0x00000006,0x00000025,
++0x00000022,0x00000000,0x00050051,0x00000006,
++0x00000026,0x00000022,0x00000001,0x00070050,
++0x00000013,0x00000027,0x00000025,0x00000026,
++0x00000023,0x00000024,0x00050041,0x00000028,
++0x00000029,0x00000018,0x0000001a,0x0003003e,
++0x00000029,0x00000027,0x0003003e,0x0000002a,
++0x0000002d,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..82addc5f545e7a25b1e1ed5bb4c7ec0561fc8ec1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag
+@@ -0,0 +1,9 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++/* Reads three of the four components the vertex shader wrote, which Vulkan
++ * allows and Metal's own linker refuses. */
++layout (location = 0) in vec3 tint;
++layout (location = 0) out vec4 fragColor;
++void main (void) {
++    fragColor = vec4(tint, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag.h b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..36f61075a4cdb771e49f945646b758b480f48cdc
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_narrow.frag.h
+@@ -0,0 +1,27 @@
++{0x07230203,0x00010600,0x000d000b,0x00000013,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000c,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00040047,0x0000000c,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040017,0x0000000a,
++0x00000006,0x00000003,0x00040020,0x0000000b,
++0x00000001,0x0000000a,0x0004003b,0x0000000b,
++0x0000000c,0x00000001,0x0004002b,0x00000006,
++0x0000000e,0x3f800000,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x0000000a,0x0000000d,
++0x0000000c,0x00050051,0x00000006,0x0000000f,
++0x0000000d,0x00000000,0x00050051,0x00000006,
++0x00000010,0x0000000d,0x00000001,0x00050051,
++0x00000006,0x00000011,0x0000000d,0x00000002,
++0x00070050,0x00000007,0x00000012,0x0000000f,
++0x00000010,0x00000011,0x0000000e,0x0003003e,
++0x00000009,0x00000012,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..1eaf6748b378a76c56ceb190f1405d11672fd096
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag
+@@ -0,0 +1,8 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++/* Reads exactly what the vertex shader wrote. */
++layout (location = 0) in vec4 tint;
++layout (location = 0) out vec4 fragColor;
++void main (void) {
++    fragColor = vec4(tint.xyz, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag.h b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..542d48943acd8a7643b577429a36a0c93498fe40
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/pipeline_library_shaders/gpl_varying_wide.frag.h
+@@ -0,0 +1,26 @@
++{0x07230203,0x00010600,0x000d000b,0x00000014,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000b,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00040047,0x0000000b,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000007,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x0004002b,0x00000006,
++0x0000000f,0x3f800000,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x0000000d,
++0x0000000b,0x00050051,0x00000006,0x00000010,
++0x0000000d,0x00000000,0x00050051,0x00000006,
++0x00000011,0x0000000d,0x00000001,0x00050051,
++0x00000006,0x00000012,0x0000000d,0x00000002,
++0x00070050,0x00000007,0x00000013,0x00000010,
++0x00000011,0x00000012,0x0000000f,0x0003003e,
++0x00000009,0x00000013,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_pipeline_library_link_time.cpp b/src/kosmickrisp/vulkan/tests/test_pipeline_library_link_time.cpp
+index ffe76ccc62ca7db5f7d4831fe8b108c8c95f5d1f..372df408e652d4b20049e6aeb1c3207cea70a218 100644
+--- a/src/kosmickrisp/vulkan/tests/test_pipeline_library_link_time.cpp
++++ b/src/kosmickrisp/vulkan/tests/test_pipeline_library_link_time.cpp
+@@ -12,17 +12,20 @@
+  * the driver advertises through graphicsPipelineLibraryFastLinking, so a run
+  * says both what the driver claims and what it delivers.
+  *
+- * KosmicKrisp answers that property with false.  Metal compiles a complete
+- * program: an MTLLibrary is built from the whole MSL text of a stage and an
+- * MTLRenderPipelineState from the functions of every stage at once, with no
+- * object that holds one separately compiled stage for a later link.  The text
+- * of a stage is not available before the link either, because Metal has no
+- * fixed-function vertex fetch, so the vertex shader carries the attribute
+- * loads built from the vertex-input state, and the fragment shader carries
+- * the blend, write mask and logic op built from the colour-blend state; both
+- * belong to libraries other than the one holding the shader.  Linking is
+- * therefore the first moment either stage can be compiled at all, and this
+- * program fails only if a driver claims fast linking it does not deliver.
++ * Each library carries a specialization constant seeded uniquely per run,
++ * because Metal keeps a persistent on-disk cache of the functions it has
++ * already built: reusing the constants would measure that cache instead of
++ * where this driver compiles.
++ *
++ * A library that compiles its stages when it is created, rather than when it
++ * is linked, has never seen the stage on the other side of the varying
++ * interface, and Metal's own linker requires every fragment input to be
++ * written by the vertex stage under the same name and the same type.  The two
++ * pipelines at the end therefore link a vertex shader writing a four-component
++ * varying to a fragment shader reading all four of it, and to one reading
++ * three of it - which Vulkan allows and Metal refuses - and draw both.  A
++ * driver that compiles early must notice the refusal and link the chain the
++ * way a monolithic pipeline does.
+  */
+ 
+ #define VK_NO_PROTOTYPES
+@@ -63,6 +66,18 @@ static const uint32_t fragment_spirv[] =
+ #include "pipeline_library_shaders/gpl.frag.h"
+ ;
+ 
++static const uint32_t varying_vertex_spirv[] =
++#include "pipeline_library_shaders/gpl_varying.vert.h"
++;
++
++static const uint32_t varying_wide_spirv[] =
++#include "pipeline_library_shaders/gpl_varying_wide.frag.h"
++;
++
++static const uint32_t varying_narrow_spirv[] =
++#include "pipeline_library_shaders/gpl_varying_narrow.frag.h"
++;
++
+ /* The conformance test reports a quality warning above this ratio, and a
+  * driver that advertises fast linking has to stay under it. */
+ static constexpr double kRatioLimit = 10.0;
+@@ -88,6 +103,7 @@ int main()
+    LOAD_I(vkDestroyInstance);
+    LOAD_I(vkEnumeratePhysicalDevices);
+    LOAD_I(vkGetPhysicalDeviceProperties2);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
+    LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
+    LOAD_I(vkCreateDevice);
+    LOAD_I(vkGetDeviceProcAddr);
+@@ -154,6 +170,33 @@ int main()
+       LOAD_D(vkDestroyPipelineLayout);
+       LOAD_D(vkCreateGraphicsPipelines);
+       LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
+ 
+       auto make_module = [&](const uint32_t *code, size_t size) {
+          VkShaderModuleCreateInfo module_info{
+@@ -180,9 +223,18 @@ int main()
+       rendering.pColorAttachmentFormats = &color_format;
+ 
+       /* Each library carries a distinct constant so that no two of the
+-       * sixteen links can share a compilation. */
+-      const int32_t vertex_seeds[2] = {1, 2};
+-      const int32_t fragment_seeds[2] = {3, 4};
++       * sixteen links can share a compilation.  The base is unique per run
++       * because Metal keeps a persistent on-disk cache of the functions it has
++       * already built: reusing constants would measure that cache rather than
++       * where this driver compiles. */
++      const int32_t seed_base =
++         (int32_t)(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      Clock::now().time_since_epoch())
++                      .count() &
++                   0x00ffffff) *
++         16;
++      const int32_t vertex_seeds[2] = {seed_base + 1, seed_base + 2};
++      const int32_t fragment_seeds[2] = {seed_base + 3, seed_base + 4};
+       VkSpecializationMapEntry entry{0, 0, sizeof(int32_t)};
+ 
+       VkPipeline libraries[8] = {};
+@@ -386,6 +438,347 @@ int main()
+ 
+       for (VkPipeline library : libraries)
+          vkDestroyPipeline(device, library, nullptr);
++
++      /* The varying interface across the library boundary. */
++      {
++         constexpr uint32_t extent = 16;
++         VkQueue graphics_queue = VK_NULL_HANDLE;
++         vkGetDeviceQueue(device, queue, 0, &graphics_queue);
++
++         VkPhysicalDeviceMemoryProperties memory_properties{};
++         vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++         auto allocate = [&](const VkMemoryRequirements &requirements,
++                             VkMemoryPropertyFlags properties) {
++            VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++            info.allocationSize = requirements.size;
++            info.memoryTypeIndex = UINT32_MAX;
++            for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
++               if (!(requirements.memoryTypeBits & (1u << i)))
++                  continue;
++               if ((memory_properties.memoryTypes[i].propertyFlags &
++                    properties) != properties)
++                  continue;
++               info.memoryTypeIndex = i;
++               break;
++            }
++            require(info.memoryTypeIndex != UINT32_MAX, "memory type");
++            VkDeviceMemory memory = VK_NULL_HANDLE;
++            result = vkAllocateMemory(device, &info, nullptr, &memory);
++            require(result == VK_SUCCESS, "allocate memory", result);
++            return memory;
++         };
++
++         VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++         image_info.imageType = VK_IMAGE_TYPE_2D;
++         image_info.format = color_format;
++         image_info.extent = {extent, extent, 1};
++         image_info.mipLevels = 1;
++         image_info.arrayLayers = 1;
++         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++         image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++         image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++         VkImage image = VK_NULL_HANDLE;
++         result = vkCreateImage(device, &image_info, nullptr, &image);
++         require(result == VK_SUCCESS, "create image", result);
++         VkMemoryRequirements image_requirements{};
++         vkGetImageMemoryRequirements(device, image, &image_requirements);
++         VkDeviceMemory image_memory =
++            allocate(image_requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++         require(vkBindImageMemory(device, image, image_memory, 0) ==
++                    VK_SUCCESS,
++                 "bind image");
++
++         VkImageViewCreateInfo view_info{
++            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++         view_info.image = image;
++         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++         view_info.format = color_format;
++         view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++         VkImageView view = VK_NULL_HANDLE;
++         result = vkCreateImageView(device, &view_info, nullptr, &view);
++         require(result == VK_SUCCESS, "create view", result);
++
++         const VkDeviceSize readback_size = VkDeviceSize(extent) * extent * 4;
++         VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++         buffer_info.size = readback_size;
++         buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++         VkBuffer readback = VK_NULL_HANDLE;
++         result = vkCreateBuffer(device, &buffer_info, nullptr, &readback);
++         require(result == VK_SUCCESS, "create buffer", result);
++         VkMemoryRequirements buffer_requirements{};
++         vkGetBufferMemoryRequirements(device, readback, &buffer_requirements);
++         VkDeviceMemory readback_memory =
++            allocate(buffer_requirements,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++         require(vkBindBufferMemory(device, readback, readback_memory, 0) ==
++                    VK_SUCCESS,
++                 "bind buffer");
++         void *readback_data = nullptr;
++         require(vkMapMemory(device, readback_memory, 0, readback_size, 0,
++                             &readback_data) == VK_SUCCESS,
++                 "map readback");
++
++         VkCommandPoolCreateInfo pool_info{
++            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++         pool_info.queueFamilyIndex = queue;
++         VkCommandPool pool = VK_NULL_HANDLE;
++         result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++         require(result == VK_SUCCESS, "create command pool", result);
++         VkCommandBufferAllocateInfo command_info{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++         command_info.commandPool = pool;
++         command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++         command_info.commandBufferCount = 1;
++         VkCommandBuffer command = VK_NULL_HANDLE;
++         result = vkAllocateCommandBuffers(device, &command_info, &command);
++         require(result == VK_SUCCESS, "allocate command buffer", result);
++
++         VkShaderModule varying_vertex =
++            make_module(varying_vertex_spirv, sizeof(varying_vertex_spirv));
++         VkShaderModule varying_wide =
++            make_module(varying_wide_spirv, sizeof(varying_wide_spirv));
++         VkShaderModule varying_narrow =
++            make_module(varying_narrow_spirv, sizeof(varying_narrow_spirv));
++
++         const VkViewport viewport{0.0f, 0.0f, float(extent), float(extent),
++                                   0.0f, 1.0f};
++         const VkRect2D scissor{{0, 0}, {extent, extent}};
++
++         /* Returns 0 when the whole image came out green, 1 when the pipeline
++          * could not be built, 2 when the image is wrong. */
++         auto draw_through_libraries = [&](VkShaderModule fragment_module) {
++            VkPipelineShaderStageCreateInfo vertex_stage_info{
++               VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++            vertex_stage_info.stage = VK_SHADER_STAGE_VERTEX_BIT;
++            vertex_stage_info.module = varying_vertex;
++            vertex_stage_info.pName = "main";
++            VkPipelineShaderStageCreateInfo fragment_stage_info{
++               VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++            fragment_stage_info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++            fragment_stage_info.module = fragment_module;
++            fragment_stage_info.pName = "main";
++
++            VkPipelineVertexInputStateCreateInfo empty_vi{
++               VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++            VkPipelineInputAssemblyStateCreateInfo triangles{
++               VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++            triangles.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++            VkPipelineViewportStateCreateInfo vp{
++               VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++            vp.viewportCount = 1;
++            vp.pViewports = &viewport;
++            vp.scissorCount = 1;
++            vp.pScissors = &scissor;
++            VkPipelineRasterizationStateCreateInfo raster{
++               VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++            raster.polygonMode = VK_POLYGON_MODE_FILL;
++            raster.cullMode = VK_CULL_MODE_NONE;
++            raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++            raster.lineWidth = 1.0f;
++            VkPipelineMultisampleStateCreateInfo ms{
++               VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++            VkPipelineDepthStencilStateCreateInfo ds{
++               VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++            ds.maxDepthBounds = 1.0f;
++            VkPipelineColorBlendAttachmentState attachment{};
++            attachment.colorWriteMask =
++               VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++            VkPipelineColorBlendStateCreateInfo blend_state{
++               VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++            blend_state.attachmentCount = 1;
++            blend_state.pAttachments = &attachment;
++
++            VkPipeline parts[4] = {};
++            auto create_part = [&](uint32_t index,
++                                   VkGraphicsPipelineLibraryFlagsEXT flags,
++                                   VkGraphicsPipelineCreateInfo info) {
++               VkGraphicsPipelineLibraryCreateInfoEXT part{
++                  VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
++               part.flags = flags;
++               part.pNext = &rendering;
++               info.pNext = &part;
++               info.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++               info.layout = layout;
++               result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                                  &info, nullptr,
++                                                  &parts[index]);
++               return result == VK_SUCCESS && parts[index] != VK_NULL_HANDLE;
++            };
++
++            VkGraphicsPipelineCreateInfo input_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            input_info.pVertexInputState = &empty_vi;
++            input_info.pInputAssemblyState = &triangles;
++            VkGraphicsPipelineCreateInfo pre_raster_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            pre_raster_info.stageCount = 1;
++            pre_raster_info.pStages = &vertex_stage_info;
++            pre_raster_info.pViewportState = &vp;
++            pre_raster_info.pRasterizationState = &raster;
++            VkGraphicsPipelineCreateInfo fragment_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            fragment_info.stageCount = 1;
++            fragment_info.pStages = &fragment_stage_info;
++            fragment_info.pMultisampleState = &ms;
++            fragment_info.pDepthStencilState = &ds;
++            VkGraphicsPipelineCreateInfo output_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            output_info.pMultisampleState = &ms;
++            output_info.pColorBlendState = &blend_state;
++
++            const bool built =
++               create_part(
++                  0, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
++                  input_info) &&
++               create_part(
++                  1,
++                  VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
++                  pre_raster_info) &&
++               create_part(
++                  2, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
++                  fragment_info) &&
++               create_part(
++                  3,
++                  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
++                  output_info);
++            if (!built) {
++               std::printf("  library creation failed: %d\n", result);
++               for (VkPipeline part : parts)
++                  if (part != VK_NULL_HANDLE)
++                     vkDestroyPipeline(device, part, nullptr);
++               return 1;
++            }
++
++            VkPipelineLibraryCreateInfoKHR link{
++               VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
++            link.libraryCount = 4;
++            link.pLibraries = parts;
++            VkGraphicsPipelineCreateInfo link_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            link_info.pNext = &link;
++            link_info.layout = layout;
++            VkPipeline pipeline = VK_NULL_HANDLE;
++            result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                               &link_info, nullptr, &pipeline);
++            for (VkPipeline part : parts)
++               vkDestroyPipeline(device, part, nullptr);
++            if (result != VK_SUCCESS || pipeline == VK_NULL_HANDLE) {
++               std::printf("  library link failed: %d\n", result);
++               return 1;
++            }
++
++            VkCommandBufferBeginInfo begin{
++               VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                    "begin command buffer");
++
++            VkImageMemoryBarrier to_color{
++               VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++            to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++            to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            to_color.image = image;
++            to_color.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                                 0, 0, nullptr, 0, nullptr, 1, &to_color);
++
++            VkRenderingAttachmentInfo color{
++               VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++            color.imageView = view;
++            color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            color.clearValue.color.float32[0] = 1.0f;
++            color.clearValue.color.float32[3] = 1.0f;
++            VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
++            render.renderArea = scissor;
++            render.layerCount = 1;
++            render.colorAttachmentCount = 1;
++            render.pColorAttachments = &color;
++            vkCmdBeginRendering(command, &render);
++            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                              pipeline);
++            vkCmdDraw(command, 3, 1, 0, 0);
++            vkCmdEndRendering(command);
++
++            VkImageMemoryBarrier to_source = to_color;
++            to_source.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++            to_source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            to_source.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            to_source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++            vkCmdPipelineBarrier(command,
++                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
++                                 0, nullptr, 1, &to_source);
++
++            VkBufferImageCopy copy{};
++            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            copy.imageExtent = {extent, extent, 1};
++            vkCmdCopyImageToBuffer(command, image,
++                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                   readback, 1, &copy);
++            require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                    "end command buffer");
++
++            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++            submit.commandBufferCount = 1;
++            submit.pCommandBuffers = &command;
++            require(vkQueueSubmit(graphics_queue, 1, &submit,
++                                  VK_NULL_HANDLE) == VK_SUCCESS,
++                    "submit");
++            require(vkQueueWaitIdle(graphics_queue) == VK_SUCCESS, "wait idle");
++            vkDestroyPipeline(device, pipeline, nullptr);
++
++            const auto *pixels = static_cast<const uint8_t *>(readback_data);
++            uint32_t wrong = 0;
++            for (VkDeviceSize p = 0; p < readback_size; p += 4) {
++               if (pixels[p] != 0 || pixels[p + 1] != 255 ||
++                   pixels[p + 2] != 0 || pixels[p + 3] != 255)
++                  ++wrong;
++            }
++            if (wrong != 0) {
++               std::printf("  %u of %u pixels wrong, first is %u %u %u %u\n",
++                           wrong, uint32_t(readback_size / 4), pixels[0],
++                           pixels[1], pixels[2], pixels[3]);
++               return 2;
++            }
++            return 0;
++         };
++
++         struct {
++            const char *name;
++            VkShaderModule fragment;
++         } varying_cases[] = {
++            {"exact varying interface", varying_wide},
++            {"narrowed varying interface", varying_narrow},
++         };
++         for (const auto &varying_case : varying_cases) {
++            const int outcome = draw_through_libraries(varying_case.fragment);
++            std::printf("  %-28s %s\n", varying_case.name,
++                        outcome == 0 ? "green" : "WRONG");
++            failures += outcome != 0;
++         }
++
++         vkDestroyShaderModule(device, varying_narrow, nullptr);
++         vkDestroyShaderModule(device, varying_wide, nullptr);
++         vkDestroyShaderModule(device, varying_vertex, nullptr);
++         vkDestroyCommandPool(device, pool, nullptr);
++         vkDestroyBuffer(device, readback, nullptr);
++         vkFreeMemory(device, readback_memory, nullptr);
++         vkDestroyImageView(device, view, nullptr);
++         vkDestroyImage(device, image, nullptr);
++         vkFreeMemory(device, image_memory, nullptr);
++      }
++
+       vkDestroyPipelineLayout(device, layout, nullptr);
+       vkDestroyShaderModule(device, vertex, nullptr);
+       vkDestroyShaderModule(device, fragment, nullptr);

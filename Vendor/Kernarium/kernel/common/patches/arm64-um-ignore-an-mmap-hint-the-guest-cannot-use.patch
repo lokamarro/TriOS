@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:55:34 +0900
+Subject: [PATCH] arm64: um: ignore an mmap hint the guest cannot use
+
+mmap(2) treats an address without MAP_FIXED as a hint: if the range is
+not available, the kernel picks another. Native arm64 Linux therefore
+ignores a hint above the task's range, and one that carries a tag in its
+top byte is such a hint. The Darwin port refused it:
+uml_darwin_mmap_check() returned EINVAL for every non-zero address
+outside the guest range, so mmap(tagged_pointer, ...) failed where
+native Linux returns a fresh mapping. Allocators and sanitizers that
+pass a tagged pointer as a hint see the difference.
+
+The check exists because the kernel's native window, which holds guest
+RAM and the kernel's own mappings, lies inside the task's address range
+and the generic allocator returns a hint unchanged when nothing is
+mapped there. The place to settle that is the allocator, not the
+argument check. arch_get_unmapped_area() and its top-down sibling drop
+a non-fixed hint that touches the window or lies beyond the guest range
+and let the generic allocator choose. arch_mmap_check() refuses only a
+fixed placement that touches the window. A fixed placement beyond the
+task's range reaches get_unmapped_area(), which answers ENOMEM as it
+does natively, where it was EINVAL.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/um/Makefile   |  2 +-
+ arch/arm64/um/asm/mman.h | 41 ++++++++++++++++++++++++++++++++--------
+ arch/arm64/um/mmap.c     | 31 ++++++++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+), 9 deletions(-)
+ create mode 100644 arch/arm64/um/mmap.c
+
+diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
+index ec420f2c6440b1dfb419a597bf60fa6e840bd672..c9712aae23d0a57eb3cb47e39e2f718b67cbf40e 100644
+--- a/arch/arm64/um/Makefile
++++ b/arch/arm64/um/Makefile
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+-obj-y := bugs.o delay.o fault.o mem.o ptrace.o registers.o setjmp.o \
++obj-y := bugs.o delay.o fault.o mem.o mmap.o ptrace.o registers.o setjmp.o \
+ 	signal.o subarch.o syscall_table.o syscalls.o sysrq.o tls.o
+ obj-$(CONFIG_UML_ARM64_SME) += sme.o sme_signal.o
+ obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
+diff --git a/arch/arm64/um/asm/mman.h b/arch/arm64/um/asm/mman.h
+index 2a075458f6d6e6a70a6c3429ab0aa809048ef4ae..1a0753af906d05cc1aac2c220670cccb2623c84c 100644
+--- a/arch/arm64/um/asm/mman.h
++++ b/arch/arm64/um/asm/mman.h
+@@ -8,23 +8,48 @@
+ #include <linux/errno.h>
+ #include <darwin-address-space.h>
+ 
++/*
++ * The kernel's native window, which holds guest RAM and the kernel's own
++ * mappings, is inside the task's address range and must stay out of every
++ * user mapping.  A fixed placement that touches it is refused; one beyond the
++ * range gets get_unmapped_area()'s ENOMEM, as it does natively.
++ */
+ static inline int uml_darwin_mmap_check(unsigned long address,
+ 					unsigned long length,
+ 					unsigned long flags)
+ {
+-	/* A zero non-fixed address asks the generic allocator to choose a range.
+-	 * Darwin's TASK_UNMAPPED_BASE and top-down base both live above the native
+-	 * kernel window.  A nonzero address is either a fixed placement or a hint;
+-	 * reject native-window hints rather than allowing the generic fast path to
+-	 * return them unchanged.
+-	 */
+-	if (address == 0 && !(flags & MAP_FIXED))
++	unsigned long native_start = uml_darwin_native_address_start();
++	unsigned long native_end = uml_darwin_native_address_end();
++
++	if (!(flags & MAP_FIXED) || address >= native_end)
+ 		return 0;
+-	return uml_darwin_guest_range(address, length) ? 0 : -EINVAL;
++	if (address >= native_start || length > native_start - address)
++		return -EINVAL;
++	return 0;
+ }
+ 
+ #define arch_mmap_check(address, length, flags) \
+ 	uml_darwin_mmap_check(address, length, flags)
++
++/*
++ * A hint that names no place the guest can map is ignored, as it is natively
++ * for a pointer above the task's range, a tagged one included.  The generic
++ * allocator would return a hint inside the native window unchanged when
++ * nothing is mapped there, so arch_get_unmapped_area() drops it first.
++ */
++static inline unsigned long uml_darwin_mmap_hint(unsigned long address,
++						 unsigned long length,
++						 unsigned long flags)
++{
++	if (!(flags & MAP_FIXED) && address &&
++	    !uml_darwin_guest_range(address, length))
++		return 0;
++	return address;
++}
++
++/* arch/arm64/um/mmap.c applies uml_darwin_mmap_hint(). */
++#define HAVE_ARCH_UNMAPPED_AREA
++#define HAVE_ARCH_UNMAPPED_AREA_TOPDOWN
+ #endif
+ 
+ #endif
+diff --git a/arch/arm64/um/mmap.c b/arch/arm64/um/mmap.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..3abc8e9a6b88a4929cb85746a9e6060ac7457b82
+--- /dev/null
++++ b/arch/arm64/um/mmap.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * The generic mmap allocators, after dropping a hint the guest cannot use
++ * (uml_darwin_mmap_hint() in asm/mman.h).
++ */
++
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/sched/mm.h>
++
++#ifdef UML_HOST_DARWIN
++unsigned long
++arch_get_unmapped_area(struct file *filp, unsigned long addr,
++		       unsigned long len, unsigned long pgoff,
++		       unsigned long flags, vm_flags_t vm_flags)
++{
++	return generic_get_unmapped_area(filp,
++					 uml_darwin_mmap_hint(addr, len, flags),
++					 len, pgoff, flags, vm_flags);
++}
++
++unsigned long
++arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
++			       unsigned long len, unsigned long pgoff,
++			       unsigned long flags, vm_flags_t vm_flags)
++{
++	return generic_get_unmapped_area_topdown(filp,
++				uml_darwin_mmap_hint(addr, len, flags),
++				len, pgoff, flags, vm_flags);
++}
++#endif

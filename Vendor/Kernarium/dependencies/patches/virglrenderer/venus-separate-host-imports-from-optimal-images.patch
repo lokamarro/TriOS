@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 15:51:18 +0900
+Subject: [PATCH] venus: separate host imports from optimal images
+
+A unified-memory driver exposes one host-visible, device-local memory type
+but needs heap-backed memory for optimal images. With VK_EXT_external_memory_
+host the guest is shown two types instead: a device-local one for optimal
+images and a host-visible one that imports guest memory as a native buffer.
+Memory requirements, allocation and the external-memory properties go through
+the guest-to-host type table this adds.
+
+The renderer's own memory-type spoof (mem_type_spoof, VKR_DEBUG=
+no_mem_type_spoof) splits the same unified type by shifting every index by
+one. It cannot run beside this table, which every allocation and requirement
+query already goes through, so this topic takes its place and the spoof is
+not carried.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_buffer.c          | 20 +++++---
+ src/venus/vkr_common.c          |  1 -
+ src/venus/vkr_common.h          |  1 -
+ src/venus/vkr_device_memory.c   | 23 +++++----
+ src/venus/vkr_image.c           | 19 ++++---
+ src/venus/vkr_physical_device.c | 87 +++++++++++++++++++++++++++------
+ src/venus/vkr_physical_device.h | 22 ++++++---
+ 7 files changed, 122 insertions(+), 51 deletions(-)
+
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index e9236fa49cde77270173206edde0f83fd32e4f05..d4d23097d94637ae990c9f5aa1f4990a66ffcecf 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -6,6 +6,7 @@
+ #include "vkr_buffer.h"
+ 
+ #include "vkr_buffer_gen.h"
++#include "vkr_physical_device.h"
+ 
+ static void
+ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+@@ -56,8 +57,9 @@ vkr_dispatch_vkGetBufferMemoryRequirements(
+ 
+    vn_replace_vkGetBufferMemoryRequirements_args_handle(args);
+    vk->GetBufferMemoryRequirements(args->device, args->buffer, args->pMemoryRequirements);
+-   vkr_physical_device_mem_type_spoof(dev->physical_device,
+-                                      &args->pMemoryRequirements->memoryTypeBits);
++   args->pMemoryRequirements->memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device, args->pMemoryRequirements->memoryTypeBits, true);
+ }
+ 
+ static void
+@@ -70,9 +72,10 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
+ 
+    vn_replace_vkGetBufferMemoryRequirements2_args_handle(args);
+    vk->GetBufferMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+-   vkr_physical_device_mem_type_spoof(
+-      dev->physical_device,
+-      &args->pMemoryRequirements->memoryRequirements.memoryTypeBits);
++   args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device,
++         args->pMemoryRequirements->memoryRequirements.memoryTypeBits, true);
+ }
+ 
+ static void
+@@ -146,9 +149,10 @@ vkr_dispatch_vkGetDeviceBufferMemoryRequirements(
+    vn_replace_vkGetDeviceBufferMemoryRequirements_args_handle(args);
+    vk->GetDeviceBufferMemoryRequirements(args->device, args->pInfo,
+                                          args->pMemoryRequirements);
+-   vkr_physical_device_mem_type_spoof(
+-      dev->physical_device,
+-      &args->pMemoryRequirements->memoryRequirements.memoryTypeBits);
++   args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device,
++         args->pMemoryRequirements->memoryRequirements.memoryTypeBits, true);
+ }
+ 
+ void
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index 314abb85190fc9443fbbacab18e5eb6eb01894da..3fcc3f17c2c24a8e890a7f42123f56997de739c5 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -229,7 +229,6 @@ static const struct debug_named_value vkr_debug_options[] = {
+    { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
+    { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
+    { "gbm", VKR_DEBUG_GBM, "Force gbm for host visible memory" },
+-   { "no_mem_type_spoof", VKR_DEBUG_NO_MEM_TYPE_SPOOF, "Disable memory type spoofing" },
+    DEBUG_NAMED_VALUE_END
+ };
+ 
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index be9abd3f2a1e755b19d1c17f3cbd0b8bf013f6ad..28ded7fd9fa1a0ebe1bf7606d4134eaf7ae3d979 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -118,7 +118,6 @@ enum vkr_debug_flags {
+    VKR_DEBUG_VALIDATE = 1 << 0,
+    VKR_DEBUG_UDMABUF = 1 << 1,
+    VKR_DEBUG_GBM = 1 << 2,
+-   VKR_DEBUG_NO_MEM_TYPE_SPOOF = 1 << 3,
+ };
+ 
+ /* base class for all objects */
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 12ba65bda639525be12e247abbea5a784b640036..82acbc43a7c0a465a1f6050dc46869889cfa883a 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -254,11 +254,16 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    struct vkr_physical_device *physical_dev = dev->physical_device;
+ 
+    VkMemoryAllocateInfo *alloc_info = (VkMemoryAllocateInfo *)args->pAllocateInfo;
+-   const uint32_t mem_type_index = alloc_info->memoryTypeIndex;
+-   if (unlikely(mem_type_index >= physical_dev->memory_properties.memoryTypeCount)) {
++   const uint32_t guest_mem_type_index = alloc_info->memoryTypeIndex;
++   if (unlikely(guest_mem_type_index >=
++                physical_dev->memory_properties.memoryTypeCount)) {
+       args->ret = VK_ERROR_UNKNOWN;
+       return;
+    }
++   const uint32_t host_mem_type_index =
++      vkr_physical_device_get_host_memory_type_index(physical_dev,
++                                                     guest_mem_type_index);
++   alloc_info->memoryTypeIndex = host_mem_type_index;
+ 
+    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
+    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
+@@ -294,10 +299,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+     * the mapping will be directly set up from the existing virgl resource.
+     */
+    const uint32_t property_flags =
+-      physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+-   if (physical_dev->mem_type_spoof && mem_type_index > 0)
+-      alloc_info->memoryTypeIndex = mem_type_index - 1;
+-
++      physical_dev->memory_properties.memoryTypes[guest_mem_type_index].propertyFlags;
+    uint32_t valid_fd_types = 0;
+    int udmabuf_fd = -1;
+    void *gbm_bo = NULL;
+@@ -329,7 +331,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+          dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+          host_shm->ptr, &host_props);
+       if (args->ret != VK_SUCCESS ||
+-          !(host_props.memoryTypeBits & (1u << mem_type_index))) {
++          !(host_props.memoryTypeBits & (1u << host_mem_type_index))) {
+          if (args->ret == VK_SUCCESS)
+             args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+          vkr_host_shm_free(host_shm);
+@@ -448,7 +450,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    mem->gbm_bo = gbm_bo;
+    mem->host_shm = host_shm;
+    mem->allocation_size = alloc_info->allocationSize;
+-   mem->memory_type_index = alloc_info->memoryTypeIndex;
++   mem->memory_type_index = host_mem_type_index;
+ }
+ 
+ static void
+@@ -523,8 +525,9 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
+    if (args->ret != VK_SUCCESS)
+       return;
+ 
+-   vkr_physical_device_mem_type_spoof(dev->physical_device, &mem_fd_props.memoryTypeBits);
+-   args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
++   args->pMemoryResourceProperties->memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device, mem_fd_props.memoryTypeBits, true);
+ 
+    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
+       vkr_find_struct(args->pMemoryResourceProperties->pNext,
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index bc236db0aebbc9a9fdcd1a6036a2e721f36757d5..9148f317ff15817e8250883c23278c719a25698e 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -57,8 +57,9 @@ vkr_dispatch_vkGetImageMemoryRequirements(
+ 
+    vn_replace_vkGetImageMemoryRequirements_args_handle(args);
+    vk->GetImageMemoryRequirements(args->device, args->image, args->pMemoryRequirements);
+-   vkr_physical_device_mem_type_spoof(dev->physical_device,
+-                                      &args->pMemoryRequirements->memoryTypeBits);
++   args->pMemoryRequirements->memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device, args->pMemoryRequirements->memoryTypeBits, false);
+ }
+ 
+ static void
+@@ -71,9 +72,10 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
+ 
+    vn_replace_vkGetImageMemoryRequirements2_args_handle(args);
+    vk->GetImageMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+-   vkr_physical_device_mem_type_spoof(
+-      dev->physical_device,
+-      &args->pMemoryRequirements->memoryRequirements.memoryTypeBits);
++   args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device,
++         args->pMemoryRequirements->memoryRequirements.memoryTypeBits, false);
+ }
+ 
+ static void
+@@ -240,9 +242,10 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+    vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
+    vk->GetDeviceImageMemoryRequirements(args->device, args->pInfo,
+                                         args->pMemoryRequirements);
+-   vkr_physical_device_mem_type_spoof(
+-      dev->physical_device,
+-      &args->pMemoryRequirements->memoryRequirements.memoryTypeBits);
++   args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
++      vkr_physical_device_get_guest_memory_type_bits(
++         dev->physical_device,
++         args->pMemoryRequirements->memoryRequirements.memoryTypeBits, false);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 5d7a95522a5abf0b1bed75abc76ffac31fd6128d..6efa397a866dcf3a3ca3b4356213a3151fb3cb35 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -171,20 +171,41 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
+    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+-   vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
+-
+-   if (!VKR_DEBUG(NO_MEM_TYPE_SPOOF)) {
+-      VkPhysicalDeviceMemoryProperties *p = &physical_dev->memory_properties;
+-      const VkMemoryPropertyFlags flags =
++   vk->GetPhysicalDeviceMemoryProperties(handle,
++                                         &physical_dev->host_memory_properties);
++   physical_dev->memory_properties = physical_dev->host_memory_properties;
++
++   for (uint32_t i = 0; i < physical_dev->memory_properties.memoryTypeCount; i++)
++      physical_dev->memory_type_guest_to_host[i] = i;
++
++   /* VK_EXT_external_memory_host imports anonymous guest memory as a native
++    * buffer.  Some unified-memory drivers expose a single host-visible,
++    * device-local type but require heap-backed memory for optimal images.  A
++    * second virtual type keeps those images on native device memory while
++    * retaining zero-copy host-visible allocations for buffers.
++    */
++   if (physical_dev->EXT_external_memory_host &&
++       physical_dev->memory_properties.memoryTypeCount == 1) {
++      const VkMemoryType host_type =
++         physical_dev->host_memory_properties.memoryTypes[0];
++      const VkMemoryPropertyFlags unified_flags =
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+-      if ((p->memoryTypes[0].propertyFlags & flags) == flags) {
+-         p->memoryTypeCount = MIN2(p->memoryTypeCount, VK_MAX_MEMORY_TYPES - 1);
+-         memmove(&p->memoryTypes[1], &p->memoryTypes[0],
+-                 sizeof(p->memoryTypes[0]) * p->memoryTypeCount);
+-         p->memoryTypeCount++;
+-         p->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+-         p->memoryTypes[1].propertyFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+-         physical_dev->mem_type_spoof = true;
++
++      if ((host_type.propertyFlags & unified_flags) == unified_flags) {
++         VkMemoryType *device_type =
++            &physical_dev->memory_properties.memoryTypes[0];
++         VkMemoryType *host_visible_type =
++            &physical_dev->memory_properties.memoryTypes[1];
++
++         device_type->propertyFlags &=
++            ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++              VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++         *host_visible_type = host_type;
++         physical_dev->memory_properties.memoryTypeCount = 2;
++         physical_dev->memory_type_guest_to_host[1] = 0;
++         physical_dev->host_visible_memory_type_bits = 1u << 1;
++         physical_dev->separate_external_host_memory = true;
+       }
+    }
+ 
+@@ -280,6 +301,42 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+    }
+ }
+ 
++uint32_t
++vkr_physical_device_get_host_memory_type_index(
++   const struct vkr_physical_device *physical_dev,
++   uint32_t guest_memory_type_index)
++{
++   assert(guest_memory_type_index <
++          physical_dev->memory_properties.memoryTypeCount);
++   return physical_dev->memory_type_guest_to_host[guest_memory_type_index];
++}
++
++uint32_t
++vkr_physical_device_get_guest_memory_type_bits(
++   const struct vkr_physical_device *physical_dev,
++   uint32_t host_memory_type_bits,
++   bool allow_external_host_memory)
++{
++   uint32_t guest_memory_type_bits = 0;
++
++   for (uint32_t guest_index = 0;
++        guest_index < physical_dev->memory_properties.memoryTypeCount;
++        guest_index++) {
++      const uint32_t host_index =
++         physical_dev->memory_type_guest_to_host[guest_index];
++      if (host_memory_type_bits & (1u << host_index))
++         guest_memory_type_bits |= 1u << guest_index;
++   }
++
++   if (!allow_external_host_memory &&
++       physical_dev->separate_external_host_memory) {
++      guest_memory_type_bits &=
++         ~physical_dev->host_visible_memory_type_bits;
++   }
++
++   return guest_memory_type_bits;
++}
++
+ static void
+ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+ {
+@@ -755,8 +812,8 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
+                                              args->pMemoryProperties);
+    }
+ 
+-   /* VkPhysicalDeviceMemoryProperties is invariant. Always return the cached
+-    * (and potentially modified) properties.
++   /* The base properties are invariant and can include renderer-provided
++    * virtual types.  Preserve any extension properties returned above.
+     */
+    args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
+ }
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index e6302891e864f2571d62e65cd2559c4982816b96..7bda834024d5d73640873e25d4a74955fd259b46 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -33,8 +33,11 @@ struct vkr_physical_device {
+    bool EXT_external_memory_metal;
+    bool EXT_metal_objects;
+ 
++   VkPhysicalDeviceMemoryProperties host_memory_properties;
+    VkPhysicalDeviceMemoryProperties memory_properties;
+-   bool mem_type_spoof;
++   uint8_t memory_type_guest_to_host[VK_MAX_MEMORY_TYPES];
++   uint32_t host_visible_memory_type_bits;
++   bool separate_external_host_memory;
+    VkPhysicalDeviceIDProperties id_properties;
+    bool is_dma_buf_fd_export_supported;
+    bool is_opaque_fd_export_supported;
+@@ -55,12 +58,15 @@ void
+ vkr_physical_device_destroy(struct vkr_context *ctx,
+                             struct vkr_physical_device *physical_dev);
+ 
+-static inline void
+-vkr_physical_device_mem_type_spoof(const struct vkr_physical_device *physical_dev,
+-                                   uint32_t *mem_type_bits)
+-{
+-   if (physical_dev->mem_type_spoof)
+-      *mem_type_bits = (*mem_type_bits << 1) | 1u;
+-}
++uint32_t
++vkr_physical_device_get_host_memory_type_index(
++   const struct vkr_physical_device *physical_dev,
++   uint32_t guest_memory_type_index);
++
++uint32_t
++vkr_physical_device_get_guest_memory_type_bits(
++   const struct vkr_physical_device *physical_dev,
++   uint32_t host_memory_type_bits,
++   bool allow_external_host_memory);
+ 
+ #endif /* VKR_PHYSICAL_DEVICE_H */

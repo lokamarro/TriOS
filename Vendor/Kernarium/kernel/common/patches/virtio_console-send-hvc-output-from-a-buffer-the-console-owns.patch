@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:02:53 +0900
+Subject: [PATCH] virtio_console: send hvc output from a buffer the console
+ owns
+
+put_chars() runs with interrupts off and allocated a port buffer and a
+copy of the output with GFP_ATOMIC for each write, up to the 4 KiB of
+hvc's output buffer. When either allocation failed it returned -ENOMEM,
+and hvc treats any error but -EAGAIN as a vterm nobody reads:
+hvc_push() threw away all the output it held, which hvc_write() had
+already reported as written, and hvc_console_print() dropped the
+characters. Under memory pressure the console silently lost output.
+
+Allocate one PAGE_SIZE port buffer with the console port, where the
+driver may sleep, and copy each write into it. The buffer is queued and
+waited for under the output queue's lock, which also keeps the tty and
+printk writers from sharing it at once. A write longer than the buffer
+is cut to its size, and hvc keeps the rest for the next write.
+
+The queue still owns a buffer it holds when it breaks, as before:
+remove_vqs() frees it, and the port, which no longer has a buffer,
+answers later writes with -EPIPE. Otherwise the buffer is freed with
+the port. __send_to_port() loses its blocking mode, which only
+put_chars() used.
+
+Each console port holds 4 KiB and a port buffer for its lifetime, which
+a write in flight held before; other ports take nothing.
+---
+ drivers/char/virtio_console.c | 121 ++++++++++++++++++----------------
+ 1 file changed, 64 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/char/virtio_console.c b/drivers/char/virtio_console.c
+index 826b737b5f3aba04a7cb22b9a279acb1974eb752..62c70db44dc6b6c43a4f4dfa05fd8cd0405aaf14 100644
+--- a/drivers/char/virtio_console.c
++++ b/drivers/char/virtio_console.c
+@@ -79,6 +79,13 @@ struct console {
+ 	 * this driver
+ 	 */
+ 	u32 vtermno;
++
++	/*
++	 * put_chars() copies hvc output here, because it runs with
++	 * interrupts off and must not allocate. NULL once a broken queue
++	 * kept the buffer, which remove_vqs() then frees.
++	 */
++	struct port_buffer *outbuf;
+ };
+ 
+ static DEFINE_IDA(vtermno_ida);
+@@ -594,14 +601,11 @@ static void reclaim_consumed_buffers(struct port *port)
+ }
+ 
+ static ssize_t __send_to_port(struct port *port, struct scatterlist *sg,
+-			      int nents, size_t in_count,
+-			      void *data, bool nonblock)
++			      int nents, size_t in_count, void *data)
+ {
+ 	struct virtqueue *out_vq;
+-	struct port_buffer *used;
+ 	int err;
+ 	unsigned long flags;
+-	unsigned int len;
+ 
+ 	out_vq = port->out_vq;
+ 
+@@ -622,29 +626,6 @@ static ssize_t __send_to_port(struct port *port, struct scatterlist *sg,
+ 	if (out_vq->num_free == 0)
+ 		port->outvq_full = true;
+ 
+-	if (nonblock)
+-		goto done;
+-
+-	/*
+-	 * Wait till the host acknowledges it pushed out the data we
+-	 * sent.  This is done for data from the hvc_console; the tty
+-	 * operations are performed with spinlocks held so we can't
+-	 * sleep here.  An alternative would be to copy the data to a
+-	 * buffer and relax the spinning requirement.  The downside is
+-	 * we need to kmalloc a GFP_ATOMIC buffer each time the
+-	 * console driver writes something out.
+-	 */
+-	while (!(used = virtqueue_get_buf(out_vq, &len))
+-		&& !virtqueue_is_broken(out_vq))
+-		cpu_relax();
+-	/*
+-	 * Only put_chars() waits here. Like every buffer on an output
+-	 * queue, the one the wait takes back is a port buffer, and one the
+-	 * host has not used when the queue broke stays queued for
+-	 * remove_vqs() to free.
+-	 */
+-	if (used)
+-		free_buf(used, false);
+ done:
+ 	spin_unlock_irqrestore(&port->outvq_lock, flags);
+ 
+@@ -836,17 +817,13 @@ static ssize_t port_fops_write(struct file *filp, const char __user *ubuf,
+ 	}
+ 
+ 	/*
+-	 * We now ask send_buf() to not spin for generic ports -- we
+-	 * can re-use the same code path that non-blocking file
+-	 * descriptors take for blocking file descriptors since the
+-	 * wait is already done and we're certain the write will go
+-	 * through to the host.
++	 * The wait is already done, so the write goes through to the
++	 * host without spinning, as a non-blocking one does.
+ 	 */
+-	nonblock = true;
+ 	sg_init_one(sg, buf->buf, count);
+-	ret = __send_to_port(port, sg, 1, count, buf, nonblock);
++	ret = __send_to_port(port, sg, 1, count, buf);
+ 
+-	if (nonblock && ret > 0)
++	if (ret > 0)
+ 		goto out;
+ 
+ free_buf:
+@@ -956,7 +933,7 @@ static ssize_t port_fops_splice_write(struct pipe_inode_info *pipe,
+ 	ret = __splice_from_pipe(pipe, &sd, pipe_to_sg);
+ 	pipe_unlock(pipe);
+ 	if (likely(ret > 0))
+-		ret = __send_to_port(port, buf->sg, sgl.n, sgl.len, buf, true);
++		ret = __send_to_port(port, buf->sg, sgl.n, sgl.len, buf);
+ 
+ 	if (unlikely(ret <= 0))
+ 		free_buf(buf, true);
+@@ -1117,8 +1094,11 @@ static ssize_t put_chars(u32 vtermno, const u8 *buf, size_t count)
+ {
+ 	struct port *port;
+ 	struct scatterlist sg[1];
+-	struct port_buffer *pbuf;
+-	ssize_t ret;
++	struct port_buffer *pbuf, *used;
++	unsigned long flags;
++	unsigned int len;
++	ssize_t ret = 0;
++	int err;
+ 
+ 	port = find_port_by_vtermno(vtermno);
+ 	if (!port)
+@@ -1127,27 +1107,42 @@ static ssize_t put_chars(u32 vtermno, const u8 *buf, size_t count)
+ 		return 0;
+ 
+ 	/*
+-	 * The output is queued as a port buffer, as every buffer on an
+-	 * output queue is, because whoever takes it back frees it as one:
+-	 * __send_to_port() once the host has used it, or remove_vqs() if
+-	 * the queue broke first.
++	 * The output is copied into the buffer the port allocated with its
++	 * console, so a write allocates nothing and cannot fail for want
++	 * of memory: hvc would throw away output put_chars() failed to
++	 * take. The buffer is queued and waited for under the queue's
++	 * lock, which also serialises the tty and printk writers.
+ 	 */
+-	pbuf = kzalloc(sizeof(*pbuf), GFP_ATOMIC);
+-	if (!pbuf)
+-		return -ENOMEM;
+-	pbuf->buf = kmemdup(buf, count, GFP_ATOMIC);
+-	if (!pbuf->buf) {
+-		kfree(pbuf);
+-		return -ENOMEM;
++	spin_lock_irqsave(&port->outvq_lock, flags);
++	pbuf = port->cons.outbuf;
++	if (!pbuf) {
++		ret = -EPIPE;
++		goto out;
+ 	}
+-	pbuf->size = count;
++	count = min(count, pbuf->size);
++	memcpy(pbuf->buf, buf, count);
+ 	pbuf->len = count;
+-
+ 	sg_init_one(sg, pbuf->buf, count);
+-	ret = __send_to_port(port, sg, 1, count, pbuf, false);
+-	/* Nothing was queued. */
+-	if (!ret)
+-		free_buf(pbuf, false);
++	err = virtqueue_add_outbuf(port->out_vq, sg, 1, pbuf, GFP_ATOMIC);
++	virtqueue_kick(port->out_vq);
++	if (err)
++		goto out;
++
++	/*
++	 * Wait till the host has used the buffer: the tty operations
++	 * call this with spinlocks held, so it cannot sleep. A buffer
++	 * the host has not used when the queue breaks stays queued for
++	 * remove_vqs() to free, and the port stops sending.
++	 */
++	while (!(used = virtqueue_get_buf(port->out_vq, &len)) &&
++	       !virtqueue_is_broken(port->out_vq))
++		cpu_relax();
++	if (!used)
++		port->cons.outbuf = NULL;
++	port->stats.bytes_sent += count;
++	ret = count;
++out:
++	spin_unlock_irqrestore(&port->outvq_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -1238,9 +1233,13 @@ static int init_port_console(struct port *port)
+ 	 * pointers.  The final argument is the output buffer size: we
+ 	 * can do any size, so we put PAGE_SIZE here.
+ 	 */
++	port->cons.outbuf = alloc_buf(port->portdev->vdev, PAGE_SIZE, 0);
++	if (!port->cons.outbuf)
++		return -ENOMEM;
++
+ 	ret = ida_alloc_min(&vtermno_ida, 1, GFP_KERNEL);
+ 	if (ret < 0)
+-		return ret;
++		goto free_outbuf;
+ 
+ 	port->cons.vtermno = ret;
+ 	port->cons.hvc = hvc_alloc(port->cons.vtermno, 0, &hv_ops, PAGE_SIZE);
+@@ -1250,7 +1249,7 @@ static int init_port_console(struct port *port)
+ 			"error %d allocating hvc for port\n", ret);
+ 		port->cons.hvc = NULL;
+ 		ida_free(&vtermno_ida, port->cons.vtermno);
+-		return ret;
++		goto free_outbuf;
+ 	}
+ 	spin_lock_irq(&pdrvdata_lock);
+ 	list_add_tail(&port->cons.list, &pdrvdata.consoles);
+@@ -1261,6 +1260,11 @@ static int init_port_console(struct port *port)
+ 	send_control_msg(port, VIRTIO_CONSOLE_PORT_OPEN, 1);
+ 
+ 	return 0;
++
++free_outbuf:
++	free_buf(port->cons.outbuf, true);
++	port->cons.outbuf = NULL;
++	return ret;
+ }
+ 
+ static ssize_t show_port_name(struct device *dev,
+@@ -1364,6 +1368,7 @@ static int add_port(struct ports_device *portdev, u32 id)
+ 	port->name = NULL;
+ 	port->inbuf = NULL;
+ 	port->cons.hvc = NULL;
++	port->cons.outbuf = NULL;
+ 	port->async_queue = NULL;
+ 
+ 	port->cons.ws.ws_row = port->cons.ws.ws_col = 0;
+@@ -1474,6 +1479,8 @@ static void remove_port(struct kref *kref)
+ 
+ 	port = container_of(kref, struct port, kref);
+ 
++	if (port->cons.outbuf)
++		free_buf(port->cons.outbuf, true);
+ 	kfree(port);
+ }
+ 

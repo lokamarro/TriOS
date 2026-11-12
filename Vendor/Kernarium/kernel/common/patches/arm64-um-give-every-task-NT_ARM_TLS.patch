@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:09:28 +0900
+Subject: [PATCH] arm64: um: give every task NT_ARM_TLS
+
+Native arm64 lists NT_ARM_TLS for every task: TPIDR_EL0, then
+TPIDR2_EL0 when the CPU implements it, which otherwise reads as zero
+and ignores writes. The UML port listed it only in the view of a run
+whose virtual CPU has SME, so a debugger or a core dump of any other
+run had no TPIDR_EL0.
+
+The regset is now the third of the base view, as natively, and only
+its TPIDR2_EL0 word depends on SME. Its accessors move from sme.c to
+ptrace.c, which builds without SME.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/um/ptrace.c | 51 ++++++++++++++++++++++++++++++++++++------
+ arch/arm64/um/sme.c    | 29 +-----------------------
+ arch/arm64/um/sme.h    |  1 -
+ 3 files changed, 45 insertions(+), 36 deletions(-)
+
+diff --git a/arch/arm64/um/ptrace.c b/arch/arm64/um/ptrace.c
+index fb694dd05be0296ea9d65ed4c9b0c1c777acd44c..5d374351c1acc2483eb6b3ff26e5f9b082ef59bd 100644
+--- a/arch/arm64/um/ptrace.c
++++ b/arch/arm64/um/ptrace.c
+@@ -10,8 +10,13 @@
+ #ifdef CONFIG_UML_ARM64_SME
+ #include <asm/sigcontext.h>
+ #include <uapi/asm/ptrace.h>
+-#include "sme.h"
+ #endif
++#include "sme.h"
++
++/* Native arm64's third regset, after the two asm/ptrace.h names. */
++enum {
++	REGSET_TLS = REGSET_FP + 1,
++};
+ 
+ static int register_index(int regno)
+ {
+@@ -140,6 +145,38 @@ static int fpregs_set(struct task_struct *target,
+ 		target->thread.regs.regs.fp, 0, sizeof(elf_fpregset_t));
+ }
+ 
++/* NT_ARM_TLS, as native: TPIDR_EL0, then TPIDR2_EL0, which reads as zero
++ * and ignores writes while the virtual CPU has no SME. */
++static int tls_get(struct task_struct *target,
++		   const struct user_regset *regset, struct membuf to)
++{
++	membuf_store(&to, target->thread.arch.tpidr_el0);
++	if (uml_arm64_sme_vl)
++		return membuf_store(&to,
++				    uml_arm64_sme_registers(target)->tpidr2);
++	return membuf_zero(&to, sizeof(u64));
++}
++
++static int tls_set(struct task_struct *target,
++		   const struct user_regset *regset, unsigned int pos,
++		   unsigned int count, const void *kbuf,
++		   const void __user *ubuf)
++{
++	unsigned long tls[2] = { target->thread.arch.tpidr_el0 };
++	int error;
++
++	if (uml_arm64_sme_vl)
++		tls[1] = uml_arm64_sme_registers(target)->tpidr2;
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf, tls, 0,
++				   sizeof(tls));
++	if (error)
++		return error;
++	target->thread.arch.tpidr_el0 = tls[0];
++	if (uml_arm64_sme_vl)
++		uml_arm64_sme_registers(target)->tpidr2 = tls[1];
++	return 0;
++}
++
+ static const struct user_regset uml_arm64_regsets[] = {
+ 	[REGSET_GENERAL] = {
+ 		USER_REGSET_NOTE_TYPE(PRSTATUS),
+@@ -157,16 +194,16 @@ static const struct user_regset uml_arm64_regsets[] = {
+ 		.regset_get = fpregs_get,
+ 		.set = fpregs_set,
+ 	},
+-#ifdef CONFIG_UML_ARM64_SME
+-	/* Only the SME view below has these, as native arm64 with SME. */
+-	{
++	[REGSET_TLS] = {
+ 		USER_REGSET_NOTE_TYPE(ARM_TLS),
+ 		.n = 2,
+ 		.size = sizeof(void *),
+ 		.align = sizeof(void *),
+-		.regset_get = uml_arm64_tls_get,
+-		.set = uml_arm64_tls_set,
++		.regset_get = tls_get,
++		.set = tls_set,
+ 	},
++#ifdef CONFIG_UML_ARM64_SME
++	/* Only the SME view below has these, as native arm64 with SME. */
+ 	{
+ 		USER_REGSET_NOTE_TYPE(ARM_SSVE),
+ 		.n = DIV_ROUND_UP(SVE_PT_SIZE(UML_ARM64_SME_VQ_MAX,
+@@ -202,7 +239,7 @@ static const struct user_regset_view uml_arm64_view = {
+ 	.name = "aarch64",
+ 	.e_machine = EM_AARCH64,
+ 	.regsets = uml_arm64_regsets,
+-	.n = REGSET_FP + 1,
++	.n = REGSET_TLS + 1,
+ };
+ 
+ #ifdef CONFIG_UML_ARM64_SME
+diff --git a/arch/arm64/um/sme.c b/arch/arm64/um/sme.c
+index 797ee012bf04d02fa63a8700f47d4f888a99f5ad..504106fdc83d43ba5edfdad818f210eba6cd7969 100644
+--- a/arch/arm64/um/sme.c
++++ b/arch/arm64/um/sme.c
+@@ -276,36 +276,9 @@ core_initcall(sme_sysctl_init);
+ /*
+  * Regsets (native ptrace.c).  There is no NT_ARM_SVE: without non-streaming
+  * SVE the streaming registers are NT_ARM_SSVE, present while SM is set.
++ * NT_ARM_TLS, which every task has, is in ptrace.c.
+  */
+ 
+-/* NT_ARM_TLS: TPIDR_EL0, then TPIDR2_EL0. */
+-int uml_arm64_tls_get(struct task_struct *target,
+-		      const struct user_regset *regset, struct membuf to)
+-{
+-	membuf_store(&to, target->thread.arch.tpidr_el0);
+-	return membuf_store(&to, uml_arm64_sme_registers(target)->tpidr2);
+-}
+-
+-int uml_arm64_tls_set(struct task_struct *target,
+-		      const struct user_regset *regset, unsigned int pos,
+-		      unsigned int count, const void *kbuf,
+-		      const void __user *ubuf)
+-{
+-	unsigned long tls[2] = {
+-		target->thread.arch.tpidr_el0,
+-		uml_arm64_sme_registers(target)->tpidr2,
+-	};
+-	int error;
+-
+-	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf, tls, 0,
+-				   sizeof(tls));
+-	if (error)
+-		return error;
+-	target->thread.arch.tpidr_el0 = tls[0];
+-	uml_arm64_sme_registers(target)->tpidr2 = tls[1];
+-	return 0;
+-}
+-
+ static unsigned int sme_vq(void)
+ {
+ 	return sve_vq_from_vl(uml_arm64_sme_vl);
+diff --git a/arch/arm64/um/sme.h b/arch/arm64/um/sme.h
+index 4afc2a47cac963ca6cffe77bdac399708c3a5dc4..5e600a5b46d72c7c8e680c8d2aa8f08b5baeeb1a 100644
+--- a/arch/arm64/um/sme.h
++++ b/arch/arm64/um/sme.h
+@@ -63,7 +63,6 @@ int uml_arm64_##name##_set(struct task_struct *target, \
+ 			   const struct user_regset *regset, \
+ 			   unsigned int pos, unsigned int count, \
+ 			   const void *kbuf, const void __user *ubuf)
+-UML_ARM64_SME_REGSET_OPS(tls);
+ UML_ARM64_SME_REGSET_OPS(ssve);
+ UML_ARM64_SME_REGSET_OPS(za);
+ UML_ARM64_SME_REGSET_OPS(zt);

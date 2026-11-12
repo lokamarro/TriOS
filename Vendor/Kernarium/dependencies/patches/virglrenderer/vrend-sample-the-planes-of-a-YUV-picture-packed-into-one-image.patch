@@ -1,0 +1,1056 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:22:55 +0900
+Subject: [PATCH] vrend: sample the planes of a YUV picture packed into one
+ image
+
+A guest allocator without host support keeps a YUV picture as the bytes of one
+R8 image: the luma rows, then the chroma rows, in the layout Android defines.
+The host holds one texture of that image and a guest shader that samples the
+luma plane, or either chroma plane, of an imported image of it read the whole
+R8 texture each time: luma came back as the picture and its chroma squeezed
+into one third of it, and both chroma views read what luma did. Every decoder
+that plays into a GL or SurfaceView view showed stripes.
+
+Let the guest tell the renderer what such an image is. A resource created with
+VIRGL_RESOURCE_FLAG_YUV_BIPLANAR (luma rows, interleaved chroma rows) or
+VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR (luma rows, then two half-stride chroma
+planes) and the picture's width in the high half of the flags is checked
+against its size, then keeps one texture per plane: R8 for luma, RG8 for
+interleaved chroma and R8 for each planar chroma plane. A triplanar image
+makes them when the first sampler view of the image is, as the first plane
+number the view carries selects its texture, and the blitter's own context
+draws the rows a write changed into them, so an image only a codec or the CPU
+touches costs nothing. The capability VIRGL_CAP_V2_PACKED_YUV says the
+renderer knows the flags; a guest that sends none gets today's resource, and a
+renderer without the capability refuses them as it refused every flag it did
+not know.
+
+A biplanar image, which is what the hardware decoders' NV12 buffers are, keeps
+its pixels only in the planes, which exist from its creation: its R8 texture is
+1x1 and only names it. A transfer of any box of it writes or reads the plane
+textures its luma rows and its chroma rows fall in, and nothing is drawn from
+an image. A chroma box that cuts a pair of bytes in two, or whose guest rows
+are an odd number of bytes apart, goes through the whole pairs it touches, so
+the half of a pair the box does not carry is kept. The bytes of a row past the
+picture's width, or past its last chroma pair, are padding no plane keeps: a
+write drops them and a read leaves the guest's bytes there alone. A decoded
+frame so costs one copy at the host, not an R8 image, the planes drawn from it
+and the staging the busy image made a write into it need.
+
+A use of the image other than a transfer (a surface, a copy region, a blit, a
+shader image, a clear, a view of a plane the image does not have, or a
+presenter) first gives it the R8 storage it had before this change, filled
+from the planes, with one warning, and the image is a plain one from then on.
+Playback and the CTS reach none of them. A triplanar image, which is what the
+software decoders produce, and an image imported from an EGL image keep the
+storage they had.
+---
+ src/virgl_hw.h             |  19 ++
+ src/vrend/vrend_blitter.c  | 195 ++++++++++++++
+ src/vrend/vrend_blitter.h  |  22 ++
+ src/vrend/vrend_renderer.c | 534 ++++++++++++++++++++++++++++++++++++-
+ src/vrend/vrend_renderer.h |  26 ++
+ 5 files changed, 786 insertions(+), 10 deletions(-)
+
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index 0ee3f60bd1870db6d95076fc84bcba235368af05..025ee81b9acbf0bebc91d4fe6012dd99dfff6cc8 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -630,6 +630,11 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_MIRROR_CLAMP         (1u << 17)
+ #define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1u << 18)
+ #define VIRGL_CAP_V2_QUERY_FORMAT_MODIFIER (1u << 19)
++/* The renderer samples the planes of a picture kept in one R8 image: it
++ * accepts VIRGL_RESOURCE_FLAG_YUV_BIPLANAR and VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR
++ * when a resource is created.
++ */
++#define VIRGL_CAP_V2_PACKED_YUV           (1u << 20)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+@@ -876,5 +881,19 @@ enum virgl_statistics_query_index {
+ #define VIRGL_RESOURCE_Y_0_TOP (1 << 0)
+ #define VIRGL_RESOURCE_FLAG_MAP_PERSISTENT (1 << 1)
+ #define VIRGL_RESOURCE_FLAG_MAP_COHERENT   (1 << 2)
++/* The resource is an R8 image that holds a YUV 4:2:0 picture the way a guest
++ * allocator without host support lays it out, and the host also keeps one
++ * texture per plane for sampling. The image is as wide as one luma row
++ * (stride bytes) and as tall as the luma and chroma rows together. BIPLANAR
++ * is the luma rows followed by the interleaved chroma rows (NV12, NV21).
++ * TRIPLANAR is the luma rows followed by two planes of ceil(height / 2) rows
++ * of stride / 2 bytes each (YV12), the V plane first. The bits above
++ * VIRGL_RESOURCE_YUV_WIDTH_SHIFT carry the picture's width in pixels, which
++ * the luma stride may exceed. Only for VIRGL_CAP_V2_PACKED_YUV; the other
++ * flag bits stay clear.
++ */
++#define VIRGL_RESOURCE_FLAG_YUV_BIPLANAR   (1 << 8)
++#define VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR  (1 << 9)
++#define VIRGL_RESOURCE_YUV_WIDTH_SHIFT     16
+ 
+ #endif
+diff --git a/src/vrend/vrend_blitter.c b/src/vrend/vrend_blitter.c
+index 2afbdd6b042adcfaaee9dda67e7140cf85a8fa3a..31da986c13dcb16ec269738ddf6aa95cf3e26400 100644
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -70,6 +70,15 @@ struct vrend_blitter_ctx {
+    GLuint vs;
+    GLuint fb_id;
+ 
++   /* The programs that read the planes of a packed YUV image out of it, made
++    * on first use, and the sampler that reads the image by exact texel. */
++   GLuint yuv_vs;
++   GLuint yuv_programs[VREND_YUV_EXTRACT_COUNT];
++   GLint yuv_geom_locations[VREND_YUV_EXTRACT_COUNT];
++   GLint yuv_position_locations[VREND_YUV_EXTRACT_COUNT];
++   GLuint yuv_sampler;
++   bool yuv_has_samplers;
++
+    unsigned dst_width;
+    unsigned dst_height;
+ 
+@@ -911,6 +920,184 @@ void vrend_renderer_blit_gl(ASSERTED struct vrend_context *ctx,
+    glBindTexture(src_res->target, 0);
+ }
+ 
++/* The rows of the plane textures of a packed YUV image are drawn from the
++ * image by a fragment shader that fetches the bytes of one texel each. The
++ * fragment's position is the texel it writes, so no coordinates are passed.
++ * The sources are integers wide enough for a byte address in a 16K image. */
++#define YUV_FS_DECLARATIONS                      \
++   "uniform sampler2D samp;\n"                   \
++   "uniform ivec4 geom;\n"                       \
++   "out vec4 FragColor;\n"                       \
++   "#define fetch(x, y) texelFetch(samp, ivec2(x, y), 0).r\n"
++
++#define YUV_FS_LUMA                                                         \
++   "void main() {\n"                                                        \
++   "   ivec2 p = ivec2(gl_FragCoord.xy);\n"                                 \
++   "   FragColor = vec4(fetch(p.x, p.y), 0.0, 0.0, 1.0);\n"                 \
++   "}\n"
++
++#define YUV_FS_PAIRS                                                        \
++   "void main() {\n"                                                        \
++   "   ivec2 p = ivec2(gl_FragCoord.xy);\n"                                 \
++   "   int y = geom.y + p.y;\n"                                             \
++   "   FragColor = vec4(fetch(2 * p.x, y), fetch(2 * p.x + 1, y), 0.0, 1.0);\n" \
++   "}\n"
++
++#define YUV_FS_PLANAR                                                       \
++   "void main() {\n"                                                        \
++   "   ivec2 p = ivec2(gl_FragCoord.xy);\n"                                 \
++   "   int a = geom.z + p.y * geom.w + p.x;\n"                              \
++   "   FragColor = vec4(fetch(a % geom.x, a / geom.x), 0.0, 0.0, 1.0);\n"   \
++   "}\n"
++
++#define YUV_VS_BODY                                                         \
++   "in vec4 arg0;\n"                                                        \
++   "void main() {\n"                                                        \
++   "   gl_Position = arg0;\n"                                               \
++   "}\n"
++
++#define YUV_FS_HEADER_GL HEADER_GL YUV_FS_DECLARATIONS
++#define YUV_FS_HEADER_GLES                                                  \
++   "#version 310 es\n"                                                      \
++   "// Blitter\n"                                                           \
++   "precision highp float;\n"                                               \
++   "precision highp int;\n"                                                 \
++   "precision highp sampler2D;\n"                                           \
++   YUV_FS_DECLARATIONS
++
++static bool blit_yuv_prepare(struct vrend_blitter_ctx *blit_ctx,
++                             enum vrend_yuv_extract mode)
++{
++   static const char *const bodies[VREND_YUV_EXTRACT_COUNT] = {
++      [VREND_YUV_EXTRACT_LUMA] = YUV_FS_LUMA,
++      [VREND_YUV_EXTRACT_PAIRS] = YUV_FS_PAIRS,
++      [VREND_YUV_EXTRACT_PLANAR] = YUV_FS_PLANAR,
++   };
++   char source[2048];
++   GLuint fs;
++   GLuint prog;
++
++   if (!blit_ctx->yuv_programs[VREND_YUV_EXTRACT_LUMA] &&
++       !blit_ctx->yuv_programs[VREND_YUV_EXTRACT_PAIRS] &&
++       !blit_ctx->yuv_programs[VREND_YUV_EXTRACT_PLANAR]) {
++      blit_ctx->yuv_has_samplers =
++         epoxy_gl_version() >= (blit_ctx->use_gles ? 30 : 33) ||
++         (!blit_ctx->use_gles && epoxy_has_gl_extension("GL_ARB_sampler_objects"));
++   }
++
++   if (!blit_ctx->yuv_sampler && blit_ctx->yuv_has_samplers) {
++      glGenSamplers(1, &blit_ctx->yuv_sampler);
++      glSamplerParameteri(blit_ctx->yuv_sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++      glSamplerParameteri(blit_ctx->yuv_sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++      glSamplerParameteri(blit_ctx->yuv_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++      glSamplerParameteri(blit_ctx->yuv_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++   }
++
++   if (blit_ctx->yuv_programs[mode])
++      return true;
++
++   if (!blit_ctx->yuv_vs) {
++      blit_ctx->yuv_vs = blit_shader_build_and_check(GL_VERTEX_SHADER,
++         blit_ctx->use_gles ? HEADER_GLES YUV_VS_BODY : HEADER_GL YUV_VS_BODY);
++      if (!blit_ctx->yuv_vs)
++         return false;
++   }
++
++   snprintf(source, sizeof(source), "%s%s",
++            blit_ctx->use_gles ? YUV_FS_HEADER_GLES : YUV_FS_HEADER_GL,
++            bodies[mode]);
++   fs = blit_shader_build_and_check(GL_FRAGMENT_SHADER, source);
++   if (!fs)
++      return false;
++
++   prog = glCreateProgram();
++   glAttachShader(prog, blit_ctx->yuv_vs);
++   glAttachShader(prog, fs);
++   if (!blit_shader_link_and_check(prog)) {
++      glDeleteShader(fs);
++      return false;
++   }
++   glDeleteShader(fs);
++
++   blit_ctx->yuv_programs[mode] = prog;
++   blit_ctx->yuv_geom_locations[mode] = glGetUniformLocation(prog, "geom");
++   blit_ctx->yuv_position_locations[mode] = glGetAttribLocation(prog, "arg0");
++   return true;
++}
++
++bool vrend_blitter_extract_yuv_plane(struct vrend_resource *src,
++                                     struct vrend_resource *dst,
++                                     enum vrend_yuv_extract mode,
++                                     const int32_t geom[4],
++                                     uint32_t first_row,
++                                     uint32_t end_row)
++{
++   struct vrend_blitter_ctx *blit_ctx = &vrend_blit_ctx;
++   GLuint prog;
++   GLint position;
++
++   if (first_row >= end_row)
++      return false;
++
++   if (!vrend_renderer_init_blit_ctx(blit_ctx))
++      return false;
++
++   if (!blit_yuv_prepare(blit_ctx, mode)) {
++      /* The caller still owes the switch back to its own context. */
++      return true;
++   }
++
++   prog = blit_ctx->yuv_programs[mode];
++   position = blit_ctx->yuv_position_locations[mode];
++
++   glUseProgram(prog);
++   glUniform4i(blit_ctx->yuv_geom_locations[mode],
++               geom[0], geom[1], geom[2], geom[3]);
++
++   glBindFramebuffer(GL_FRAMEBUFFER, blit_ctx->fb_id);
++   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                          dst->gl_id, 0);
++   GLuint buffers = GL_COLOR_ATTACHMENT0;
++   glDrawBuffers(1, &buffers);
++
++   glActiveTexture(GL_TEXTURE0);
++   glBindTexture(GL_TEXTURE_2D, src->gl_id);
++   if (blit_ctx->yuv_sampler) {
++      glBindSampler(0, blit_ctx->yuv_sampler);
++   } else {
++      /* A host without sampler objects reads the image by what its own
++       * parameters say, which for a level-0-only texture without immutable
++       * storage must not ask for mip levels. */
++      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++   }
++
++   glDisable(GL_SCISSOR_TEST);
++   glDisable(GL_BLEND);
++   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++
++   blit_ctx->dst_width = dst->base.width0;
++   blit_ctx->dst_height = dst->base.height0;
++   blitter_set_rectangle(blit_ctx, 0, first_row, dst->base.width0, end_row);
++
++   glBufferData(GL_ARRAY_BUFFER, sizeof(blit_ctx->vertices), blit_ctx->vertices,
++                GL_STATIC_DRAW);
++   if (position >= 0) {
++      glVertexAttribPointer(position, 4, GL_FLOAT, GL_FALSE,
++                            8 * sizeof(float), (void *)0);
++      glEnableVertexAttribArray(position);
++   }
++   glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
++
++   if (blit_ctx->yuv_sampler)
++      glBindSampler(0, 0);
++   glBindTexture(GL_TEXTURE_2D, 0);
++   glUseProgram(0);
++   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                          0, 0);
++   return true;
++}
++
+ static void delete_program_cb(struct hash_entry *entry)
+ {
+    glDeleteProgram(pointer_to_uintptr(entry->data));
+@@ -919,6 +1106,14 @@ static void delete_program_cb(struct hash_entry *entry)
+ void vrend_blitter_fini(void)
+ {
+    vrend_blit_ctx.initialised = false;
++   for (unsigned i = 0; i < ARRAY_SIZE(vrend_blit_ctx.yuv_programs); i++) {
++      if (vrend_blit_ctx.yuv_programs[i])
++         glDeleteProgram(vrend_blit_ctx.yuv_programs[i]);
++   }
++   if (vrend_blit_ctx.yuv_vs)
++      glDeleteShader(vrend_blit_ctx.yuv_vs);
++   if (vrend_blit_ctx.yuv_sampler)
++      glDeleteSamplers(1, &vrend_blit_ctx.yuv_sampler);
+    if (vrend_blit_ctx.blit_programs)
+       _mesa_hash_table_u64_destroy(vrend_blit_ctx.blit_programs, delete_program_cb);
+    vrend_clicbs->destroy_gl_context(vrend_blit_ctx.gl_context);
+diff --git a/src/vrend/vrend_blitter.h b/src/vrend/vrend_blitter.h
+index 91e24352f6d569f84c92ebe11e87de187f3731a3..67939c7dd35b8410ec418045e248e56bdbfb3ff3 100644
+--- a/src/vrend/vrend_blitter.h
++++ b/src/vrend/vrend_blitter.h
+@@ -188,4 +188,26 @@ void vrend_renderer_blit_gl(ASSERTED struct vrend_context *ctx,
+                             const struct vrend_blit_info *info);
+ void vrend_blitter_fini(void);
+ 
++/* How a plane of a YUV picture packed into an R8 image is read out of it.
++ * geom is the image's width in texels, the picture's luma height, and for a
++ * planar chroma plane the byte offset of the plane and the bytes of one of its
++ * rows. */
++enum vrend_yuv_extract {
++   VREND_YUV_EXTRACT_LUMA,    /* the rows of the image as they are */
++   VREND_YUV_EXTRACT_PAIRS,   /* interleaved chroma pairs below the luma rows */
++   VREND_YUV_EXTRACT_PLANAR,  /* a chroma plane of half-width rows */
++   VREND_YUV_EXTRACT_COUNT
++};
++
++/* Redraw rows [first_row, end_row) of the plane texture dst from the R8 image
++ * src, in the blitter's own context. Returns false, having drawn nothing,
++ * when the host cannot, and true when the caller must make its own context
++ * current again with vrend_sync_make_current(). */
++bool vrend_blitter_extract_yuv_plane(struct vrend_resource *src,
++                                     struct vrend_resource *dst,
++                                     enum vrend_yuv_extract mode,
++                                     const int32_t geom[4],
++                                     uint32_t first_row,
++                                     uint32_t end_row);
++
+ #endif
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index ef0e44ed939753a4cbf31153d1d77505cae85615..3423fe7f586d39713e3b91fde8df1d5672bc2247 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -923,6 +923,14 @@ static void vrend_apply_sampler_state(struct vrend_sub_context *sub_ctx,
+                                       struct vrend_sampler_view *tview);
+ static void vrend_object_bind_dsa_to_sub_context(struct vrend_sub_context *sub_ctx,
+                                                  uint32_t handle);
++static struct vrend_resource *
++vrend_packed_yuv_plane(struct vrend_context *ctx, struct vrend_resource *res,
++                       uint32_t plane);
++static bool vrend_packed_yuv_need_image(struct vrend_context *ctx,
++                                        struct vrend_resource *res,
++                                        const char *use);
++static int vrend_packed_yuv_alloc_name(struct vrend_resource *gr);
++static bool vrend_packed_yuv_make_planes(struct vrend_packed_yuv *yuv);
+ static GLenum tgsitargettogltarget(const enum pipe_texture_target target, int nr_samples);
+ 
+ void vrend_update_stencil_state(struct vrend_sub_context *sub_ctx);
+@@ -2398,6 +2406,9 @@ int vrend_create_surface(struct vrend_context *ctx,
+    struct vrend_surface *surf;
+    uint32_t ret_handle;
+ 
++   if (!vrend_packed_yuv_need_image(ctx, res, "a surface"))
++      return ENOMEM;
++
+    surf = CALLOC_STRUCT(vrend_surface);
+    if (!surf)
+       return ENOMEM;
+@@ -2820,10 +2831,35 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
+        * layers that do not exist would fail the view and the command buffer
+        * with it.
+        */
+-      if (view->u.tex.first_layer > view->u.tex.last_layer &&
++      const bool plane_number = view->u.tex.first_layer > view->u.tex.last_layer;
++
++      if (plane_number &&
+           !(val0 < ARRAY_SIZE(res->aux_plane_egl_image) &&
+             res->aux_plane_egl_image[val0]))
+          view->u.tex.first_layer = view->u.tex.last_layer = 0;
++
++      /* A picture packed into one R8 image is sampled through the texture
++       * the host keeps for the plane the view names: the image itself holds
++       * every plane as rows of one luma plane. */
++      if (res->packed_yuv) {
++         struct vrend_resource *plane =
++            vrend_packed_yuv_plane(ctx, res, plane_number ? val0 : 0);
++
++         if (plane) {
++            vrend_resource_reference(&view->texture, plane);
++            view->gl_id = plane->gl_id;
++            view->u.tex.first_layer = view->u.tex.last_layer = 0;
++         } else if (!vrend_packed_yuv_need_image(ctx, res,
++                                                 "a view of a plane it has not")) {
++            /* A plane the image does not have reads its whole R8 image,
++             * which a planes-only image has to get back first. */
++            vrend_resource_reference(&view->texture, NULL);
++            FREE(view);
++            return ENOMEM;
++         } else {
++            view->gl_id = res->gl_id;
++         }
++      }
+    }
+ 
+    view->srgb_decode = GL_DECODE_EXT;
+@@ -3956,6 +3992,11 @@ int vrend_set_single_image_view(struct vrend_context *ctx,
+          return EINVAL;
+       }
+ 
++      if (!vrend_packed_yuv_need_image(ctx, res, "a shader image")) {
++         vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, handle);
++         return ENOMEM;
++      }
++
+       if (has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE)) {
+          uint16_t first_layer = layers_or_offset & 0xffff;
+          uint16_t last_layer = (layers_or_offset >> 16) & 0xffff;
+@@ -5020,6 +5061,9 @@ int vrend_clear_texture(struct vrend_context* ctx,
+ {
+    GLenum format, type;
+ 
++   if (!vrend_packed_yuv_need_image(ctx, res, "a clear"))
++      return ENOMEM;
++
+    enum virgl_formats fmt = res->base.format;
+    format = tex_conv_table[fmt].glformat;
+    type = tex_conv_table[fmt].gltype;
+@@ -8613,6 +8657,67 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+    return grctx;
+ }
+ 
++/* The layout of the picture a packed YUV resource holds, from the arguments
++ * that create it. The image is as wide as a luma row and as tall as the luma
++ * rows and the chroma rows together, which is what fixes the picture's
++ * height; the width in pixels comes with the flags because a luma row may be
++ * padded. Anything that does not describe one picture is refused. */
++static int vrend_packed_yuv_describe(const struct vrend_renderer_resource_create_args *args,
++                                     struct vrend_packed_yuv *yuv,
++                                     char errmsg[256])
++{
++   const uint32_t layouts = VIRGL_RESOURCE_FLAG_YUV_BIPLANAR |
++                            VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR;
++   const uint32_t layout = args->flags & layouts;
++   const uint32_t width = args->flags >> VIRGL_RESOURCE_YUV_WIDTH_SHIFT;
++   const uint32_t stride = args->width;
++   const uint32_t rows = args->height;
++   const uint32_t height = (2 * rows) / 3;
++   const uint32_t chroma_rows = (height + 1) / 2;
++   const uint32_t chroma_width = (width + 1) / 2;
++
++   if (layout == layouts) {
++      snprintf(errmsg, 256, "A packed YUV image has one layout, not both");
++      return -1;
++   }
++
++   if (args->target != PIPE_TEXTURE_2D || args->format != VIRGL_FORMAT_R8_UNORM ||
++       args->depth > 1 || args->array_size > 1 || args->last_level > 0 ||
++       args->nr_samples > 1) {
++      snprintf(errmsg, 256, "A packed YUV image is a single 2D R8 texture");
++      return -1;
++   }
++
++   if (args->flags & 0xffffu & ~layouts) {
++      snprintf(errmsg, 256, "Resource flags 0x%x do not go with a packed YUV image",
++               args->flags);
++      return -1;
++   }
++
++   if (!width || width > stride || !height || height + chroma_rows != rows) {
++      snprintf(errmsg, 256, "A packed YUV image of %ux%u does not hold a %u pixel wide picture",
++               stride, rows, width);
++      return -1;
++   }
++
++   if (layout == VIRGL_RESOURCE_FLAG_YUV_BIPLANAR ? stride < 2 * chroma_width
++                                                  : (stride % 2 || stride / 2 < chroma_width)) {
++      snprintf(errmsg, 256, "A %u byte luma row cannot hold the chroma rows of a %u pixel wide picture",
++               stride, width);
++      return -1;
++   }
++
++   if (yuv) {
++      yuv->biplanar = layout == VIRGL_RESOURCE_FLAG_YUV_BIPLANAR;
++      yuv->width = width;
++      yuv->height = height;
++      yuv->stride = stride;
++      yuv->chroma_rows = chroma_rows;
++      yuv->num_planes = yuv->biplanar ? 2 : 3;
++   }
++   return 0;
++}
++
+ static int check_resource_valid(const struct vrend_renderer_resource_create_args *args,
+                                 char errmsg[256])
+ {
+@@ -8673,11 +8778,22 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
+    if (args->flags != 0) {
+       uint32_t supported_mask = VIRGL_RESOURCE_Y_0_TOP | VIRGL_RESOURCE_FLAG_MAP_PERSISTENT
+                                 | VIRGL_RESOURCE_FLAG_MAP_COHERENT;
++      const uint32_t yuv_layouts = VIRGL_RESOURCE_FLAG_YUV_BIPLANAR |
++                                   VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR;
++
++      /* The picture's width rides in the high half of the flags, and only
++       * with a layout that says what the image is. */
++      if (args->flags & yuv_layouts)
++         supported_mask |= yuv_layouts | (0xffffu << VIRGL_RESOURCE_YUV_WIDTH_SHIFT);
+ 
+       if (args->flags & ~supported_mask) {
+          snprintf(errmsg, 256, "Resource flags 0x%x not supported", args->flags);
+          return -1;
+       }
++
++      if ((args->flags & yuv_layouts) &&
++          vrend_packed_yuv_describe(args, NULL, errmsg))
++         return -1;
+    }
+ 
+    if (args->flags & VIRGL_RESOURCE_Y_0_TOP) {
+@@ -9518,8 +9634,31 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    if (!gr)
+       return NULL;
+ 
++   if (args->flags & (VIRGL_RESOURCE_FLAG_YUV_BIPLANAR |
++                      VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR)) {
++      char error_string[256];
++
++      gr->packed_yuv = CALLOC_STRUCT(vrend_packed_yuv);
++      if (!gr->packed_yuv || vrend_packed_yuv_describe(args, gr->packed_yuv,
++                                                       error_string)) {
++         FREE(gr->packed_yuv);
++         FREE(gr);
++         return NULL;
++      }
++   }
++
++   /* The pixels of a biplanar picture live in its plane textures. */
++   if (gr->packed_yuv && gr->packed_yuv->biplanar && !image_oes)
++      gr->packed_yuv->planes_only = true;
++
+    if (args->target == PIPE_BUFFER) {
+       ret = vrend_resource_alloc_buffer(gr, args->flags);
++   } else if (gr->packed_yuv && gr->packed_yuv->planes_only) {
++      ret = vrend_packed_yuv_alloc_name(gr);
++      if (!ret && !vrend_packed_yuv_make_planes(gr->packed_yuv)) {
++         glDeleteTextures(1, &gr->gl_id);
++         ret = ENOMEM;
++      }
+    } else {
+       const enum virgl_formats format = gr->base.format;
+       ret = vrend_resource_alloc_texture(gr, format, image_oes);
+@@ -9528,6 +9667,7 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    }
+ 
+    if (ret) {
++      FREE(gr->packed_yuv);
+       FREE(gr);
+       return NULL;
+    }
+@@ -9535,6 +9675,124 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    return &gr->base;
+ }
+ 
++/* The R8 texture of a planes-only packed YUV image is the 1x1 texture that
++ * gives the image a name; the planes hold its pixels. */
++static int vrend_packed_yuv_alloc_name(struct vrend_resource *gr)
++{
++   const uint32_t width0 = gr->base.width0;
++   const uint32_t height0 = gr->base.height0;
++   int ret;
++
++   gr->base.width0 = gr->base.height0 = 1;
++   ret = vrend_resource_alloc_texture(gr, gr->base.format, NULL);
++   gr->base.width0 = width0;
++   gr->base.height0 = height0;
++   return ret;
++}
++
++/* Make the textures a packed YUV image is sampled through: one per plane,
++ * each the size of the plane it holds. NULL when one cannot be made. */
++static bool vrend_packed_yuv_make_planes(struct vrend_packed_yuv *yuv)
++{
++   const uint32_t chroma_width = (yuv->width + 1) / 2;
++
++   for (uint32_t plane = 0; plane < yuv->num_planes; plane++) {
++      const struct vrend_renderer_resource_create_args args = {
++         .target = PIPE_TEXTURE_2D,
++         .format = plane == 1 && yuv->biplanar ? VIRGL_FORMAT_R8G8_UNORM
++                                               : VIRGL_FORMAT_R8_UNORM,
++         .bind = VIRGL_BIND_SAMPLER_VIEW | VIRGL_BIND_RENDER_TARGET,
++         .width = plane ? chroma_width : yuv->width,
++         .height = plane ? yuv->chroma_rows : yuv->height,
++         .depth = 1,
++         .array_size = 1,
++      };
++
++      yuv->plane[plane] = (struct vrend_resource *)
++         vrend_renderer_resource_create(&args, NULL);
++      if (!yuv->plane[plane]) {
++         while (plane--)
++            vrend_resource_reference(&yuv->plane[plane], NULL);
++         return false;
++      }
++   }
++   return true;
++}
++
++/* Redraw the rows of the plane textures that image rows [first, end) of a
++ * packed YUV image feed, from the image. Only the rows the bytes of those
++ * image rows fall in: a luma row is an image row, a chroma row of a
++ * biplanar image is the image row after the luma rows, and a chroma row of
++ * a triplanar image is half an image row, so two of them share one. */
++static void vrend_packed_yuv_refresh(struct vrend_context *ctx,
++                                     struct vrend_resource *res,
++                                     uint32_t first, uint32_t end)
++{
++   struct vrend_packed_yuv *yuv = res->packed_yuv;
++   bool drawn = false;
++
++   if (!yuv->plane[0])
++      return;
++   end = MIN2(end, res->base.height0);
++
++   for (uint32_t plane = 0; plane < yuv->num_planes; plane++) {
++      int32_t geom[4] = { yuv->stride, yuv->height, 0, 0 };
++      enum vrend_yuv_extract mode;
++      uint32_t from, to;
++
++      if (plane == 0) {
++         mode = VREND_YUV_EXTRACT_LUMA;
++         from = first;
++         to = MIN2(end, yuv->height);
++      } else if (yuv->biplanar) {
++         mode = VREND_YUV_EXTRACT_PAIRS;
++         from = MAX2(first, yuv->height) - yuv->height;
++         to = end > yuv->height ? end - yuv->height : 0;
++      } else {
++         const uint64_t row = yuv->stride / 2;
++         const uint64_t base = (uint64_t)yuv->stride * yuv->height +
++                               (plane - 1) * row * yuv->chroma_rows;
++         const uint64_t top = base + row * yuv->chroma_rows;
++         const uint64_t low = (uint64_t)first * yuv->stride;
++         const uint64_t high = (uint64_t)end * yuv->stride;
++
++         mode = VREND_YUV_EXTRACT_PLANAR;
++         if (high <= base || low >= top)
++            continue;
++         from = (MAX2(low, base) - base) / row;
++         to = (MIN2(high, top) - base + row - 1) / row;
++         geom[2] = base;
++         geom[3] = row;
++      }
++
++      if (from < to)
++         drawn |= vrend_blitter_extract_yuv_plane(res, yuv->plane[plane], mode,
++                                                  geom, from, to);
++   }
++
++   if (drawn)
++      vrend_sync_make_current(ctx->sub->gl_context);
++}
++
++/* The texture a view of plane `plane` of a packed YUV image reads, made along
++ * with its siblings from the image as it is now. */
++static struct vrend_resource *
++vrend_packed_yuv_plane(struct vrend_context *ctx, struct vrend_resource *res,
++                       uint32_t plane)
++{
++   struct vrend_packed_yuv *yuv = res->packed_yuv;
++
++   if (plane >= yuv->num_planes)
++      return NULL;
++
++   if (!yuv->plane[0]) {
++      if (!vrend_packed_yuv_make_planes(yuv))
++         return NULL;
++      vrend_packed_yuv_refresh(ctx, res, 0, res->base.height0);
++   }
++   return yuv->plane[plane];
++}
++
+ /* Whether an image of width x height texels, blocksize bytes each, whose rows
+  * start stride bytes apart at offset, lies wholly inside a mapping of size
+  * bytes. The alias and the refresh both read every row in full - a driver
+@@ -9839,6 +10097,11 @@ void vrend_resource_sync_shm_import(struct vrend_resource *res)
+ 
+ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ {
++   if (res->packed_yuv) {
++      for (unsigned i = 0; i < ARRAY_SIZE(res->packed_yuv->plane); i++)
++         vrend_resource_reference(&res->packed_yuv->plane[i], NULL);
++      FREE(res->packed_yuv);
++   }
+    if (res->shm_import_pbo)
+       glDeleteBuffers(1, &res->shm_import_pbo);
+ #ifdef ENABLE_METAL
+@@ -10279,18 +10542,13 @@ static void vrend_collapse_data_r16g16b16x16(uint64_t size, void *data) {
+    }
+ }
+ 
+-static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+-                                             struct vrend_resource *res,
+-                                             const struct iovec *iov, int num_iovs,
+-                                             const struct vrend_transfer_info *info)
++static int vrend_transfer_write_storage(struct vrend_context *ctx,
++                                        struct vrend_resource *res,
++                                        const struct iovec *iov, int num_iovs,
++                                        const struct vrend_transfer_info *info)
+ {
+    void *data;
+ 
+-   vrend_resource_gl_write(res, vrend_write_is_whole(res, info->level,
+-                                                     info->box->x, info->box->y,
+-                                                     info->box->width,
+-                                                     info->box->height));
+-
+    if ((is_only_bit(res->storage_bits, VREND_STORAGE_GUEST_MEMORY) ||
+        has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) && res->iov) {
+       return virgl_copy_iovec(iov, num_iovs, info->offset,
+@@ -10587,6 +10845,231 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+    return 0;
+ }
+ 
++static int vrend_renderer_transfer_send_iov(struct vrend_context *ctx,
++                                            struct vrend_resource *res,
++                                            const struct iovec *iov, int num_iovs,
++                                            const struct vrend_transfer_info *info);
++
++/* One part of a transfer of a planes-only packed YUV image, done as a transfer
++ * of the plane texture it falls in. `box` is in texels of the plane, `offset`
++ * is where the guest's bytes of its first row start, and `stride` is the
++ * distance between the guest's rows. */
++static int vrend_packed_yuv_move(struct vrend_context *ctx,
++                                 struct vrend_resource *plane,
++                                 const struct iovec *iov, int num_iovs,
++                                 const struct vrend_transfer_info *info,
++                                 const struct pipe_box *box,
++                                 uint64_t offset, uint32_t stride, bool write)
++{
++   struct pipe_box part_box = *box;
++   struct vrend_transfer_info part = *info;
++
++   part.level = 0;
++   part.box = &part_box;
++   part.stride = stride;
++   part.layer_stride = 0;
++   part.offset = offset;
++   return write ? vrend_transfer_write_storage(ctx, plane, iov, num_iovs, &part)
++                : vrend_renderer_transfer_send_iov(ctx, plane, iov, num_iovs, &part);
++}
++
++/* The chroma bytes [x0, x1) of the image rows [first, end), for a transfer
++ * that cannot go to the chroma plane as it is: a box that cuts a pair of
++ * bytes (the texel of the plane) in two, or guest rows that are not a whole
++ * number of texels apart. The whole pairs the bytes touch go through a buffer
++ * of their own, a write keeps the half of a cut pair the box does not carry,
++ * and a read leaves the guest's bytes outside the box alone. */
++static int vrend_packed_yuv_move_pairs(struct vrend_context *ctx,
++                                       const struct vrend_packed_yuv *yuv,
++                                       const struct iovec *iov, int num_iovs,
++                                       const struct vrend_transfer_info *info,
++                                       uint32_t first, uint32_t end,
++                                       uint32_t x0, uint32_t x1,
++                                       uint32_t stride, bool write)
++{
++   const uint32_t p0 = x0 / 2, p1 = (x1 + 1) / 2;
++   const uint32_t rows = end - first;
++   const size_t row_bytes = (size_t)(p1 - p0) * 2;
++   const size_t head = x0 - 2 * p0;
++   const size_t count = x1 - x0;
++   const bool whole = !head && !(x1 & 1);
++   const struct pipe_box pairs = {
++      .x = p0, .y = first - yuv->height,
++      .width = p1 - p0, .height = rows, .depth = 1,
++   };
++   struct iovec temp = { .iov_len = row_bytes * rows };
++   int ret = 0;
++
++   temp.iov_base = malloc(temp.iov_len);
++   if (!temp.iov_base)
++      return ENOMEM;
++
++   if (!write || !whole)
++      ret = vrend_packed_yuv_move(ctx, yuv->plane[1], &temp, 1, info, &pairs,
++                                  0, row_bytes, false);
++
++   for (uint32_t row = 0; row < rows && !ret; row++) {
++      const uint64_t guest = info->offset +
++                             (uint64_t)(first - (uint32_t)info->box->y + row) * stride;
++      char *bytes = (char *)temp.iov_base + row * row_bytes + head;
++
++      if (write)
++         virgl_read_from_iovec(iov, num_iovs, guest, bytes, count);
++      else
++         virgl_write_to_iovec(iov, num_iovs, guest, bytes, count);
++   }
++
++   if (write && !ret)
++      ret = vrend_packed_yuv_move(ctx, yuv->plane[1], &temp, 1, info, &pairs,
++                                  0, row_bytes, true);
++   free(temp.iov_base);
++   return ret;
++}
++
++/* A transfer of a planes-only packed YUV image goes to the planes its rows
++ * fall in: the box's luma rows to the luma texture and its chroma rows to the
++ * chroma texture. The bytes of a luma row past the picture's width and of a
++ * chroma row past its last pair are padding, which no plane keeps: a write
++ * drops them and a read leaves the guest's own bytes there. */
++static int vrend_packed_yuv_transfer(struct vrend_context *ctx,
++                                     struct vrend_resource *res,
++                                     const struct iovec *iov, int num_iovs,
++                                     const struct vrend_transfer_info *info,
++                                     bool write)
++{
++   const struct vrend_packed_yuv *yuv = res->packed_yuv;
++   const struct pipe_box *box = info->box;
++   const uint32_t stride = info->stride ? info->stride : yuv->stride;
++   const uint32_t pair_bytes = 2 * ((yuv->width + 1) / 2);
++   int ret = 0;
++
++   if (info->level || box->z || box->depth != 1 ||
++       box->x < 0 || box->y < 0 || box->width < 0 || box->height < 0)
++      return EINVAL;
++   if (!box->width || !box->height)
++      return 0;
++
++   const uint32_t x0 = box->x, y0 = box->y;
++   const uint64_t x1 = (uint64_t)x0 + box->width;
++   const uint64_t y1 = (uint64_t)y0 + box->height;
++
++   if (y0 < yuv->height && x0 < yuv->width) {
++      const struct pipe_box luma = {
++         .x = x0, .y = y0,
++         .width = (uint32_t)MIN2(x1, (uint64_t)yuv->width) - x0,
++         .height = (uint32_t)MIN2(y1, (uint64_t)yuv->height) - y0,
++         .depth = 1,
++      };
++
++      ret = vrend_packed_yuv_move(ctx, yuv->plane[0], iov, num_iovs, info,
++                                  &luma, info->offset, stride, write);
++   }
++
++   if (!ret && y1 > yuv->height && x0 < pair_bytes) {
++      const uint32_t first = MAX2(y0, yuv->height);
++      const uint32_t x_end = (uint32_t)MIN2(x1, (uint64_t)pair_bytes);
++
++      if (x0 % 2 == 0 && x_end % 2 == 0 && stride % 2 == 0) {
++         const struct pipe_box chroma = {
++            .x = x0 / 2, .y = first - yuv->height,
++            .width = (x_end - x0) / 2, .height = (uint32_t)y1 - first,
++            .depth = 1,
++         };
++
++         ret = vrend_packed_yuv_move(ctx, yuv->plane[1], iov, num_iovs, info,
++                                     &chroma,
++                                     info->offset + (uint64_t)(first - y0) * stride,
++                                     stride, write);
++      } else {
++         ret = vrend_packed_yuv_move_pairs(ctx, yuv, iov, num_iovs, info,
++                                           first, (uint32_t)y1, x0, x_end,
++                                           stride, write);
++      }
++   }
++   return ret;
++}
++
++/* Give a planes-only packed YUV image the R8 storage of today's mode back,
++ * filled from its planes, because something other than a transfer is about to
++ * use it: a surface, a copy, a blit, a shader image, a clear, or a view of a
++ * plane it does not have. Nothing in playback or in the CTS does; this is
++ * what keeps such a use correct anyway. The padding bytes of the rows, which
++ * the planes do not keep, come back as zeros. */
++static bool vrend_packed_yuv_materialize(struct vrend_context *ctx,
++                                         struct vrend_resource *res,
++                                         const char *use)
++{
++   struct vrend_packed_yuv *yuv = res->packed_yuv;
++   struct pipe_box box = {
++      .width = res->base.width0, .height = res->base.height0, .depth = 1,
++   };
++   const struct vrend_transfer_info info = {
++      .stride = yuv->stride, .box = &box,
++   };
++   const GLuint named = res->gl_id;
++   struct iovec image = { .iov_len = (size_t)yuv->stride * res->base.height0 };
++   bool done = false;
++
++   virgl_warn("A packed YUV image used by %s gets its R8 storage back\n", use);
++
++   image.iov_base = calloc(1, image.iov_len);
++   if (!image.iov_base)
++      return false;
++
++   if (vrend_packed_yuv_transfer(ctx, res, &image, 1, &info, false) == 0) {
++      res->gl_id = 0;
++      if (vrend_resource_alloc_texture(res, res->base.format, NULL) == 0) {
++         if (vrend_transfer_write_storage(ctx, res, &image, 1, &info) == 0) {
++            glDeleteTextures(1, &named);
++            yuv->planes_only = false;
++            done = true;
++         } else {
++            glDeleteTextures(1, &res->gl_id);
++            res->gl_id = named;
++         }
++      } else {
++         if (res->gl_id)
++            glDeleteTextures(1, &res->gl_id);
++         res->gl_id = named;
++      }
++   }
++   free(image.iov_base);
++   return done;
++}
++
++/* Whether `res` has the R8 storage a use of the whole image needs: always for
++ * anything but a planes-only packed YUV image, which gets it back first. */
++static bool vrend_packed_yuv_need_image(struct vrend_context *ctx,
++                                        struct vrend_resource *res,
++                                        const char *use)
++{
++   if (likely(!res->packed_yuv || !res->packed_yuv->planes_only))
++      return true;
++   return vrend_packed_yuv_materialize(ctx, res, use);
++}
++
++static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
++                                             struct vrend_resource *res,
++                                             const struct iovec *iov, int num_iovs,
++                                             const struct vrend_transfer_info *info)
++{
++   if (unlikely(res->packed_yuv) && res->packed_yuv->planes_only)
++      return vrend_packed_yuv_transfer(ctx, res, iov, num_iovs, info, true);
++
++   vrend_resource_gl_write(res, vrend_write_is_whole(res, info->level,
++                                                     info->box->x, info->box->y,
++                                                     info->box->width,
++                                                     info->box->height));
++   const int ret = vrend_transfer_write_storage(ctx, res, iov, num_iovs, info);
++
++   /* The textures a packed YUV image is sampled through follow the bytes the
++    * guest wrote, which are the rows of the box. */
++   if (unlikely(res->packed_yuv) && !ret && info->level == 0)
++      vrend_packed_yuv_refresh(ctx, res, info->box->y,
++                               info->box->y + info->box->height);
++   return ret;
++}
++
+ static uint32_t vrend_get_texture_depth(struct vrend_resource *res, uint32_t level)
+ {
+    uint32_t depth = 1;
+@@ -10991,6 +11474,9 @@ static int vrend_renderer_transfer_send_iov(struct vrend_context *ctx,
+                                             const struct iovec *iov, int num_iovs,
+                                             const struct vrend_transfer_info *info)
+ {
++   if (unlikely(res->packed_yuv) && res->packed_yuv->planes_only)
++      return vrend_packed_yuv_transfer(ctx, res, iov, num_iovs, info, false);
++
+    /* a readback is one more GL read of an imported or exported texture */
+    vrend_resource_sync_shm_import(res);
+ 
+@@ -11755,6 +12241,15 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
+       return;
+    }
+ 
++   if (!vrend_packed_yuv_need_image(ctx, src_res, "a copy source")) {
++      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, src_handle);
++      return;
++   }
++   if (!vrend_packed_yuv_need_image(ctx, dst_res, "a copy destination")) {
++      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
++      return;
++   }
++
+    vrend_resource_sync_shm_import(src_res);
+    vrend_resource_gl_write(dst_res, vrend_write_is_whole(dst_res, dst_level,
+                                                          dstx, dsty,
+@@ -12285,6 +12780,15 @@ void vrend_renderer_blit(struct vrend_context *ctx,
+    if (ctx->in_error)
+       return;
+ 
++   if (!vrend_packed_yuv_need_image(ctx, src_res, "a blit source")) {
++      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, src_handle);
++      return;
++   }
++   if (!vrend_packed_yuv_need_image(ctx, dst_res, "a blit destination")) {
++      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
++      return;
++   }
++
+    if (unlikely(info->src.format >= VIRGL_FORMAT_MAX ||
+                 tex_conv_table[info->src.format].format == VIRGL_FORMAT_NONE)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_FORMAT, info->src.format);
+@@ -13958,6 +14462,13 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+ #endif
+    if (vrend_has_venus_interop())
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_QUERY_FORMAT_MODIFIER;
++
++   /* The planes of a packed YUV image are textures the host draws into. */
++   if (vrend_format_can_render(VIRGL_FORMAT_R8_UNORM) &&
++       vrend_format_can_render(VIRGL_FORMAT_R8G8_UNORM) &&
++       vrend_format_can_sample(VIRGL_FORMAT_R8_UNORM) &&
++       vrend_format_can_sample(VIRGL_FORMAT_R8G8_UNORM))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PACKED_YUV;
+ }
+ 
+ void vrend_renderer_fill_caps(uint32_t set, uint32_t version,
+@@ -14251,6 +14762,9 @@ vrend_renderer_resource_metal_texture(struct pipe_resource *pres, void **texture
+    if (!vrend_hw_switch_context(vrend_state.ctx0, true))
+       return EINVAL;
+ 
++   if (!vrend_packed_yuv_need_image(vrend_state.ctx0, res, "a presenter"))
++      return EINVAL;
++
+    /* A texture that shadows a shared-memory segment is refreshed from the
+     * segment before every GL read, because another context may have written
+     * the segment since (see vrend_resource_sync_shm_import()); a presenter
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index e8cc02e843c9f056e09d3dadaba1d7f4131d4d1a..5589b218a457645d6d341f879ae49f393bd9aabd 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -151,6 +151,32 @@ struct vrend_resource {
+    uint32_t blob_id;
+    struct list_head head;
+    bool is_imported;
++
++   /* Set for an R8 image that holds a YUV picture laid out the way a guest
++    * allocator without host support lays one out (see
++    * VIRGL_RESOURCE_FLAG_YUV_BIPLANAR). NULL for every other resource. */
++   struct vrend_packed_yuv *packed_yuv;
++};
++
++/* The layout of a picture packed into an R8 image, and the texture the host
++ * keeps for each of its planes, which a sampler view of the image selects by
++ * the plane number the guest sends. A triplanar image makes the textures when
++ * the first view is, and a write to the image refreshes the rows of every
++ * plane it touched. A biplanar image keeps its pixels only in the plane
++ * textures, which exist from its creation. */
++struct vrend_packed_yuv {
++   bool biplanar;          /* interleaved chroma pairs, else two chroma planes */
++   /* The plane textures are the image's only storage: its R8 texture is 1x1,
++    * a transfer writes or reads the planes, and nothing is drawn from the
++    * image. Any other use of the image first gives it its full R8 storage
++    * back, filled from the planes, and clears this. */
++   bool planes_only;
++   uint32_t width;         /* the picture's width in pixels */
++   uint32_t height;        /* and height: the luma rows of the image */
++   uint32_t stride;        /* bytes of a luma row, the image's width */
++   uint32_t chroma_rows;   /* ceil(height / 2) */
++   uint32_t num_planes;    /* 2 for biplanar, else 3 */
++   struct vrend_resource *plane[3];
+ };
+ 
+ /* Bring an imported shared-memory blob's texture up to date with the memory

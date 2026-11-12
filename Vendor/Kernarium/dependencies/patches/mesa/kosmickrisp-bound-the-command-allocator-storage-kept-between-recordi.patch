@@ -1,0 +1,1542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 01:33:31 +0900
+Subject: [PATCH] kosmickrisp: bound the command allocator storage kept between
+ recordings
+
+A Metal 4 command allocator keeps its storage at its high-water mark when
+it is reset, and releasing it is the only way to return that storage. The
+device cached up to 24 reset allocators with no limit on their size, and
+every command buffer took an allocator for each of its three lanes when it
+was created or begun and kept them across recordings, whether or not it
+recorded anything. A GL driver begins spare command buffers it seldom
+uses, so 150 s into a Plasma desktop session on a Mac, 255 allocators
+held 3.6 GiB of command storage, the largest 1.1 GiB, while no recording
+needed it.
+
+A command buffer now takes an allocator for a lane only when that lane
+opens a Metal command buffer. Every submission, not only a one-time one,
+takes the allocators it recorded into along with its Metal command buffers
+and hands them to the device cache when Metal reports it complete, and a
+reset hands the cache only allocators that were never submitted. The cache
+recycles only allocators of at most 16 MiB, since a recording that takes a
+grown one keeps all of that storage however little it records. It keeps at
+most 64 MiB in total and releases every other allocator.
+
+A command buffer in the initial state therefore holds no allocator, so the
+driver's vkResetCommandBuffer, which reset initial buffers too so that a
+release reached their allocators, goes, and the common entrypoint applies.
+
+Handing allocators to a shared cache makes one case unsafe that was merely
+wrong before. Vulkan lets a SIMULTANEOUS_USE command buffer be resubmitted
+while its last submission is still running, and Metal cannot run a
+recording twice, so the driver records the buffer again. That re-record
+frees the uploads, large BOs and descriptor buffers the running submission
+reads, and it used to reset the lane's allocator under it; with the cache,
+another command buffer could also take that allocator and record into it.
+The command buffer now keeps a reference to its last submission, and a
+re-record waits for Metal to report that submission before it frees
+anything. A queue that stops answering loses the device after the bound
+the timeline and query waits give it, because a submit on the caller's
+thread would otherwise wait with nothing else to notice. The new
+kosmickrisp_command_resubmit test holds a first submission on the GPU
+behind a timeline wait and requires the resubmission to wait for it.
+
+With the previous commit, the same session peaks at one 257 MiB allocator
+during its first frame and then keeps 39 MiB in 9 allocators, none larger
+than 6 MiB. Without the 16 MiB recycling limit it kept 61 MiB, 41 MiB of
+it in two allocators larger than 16 MiB.
+---
+ src/kosmickrisp/bridge/mtl_command_buffer.h   |   2 +
+ src/kosmickrisp/bridge/mtl_command_buffer.m   |   9 +
+ .../bridge/stubs/mtl_command_buffer.c         |   6 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        | 121 +++---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |   7 +
+ src/kosmickrisp/vulkan/kk_device.c            |  15 +-
+ src/kosmickrisp/vulkan/kk_device.h            |  14 +
+ src/kosmickrisp/vulkan/kk_queue.c             | 177 +++++++--
+ src/kosmickrisp/vulkan/kk_queue.h             |   6 +
+ src/kosmickrisp/vulkan/meson.build            |  41 +++
+ .../tests/test_command_allocator_budget.c     | 343 ++++++++++++++++++
+ .../vulkan/tests/test_command_completion.m    |  57 ++-
+ .../vulkan/tests/test_command_pool_release.m  |   4 +-
+ .../vulkan/tests/test_command_resubmit.c      | 273 ++++++++++++++
+ 14 files changed, 941 insertions(+), 134 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_command_resubmit.c
+
+diff --git a/src/kosmickrisp/bridge/mtl_command_buffer.h b/src/kosmickrisp/bridge/mtl_command_buffer.h
+index fbb71c63f66ae1125e4a8fe7ce13941127bfbc38..db598c9506e56aaf934c1bf1747b05bef50f1a22 100644
+--- a/src/kosmickrisp/bridge/mtl_command_buffer.h
++++ b/src/kosmickrisp/bridge/mtl_command_buffer.h
+@@ -12,6 +12,8 @@
+ #include <stdint.h>
+ 
+ void mtl_command_allocator_reset(mtl_command_allocator *allocator);
++/* Bytes of command storage the allocator holds, which a reset keeps. */
++uint64_t mtl_command_allocator_allocated_size(mtl_command_allocator *allocator);
+ 
+ void mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
+                               mtl_command_allocator *allocator);
+diff --git a/src/kosmickrisp/bridge/mtl_command_buffer.m b/src/kosmickrisp/bridge/mtl_command_buffer.m
+index 334c218016d7b4a68836f27d417f2410666b84ff..0200295b5828030e9f6dac4f9445a17b69a3fd52 100644
+--- a/src/kosmickrisp/bridge/mtl_command_buffer.m
++++ b/src/kosmickrisp/bridge/mtl_command_buffer.m
+@@ -20,6 +20,15 @@
+    }
+ }
+ 
++uint64_t
++mtl_command_allocator_allocated_size(mtl_command_allocator *allocator)
++{
++   @autoreleasepool {
++      id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
++      return [alloc allocatedSize];
++   }
++}
++
+ void
+ mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
+                          mtl_command_allocator *allocator)
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_command_buffer.c b/src/kosmickrisp/bridge/stubs/mtl_command_buffer.c
+index d87a8dc077cdb06eab7902968a3aec805e9bb356..1c5ecad4c45b7daef95a04041addbf91e8dcabca 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_command_buffer.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_command_buffer.c
+@@ -11,6 +11,12 @@ mtl_command_allocator_reset(mtl_command_allocator *allocator)
+ {
+ }
+ 
++uint64_t
++mtl_command_allocator_allocated_size(mtl_command_allocator *allocator)
++{
++   return 0u;
++}
++
+ void
+ mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
+                          mtl_command_allocator *allocator)
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index bbe6df540b4edc5ace683dd9b078dd9b06fbf437..acbd04ccd58b65a9211b38907ef0e87ec8d8e255 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -102,6 +102,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    cs_flush(cmd);
+ 
+    mtl_release(cmd->argument_table);
++   kk_completed_recording_unref(cmd->last_submission);
+    kk_destroy_encoder_state(&cmd->cmp[0]);
+    kk_destroy_encoder_state(&cmd->cmp[1]);
+    kk_destroy_encoder_state(&cmd->gfx);
+@@ -130,13 +131,31 @@ kk_acquire_command_allocator(struct kk_device *dev)
+    return allocator ? allocator : mtl_new_command_allocator(dev->mtl_handle);
+ }
+ 
+-static bool
+-kk_init_encoder_state(struct kk_encoder_state *es, struct kk_device *dev)
++static void
++kk_init_encoder_state(struct kk_encoder_state *es)
+ {
+-   es->allocator = kk_acquire_command_allocator(dev);
+    es->ts_resolves = UTIL_DYNARRAY_INIT;
+    es->ts_samples = UTIL_DYNARRAY_INIT;
+-   return es->allocator != NULL;
++}
++
++/* Opens a Metal command buffer on the lane's allocator, taking one if the
++ * lane holds none. Without an allocator there is nothing to record into, so
++ * the recording fails instead. */
++static mtl_command_buffer *
++kk_open_command_buffer(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++
++   if (!es->allocator)
++      es->allocator = kk_acquire_command_allocator(dev);
++   mtl_command_buffer *cmd_buf =
++      es->allocator ? mtl_new_command_buffer(dev->mtl_handle) : NULL;
++   if (!cmd_buf) {
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return NULL;
++   }
++   mtl_begin_command_buffer(cmd_buf, es->allocator);
++   return cmd_buf;
+ }
+ 
+ static VkResult
+@@ -166,14 +185,9 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+ 
+    cmd->pre_gfx = &cmd->cmp[0];
+    cmd->post_gfx = &cmd->cmp[1];
+-   if (!kk_init_encoder_state(cmd->pre_gfx, dev))
+-      goto pre_gfx_allocator_fail;
+-
+-   if (!kk_init_encoder_state(&cmd->gfx, dev))
+-      goto gfx_allocator_fail;
+-
+-   if (!kk_init_encoder_state(cmd->post_gfx, dev))
+-      goto post_gfx_allocator_fail;
++   kk_init_encoder_state(cmd->pre_gfx);
++   kk_init_encoder_state(&cmd->gfx);
++   kk_init_encoder_state(cmd->post_gfx);
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+@@ -210,23 +224,19 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+ 
+    return VK_SUCCESS;
+ 
+-post_gfx_allocator_fail:
+-   kk_destroy_encoder_state(&cmd->gfx);
+-gfx_allocator_fail:
+-   kk_destroy_encoder_state(cmd->pre_gfx);
+-pre_gfx_allocator_fail:
+-   vk_command_buffer_finish(&cmd->vk);
+-   result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ alloc_fail:
+    vk_free(&pool->vk.alloc, cmd);
+    return result;
+ }
+ 
++/* A lane's allocator has never been submitted: every submission detaches the
++ * allocators it recorded into (see kk_queue.c), so the GPU has nothing in this
++ * storage. The cache keeps it within its budget. */
+ static void
+-kk_reset_encoder_state(struct kk_encoder_state *es)
++kk_reset_encoder_state(struct kk_device *dev, struct kk_encoder_state *es)
+ {
+-   if (es->allocator)
+-      mtl_command_allocator_reset(es->allocator);
++   kk_command_allocator_cache_give(dev->allocator_cache, es->allocator);
++   es->allocator = NULL;
+ }
+ 
+ void
+@@ -238,9 +248,9 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+    cs_flush(cmd);
+    kk_cmd_release_resources(dev, cmd);
+ 
+-   kk_reset_encoder_state(cmd->pre_gfx);
+-   kk_reset_encoder_state(&cmd->gfx);
+-   kk_reset_encoder_state(cmd->post_gfx);
++   kk_reset_encoder_state(dev, cmd->pre_gfx);
++   kk_reset_encoder_state(dev, &cmd->gfx);
++   kk_reset_encoder_state(dev, cmd->post_gfx);
+ 
+    cmd->uploader.bo = NULL;
+    cmd->uploader.offset = 0;
+@@ -253,23 +263,18 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ 
+ static void
+ kk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+-                    VkCommandBufferResetFlags flags)
++                    UNUSED VkCommandBufferResetFlags flags)
+ {
+    struct kk_cmd_buffer *cmd =
+       container_of(vk_cmd_buffer, struct kk_cmd_buffer, vk);
+ 
+    vk_command_buffer_reset(&cmd->vk);
++   /* Vulkan forbids resetting a pending command buffer, so the last
++    * submission has completed and nothing is left to wait for. */
++   kk_completed_recording_unref(cmd->last_submission);
++   cmd->last_submission = NULL;
++   /* This also hands the allocators back, whatever the flags. */
+    kk_reset_cmd_buffer_internal(cmd);
+-   if (flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) {
+-      /* Metal reset retains allocator high-water capacity. The recording has
+-       * been discarded, so release the allocators and recreate them at Begin. */
+-      struct kk_encoder_state *encoders[] = {&cmd->cmp[0], &cmd->gfx,
+-                                             &cmd->cmp[1]};
+-      for (unsigned i = 0; i < ARRAY_SIZE(encoders); i++) {
+-         mtl_release(encoders[i]->allocator);
+-         encoders[i]->allocator = NULL;
+-      }
+-   }
+    cmd->submitted = false;
+    cmd->one_time_submit = false;
+ }
+@@ -280,17 +285,6 @@ const struct vk_command_buffer_ops kk_cmd_buffer_ops = {
+    .destroy = kk_destroy_cmd_buffer,
+ };
+ 
+-VKAPI_ATTR VkResult VKAPI_CALL
+-kk_ResetCommandBuffer(VkCommandBuffer commandBuffer,
+-                      VkCommandBufferResetFlags flags)
+-{
+-   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+-
+-   /* INITIAL buffers can retain capacity from an earlier reset without release. */
+-   kk_reset_cmd_buffer(&cmd->vk, flags);
+-   return VK_SUCCESS;
+-}
+-
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+                       const VkCommandBufferBeginInfo *pBeginInfo)
+@@ -298,18 +292,6 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+ 
+    kk_reset_cmd_buffer(&cmd->vk, 0u);
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   struct kk_encoder_state *encoders[] = {&cmd->cmp[0], &cmd->gfx,
+-                                          &cmd->cmp[1]};
+-   for (unsigned i = 0; i < ARRAY_SIZE(encoders); i++) {
+-      if (!encoders[i]->allocator)
+-         encoders[i]->allocator = kk_acquire_command_allocator(dev);
+-      if (!encoders[i]->allocator) {
+-         kk_reset_cmd_buffer(&cmd->vk,
+-                             VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+-         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-      }
+-   }
+    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+    cmd->one_time_submit =
+       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+@@ -345,11 +327,8 @@ static void kk_stop_encoder(struct kk_cmd_buffer *cmd,
+ static mtl_command_buffer *
+ cs_open_main(struct kk_cmd_buffer *cmd)
+ {
+-   if (!cmd->main.cmd_buf) {
+-      struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-      cmd->main.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
+-      mtl_begin_command_buffer(cmd->main.cmd_buf, cmd->gfx.allocator);
+-   }
++   if (!cmd->main.cmd_buf)
++      cmd->main.cmd_buf = kk_open_command_buffer(cmd, &cmd->gfx);
+    return cmd->main.cmd_buf;
+ }
+ 
+@@ -404,6 +383,9 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+ 
+    cmd->main.render_follows_work = cmd->main.cmd_buf != NULL;
+    cmd->gfx.cmd_buf = cs_open_main(cmd);
++   /* The recording has already failed; its draws record nothing. */
++   if (!cmd->gfx.cmd_buf)
++      return;
+    if (layered)
+       cmd->main.queue_wait = true;
+    cmd->gfx.in_main = true;
+@@ -472,13 +454,10 @@ static void
+ kk_start_compute_encoder(struct kk_cmd_buffer *cmd,
+                          struct kk_encoder_state *es, bool in_main)
+ {
+-   if (in_main) {
+-      es->cmd_buf = cs_open_main(cmd);
+-   } else {
+-      struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-      es->cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
+-      mtl_begin_command_buffer(es->cmd_buf, es->allocator);
+-   }
++   es->cmd_buf = in_main ? cs_open_main(cmd) : kk_open_command_buffer(cmd, es);
++   /* The recording has already failed; its dispatches record nothing. */
++   if (!es->cmd_buf)
++      return;
+    es->in_main = in_main;
+    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index af62d43c89cfbd9ca95503ec6dae7ad435a3b223..5b9dc75e4ff5166029626e19b8f92bbf4e275d6c 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -336,6 +336,9 @@ struct kk_ts_sample {
+ struct kk_encoder_state {
+    /* either a mtl_compute_encoder or a mtl_render_encoder */
+    mtl_command_encoder *encoder;
++   /* Taken when this lane first opens a Metal command buffer and returned to
++    * the device cache when the recording is reset or retired. An idle command
++    * buffer therefore holds no command storage. */
+    mtl_command_allocator *allocator;
+    mtl_command_buffer *cmd_buf;
+    /* Pending timestamp resolves and the availability words they and
+@@ -438,6 +441,10 @@ struct kk_cmd_buffer {
+    /* Metal command buffers are single-shot: a resubmission must re-record
+     * by replaying the enqueued commands (see rerecord_cmd_buffer). */
+    bool submitted;
++   /* The storage the last submission of this buffer detached, which a
++    * re-record waits on until Metal has reported that submission. Null once a
++    * re-record or reset has let go of it. */
++   struct kk_completed_recording *last_submission;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 17247a46280e67677483b64f9ab04ba98ce526fa..610112f6a98e84c25f2252a6d02adcbb4cabab47 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -309,8 +309,10 @@ kk_command_allocator_cache_take(struct kk_command_allocator_cache *cache)
+    mtl_command_allocator *allocator = NULL;
+ 
+    simple_mtx_lock(&cache->mutex);
+-   if (cache->count)
++   if (cache->count) {
+       allocator = cache->entries[--cache->count];
++      cache->bytes -= cache->sizes[cache->count];
++   }
+    simple_mtx_unlock(&cache->mutex);
+ 
+    return allocator;
+@@ -326,10 +328,15 @@ kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+    /* The caller only reaches here once the GPU has finished with the storage,
+     * which is the condition Metal places on a reset. */
+    mtl_command_allocator_reset(allocator);
++   const uint64_t size = mtl_command_allocator_allocated_size(allocator);
+ 
+    simple_mtx_lock(&cache->mutex);
+-   if (cache->count < KK_COMMAND_ALLOCATOR_CACHE_MAX) {
++   if (cache->count < KK_COMMAND_ALLOCATOR_CACHE_MAX &&
++       size <= KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B &&
++       size <= KK_COMMAND_ALLOCATOR_RETAIN_MAX_B - cache->bytes) {
++      cache->sizes[cache->count] = size;
+       cache->entries[cache->count++] = allocator;
++      cache->bytes += size;
+       allocator = NULL;
+    }
+    simple_mtx_unlock(&cache->mutex);
+@@ -559,7 +566,9 @@ kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
+  * only when work is submitted, so a destroyed allocation that a submission
+  * once made resident would stay allocated until the device's next submission,
+  * which may never come. Commit the removal at once. Vulkan requires work that
+- * uses an object to finish before the object is destroyed, so this cannot take
++ * uses an object to finish before the object is destroyed, and the driver's own
++ * re-record of a resubmitted command buffer, which destroys that recording's
++ * BOs, first waits for its last submission to complete, so this cannot take
+  * residency from pending work.
+  */
+ static void
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index e726ab2ed10d6d309944ffe67f53eca7fec883cc..4be717b353bd93e44442ebd906502593cb36f6e0 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -106,14 +106,28 @@ struct kk_precompiled_cache {
+  * callback after the device is gone, and the callback must be able to return
+  * its allocators somewhere. It therefore holds no Vulkan pointers, exactly
+  * like the queue's feedback block.
++ *
++ * A reset keeps an allocator's storage at its high-water mark, so one large
++ * recording would otherwise stay charged to the process for as long as its
++ * allocators are cached, and every recording that takes one of them keeps
++ * that storage for as long as it records, however little it needs. The cache
++ * therefore recycles only allocators no larger than
++ * KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B, keeps at most
++ * KK_COMMAND_ALLOCATOR_RETAIN_MAX_B of storage, and releases every other
++ * allocator, which returns its storage to the kernel. A steady GL desktop's
++ * recordings stay near 11 MiB.
+  */
+ #define KK_COMMAND_ALLOCATOR_CACHE_MAX 24
++#define KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B (16ull << 20)
++#define KK_COMMAND_ALLOCATOR_RETAIN_MAX_B (64ull << 20)
+ 
+ struct kk_command_allocator_cache {
+    int refcount;
+    simple_mtx_t mutex;
+    unsigned count;
++   uint64_t bytes;
+    mtl_command_allocator *entries[KK_COMMAND_ALLOCATOR_CACHE_MAX];
++   uint64_t sizes[KK_COMMAND_ALLOCATOR_CACHE_MAX];
+ };
+ 
+ struct kk_command_allocator_cache *kk_command_allocator_cache_create(void);
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 7dabd36bae5bafd9b696402c716f16d6102dca9d..d119f268316d1d039e9b0b423e631c50ab168ff6 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -19,6 +19,11 @@
+ 
+ #include "vk_cmd_queue.h"
+ 
++#include "util/cnd_monotonic.h"
++#include "util/os_time.h"
++#include "util/timespec.h"
++
++#include <inttypes.h>
+ #include <stdio.h>
+ 
+ /* Drop every record Metal has already made good, so the list holds only
+@@ -518,11 +523,23 @@ out:
+    return probed;
+ }
+ 
+-/* One-time Vulkan recordings do not need their native command storage after
+- * GPU completion. This batch contains no Vulkan device or command buffer
+- * pointers, because either object can die before Metal dispatches feedback. */
++/* A submitted recording's native command storage. Metal cannot run a
++ * recording twice, so every submission detaches the storage from its Vulkan
++ * command buffer, and the storage goes back once the GPU is done with it
++ * rather than when the command buffer is next reset. This batch contains no
++ * Vulkan device or command buffer pointers, because either object can die
++ * before Metal dispatches feedback. */
+ struct kk_completed_recording {
++   /* The submitter and the completion handler each hold the storage below,
++    * because commit can dispatch feedback before it returns. */
++   int storage_refs;
++   /* Those two and the command buffer each hold the structure itself. */
+    int refcount;
++   /* Whether Metal has reported the commit, for a re-record of the command
++    * buffer to wait on. Guarded by mutex. */
++   mtx_t mutex;
++   struct u_cnd_monotonic reported;
++   bool completed;
+    struct util_dynarray command_buffers;
+    mtl_command_allocator *allocators[3];
+    mtl_command_queue *queue;
+@@ -530,10 +547,22 @@ struct kk_completed_recording {
+    struct kk_command_allocator_cache *allocator_cache;
+ };
+ 
+-static void
++void
+ kk_completed_recording_unref(struct kk_completed_recording *recording)
+ {
+-   if (!p_atomic_dec_zero(&recording->refcount))
++   if (!recording || !p_atomic_dec_zero(&recording->refcount))
++      return;
++
++   u_cnd_monotonic_destroy(&recording->reported);
++   mtx_destroy(&recording->mutex);
++   free(recording);
++}
++
++static void
++kk_completed_recording_release_storage(
++   struct kk_completed_recording *recording)
++{
++   if (!p_atomic_dec_zero(&recording->storage_refs))
+       return;
+ 
+    util_dynarray_foreach(&recording->command_buffers, mtl_command_buffer *, cb)
+@@ -546,13 +575,20 @@ kk_completed_recording_unref(struct kk_completed_recording *recording)
+                                       recording->allocators[i]);
+    kk_command_allocator_cache_unref(recording->allocator_cache);
+    mtl_release(recording->queue);
+-   free(recording);
+ }
+ 
+ static void
+ kk_completed_recording_callback(struct mtl_feedback_data *data)
+ {
+-   kk_completed_recording_unref(data->user_data);
++   struct kk_completed_recording *recording = data->user_data;
++
++   mtx_lock(&recording->mutex);
++   recording->completed = true;
++   u_cnd_monotonic_broadcast(&recording->reported);
++   mtx_unlock(&recording->mutex);
++
++   kk_completed_recording_release_storage(recording);
++   kk_completed_recording_unref(recording);
+ }
+ 
+ static struct kk_completed_recording *
+@@ -563,10 +599,23 @@ kk_detach_completed_recording(struct kk_cmd_buffer *cmd,
+    if (!recording)
+       return NULL;
+ 
++   if (mtx_init(&recording->mutex, mtx_plain) != thrd_success) {
++      free(recording);
++      return NULL;
++   }
++   if (u_cnd_monotonic_init(&recording->reported) != thrd_success) {
++      mtx_destroy(&recording->mutex);
++      free(recording);
++      return NULL;
++   }
++
+    /* Commit can dispatch feedback before returning. Keep the pointer array
+-    * alive for both the submitter and the completion callback. Retaining the
+-    * native queue keeps its feedback service alive through Vulkan teardown. */
+-   recording->refcount = 2;
++    * alive for both the submitter and the completion callback, and the
++    * structure for the command buffer as well, whose re-record waits on the
++    * report. Retaining the native queue keeps its feedback service alive
++    * through Vulkan teardown. */
++   recording->storage_refs = 2;
++   recording->refcount = 3;
+    recording->queue = mtl_retain(queue);
+    recording->allocator_cache = kk_command_allocator_cache_ref(
+       kk_cmd_buffer_device(cmd)->allocator_cache);
+@@ -584,9 +633,80 @@ kk_detach_completed_recording(struct kk_cmd_buffer *cmd,
+    return recording;
+ }
+ 
+-static void
+-rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
++/* How long a re-record waits for the queue's report before it checks
++ * whether the device was lost or the queue has stopped. */
++static const uint64_t kk_resubmit_wait_slice_ns = 100ull * 1000000ull;
++
++/* Re-recording frees what the last recording's commands read: its uploads,
++ * its large BOs and its descriptor buffers. Vulkan lets a command buffer
++ * recorded with SIMULTANEOUS_USE be resubmitted while its last submission is
++ * still running, so wait for Metal to report that submission first; any
++ * other buffer has already completed. A queue that stops answering never
++ * reports it, and a submit that runs on the caller's thread then waits with
++ * nothing else to notice, so this wait loses the device after the bound a
++ * timeline or query wait gives such a queue. */
++static VkResult
++kk_wait_for_last_submission(struct kk_queue *queue, struct kk_cmd_buffer *cmd)
+ {
++   struct kk_completed_recording *recording = cmd->last_submission;
++   if (!recording)
++      return VK_SUCCESS;
++
++   struct kk_device *dev = kk_queue_device(queue);
++   struct kk_queue_stall_clock stall = {0};
++
++   mtx_lock(&recording->mutex);
++   while (!recording->completed) {
++      struct timespec deadline;
++      timespec_from_nsec(&deadline,
++                         os_time_get_nano() + kk_resubmit_wait_slice_ns);
++      u_cnd_monotonic_timedwait(&recording->reported, &recording->mutex,
++                                &deadline);
++      if (recording->completed)
++         break;
++
++      /* The progress read takes the queue's own lock, so never hold this
++       * one across it. */
++      mtx_unlock(&recording->mutex);
++      if (vk_device_is_lost(&dev->vk))
++         return VK_ERROR_DEVICE_LOST;
++      const struct kk_queue_progress progress = kk_queue_get_progress(queue);
++      if (kk_queue_has_stopped(&progress, &stall, os_time_get_nano())) {
++         /* Say this on stderr as well as through the device, as the
++          * timeline wait does: the runtime's own report goes to the Mesa
++          * log, which this product leaves muted. */
++         fprintf(stderr,
++                 "KosmicKrisp the Metal command queue stopped making "
++                 "progress: a resubmitted command buffer waited %" PRIu64
++                 " s for its last submission while the queue answered for "
++                 "none of the %" PRIu64 " submission(s) it holds. Losing the "
++                 "device\n",
++                 KK_STOPPED_QUEUE_TIMEOUT_NS / 1000000000ull,
++                 progress.unreported);
++         return vk_device_set_lost(
++            &dev->vk,
++            "the Metal command queue stopped making progress: a resubmitted "
++            "command buffer waited %" PRIu64
++            " s for its last submission while the queue answered for none of "
++            "the %" PRIu64 " submission(s) it holds",
++            KK_STOPPED_QUEUE_TIMEOUT_NS / 1000000000ull, progress.unreported);
++      }
++      mtx_lock(&recording->mutex);
++   }
++   mtx_unlock(&recording->mutex);
++
++   kk_completed_recording_unref(recording);
++   cmd->last_submission = NULL;
++   return VK_SUCCESS;
++}
++
++static VkResult
++rerecord_cmd_buffer(struct kk_queue *queue, struct kk_cmd_buffer *cmd)
++{
++   VkResult result = kk_wait_for_last_submission(queue, cmd);
++   if (result != VK_SUCCESS)
++      return result;
++
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    kk_reset_cmd_buffer_internal(cmd);
+ 
+@@ -597,6 +717,8 @@ rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
+ 
+    /* Need to ensure the new buffers allocated at record are resident. */
+    kk_device_make_resources_resident(dev);
++
++   return VK_SUCCESS;
+ }
+ 
+ /* KK_WORKAROUND_18: everything committed after this runs only once
+@@ -668,8 +790,12 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+ 
+       /* Submitted command buffers require re-recording since Metal does not
+        * support multiple submissions. */
+-      if (cmd_buffer->submitted)
+-         rerecord_cmd_buffer(cmd_buffer);
++      if (cmd_buffer->submitted) {
++         /* A failure here has already lost the device. */
++         VkResult result = rerecord_cmd_buffer(queue, cmd_buffer);
++         if (result != VK_SUCCESS)
++            return result;
++      }
+       cmd_buffer->submitted = true;
+ 
+       mtl_command_buffer **cmds =
+@@ -703,13 +829,11 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+             parts[p].submission = kk_queue_submission_new(queue->feedback, 0u);
+             allocated = parts[p].options && parts[p].submission;
+          }
+-         struct kk_completed_recording *recording = NULL;
+-         if (allocated && cmd_buffer->one_time_submit) {
+-            recording = kk_detach_completed_recording(cmd_buffer,
+-                                                      queue->mtl_handle);
+-            allocated = recording != NULL;
+-         }
+-         if (!allocated) {
++         struct kk_completed_recording *recording =
++            allocated
++               ? kk_detach_completed_recording(cmd_buffer, queue->mtl_handle)
++               : NULL;
++         if (!recording) {
+             kk_commit_parts_free(parts, part_count);
+             /* Earlier waits or command buffers may already be queued. */
+             return vk_queue_set_lost(&queue->vk,
+@@ -730,7 +854,7 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+              * the signals ordered behind it. */
+             struct kk_queue_submission *submission = parts[p].submission;
+             submission->serial = kk_queue_reserve_serial(queue->feedback);
+-            if (recording && p + 1u == part_count)
++            if (p + 1u == part_count)
+                mtl_commit_options_add_feedback_handler(
+                   parts[p].options, kk_completed_recording_callback,
+                   recording);
+@@ -743,8 +867,13 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+          }
+          assert(start == count && w == wait_count);
+          free(parts);
+-         if (recording)
+-            kk_completed_recording_unref(recording);
++         kk_completed_recording_release_storage(recording);
++         kk_completed_recording_unref(recording);
++         /* A re-record waits on this submission. A buffer submitted before
++          * has already let go of its last one, in the re-record above or when
++          * it was begun again. */
++         assert(cmd_buffer->last_submission == NULL);
++         cmd_buffer->last_submission = recording;
+       }
+ 
+       if (cmd_buffer->drawable) {
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index ce5aa43bac0921d9001d5cf72ae2fbae3b1ec82e..dd4f1556f802147a40451c711c8df1c1c82f88b7 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -215,6 +215,12 @@ kk_queue_has_stopped(const struct kk_queue_progress *progress,
+    return now - clock->since >= KK_STOPPED_QUEUE_TIMEOUT_NS;
+ }
+ 
++/* The native storage a submission detaches from its command buffer; see
++ * kk_queue.c. The command buffer keeps a reference so that a re-record can
++ * wait for that submission, and drops it with this, which accepts NULL. */
++struct kk_completed_recording;
++void kk_completed_recording_unref(struct kk_completed_recording *recording);
++
+ VkResult kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+                        const VkDeviceQueueCreateInfo *pCreateInfo,
+                        uint32_t index_in_family);
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index b7ac08ca99af70683277d4e16e1d3e55b1f711c8..d6a12871b94c3ce125e733218a70d5ec5365c822 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1120,6 +1120,47 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true', 'MTL_SHADER_VALIDATION=1'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_command_allocator_budget',
++      executable(
++        'test_kosmickrisp_command_allocator_budget',
++        files('tests/test_command_allocator_budget.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
++    test(
++      'kosmickrisp_command_resubmit',
++      executable(
++        'test_kosmickrisp_command_resubmit',
++        files('tests/test_command_resubmit.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++          dep_thread,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_command_buffer_consolidation',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..18d4204b144c4560c03963e7698b72ec74ebf70e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+@@ -0,0 +1,343 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A Metal command allocator keeps its storage at its high-water mark when it
++ * is reset. After one large recording has completed, neither the device's
++ * allocator cache nor a reset command buffer may keep that storage beyond
++ * KK_COMMAND_ALLOCATOR_RETAIN_MAX_B, or the process stays charged for its
++ * largest recording ever. A command buffer that records nothing holds no
++ * allocator at all, so idle command buffers cannot pin the cached storage.
++ */
++
++#define VK_NO_PROTOTYPES
++#include "kosmickrisp/vulkan/kk_cmd_buffer.h"
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/bridge/mtl_command_buffer.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++#define CHECK(x)                                                               \
++   do {                                                                        \
++      if (!(x)) {                                                              \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);               \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++#define LOAD_I(name)                                                           \
++   PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name);       \
++   CHECK(name)
++#define LOAD_D(name)                                                           \
++   PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name);           \
++   CHECK(name)
++
++/* Each pass and fill costs about 0.28 MiB of allocator storage, so this
++ * recording grows its allocator well past the retained budget. */
++#define PASSES 400u
++
++static uint64_t
++gfx_allocator_bytes(VkCommandBuffer commands)
++{
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(commands);
++   return cmd->gfx.allocator
++             ? mtl_command_allocator_allocated_size(cmd->gfx.allocator)
++             : 0u;
++}
++
++static bool
++holds_no_allocator(VkCommandBuffer commands)
++{
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(commands);
++   return !cmd->gfx.allocator && !cmd->cmp[0].allocator &&
++          !cmd->cmp[1].allocator;
++}
++
++static void
++cache_state(struct kk_device *dev, unsigned *count, uint64_t *bytes)
++{
++   struct kk_command_allocator_cache *cache = dev->allocator_cache;
++   simple_mtx_lock(&cache->mutex);
++   *count = cache->count;
++   *bytes = cache->bytes;
++   uint64_t sum = 0;
++   for (unsigned i = 0; i < cache->count; i++) {
++      CHECK(cache->sizes[i] <= KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B);
++      sum += cache->sizes[i];
++   }
++   CHECK(sum == cache->bytes);
++   simple_mtx_unlock(&cache->mutex);
++}
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++                               .pApplicationInfo = &app};
++   CHECK(vkCreateInstance(&ici, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++   CHECK(count == 1);
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++   CHECK(families);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++   uint32_t family = 0;
++   while (family < family_count &&
++          !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++      family++;
++   CHECK(family < family_count);
++   free(families);
++
++   float priority = 1;
++   VkDeviceQueueCreateInfo qci = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = family,
++      .queueCount = 1,
++      .pQueuePriorities = &priority};
++   VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .dynamicRendering = VK_TRUE};
++   VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++                             .pNext = &features13,
++                             .queueCreateInfoCount = 1,
++                             .pQueueCreateInfos = &qci};
++   VkDevice device;
++   CHECK(vkCreateDevice(physical, &dci, NULL, &device) == VK_SUCCESS);
++   struct kk_device *dev = kk_device_from_handle(device);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkResetCommandBuffer);
++   LOAD_D(vkCmdBeginRendering);
++   LOAD_D(vkCmdEndRendering);
++   LOAD_D(vkCmdFillBuffer);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++
++   VkQueue queue;
++   vkGetDeviceQueue(device, family, 0, &queue);
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++   uint32_t device_local = 0;
++   while (device_local < memory_properties.memoryTypeCount &&
++          !(memory_properties.memoryTypes[device_local].propertyFlags &
++            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++      device_local++;
++   CHECK(device_local < memory_properties.memoryTypeCount);
++
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {64, 64, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
++   VkImage image;
++   CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++   VkMemoryRequirements image_requirements;
++   vkGetImageMemoryRequirements(device, image, &image_requirements);
++   CHECK(image_requirements.memoryTypeBits & (1u << device_local));
++   VkMemoryAllocateInfo image_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = image_requirements.size,
++      .memoryTypeIndex = device_local};
++   VkDeviceMemory image_memory;
++   CHECK(vkAllocateMemory(device, &image_allocate, NULL, &image_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindImageMemory(device, image, image_memory, 0) == VK_SUCCESS);
++   VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++   VkImageView view;
++   CHECK(vkCreateImageView(device, &view_info, NULL, &view) == VK_SUCCESS);
++
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = 4096,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
++   VkBuffer buffer;
++   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
++   VkMemoryRequirements buffer_requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &buffer_requirements);
++   CHECK(buffer_requirements.memoryTypeBits & (1u << device_local));
++   VkMemoryAllocateInfo buffer_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = buffer_requirements.size,
++      .memoryTypeIndex = device_local};
++   VkDeviceMemory buffer_memory;
++   CHECK(vkAllocateMemory(device, &buffer_allocate, NULL, &buffer_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, buffer, buffer_memory, 0) == VK_SUCCESS);
++
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = family};
++   VkCommandPool pool;
++   CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool) == VK_SUCCESS);
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 4};
++   VkCommandBuffer commands[4];
++   CHECK(vkAllocateCommandBuffers(device, &command_info, commands) ==
++         VK_SUCCESS);
++
++   VkRenderingAttachmentInfo color_attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
++   VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = {{0, 0}, {64, 64}},
++      .layerCount = 1,
++      .colorAttachmentCount = 1,
++      .pColorAttachments = &color_attachment};
++
++   /* commands[0] is one-time and commands[1] reusable. Each submission takes
++    * its allocators with it and returns them to the device cache when it
++    * completes, so a reset leaves the reusable one holding none. */
++   for (unsigned i = 0; i < 2; i++) {
++      VkCommandBufferBeginInfo begin = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++         .flags = i == 0 ? VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT : 0};
++      CHECK(vkBeginCommandBuffer(commands[i], &begin) == VK_SUCCESS);
++      for (uint32_t pass = 0; pass < PASSES; pass++) {
++         vkCmdFillBuffer(commands[i], buffer, 0, 4096, pass);
++         vkCmdBeginRendering(commands[i], &rendering);
++         vkCmdEndRendering(commands[i]);
++      }
++      CHECK(vkEndCommandBuffer(commands[i]) == VK_SUCCESS);
++      const uint64_t grown = gfx_allocator_bytes(commands[i]);
++      printf("recording %u grew its allocator to %.1f MiB\n", i,
++             grown / 1048576.0);
++      /* Otherwise the budget is never exercised. */
++      CHECK(grown > KK_COMMAND_ALLOCATOR_RETAIN_MAX_B);
++
++      unsigned cached_before;
++      uint64_t bytes_before;
++      cache_state(dev, &cached_before, &bytes_before);
++      VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                             .commandBufferCount = 1,
++                             .pCommandBuffers = &commands[i]};
++      CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++      if (i == 0) {
++         /* The grown allocator exceeds what the cache keeps, so its
++          * completion leaves nothing behind to wait for. A small one-time
++          * recording submitted after it completes after it, and its
++          * allocator reaching the cache shows the large one was handled. */
++         VkCommandBufferBeginInfo sentinel_begin = {
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++         CHECK(vkBeginCommandBuffer(commands[3], &sentinel_begin) ==
++               VK_SUCCESS);
++         vkCmdFillBuffer(commands[3], buffer, 0, 4096, 0);
++         CHECK(vkEndCommandBuffer(commands[3]) == VK_SUCCESS);
++         VkSubmitInfo sentinel = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                                  .commandBufferCount = 1,
++                                  .pCommandBuffers = &commands[3]};
++         CHECK(vkQueueSubmit(queue, 1, &sentinel, VK_NULL_HANDLE) ==
++               VK_SUCCESS);
++      }
++      CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++
++      if (i == 0) {
++         /* Metal hands the allocators back from its completion thread, which
++          * may run just after the wait returns. */
++         unsigned cached;
++         uint64_t bytes;
++         struct timespec start, now;
++         clock_gettime(CLOCK_MONOTONIC, &start);
++         for (;;) {
++            cache_state(dev, &cached, &bytes);
++            clock_gettime(CLOCK_MONOTONIC, &now);
++            if (cached > cached_before || now.tv_sec - start.tv_sec > 5)
++               break;
++            struct timespec pause = {0, 1000000};
++            nanosleep(&pause, NULL);
++         }
++         printf("cache holds %u allocators, %.1f MiB\n", cached,
++                bytes / 1048576.0);
++         CHECK(cached > cached_before);
++         CHECK(bytes <= KK_COMMAND_ALLOCATOR_RETAIN_MAX_B);
++
++         /* A command buffer that is begun and never records, as a GL
++          * driver's spare command buffers are, takes none of that storage. */
++         VkCommandBufferBeginInfo idle_begin = {
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++         CHECK(holds_no_allocator(commands[2]));
++         CHECK(vkBeginCommandBuffer(commands[2], &idle_begin) == VK_SUCCESS);
++         CHECK(holds_no_allocator(commands[2]));
++         CHECK(vkEndCommandBuffer(commands[2]) == VK_SUCCESS);
++         CHECK(holds_no_allocator(commands[2]));
++         unsigned cached_idle;
++         uint64_t bytes_idle;
++         cache_state(dev, &cached_idle, &bytes_idle);
++         CHECK(cached_idle == cached && bytes_idle == bytes);
++      } else {
++         CHECK(vkResetCommandBuffer(commands[i], 0) == VK_SUCCESS);
++         unsigned cached;
++         uint64_t bytes;
++         cache_state(dev, &cached, &bytes);
++         printf("reset left the command buffer %.1f MiB, the cache %.1f MiB\n",
++                gfx_allocator_bytes(commands[i]) / 1048576.0,
++                bytes / 1048576.0);
++         CHECK(holds_no_allocator(commands[i]));
++         CHECK(bytes <= KK_COMMAND_ALLOCATOR_RETAIN_MAX_B);
++      }
++   }
++
++   vkDestroyCommandPool(device, pool, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, buffer_memory, NULL);
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, image_memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("command allocator budget ok\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_completion.m b/src/kosmickrisp/vulkan/tests/test_command_completion.m
+index 66bf5fd313c15c11024f646f2f5be68a7d8ed707..7600922546c21c1a361e7a5d25c9795064fda302 100644
+--- a/src/kosmickrisp/vulkan/tests/test_command_completion.m
++++ b/src/kosmickrisp/vulkan/tests/test_command_completion.m
+@@ -55,19 +55,22 @@
+ /* The native objects of one recording, split by how each is retired. Metal
+  * command buffers die with the completed recording, while the command
+  * allocators own storage the device recycles, so they outlive the recording
+- * and die with the cache holding them. */
++ * and die with the cache holding them. A lane takes an allocator only when it
++ * records, and a fill records into the main command buffer on the gfx
++ * lane's. */
+ static NSPointerArray *
+ watch_recording(VkCommandBuffer command, NSPointerArray **allocators_out)
+ {
+    struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
++   CHECK(cmd->gfx.allocator != NULL);
++   CHECK(cmd->cmp[0].allocator == NULL);
++   CHECK(cmd->cmp[1].allocator == NULL);
+    NSPointerArray *allocators = [NSPointerArray weakObjectsPointerArray];
+-   [allocators addPointer:cmd->cmp[0].allocator];
+    [allocators addPointer:cmd->gfx.allocator];
+-   [allocators addPointer:cmd->cmp[1].allocator];
+    NSPointerArray *objects = [NSPointerArray weakObjectsPointerArray];
+    util_dynarray_foreach(&cmd->submit_cmd_bufs, mtl_command_buffer *, cb)
+       [objects addPointer:*cb];
+-   CHECK(allocators.count == 3);
++   CHECK(allocators.count == 1);
+    CHECK(objects.count > 0);
+    CHECK(live_objects(allocators) == allocators.count);
+    CHECK(live_objects(objects) == objects.count);
+@@ -77,29 +80,12 @@
+ 
+ /* Reading a weak reference retains it until the pool drains, so identity has
+  * to be taken inside one or the observer keeps what it observes alive. */
+-static void
+-capture_allocators(NSPointerArray *objects, void *out[3])
++static void *
++capture_allocator(NSPointerArray *objects)
+ {
+    @autoreleasepool {
+-      for (unsigned i = 0; i < 3; i++)
+-         out[i] = [objects pointerAtIndex:i];
+-   }
+-}
+-
+-/* The cache hands storage back in its own order, so reuse is a set. */
+-static bool
+-same_allocators(NSPointerArray *objects, void *const previous[3])
+-{
+-   void *current[3];
+-   capture_allocators(objects, current);
+-   for (unsigned i = 0; i < 3; i++) {
+-      bool found = false;
+-      for (unsigned j = 0; j < 3; j++)
+-         found |= previous[j] == current[i];
+-      if (!found)
+-         return false;
++      return [objects pointerAtIndex:0];
+    }
+-   return true;
+ }
+ 
+ /* Synthetic reports still obey the production callback's payload and serial
+@@ -228,7 +214,7 @@
+          .flags = one_time ? VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT : 0};
+       const unsigned rounds = one_time ? 3 : 1;
+       NSPointerArray *allocators = nil;
+-      void *previous[3] = {NULL, NULL, NULL};
++      void *previous = NULL;
+       for (unsigned round = 0; round < rounds; round++) {
+          CHECK(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS);
+          uint32_t value = 0x13579bdf + round;
+@@ -237,11 +223,11 @@
+          CHECK(vkEndCommandBuffer(command) == VK_SUCCESS);
+          NSPointerArray *objects = watch_recording(command, &allocators);
+          /* A completed recording hands its storage to the device instead of
+-          * returning it to the kernel, so the next recording begins on the
+-          * very same allocators. */
++          * returning it to the kernel, so the next recording records into the
++          * very same allocator. */
+          if (round > 0)
+-            CHECK(same_allocators(allocators, previous));
+-         capture_allocators(allocators, previous);
++            CHECK(capture_allocator(allocators) == previous);
++         previous = capture_allocator(allocators);
+          dispatch_semaphore_t gate = dispatch_semaphore_create(0);
+          dispatch_async(feedback_queue, ^{
+             CHECK(dispatch_semaphore_wait(gate,
+@@ -259,9 +245,10 @@
+          vkDestroyFence(device, fence, NULL);
+          CHECK(live_objects(objects) == objects.count);
+          struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
+-         CHECK((cmd->gfx.allocator == NULL) == one_time);
+-         CHECK((cmd->cmp[0].allocator == NULL) == one_time);
+-         CHECK((cmd->cmp[1].allocator == NULL) == one_time);
++         /* Every submission takes its allocators with it. */
++         CHECK(cmd->gfx.allocator == NULL);
++         CHECK(cmd->cmp[0].allocator == NULL);
++         CHECK(cmd->cmp[1].allocator == NULL);
+ 
+          if (round + 1 == rounds) {
+             /* Retain the real reporter context exactly as commit registration
+@@ -286,8 +273,7 @@
+             vkFreeMemory(device, memory, NULL);
+             vkDestroyDevice(device, NULL);
+             vkDestroyInstance(instance, NULL);
+-            if (one_time)
+-               CHECK(live_objects(objects) == objects.count);
++            CHECK(live_objects(objects) == objects.count);
+             CHECK(feedback->device == NULL);
+             CHECK(live_objects(weak_queue) == 1);
+             struct mtl_feedback_data success = {.user_data = late_success,
+@@ -307,7 +293,8 @@
+             CHECK(live_objects(allocators) == allocators.count);
+          dispatch_release(gate);
+          /* In early rounds the same Vulkan command buffer is still allocated.
+-          * Begin must recreate native allocators and produce correct GPU data. */
++          * Its next recording must take an allocator again and produce
++          * correct GPU data. */
+       }
+       /* Recycled storage still has an owner, so it goes away once the device
+        * and the last outstanding completion have both let go of the cache. */
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_pool_release.m b/src/kosmickrisp/vulkan/tests/test_command_pool_release.m
+index f92d7dfcd9344e4234b7ffcb205f442aabff01b5..a5576a617d74a53ee9b142a8b01e585033bd89c4 100644
+--- a/src/kosmickrisp/vulkan/tests/test_command_pool_release.m
++++ b/src/kosmickrisp/vulkan/tests/test_command_pool_release.m
+@@ -179,8 +179,10 @@ int main(void)
+          CHECK(vkEndCommandBuffer(commands[0]) == VK_SUCCESS);
+          CHECK(allocator_bytes(commands[0]) > 0);
+          if (round == 0) {
++            /* Any reset hands the storage to the device's allocator cache,
++             * which keeps it for whichever recording needs it next. */
+             CHECK(vkResetCommandBuffer(commands[0], 0) == VK_SUCCESS);
+-            CHECK(allocator_bytes(commands[0]) > 0);
++            check_released(commands[0]);
+             CHECK(vkResetCommandBuffer(commands[0], release) == VK_SUCCESS);
+             check_released(commands[0]);
+          } else if (round == 1) {
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_resubmit.c b/src/kosmickrisp/vulkan/tests/test_command_resubmit.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2bbea124a5b431e1d72d95640eabb0f1386ef69
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_command_resubmit.c
+@@ -0,0 +1,273 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A command buffer recorded with SIMULTANEOUS_USE may be submitted again while
++ * its last submission is still running. Metal cannot run one recording twice,
++ * so the driver records the buffer again, and that must wait for the running
++ * submission: re-recording frees what its commands read, and the storage it
++ * recorded into goes back to a cache any recording can take from. */
++
++#define VK_NO_PROTOTYPES
++#include "kk_cmd_buffer.h"
++#include "kk_device.h"
++#include "kk_sync.h"
++#include "vk_semaphore.h"
++#include "util/u_atomic.h"
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++struct resubmission {
++   PFN_vkQueueSubmit submit;
++   VkQueue queue;
++   const VkSubmitInfo *info;
++   VkFence fence;
++   VkResult result;
++   int done;
++};
++
++static void *
++resubmit(void *data)
++{
++   struct resubmission *resubmission = data;
++   resubmission->result = resubmission->submit(
++      resubmission->queue, 1, resubmission->info, resubmission->fence);
++   p_atomic_set(&resubmission->done, 1);
++   return NULL;
++}
++
++int
++main(void)
++{
++   /* In particular, a resubmission that never returns must not strand the
++    * test runner. */
++   alarm(30);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++   CHECK(count == 1);
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++   CHECK(families);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++   uint32_t family = 0;
++   while (family < family_count &&
++          !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++      family++;
++   CHECK(family < family_count);
++   free(families);
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = family,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan12Features features = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++      .timelineSemaphore = VK_TRUE,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkMapMemory);
++   LOAD_D(vkCreateSemaphore);
++   LOAD_D(vkDestroySemaphore);
++   LOAD_D(vkSignalSemaphore);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdFillBuffer);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkCreateFence);
++   LOAD_D(vkWaitForFences);
++   LOAD_D(vkDestroyFence);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, family, 0, &queue);
++
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = 4096,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   VkBuffer buffer = VK_NULL_HANDLE;
++   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
++   VkMemoryRequirements requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &requirements);
++   VkPhysicalDeviceMemoryProperties properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &properties);
++   const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   uint32_t type = 0;
++   while (type < properties.memoryTypeCount &&
++          (!(requirements.memoryTypeBits & (1u << type)) ||
++           (properties.memoryTypes[type].propertyFlags & required) != required))
++      type++;
++   CHECK(type < properties.memoryTypeCount);
++   VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = requirements.size,
++      .memoryTypeIndex = type,
++   };
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &memory_info, NULL, &memory) == VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, buffer, memory, 0) == VK_SUCCESS);
++   uint32_t *mapped = NULL;
++   CHECK(vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mapped) ==
++         VK_SUCCESS);
++   memset(mapped, 0, 4096);
++
++   VkSemaphoreTypeCreateInfo semaphore_type = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++   };
++   VkSemaphoreCreateInfo semaphore_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++      .pNext = &semaphore_type,
++   };
++   VkSemaphore semaphore = VK_NULL_HANDLE;
++   CHECK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore) ==
++         VK_SUCCESS);
++
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = family,
++   };
++   VkCommandPool pool = VK_NULL_HANDLE;
++   CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool) == VK_SUCCESS);
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VkCommandBuffer command = VK_NULL_HANDLE;
++   CHECK(vkAllocateCommandBuffers(device, &command_info, &command) ==
++         VK_SUCCESS);
++   VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
++   };
++   const uint32_t value = 0x2468ace1u;
++   CHECK(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS);
++   vkCmdFillBuffer(command, buffer, 0, 4096, value);
++   CHECK(vkEndCommandBuffer(command) == VK_SUCCESS);
++
++   /* Hold the first submission on the GPU. The timeline says a signal for
++    * value 1 is already on its way, so the queue hands the wait for it to
++    * Metal, which then runs nothing behind it until the host signals. */
++   struct vk_sync *sync =
++      vk_semaphore_get_active_sync(vk_semaphore_from_handle(semaphore));
++   kk_timeline_mark_pending(sync, 1);
++   const uint64_t wait_value = 1;
++   VkTimelineSemaphoreSubmitInfo timeline = {
++      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++      .waitSemaphoreValueCount = 1,
++      .pWaitSemaphoreValues = &wait_value,
++   };
++   const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++   VkSubmitInfo held = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .pNext = &timeline,
++      .waitSemaphoreCount = 1,
++      .pWaitSemaphores = &semaphore,
++      .pWaitDstStageMask = &stage,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &command,
++   };
++   VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++   VkFence fences[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++   for (unsigned i = 0; i < 2; i++)
++      CHECK(vkCreateFence(device, &fence_info, NULL, &fences[i]) == VK_SUCCESS);
++   CHECK(vkQueueSubmit(queue, 1, &held, fences[0]) == VK_SUCCESS);
++
++   /* The submission took its storage with it. */
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
++   CHECK(cmd->gfx.allocator == NULL);
++   CHECK(cmd->last_submission != NULL);
++
++   VkSubmitInfo again = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &command,
++   };
++   struct resubmission resubmission = {
++      .submit = vkQueueSubmit,
++      .queue = queue,
++      .info = &again,
++      .fence = fences[1],
++   };
++   pthread_t thread;
++   CHECK(pthread_create(&thread, NULL, resubmit, &resubmission) == 0);
++
++   /* The resubmission must not re-record while the first one is held. */
++   usleep(300000);
++   CHECK(!p_atomic_read(&resubmission.done));
++   CHECK(mapped[0] == 0u);
++
++   VkSemaphoreSignalInfo signal = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
++      .semaphore = semaphore,
++      .value = 1,
++   };
++   CHECK(vkSignalSemaphore(device, &signal) == VK_SUCCESS);
++   CHECK(vkWaitForFences(device, 1, &fences[0], VK_TRUE, 10000000000ull) ==
++         VK_SUCCESS);
++   CHECK(pthread_join(thread, NULL) == 0);
++   CHECK(resubmission.result == VK_SUCCESS);
++   CHECK(vkWaitForFences(device, 1, &fences[1], VK_TRUE, 10000000000ull) ==
++         VK_SUCCESS);
++   for (unsigned i = 0; i < 1024; i++)
++      CHECK(mapped[i] == value);
++
++   for (unsigned i = 0; i < 2; i++)
++      vkDestroyFence(device, fences[i], NULL);
++   vkDestroyCommandPool(device, pool, NULL);
++   vkDestroySemaphore(device, semaphore, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   alarm(0);
++   printf("a resubmitted SIMULTANEOUS_USE command buffer waited for its "
++          "running submission\n");
++   return 0;
++}

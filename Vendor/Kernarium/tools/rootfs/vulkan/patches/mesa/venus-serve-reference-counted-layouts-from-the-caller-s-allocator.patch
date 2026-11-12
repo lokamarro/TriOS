@@ -1,0 +1,475 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 14:26:52 +0900
+Subject: [PATCH] venus: serve reference-counted layouts from the caller's
+ allocator
+
+vkCreateDescriptorSetLayout and vkCreatePipelineLayout ignored the
+VkAllocationCallbacks the application passed and took the layout's storage
+from the device's own allocator instead, because both layouts are reference
+counted and can outlive their destroy command. An application that installs
+callbacks therefore never sees the allocation its layout costs, and a layout
+created while every one of its callbacks refuses memory still succeeds.
+
+Vulkan asks an implementation to serve an object's host allocations from the
+callbacks its create command carried, and the object management CTS observes
+it:
+
+    dEQP-VK.api.object_management.alloc_callback_fail.pipeline_layout_empty
+    dEQP-VK.api.object_management.alloc_callback_fail.pipeline_layout_single
+    dEQP-VK.api.object_management.alloc_callback_fail.descriptor_set_layout_empty
+    dEQP-VK.api.object_management.alloc_callback_fail.descriptor_set_layout_single
+
+create each layout with an allocator that fails its first allocation and
+expect VK_ERROR_OUT_OF_HOST_MEMORY; all four reported the QualityWarning
+"Allocation callbacks not called" because construction succeeded with no
+callback ever reached.
+
+Serve both layouts from the creating command's callbacks, keep those
+callbacks in the layout, and return the storage to them when the last
+reference goes away. Reference counting is unchanged: the layout still
+survives the descriptor sets, pipelines, update templates and push
+descriptors that describe themselves with it, and its renderer object is
+still destroyed with the last reference. The storage keeps the device
+allocation scope that extended lifetime needs, so an application that pools
+by scope pools it with the rest of the device's memory, and the callbacks a
+destroy command carries must already be compatible with the ones its create
+command carried.
+
+vn_object_alloc.h holds the allocate-and-keep pair both layouts use, and the
+vn_object_alloc test in the venus suite pins the contract: the creating
+command's callbacks serve the storage and receive it back, absent callbacks
+fall back to the device's own, and callbacks that refuse the allocation fail
+the object instead of letting the device's allocator serve it quietly.
+---
+ src/virtio/vulkan/meson.build                 |   6 +
+ .../vulkan/tests/vn_object_alloc_test.c       | 167 ++++++++++++++++++
+ src/virtio/vulkan/vn_descriptor_set.c         |  19 +-
+ src/virtio/vulkan/vn_descriptor_set.h         |   7 +
+ src/virtio/vulkan/vn_object_alloc.h           |  73 ++++++++
+ src/virtio/vulkan/vn_pipeline.c               |  15 +-
+ src/virtio/vulkan/vn_pipeline.h               |   7 +
+ 7 files changed, 279 insertions(+), 15 deletions(-)
+ create mode 100644 src/virtio/vulkan/tests/vn_object_alloc_test.c
+ create mode 100644 src/virtio/vulkan/vn_object_alloc.h
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index 507d0b327c026eb7aaa04464462a8629291e72cc..57604e32f1d873da882ee2f9ffd178ec69b580a2 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -190,4 +190,10 @@ if with_tests
+                include_directories : inc_include),
+     suite : ['venus'],
+   )
++  test(
++    'vn_object_alloc',
++    executable('vn_object_alloc_test', 'tests/vn_object_alloc_test.c',
++               include_directories : inc_include),
++    suite : ['venus'],
++  )
+ endif
+diff --git a/src/virtio/vulkan/tests/vn_object_alloc_test.c b/src/virtio/vulkan/tests/vn_object_alloc_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7d7e3d6b24b56e80b5ee3f9029995361fa763be
+--- /dev/null
++++ b/src/virtio/vulkan/tests/vn_object_alloc_test.c
+@@ -0,0 +1,167 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "../vn_object_alloc.h"
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(expr)                                                          \
++   do {                                                                      \
++      if (!(expr)) {                                                         \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr);          \
++         return 1;                                                           \
++      }                                                                      \
++   } while (0)
++
++struct test_allocator {
++   unsigned allocations;
++   unsigned frees;
++   size_t last_size;
++   size_t last_alignment;
++   VkSystemAllocationScope last_scope;
++   bool fail;
++};
++
++static VKAPI_ATTR void *VKAPI_CALL
++test_allocation(void *user_data,
++                size_t size,
++                size_t alignment,
++                VkSystemAllocationScope scope)
++{
++   struct test_allocator *allocator = user_data;
++
++   allocator->allocations++;
++   allocator->last_size = size;
++   allocator->last_alignment = alignment;
++   allocator->last_scope = scope;
++
++   if (allocator->fail)
++      return NULL;
++
++   /* the caller zeroes what it is handed, so hand back dirty storage */
++   void *memory = malloc(size);
++   if (memory)
++      memset(memory, 0x5a, size);
++
++   return memory;
++}
++
++static VKAPI_ATTR void *VKAPI_CALL
++test_reallocation(void *user_data,
++                  void *original,
++                  size_t size,
++                  size_t alignment,
++                  VkSystemAllocationScope scope)
++{
++   (void)user_data;
++   (void)original;
++   (void)size;
++   (void)alignment;
++   (void)scope;
++
++   /* reference-counted objects never grow */
++   abort();
++}
++
++static VKAPI_ATTR void VKAPI_CALL
++test_free(void *user_data, void *memory)
++{
++   struct test_allocator *allocator = user_data;
++
++   allocator->frees++;
++   free(memory);
++}
++
++static VkAllocationCallbacks
++test_callbacks(struct test_allocator *allocator)
++{
++   return (VkAllocationCallbacks){
++      .pUserData = allocator,
++      .pfnAllocation = test_allocation,
++      .pfnReallocation = test_reallocation,
++      .pfnFree = test_free,
++   };
++}
++
++/* an object shaped like the reference-counted layouts: it stores the
++ * callbacks that served it and is released through them
++ */
++struct test_object {
++   VkAllocationCallbacks allocator;
++   uint32_t payload[4];
++};
++
++int
++main(void)
++{
++   struct test_allocator device = {0};
++   struct test_allocator object = {0};
++   const VkAllocationCallbacks device_callbacks = test_callbacks(&device);
++   const VkAllocationCallbacks object_callbacks = test_callbacks(&object);
++   VkAllocationCallbacks kept = {0};
++
++   /* a command that carries callbacks is served by them, with the device
++    * scope a reference-counted lifetime needs, and never reaches the
++    * device's own allocator
++    */
++   struct test_object *owned = vn_refcounted_object_zalloc(
++      &device_callbacks, &object_callbacks, sizeof(*owned), &kept);
++   CHECK(owned);
++   CHECK(object.allocations == 1);
++   CHECK(device.allocations == 0);
++   CHECK(object.last_size == sizeof(*owned));
++   CHECK(object.last_alignment == VN_OBJECT_ALLOC_ALIGN);
++   CHECK(object.last_scope == VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   CHECK(kept.pUserData == &object);
++   CHECK(kept.pfnAllocation == test_allocation);
++   CHECK(kept.pfnFree == test_free);
++   for (unsigned i = 0; i < 4; i++)
++      CHECK(owned->payload[i] == 0);
++
++   /* the object keeps the callbacks that served it, inside the storage they
++    * served, and the storage goes back to them
++    */
++   owned->allocator = kept;
++   vn_refcounted_object_free(&owned->allocator, owned);
++   CHECK(object.frees == 1);
++   CHECK(device.frees == 0);
++
++   /* a command with no callbacks falls back to the device's own */
++   struct test_object *shared = vn_refcounted_object_zalloc(
++      &device_callbacks, NULL, sizeof(*shared), &kept);
++   CHECK(shared);
++   CHECK(device.allocations == 1);
++   CHECK(object.allocations == 1);
++   CHECK(kept.pUserData == &device);
++   shared->allocator = kept;
++   vn_refcounted_object_free(&shared->allocator, shared);
++   CHECK(device.frees == 1);
++   CHECK(object.frees == 1);
++
++   /* callbacks that refuse the allocation fail the object; the device's own
++    * allocator must not quietly serve it instead
++    */
++   object.fail = true;
++   CHECK(!vn_refcounted_object_zalloc(&device_callbacks, &object_callbacks,
++                                      sizeof(*owned), &kept));
++   CHECK(object.allocations == 2);
++   CHECK(device.allocations == 1);
++   CHECK(object.frees == 1);
++   CHECK(device.frees == 1);
++
++   /* a failed creation has nothing to release */
++   vn_refcounted_object_free(&device_callbacks, NULL);
++   CHECK(device.frees == 1);
++
++   /* device callbacks that refuse an allocation fail it too */
++   device.fail = true;
++   CHECK(!vn_refcounted_object_zalloc(&device_callbacks, NULL,
++                                      sizeof(*shared), &kept));
++   CHECK(device.allocations == 2);
++
++   return 0;
++}
+diff --git a/src/virtio/vulkan/vn_descriptor_set.c b/src/virtio/vulkan/vn_descriptor_set.c
+index 10a4c002608056501a5f6dbbbbae8459fed0e5d0..eef6ab0d17c00eab181c5af59b1d7214f8fcfdf8 100644
+--- a/src/virtio/vulkan/vn_descriptor_set.c
++++ b/src/virtio/vulkan/vn_descriptor_set.c
+@@ -18,6 +18,9 @@
+ #include "vn_device.h"
+ #include "vn_pipeline.h"
+ 
++static_assert(VN_OBJECT_ALLOC_ALIGN == VN_DEFAULT_ALIGN,
++              "reference-counted objects keep the driver's own alignment");
++
+ void
+ vn_descriptor_set_layout_destroy(struct vn_device *dev,
+                                  struct vn_descriptor_set_layout *layout)
+@@ -25,13 +28,12 @@ vn_descriptor_set_layout_destroy(struct vn_device *dev,
+    VkDevice dev_handle = vn_device_to_handle(dev);
+    VkDescriptorSetLayout layout_handle =
+       vn_descriptor_set_layout_to_handle(layout);
+-   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
+ 
+    vn_async_vkDestroyDescriptorSetLayout(dev->primary_ring, dev_handle,
+                                          layout_handle, NULL);
+ 
+    vn_object_base_fini(&layout->base);
+-   vk_free(alloc, layout);
++   vn_refcounted_object_free(&layout->allocator, layout);
+ }
+ 
+ static void
+@@ -161,8 +163,6 @@ vn_CreateDescriptorSetLayout(
+    VkDescriptorSetLayout *pSetLayout)
+ {
+    struct vn_device *dev = vn_device_from_handle(device);
+-   /* ignore pAllocator as the layout is reference-counted */
+-   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
+ 
+    STACK_ARRAY(VkDescriptorSetLayoutBinding, bindings,
+                pCreateInfo->bindingCount);
+@@ -196,14 +196,17 @@ vn_CreateDescriptorSetLayout(
+ 
+    const size_t layout_size =
+       offsetof(struct vn_descriptor_set_layout, bindings[last_binding + 1]);
+-   /* allocated with the device scope */
+-   struct vn_descriptor_set_layout *layout =
+-      vk_zalloc(alloc, layout_size, VN_DEFAULT_ALIGN,
+-                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   /* served by the creating command's callbacks, with the device scope a
++    * reference-counted lifetime needs
++    */
++   VkAllocationCallbacks kept;
++   struct vn_descriptor_set_layout *layout = vn_refcounted_object_zalloc(
++      &dev->base.vk.alloc, pAllocator, layout_size, &kept);
+    if (!layout) {
+       STACK_ARRAY_FINISH(bindings);
+       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
++   layout->allocator = kept;
+ 
+    vn_object_base_init(&layout->base, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+                        &dev->base);
+diff --git a/src/virtio/vulkan/vn_descriptor_set.h b/src/virtio/vulkan/vn_descriptor_set.h
+index d692473ac166cc9c87d0cdebb500aba98b893534..2bdbfeb5b41666dfb65b1fd0cb5b1f705c790660 100644
+--- a/src/virtio/vulkan/vn_descriptor_set.h
++++ b/src/virtio/vulkan/vn_descriptor_set.h
+@@ -12,6 +12,7 @@
+ #define VN_DESCRIPTOR_SET_H
+ 
+ #include "vn_descriptor.h"
++#include "vn_object_alloc.h"
+ 
+ struct vn_descriptor_set_layout_binding {
+    enum vn_descriptor_type type;
+@@ -23,6 +24,12 @@ struct vn_descriptor_set_layout_binding {
+ struct vn_descriptor_set_layout {
+    struct vn_object_base base;
+ 
++   /* the callbacks this layout's storage came from; a layout can outlive
++    * vkDestroyDescriptorSetLayout, so its storage returns to them on the
++    * final unref
++    */
++   VkAllocationCallbacks allocator;
++
+    struct vn_refcount refcount;
+ 
+    uint32_t last_binding;
+diff --git a/src/virtio/vulkan/vn_object_alloc.h b/src/virtio/vulkan/vn_object_alloc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d068b8dd261b6d299ec37283f16813ad912b2b15
+--- /dev/null
++++ b/src/virtio/vulkan/vn_object_alloc.h
+@@ -0,0 +1,73 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VN_OBJECT_ALLOC_H
++#define VN_OBJECT_ALLOC_H
++
++#include <string.h>
++#include <vulkan/vulkan_core.h>
++
++/* Descriptor set layouts and pipeline layouts are reference counted, because
++ * the specification lets an application destroy one while descriptor sets,
++ * pipelines, update templates and recorded push descriptors still describe
++ * themselves with it.  Venus therefore keeps the layout, and its renderer
++ * object, until its last internal reference goes away.
++ *
++ * A reference-counted object still belongs to the allocator its creator
++ * provided.  Vulkan asks an implementation to serve every host allocation an
++ * object needs from that object's callbacks, and the object management CTS
++ * observes it: a layout created while every callback fails must fail with
++ * VK_ERROR_OUT_OF_HOST_MEMORY rather than quietly allocate elsewhere.
++ *
++ * Keep the callbacks that provided the storage inside the object and return
++ * the storage to them, so the allocation a creator paid for is the allocation
++ * that is released.  The storage is requested with device scope, which is what
++ * an extended lifetime is: the object may outlive its destroy command, and an
++ * application's device-scoped arena outlives every object in the device.  The
++ * callbacks a destroy command carries are compatible with the ones its create
++ * command carried, so either set can release the storage; the kept set is the
++ * one that is still known when the last reference goes away.
++ */
++
++#define VN_OBJECT_ALLOC_ALIGN 8
++
++/* Allocate zeroed storage for a reference-counted object from the callbacks
++ * the creating command carried, falling back to the device's own callbacks.
++ * On success *kept receives the callbacks that served the allocation, for the
++ * object to store and hand back to vn_refcounted_object_free.
++ */
++static inline void *
++vn_refcounted_object_zalloc(const VkAllocationCallbacks *device_alloc,
++                            const VkAllocationCallbacks *object_alloc,
++                            size_t size,
++                            VkAllocationCallbacks *kept)
++{
++   const VkAllocationCallbacks *alloc =
++      object_alloc ? object_alloc : device_alloc;
++   void *object =
++      alloc->pfnAllocation(alloc->pUserData, size, VN_OBJECT_ALLOC_ALIGN,
++                           VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (!object)
++      return NULL;
++
++   memset(object, 0, size);
++   *kept = *alloc;
++
++   return object;
++}
++
++/* Release storage vn_refcounted_object_zalloc served.  The kept callbacks
++ * live inside the object being released, so read them out first.
++ */
++static inline void
++vn_refcounted_object_free(const VkAllocationCallbacks *kept, void *object)
++{
++   const VkAllocationCallbacks alloc = *kept;
++
++   if (object)
++      alloc.pfnFree(alloc.pUserData, object);
++}
++
++#endif /* VN_OBJECT_ALLOC_H */
+diff --git a/src/virtio/vulkan/vn_pipeline.c b/src/virtio/vulkan/vn_pipeline.c
+index 4b1e77e12ba81eac7e8e3097a18db0eb628b4757..e4204caf371aba50b9029a12333c6290dfce3337 100644
+--- a/src/virtio/vulkan/vn_pipeline.c
++++ b/src/virtio/vulkan/vn_pipeline.c
+@@ -297,7 +297,6 @@ static void
+ vn_pipeline_layout_destroy(struct vn_device *dev,
+                            struct vn_pipeline_layout *pipeline_layout)
+ {
+-   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
+    if (pipeline_layout->push_descriptor_set_layout) {
+       vn_descriptor_set_layout_unref(
+          dev, pipeline_layout->push_descriptor_set_layout);
+@@ -307,7 +306,7 @@ vn_pipeline_layout_destroy(struct vn_device *dev,
+       vn_pipeline_layout_to_handle(pipeline_layout), NULL);
+ 
+    vn_object_base_fini(&pipeline_layout->base);
+-   vk_free(alloc, pipeline_layout);
++   vn_refcounted_object_free(&pipeline_layout->allocator, pipeline_layout);
+ }
+ 
+ static inline struct vn_pipeline_layout *
+@@ -333,14 +332,16 @@ vn_CreatePipelineLayout(VkDevice device,
+                         VkPipelineLayout *pPipelineLayout)
+ {
+    struct vn_device *dev = vn_device_from_handle(device);
+-   /* ignore pAllocator as the pipeline layout is reference-counted */
+-   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
+ 
+-   struct vn_pipeline_layout *layout =
+-      vk_zalloc(alloc, sizeof(*layout), VN_DEFAULT_ALIGN,
+-                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   /* served by the creating command's callbacks, with the device scope a
++    * reference-counted lifetime needs
++    */
++   VkAllocationCallbacks kept;
++   struct vn_pipeline_layout *layout = vn_refcounted_object_zalloc(
++      &dev->base.vk.alloc, pAllocator, sizeof(*layout), &kept);
+    if (!layout)
+       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
++   layout->allocator = kept;
+ 
+    vn_object_base_init(&layout->base, VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+                        &dev->base);
+diff --git a/src/virtio/vulkan/vn_pipeline.h b/src/virtio/vulkan/vn_pipeline.h
+index 3e4ba6993ef744c06ebad3d97f5c94f25eed2693..c135f80e84eab538caf8a6eb4c4040a4d6b9787f 100644
+--- a/src/virtio/vulkan/vn_pipeline.h
++++ b/src/virtio/vulkan/vn_pipeline.h
+@@ -12,6 +12,7 @@
+ #define VN_PIPELINE_H
+ 
+ #include "vn_common.h"
++#include "vn_object_alloc.h"
+ 
+ struct vn_shader_module {
+    struct vn_object_base base;
+@@ -24,6 +25,12 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(vn_shader_module,
+ struct vn_pipeline_layout {
+    struct vn_object_base base;
+ 
++   /* the callbacks this layout's storage came from; a layout can outlive
++    * vkDestroyPipelineLayout, so its storage returns to them on the final
++    * unref
++    */
++   VkAllocationCallbacks allocator;
++
+    struct vn_descriptor_set_layout *push_descriptor_set_layout;
+    bool has_push_constant_ranges;
+    struct vn_refcount refcount;

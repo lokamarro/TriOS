@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 12:17:23 +0900
+Subject: [PATCH] venus: expose host-backed guest memory fds
+
+---
+ src/virtio/vulkan/vn_device.c          |  12 +++
+ src/virtio/vulkan/vn_device_memory.c   |  24 +++++-
+ src/virtio/vulkan/vn_image.c           |   3 +-
+ src/virtio/vulkan/vn_physical_device.c | 103 ++++++++++++++++++-------
+ src/virtio/vulkan/vn_physical_device.h |  16 ++++
+ 5 files changed, 125 insertions(+), 33 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+index f42b9f91d126687007f3671f6ea6bbd8add40be2..e938ebc1c88f5856f71b274bd746c07aab7e8565 100644
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -316,6 +316,18 @@ vn_device_fix_create_info(const struct vn_device *dev,
+             extra_exts[extra_count++] =
+                VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+          }
++      } else if (physical_dev->external_memory.renderer_handle_type ==
++                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
++         /* These are guest-native extensions.  The renderer device uses
++          * VK_EXT_external_memory_host internally and must not be asked to
++          * enable fd extensions absent from the native Vulkan driver.
++          */
++         if (app_exts->KHR_external_memory_fd)
++            block_exts[block_count++] =
++               VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
++         if (app_exts->EXT_external_memory_dma_buf)
++            block_exts[block_count++] =
++               VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+       }
+    }
+ 
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index 8e8b2641f39d722792000942b39d945e4c8fdef3..35ab14f51dc379bc9e9a21b343ebc5540f6a2bf0 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -150,7 +150,16 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
+       .allocationSize = alloc_info->allocationSize,
+       .memoryTypeIndex = alloc_info->memoryTypeIndex,
+    };
+-   result = vn_device_memory_alloc_simple(dev, mem, &memory_allocate_info);
++   /* An external allocation may be rejected even after its resource was
++    * imported successfully (for example, when allocationSize exceeds the
++    * backing allocation).  Observe that result before publishing a memory
++    * handle or taking ownership of the fd; an asynchronous failure would
++    * leave subsequent binds referring to a nonexistent renderer object.
++    */
++   VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
++   result = vn_call_vkAllocateMemory(dev->primary_ring,
++                                    vn_device_to_handle(dev),
++                                    &memory_allocate_info, NULL, &mem_handle);
+    if (result != VK_SUCCESS) {
+       vn_renderer_bo_unref(dev->renderer, bo);
+       return result;
+@@ -310,8 +319,19 @@ vn_device_memory_alloc(struct vn_device *dev,
+       mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const bool export_alloc = mem_vk->export_handle_types;
+ 
+-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
++   VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+       dev->physical_device->external_memory.renderer_handle_type;
++   if (export_alloc &&
++       !(mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++       dev->physical_device->external_memory
++          .renderer_optimal_image_handle_type) {
++      /* Optimal external images use the virtual device-only memory type.
++       * Preserve their native MTLHeap rather than making the allocation
++       * host-linear merely to manufacture a guest fd.
++       */
++      renderer_handle_type = dev->physical_device->external_memory
++                                .renderer_optimal_image_handle_type;
++   }
+    struct vn_device_memory_alloc_info local_info;
+    if (mem_vk->export_handle_types &&
+        mem_vk->export_handle_types != renderer_handle_type) {
+diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
+index 5d4f9168e47e54b071194c347c50b87a171f2cc1..931cf79e691c0727eb5e67a6dd082a7cfdd40707 100644
+--- a/src/virtio/vulkan/vn_image.c
++++ b/src/virtio/vulkan/vn_image.c
+@@ -536,7 +536,8 @@ vn_CreateImage(VkDevice device,
+    const VkAllocationCallbacks *alloc =
+       pAllocator ? pAllocator : &dev->base.vk.alloc;
+    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+-      dev->physical_device->external_memory.renderer_handle_type;
++      vn_physical_device_renderer_image_handle_type(
++         dev->physical_device, pCreateInfo->tiling);
+    struct vn_image *img;
+    VkResult result;
+ 
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index b6ee45ed4c9705a9ac57e3092d6621686f4e8f02..b00c56e456f8bfc49f74248bfe2a7989c537786b 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1046,6 +1046,22 @@ vn_physical_device_init_external_memory(
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+ #endif
++   } else if (physical_dev->external_memory.renderer_supports_host_allocation &&
++              physical_dev->instance->renderer->info.has_dma_buf_import) {
++      /* A paired renderer can back a HOST3D blob with anonymous shared
++       * memory and import that same allocation into native Vulkan.  Guest fd
++       * export/import then stays in virtio-gpu and does not require a native
++       * dma-buf implementation.
++       */
++      physical_dev->external_memory.renderer_handle_type =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++      physical_dev->external_memory.supported_handle_types =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      if (physical_dev->external_memory.renderer_supports_metal_heap) {
++         physical_dev->external_memory.renderer_optimal_image_handle_type =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
++      }
+    }
+ }
+ 
+@@ -1452,6 +1468,17 @@ vn_physical_device_init_renderer_extensions(
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
++   for (uint32_t i = 0; i < count; i++) {
++      if (!strcmp(exts[i].extensionName,
++                  VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
++         physical_dev->external_memory.renderer_supports_host_allocation =
++            true;
++      } else if (!strcmp(exts[i].extensionName,
++                         "VK_EXT_external_memory_metal")) {
++         physical_dev->external_memory.renderer_supports_metal_heap = true;
++      }
++   }
++
+    for (uint32_t i = 0; i < VK_DEVICE_EXTENSION_COUNT; i++) {
+       const VkExtensionProperties *props = &vk_device_extensions[i];
+       for (uint32_t j = 0; j < count; j++) {
+@@ -2583,6 +2610,43 @@ vn_image_store_format_in_cache(
+    simple_mtx_unlock(&cache->mutex);
+ }
+ 
++static inline void
++vn_sanitize_external_memory_properties(
++   struct vn_physical_device *physical_dev,
++   VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
++   VkExternalMemoryProperties *props)
++{
++   const VkExternalMemoryHandleTypeFlags supported_handle_types =
++      physical_dev->external_memory.supported_handle_types;
++
++   /* Export support is provided by virtio-gpu, while import requires the
++    * renderer to consume the resource attached to its context.
++    */
++   if (!physical_dev->instance->renderer->info.has_dma_buf_import) {
++      props->externalMemoryFeatures &=
++         ~VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
++   }
++
++   props->compatibleHandleTypes = supported_handle_types;
++   if (renderer_handle_type ==
++          VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT &&
++       (props->externalMemoryFeatures &
++        VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)) {
++      /* HOST_ALLOCATION is import-only for the native driver.  The virtual
++       * device can nevertheless export and re-export the same shareable blob
++       * as either guest fd handle type without copying it.
++       */
++      props->externalMemoryFeatures |=
++         VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
++      props->exportFromImportedHandleTypes = supported_handle_types;
++   } else {
++      props->exportFromImportedHandleTypes =
++         (props->exportFromImportedHandleTypes & renderer_handle_type)
++            ? supported_handle_types
++            : 0;
++   }
++}
++
+ static inline void
+ vn_sanitize_image_format_properties(
+    struct vn_physical_device *physical_dev,
+@@ -2591,10 +2655,8 @@ vn_sanitize_image_format_properties(
+    VkImageFormatProperties2 *props)
+ {
+    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+-      physical_dev->external_memory.renderer_handle_type;
+-   const VkExternalMemoryHandleTypeFlags supported_handle_types =
+-      physical_dev->external_memory.supported_handle_types;
+-
++      vn_physical_device_renderer_image_handle_type(
++         physical_dev, info->tiling);
+    /* TODO drop this after supporting VK_EXT_rgba10x6_formats */
+    if (info->format == VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16) {
+       props->imageFormatProperties.sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+@@ -2604,19 +2666,9 @@ vn_sanitize_image_format_properties(
+    VkExternalImageFormatProperties *external_props =
+       vk_find_struct(props->pNext, EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+    if (external_props) {
+-      VkExternalMemoryProperties *mem_props =
+-         &external_props->externalMemoryProperties;
+-      /* export support is via virtgpu but import relies on the renderer */
+-      if (!physical_dev->instance->renderer->info.has_dma_buf_import) {
+-         mem_props->externalMemoryFeatures &=
+-            ~VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+-      }
+-
+-      mem_props->compatibleHandleTypes = supported_handle_types;
+-      mem_props->exportFromImportedHandleTypes =
+-         (mem_props->exportFromImportedHandleTypes & renderer_handle_type)
+-            ? supported_handle_types
+-            : 0;
++      vn_sanitize_external_memory_properties(
++         physical_dev, renderer_handle_type,
++         &external_props->externalMemoryProperties);
+    }
+ }
+ 
+@@ -2699,7 +2751,8 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+       vn_physical_device_from_handle(physicalDevice);
+    struct vn_ring *ring = physical_dev->instance->ring.ring;
+    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+-      physical_dev->external_memory.renderer_handle_type;
++      vn_physical_device_renderer_image_handle_type(
++         physical_dev, pImageFormatInfo->tiling);
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+       physical_dev->external_memory.supported_handle_types;
+ 
+@@ -2868,18 +2921,8 @@ vn_GetPhysicalDeviceExternalBufferProperties(
+    vn_call_vkGetPhysicalDeviceExternalBufferProperties(
+       ring, physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
+ 
+-   if (renderer_handle_type ==
+-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+-       !physical_dev->instance->renderer->info.has_dma_buf_import) {
+-      props->externalMemoryFeatures &=
+-         ~VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+-   }
+-
+-   props->compatibleHandleTypes = supported_handle_types;
+-   props->exportFromImportedHandleTypes =
+-      (props->exportFromImportedHandleTypes & renderer_handle_type)
+-         ? supported_handle_types
+-         : 0;
++   vn_sanitize_external_memory_properties(
++      physical_dev, renderer_handle_type, props);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+diff --git a/src/virtio/vulkan/vn_physical_device.h b/src/virtio/vulkan/vn_physical_device.h
+index d812f4d54d50d6eb6523e2f11cf4a12ef026ce79..e6102d2355182166f556f7435f06bf38a7440a56 100644
+--- a/src/virtio/vulkan/vn_physical_device.h
++++ b/src/virtio/vulkan/vn_physical_device.h
+@@ -115,7 +115,10 @@ struct vn_physical_device {
+ 
+    struct {
+       VkExternalMemoryHandleTypeFlagBits renderer_handle_type;
++      VkExternalMemoryHandleTypeFlagBits renderer_optimal_image_handle_type;
+       VkExternalMemoryHandleTypeFlags supported_handle_types;
++      bool renderer_supports_host_allocation;
++      bool renderer_supports_metal_heap;
+    } external_memory;
+ 
+    VkExternalFenceHandleTypeFlags external_fence_handles;
+@@ -140,6 +143,19 @@ VK_DEFINE_HANDLE_CASTS(vn_physical_device,
+ void
+ vn_physical_device_fini(struct vn_physical_device *physical_dev);
+ 
++static inline VkExternalMemoryHandleTypeFlagBits
++vn_physical_device_renderer_image_handle_type(
++   const struct vn_physical_device *physical_dev,
++   VkImageTiling tiling)
++{
++   if (tiling == VK_IMAGE_TILING_OPTIMAL &&
++       physical_dev->external_memory.renderer_optimal_image_handle_type) {
++      return physical_dev->external_memory.renderer_optimal_image_handle_type;
++   }
++
++   return physical_dev->external_memory.renderer_handle_type;
++}
++
+ static inline bool
+ vn_queue_family_can_feedback(struct vn_physical_device *physical_dev,
+                              uint32_t queue_family_index)

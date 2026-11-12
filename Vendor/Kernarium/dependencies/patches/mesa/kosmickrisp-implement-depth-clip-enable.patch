@@ -1,0 +1,826 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:07:49 +0900
+Subject: [PATCH] kosmickrisp: implement depth clip enable
+
+---
+ docs/features.txt                             |   2 +-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |   4 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  35 ++-
+ src/kosmickrisp/vulkan/kk_depth_clip.h        | 117 +++++++++
+ .../vulkan/kk_nir_lower_descriptors.c         |   7 +
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   5 +
+ src/kosmickrisp/vulkan/kk_shader.c            | 170 ++++++++++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |   5 +
+ src/kosmickrisp/vulkan/meson.build            |  12 +
+ .../vulkan/tests/test_depth_clip.c            | 223 ++++++++++++++++++
+ 10 files changed, 568 insertions(+), 12 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_depth_clip.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_depth_clip.c
+
+diff --git a/docs/features.txt b/docs/features.txt
+index ada13f68970ee974d572b14649152a5ca5a97ff0..1fce418824d7e6927d4ed1d24e14fd233457a545 100644
+--- a/docs/features.txt
++++ b/docs/features.txt
+@@ -625,7 +625,7 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_EXT_depth_clamp_control                            DONE (anv, hasvk, nvk, panvk, radv, tu, vn)
+   VK_EXT_depth_clamp_zero_one                           DONE (anv, hasvk, nvk, panvk, pvr, radv, tu, v3dv/vc7+, vn)
+   VK_EXT_depth_clip_control                             DONE (anv, hasvk, hk, kk, lvp, nvk, panvk, radv, tu, v3dv, vn)
+-  VK_EXT_depth_clip_enable                              DONE (anv, hasvk, hk, lvp, nvk, panvk, pvr, radv, tu, v3dv/vc7+, vn)
++  VK_EXT_depth_clip_enable                              DONE (anv, hasvk, hk, kk, lvp, nvk, panvk, pvr, radv, tu, v3dv/vc7+, vn)
+   VK_EXT_depth_range_unrestricted                       DONE (anv/gen20+, nvk, radv, lvp, vn)
+   VK_EXT_descriptor_buffer                              DONE (anv, lvp, nvk, radv, tu)
+   VK_EXT_descriptor_heap                                DONE (anv, radv, vn)
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 7d061bd1220e2de5b0bf950737641bddf69fd23d..f9879e5770e21b5d6837e650b7b744fd77fd0768 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -10,6 +10,7 @@
+ 
+ #include "kk_private.h"
+ 
++#include "kk_depth_clip.h"
+ #include "kk_descriptor_set.h"
+ #include "kk_image.h"
+ #include "kk_nir_lower_vbo.h"
+@@ -39,6 +40,9 @@ struct kk_root_descriptor_table {
+ 
+          float blend_constant[4];
+          float clip_z_coeff;
++         struct kk_depth_clip_transform depth_clip_transforms[KK_MAX_VIEWPORTS];
++         struct kk_depth_clamp_range depth_clamp_ranges[KK_MAX_VIEWPORTS];
++         uint32_t manual_depth_clamp_enable;
+       } draw;
+       struct {
+          uint32_t base_group[3];
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 5d4477e7c02505debc89d885489276f567695a0e..d19a71481a69dd871702e96c42c939d0f7b1d8e0 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -11,6 +11,7 @@
+ 
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_depth_clip.h"
+ #include "kk_format.h"
+ #include "kk_image_view.h"
+ #include "kk_query_pool.h"
+@@ -708,6 +709,7 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
+ {
+    const struct vk_dynamic_graphics_state *dyn =
+       &cmd->vk.dynamic_graphics_state;
++   const bool remap_depth = kk_depth_clip_requires_viewport_remap(&dyn->rs);
+ 
+    /* We always need at least 1 viewport for the hardware. With rasterizer
+     * discard the app may not supply any, but we can just program garbage.
+@@ -754,8 +756,8 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
+       viewports[i].width = vp->width;
+       viewports[i].height = -vp->height;
+ 
+-      viewports[i].znear = vp->minDepth;
+-      viewports[i].zfar = vp->maxDepth;
++      viewports[i].znear = remap_depth ? 0.0 : vp->minDepth;
++      viewports[i].zfar = remap_depth ? 1.0 : vp->maxDepth;
+    }
+ 
+    mtl_set_viewports(encoder, viewports, count);
+@@ -1487,7 +1489,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    /* We enable raster discard by setting scissor to size (0, 0) */
+    if (!(kk_rast_discard(cmd) || gfx->is_cull_front_and_back) &&
+        (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
+-        IS_DIRTY(VP_SCISSOR_COUNT) || IS_DIRTY(VP_SCISSORS)))
++        IS_DIRTY(VP_SCISSOR_COUNT) || IS_DIRTY(VP_SCISSORS) ||
++        IS_DIRTY(RS_DEPTH_CLIP_ENABLE) || IS_DIRTY(RS_DEPTH_CLAMP_ENABLE)))
+       kk_flush_vp_state(cmd);
+ 
+    if (IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
+@@ -1496,6 +1499,24 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       desc->root_dirty = true;
+    }
+ 
++   if (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
++       IS_DIRTY(RS_DEPTH_CLIP_ENABLE) || IS_DIRTY(RS_DEPTH_CLAMP_ENABLE)) {
++      for (uint32_t i = 0; i < KK_MAX_VIEWPORTS; i++) {
++         const VkViewport *vp =
++            i < dyn->vp.viewport_count ? &dyn->vp.viewports[i] : NULL;
++         const float min_depth = vp ? vp->minDepth : 0.0f;
++         const float max_depth = vp ? vp->maxDepth : 1.0f;
++
++         desc->root.draw.depth_clip_transforms[i] =
++            kk_depth_clip_transform(&dyn->rs, min_depth, max_depth);
++         desc->root.draw.depth_clamp_ranges[i] =
++            kk_depth_clamp_range(min_depth, max_depth);
++      }
++      desc->root.draw.manual_depth_clamp_enable =
++         kk_manual_depth_clamp_enable(&dyn->rs);
++      desc->root_dirty = true;
++   }
++
+    if (IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(TS_DOMAIN_ORIGIN) ||
+        IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL)) {
+       bool front_face_ccw = dyn->rs.front_face != VK_FRONT_FACE_CLOCKWISE;
+@@ -1518,12 +1539,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+          mtl_set_depth_bias(enc, 0.0f, 0.0f, 0.0f);
+    }
+ 
+-   if (IS_DIRTY(RS_DEPTH_CLAMP_ENABLE)) {
+-      enum mtl_depth_clip_mode mode = dyn->rs.depth_clamp_enable
+-                                         ? MTL_DEPTH_CLIP_MODE_CLAMP
+-                                         : MTL_DEPTH_CLIP_MODE_CLIP;
+-      mtl_set_depth_clip_mode(enc, mode);
+-   }
++   if (IS_DIRTY(RS_DEPTH_CLIP_ENABLE) || IS_DIRTY(RS_DEPTH_CLAMP_ENABLE))
++      mtl_set_depth_clip_mode(enc, kk_mtl_depth_clip_mode(&dyn->rs));
+ 
+    if (IS_DIRTY(DS_STENCIL_REFERENCE))
+       mtl_set_stencil_references(
+diff --git a/src/kosmickrisp/vulkan/kk_depth_clip.h b/src/kosmickrisp/vulkan/kk_depth_clip.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b698c583019baad22275dfd358aacb4e77726fc
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_depth_clip.h
+@@ -0,0 +1,117 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_DEPTH_CLIP_H
++#define KK_DEPTH_CLIP_H 1
++
++#include "kosmickrisp/bridge/mtl_types.h"
++
++#include "vulkan/runtime/vk_graphics_state.h"
++
++struct kk_depth_clip_transform {
++   float scale;
++   float bias;
++};
++
++struct kk_depth_clamp_range {
++   float min;
++   float max;
++};
++
++enum kk_fragment_depth_clamp_mode {
++   KK_FRAGMENT_DEPTH_CLAMP_NONE,
++   KK_FRAGMENT_DEPTH_CLAMP_ALWAYS,
++   KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC,
++};
++
++static inline bool
++kk_is_possible_both_depth_clip_clamp(
++   const struct vk_graphics_pipeline_state *state, bool enabled)
++{
++   const bool clamp_dynamic =
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE);
++   const bool clip_dynamic =
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
++
++   /* Without rasterization state, depth clamp must be dynamic and depth clip
++    * remains its inverse unless that state is dynamic too.
++    */
++   if (state->rs == NULL)
++      return clamp_dynamic && clip_dynamic;
++
++   /* The legacy state is defined as the inverse of depthClampEnable. */
++   if (!clip_dynamic &&
++       state->rs->depth_clip_enable == VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP)
++      return false;
++
++   const bool static_clamp_match = state->rs->depth_clamp_enable == enabled;
++   const bool static_clip_match =
++      vk_rasterization_state_depth_clip_enable(state->rs) == enabled;
++
++   return (clamp_dynamic || static_clamp_match) &&
++          (clip_dynamic || static_clip_match);
++}
++
++static inline enum mtl_depth_clip_mode
++kk_mtl_depth_clip_mode(const struct vk_rasterization_state *rs)
++{
++   return vk_rasterization_state_depth_clip_enable(rs)
++             ? MTL_DEPTH_CLIP_MODE_CLIP
++             : MTL_DEPTH_CLIP_MODE_CLAMP;
++}
++
++static inline bool
++kk_depth_clip_requires_viewport_remap(const struct vk_rasterization_state *rs)
++{
++   return !vk_rasterization_state_depth_clip_enable(rs) &&
++          !rs->depth_clamp_enable;
++}
++
++static inline bool
++kk_manual_depth_clamp_enable(const struct vk_rasterization_state *rs)
++{
++   return rs->depth_clamp_enable &&
++          vk_rasterization_state_depth_clip_enable(rs);
++}
++
++static inline enum kk_fragment_depth_clamp_mode
++kk_fragment_depth_clamp_mode(const struct vk_graphics_pipeline_state *state)
++{
++   const bool clamp_dynamic =
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE);
++   const bool clip_dynamic =
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
++
++   if (!kk_is_possible_both_depth_clip_clamp(state, true))
++      return KK_FRAGMENT_DEPTH_CLAMP_NONE;
++
++   return clamp_dynamic || clip_dynamic ? KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC
++                                        : KK_FRAGMENT_DEPTH_CLAMP_ALWAYS;
++}
++
++static inline struct kk_depth_clip_transform
++kk_depth_clip_transform(const struct vk_rasterization_state *rs,
++                        float min_depth, float max_depth)
++{
++   if (kk_depth_clip_requires_viewport_remap(rs)) {
++      return (struct kk_depth_clip_transform){
++         .scale = max_depth - min_depth,
++         .bias = min_depth,
++      };
++   }
++
++   return (struct kk_depth_clip_transform){.scale = 1.0f, .bias = 0.0f};
++}
++
++static inline struct kk_depth_clamp_range
++kk_depth_clamp_range(float min_depth, float max_depth)
++{
++   return min_depth < max_depth
++             ? (struct kk_depth_clamp_range){.min = min_depth, .max = max_depth}
++             : (struct kk_depth_clamp_range){.min = max_depth,
++                                             .max = min_depth};
++}
++
++#endif /* KK_DEPTH_CLIP_H */
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 9f9b33b8a44f687cde77f661b912af28dfbec4f8..f1f7f63a6a403c1dd84fa546252f0de7fbe89415 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -65,6 +65,13 @@ load_root(nir_builder *b, unsigned num_components, unsigned bit_size,
+    return load_speculatable(b, num_components, bit_size, addr, align);
+ }
+ 
++nir_def *
++kk_nir_load_root(nir_builder *b, unsigned num_components, unsigned bit_size,
++                 nir_def *offset, unsigned align)
++{
++   return load_root(b, num_components, bit_size, offset, align);
++}
++
+ static nir_def *
+ load_per_draw(nir_builder *b, unsigned num_components, unsigned bit_size,
+               nir_def *offset, unsigned align)
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 628b8e8bdb3411697499a8207ea0f13d97580fd8..073e9adb13971b84a3f97b15d987b57d9998bd8f 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -167,6 +167,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_custom_resolve = true,
+       .EXT_debug_marker = true,
+       .EXT_depth_clip_control = true,
++      .EXT_depth_clip_enable = true,
+       .EXT_dynamic_rendering_unused_attachments = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_metal = true,
+@@ -434,6 +435,9 @@ kk_get_device_features(
+       /* VK_EXT_depth_clip_control */
+       .depthClipControl = true,
+ 
++      /* VK_EXT_depth_clip_enable */
++      .depthClipEnable = true,
++
+       /* VK_EXT_dynamic_rendering_unused_attachments
+        *
+        * A render pass may leave some of the pipeline's colour attachments
+@@ -445,6 +449,7 @@ kk_get_device_features(
+ 
+       /* VK_EXT_extended_dynamic_state3 */
+       .extendedDynamicState3DepthClampEnable = true,
++      .extendedDynamicState3DepthClipEnable = true,
+       .extendedDynamicState3DepthClipNegativeOneToOne = true,
+       /* Rectangular-line expansion is selected at pipeline compile time. */
+       .extendedDynamicState3LineRasterizationMode = false,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 4f27d90b90c088abe8dad9b6ee5fa6e1aeeff41a..93b77ae4a35eb7d96c3667d5d3de34ac9fc6b600 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -117,6 +117,7 @@ struct kk_vs_key {
+    bool is_points;
+    bool polygon_point_emulation;
+    bool rectangular_line_emulation;
++   bool depth_clip_viewport_remap;
+    struct vk_vertex_input_state vi;
+ };
+ 
+@@ -165,6 +166,8 @@ kk_populate_vs_key(struct kk_vs_key *key,
+    key->polygon_point_emulation = kk_needs_polygon_point_emulation(state);
+    key->rectangular_line_emulation =
+       kk_needs_rectangular_line_emulation(state);
++   key->depth_clip_viewport_remap =
++      kk_is_possible_both_depth_clip_clamp(state, false);
+    key->vi = *state->vi;
+ }
+ 
+@@ -176,6 +179,7 @@ struct kk_fs_key {
+    uint16_t static_sample_mask;
+    bool sample_shading_enable;
+    bool has_depth;
++   enum kk_fragment_depth_clamp_mode depth_clamp_mode;
+ };
+ 
+ static void
+@@ -204,6 +208,7 @@ kk_populate_fs_key(struct kk_fs_key *key,
+ 
+    /* Depth writes are removed unless there's an actual attachment */
+    key->has_depth = state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
++   key->depth_clamp_mode = kk_fragment_depth_clamp_mode(state);
+ }
+ 
+ static void
+@@ -372,6 +377,107 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
+ }
+ 
++static nir_def *
++kk_load_depth_clip_array(nir_builder *b, nir_def *viewport,
++                         unsigned array_offset, unsigned element_size)
++{
++   viewport = nir_umin_imm(b, nir_u2u32(b, viewport), KK_MAX_VIEWPORTS - 1);
++
++   nir_def *byte_offset = nir_imul_imm(b, viewport, element_size);
++   byte_offset = nir_iadd_imm(b, byte_offset, array_offset);
++
++   return kk_nir_load_root(b, 2, 32, byte_offset, 4);
++}
++
++static nir_def *
++kk_load_depth_clip_transform(nir_builder *b, nir_def *viewport)
++{
++   return kk_load_depth_clip_array(
++      b, viewport,
++      offsetof(struct kk_root_descriptor_table, draw.depth_clip_transforms),
++      sizeof(struct kk_depth_clip_transform));
++}
++
++static nir_def *
++kk_load_depth_clamp_range(nir_builder *b, nir_def *viewport)
++{
++   return kk_load_depth_clip_array(
++      b, viewport,
++      offsetof(struct kk_root_descriptor_table, draw.depth_clamp_ranges),
++      sizeof(struct kk_depth_clamp_range));
++}
++
++static nir_def *
++kk_load_manual_depth_clamp_enable(nir_builder *b)
++{
++   return kk_nir_load_root(
++      b, 1, 32,
++      nir_imm_int(b, offsetof(struct kk_root_descriptor_table,
++                              draw.manual_depth_clamp_enable)),
++      4);
++}
++
++static bool
++kk_nir_lower_depth_clip_position(nir_shader *nir)
++{
++   bool progress = false;
++
++   nir_foreach_function_impl(impl, nir) {
++      bool impl_progress = false;
++
++      nir_foreach_block(block, impl) {
++         nir_intrinsic_instr *position = NULL;
++         nir_intrinsic_instr *viewport = NULL;
++
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_store_output)
++               continue;
++
++            const nir_io_semantics io = nir_intrinsic_io_semantics(intr);
++            if (io.location == VARYING_SLOT_POS) {
++               assert(position == NULL && "one position store per exit");
++               position = intr;
++            } else if (io.location == VARYING_SLOT_VIEWPORT) {
++               assert(viewport == NULL && "one viewport store per exit");
++               viewport = intr;
++            }
++         }
++
++         if (position == NULL)
++            continue;
++
++         /* Output stores are unordered.  Place position last so a dynamic
++          * viewport index is available regardless of source assignment order.
++          */
++         nir_instr_move(nir_after_block_before_jump(block), &position->instr);
++
++         nir_builder b = nir_builder_at(nir_before_instr(&position->instr));
++         nir_def *viewport_index =
++            viewport ? viewport->src[0].ssa : nir_imm_int(&b, 0);
++         nir_def *transform = kk_load_depth_clip_transform(&b, viewport_index);
++         nir_def *pos = position->src[0].ssa;
++         nir_def *z = nir_ffma_weak(&b, nir_channel(&b, pos, 2),
++                                    nir_channel(&b, transform, 0),
++                                    nir_fmul(&b, nir_channel(&b, pos, 3),
++                                             nir_channel(&b, transform, 1)));
++
++         nir_src_rewrite(&position->src[0],
++                         nir_vector_insert_imm(&b, pos, z, 2));
++         impl_progress = true;
++      }
++
++      if (impl_progress)
++         nir_progress(true, impl, nir_metadata_control_flow);
++      progress |= impl_progress;
++   }
++
++   return progress;
++}
++
+ /* Lowering for the stage which ends up as the vertex stage on hardware */
+ static void
+ kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
+@@ -392,6 +498,14 @@ kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
+ 
+    NIR_PASS(_, nir, msl_ensure_vertex_position_output);
+    NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
++
++   /* Metal's clamp mode also clamps the post-viewport depth.  Apply the
++    * Vulkan viewport transform in the vertex shader only when both clipping
++    * and clamping can be disabled, and give Metal an identity depth range.
++    */
++   if (kk_is_possible_both_depth_clip_clamp(state, false))
++      NIR_PASS(_, nir, kk_nir_lower_depth_clip_position);
++
+    NIR_PASS(_, nir, msl_nir_vs_io_types);
+ }
+ 
+@@ -525,9 +639,46 @@ lower_subpass_dim(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
+    return true;
+ }
+ 
++static bool
++lower_fragment_depth_clamp(nir_builder *b, nir_intrinsic_instr *intr,
++                           void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_store_output ||
++       nir_intrinsic_io_semantics(intr).location != FRAG_RESULT_DEPTH)
++      return false;
++
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def *depth = intr->src[0].ssa;
++   const enum kk_fragment_depth_clamp_mode mode =
++      *(const enum kk_fragment_depth_clamp_mode *)data;
++
++   if (mode == KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC)
++      nir_push_if(b, nir_ine_imm(b, kk_load_manual_depth_clamp_enable(b), 0));
++
++   nir_def *viewport = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = 0,
++                                      .range = 1, .dest_type = nir_type_uint32,
++                                      .io_semantics = (nir_io_semantics){
++                                         .location = VARYING_SLOT_VIEWPORT,
++                                         .num_slots = 1,
++                                      });
++   nir_def *range = kk_load_depth_clamp_range(b, viewport);
++   nir_def *clamped =
++      nir_fclamp(b, depth, nir_channel(b, range, 0), nir_channel(b, range, 1));
++
++   if (mode == KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC) {
++      nir_pop_if(b, NULL);
++      clamped = nir_if_phi(b, clamped, depth);
++   } else {
++      assert(mode == KK_FRAGMENT_DEPTH_CLAMP_ALWAYS);
++   }
++
++   nir_src_rewrite(&intr->src[0], clamped);
++   return true;
++}
++
+ static void
+ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+-            const struct vk_graphics_pipeline_state *state)
++            const struct vk_graphics_pipeline_state *state, bool writes_depth)
+ {
+    /* Metal pipelines must not expose fragment outputs for attachments that
+     * were not declared by the Vulkan pipeline.  In particular, an extra
+@@ -567,6 +718,17 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+       NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                msl_nir_fs_remove_depth_write, nir_metadata_control_flow, NULL);
+ 
++   if (writes_depth) {
++      const enum kk_fragment_depth_clamp_mode mode =
++         kk_fragment_depth_clamp_mode(state);
++      bool lowered = false;
++      if (mode != KK_FRAGMENT_DEPTH_CLAMP_NONE)
++         NIR_PASS(lowered, nir, nir_shader_intrinsics_pass,
++                  lower_fragment_depth_clamp, nir_metadata_none, (void *)&mode);
++      if (lowered)
++         nir->info.inputs_read |= VARYING_BIT_VIEWPORT;
++   }
++
+    /* Input attachments are treated as 2D textures. Fixes sampler dimension */
+    NIR_PASS(_, nir, nir_shader_tex_pass, lower_subpass_dim, nir_metadata_all,
+             NULL);
+@@ -621,6 +783,10 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+    if (nir->info.io_lowered)
+       return;
+ 
++   const bool writes_depth =
++      nir->info.stage == MESA_SHADER_FRAGMENT &&
++      (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH));
++
+    if (KK_DEBUG(FORCE_ROBUSTNESS))
+       rs = &rs_all_supported;
+ 
+@@ -718,7 +884,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+        !emulated_stage) {
+       kk_lower_hw_vs(nir, state);
+    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+-      kk_lower_fs(dev, nir, state);
++      kk_lower_fs(dev, nir, state, writes_depth);
+    }
+ 
+    /* Descriptor lowering needs to happen after lowering blend since we will
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index c14ac9789877ffc1fe6b8b4253c51e83a72a2017..67d45395434530d7b1f835fa75a079edb1588883 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -195,6 +195,11 @@ kk_nir_lower_descriptors(nir_shader *nir,
+                          uint32_t set_layout_count,
+                          struct vk_descriptor_set_layout *const *set_layouts);
+ 
++/* Loads from the root descriptor table the way the descriptor lowering does,
++ * for the other passes that read it. */
++nir_def *kk_nir_load_root(struct nir_builder *b, unsigned num_components,
++                          unsigned bit_size, nir_def *offset, unsigned align);
++
+ bool kk_nir_lower_poly(struct nir_shader *nir);
+ bool kk_nir_lower_null_images(nir_shader *nir);
+ 
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 5393a11d97e820f617860e3f8281bb61f4e5e141..e0aa4cd8bad2045135b6e88e25b62294c90a2e22 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -62,6 +62,7 @@ kk_files = files(
+   'kk_cmd_copy.c',
+   'kk_cmd_dispatch.c',
+   'kk_cmd_draw.c',
++  'kk_depth_clip.h',
+   'kk_cmd_meta.c',
+   'kk_cmd_pool.h',
+   'kk_cmd_pool.c',
+@@ -272,4 +273,15 @@ if with_tests
+       timeout : 60,
+     )
+   endif
++
++  test(
++    'kosmickrisp_depth_clip',
++    executable(
++      'test_kosmickrisp_depth_clip',
++      files('tests/test_depth_clip.c'),
++      include_directories : [inc_include, inc_src],
++      dependencies : [idep_vulkan_runtime_headers],
++    ),
++    suite : ['kosmickrisp'],
++  )
+ endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_depth_clip.c b/src/kosmickrisp/vulkan/tests/test_depth_clip.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea22399e94091d0ed8b1f3a7f9964071bf9fe9ef
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_depth_clip.c
+@@ -0,0 +1,223 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kosmickrisp/vulkan/kk_depth_clip.h"
++
++#include <assert.h>
++
++static void
++check_state(enum vk_mesa_depth_clip_enable depth_clip_enable,
++            bool depth_clamp_enable, enum mtl_depth_clip_mode expected_mode,
++            bool expected_remap, bool expected_manual_clamp)
++{
++   struct vk_rasterization_state rs = {
++      .depth_clamp_enable = depth_clamp_enable,
++      .depth_clip_enable = depth_clip_enable,
++   };
++
++   assert(kk_mtl_depth_clip_mode(&rs) == expected_mode);
++   assert(kk_depth_clip_requires_viewport_remap(&rs) == expected_remap);
++   assert(kk_manual_depth_clamp_enable(&rs) == expected_manual_clamp);
++}
++
++static void
++check_fragment_mode(enum vk_mesa_depth_clip_enable depth_clip_enable,
++                    bool depth_clamp_enable, bool dynamic_clip,
++                    bool dynamic_clamp,
++                    enum kk_fragment_depth_clamp_mode expected)
++{
++   struct vk_rasterization_state rs = {
++      .depth_clamp_enable = depth_clamp_enable,
++      .depth_clip_enable = depth_clip_enable,
++   };
++   struct vk_graphics_pipeline_state state = {.rs = &rs};
++
++   if (dynamic_clip)
++      BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
++   if (dynamic_clamp)
++      BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE);
++
++   assert(kk_fragment_depth_clamp_mode(&state) == expected);
++}
++
++static void
++check_possible(enum vk_mesa_depth_clip_enable depth_clip_enable,
++               bool depth_clamp_enable, bool dynamic_clip, bool dynamic_clamp,
++               bool enabled, bool expected)
++{
++   struct vk_rasterization_state rs = {
++      .depth_clamp_enable = depth_clamp_enable,
++      .depth_clip_enable = depth_clip_enable,
++   };
++   struct vk_graphics_pipeline_state state = {.rs = &rs};
++
++   if (dynamic_clip)
++      BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
++   if (dynamic_clamp)
++      BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE);
++
++   assert(kk_is_possible_both_depth_clip_clamp(&state, enabled) == expected);
++}
++
++static bool
++reference_possible(enum vk_mesa_depth_clip_enable static_clip,
++                   bool static_clamp, bool dynamic_clip, bool dynamic_clamp,
++                   bool enabled)
++{
++   for (unsigned clamp = 0; clamp <= 1; clamp++) {
++      if (!dynamic_clamp && clamp != static_clamp)
++         continue;
++
++      for (unsigned clip = 0; clip <= 1; clip++) {
++         if (!dynamic_clip) {
++            const bool resolved_clip =
++               static_clip == VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP
++                  ? !clamp
++                  : static_clip == VK_MESA_DEPTH_CLIP_ENABLE_TRUE;
++            if (clip != resolved_clip)
++               continue;
++         }
++
++         if (clip == enabled && clamp == enabled)
++            return true;
++      }
++   }
++
++   return false;
++}
++
++static void
++check_all_pipeline_possibilities(void)
++{
++   const enum vk_mesa_depth_clip_enable clip_states[] = {
++      VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP,
++      VK_MESA_DEPTH_CLIP_ENABLE_FALSE,
++      VK_MESA_DEPTH_CLIP_ENABLE_TRUE,
++   };
++
++   for (unsigned s = 0; s < ARRAY_SIZE(clip_states); s++) {
++      for (unsigned static_clamp = 0; static_clamp <= 1; static_clamp++) {
++         for (unsigned dynamic_clip = 0; dynamic_clip <= 1; dynamic_clip++) {
++            for (unsigned dynamic_clamp = 0; dynamic_clamp <= 1;
++                 dynamic_clamp++) {
++               for (unsigned enabled = 0; enabled <= 1; enabled++) {
++                  const bool expected =
++                     reference_possible(clip_states[s], static_clamp,
++                                        dynamic_clip, dynamic_clamp, enabled);
++                  check_possible(clip_states[s], static_clamp, dynamic_clip,
++                                 dynamic_clamp, enabled, expected);
++               }
++            }
++         }
++      }
++   }
++}
++
++static void
++check_transform(enum vk_mesa_depth_clip_enable depth_clip_enable,
++                bool depth_clamp_enable, float min_depth, float max_depth,
++                float expected_scale, float expected_bias)
++{
++   const struct vk_rasterization_state rs = {
++      .depth_clamp_enable = depth_clamp_enable,
++      .depth_clip_enable = depth_clip_enable,
++   };
++   const struct kk_depth_clip_transform transform =
++      kk_depth_clip_transform(&rs, min_depth, max_depth);
++
++   assert(transform.scale == expected_scale);
++   assert(transform.bias == expected_bias);
++}
++
++int
++main(void)
++{
++   /* Explicit depth clipping is independent of depth clamping. */
++   check_state(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, false,
++               MTL_DEPTH_CLIP_MODE_CLAMP, true, false);
++   check_state(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, true, MTL_DEPTH_CLIP_MODE_CLAMP,
++               false, false);
++   check_state(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, MTL_DEPTH_CLIP_MODE_CLIP,
++               false, false);
++   check_state(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, true, MTL_DEPTH_CLIP_MODE_CLIP,
++               false, true);
++
++   /* Without explicit state, depthClampEnable retains Vulkan 1.0 behavior. */
++   check_state(VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP, false,
++               MTL_DEPTH_CLIP_MODE_CLIP, false, false);
++   check_state(VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP, true,
++               MTL_DEPTH_CLIP_MODE_CLAMP, false, false);
++
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, true, false, false,
++                       KK_FRAGMENT_DEPTH_CLAMP_ALWAYS);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, true, true, false,
++                       KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, true, false, true,
++                       KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, false, true,
++                       KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, true, true, false,
++                       KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, true, false,
++                       KK_FRAGMENT_DEPTH_CLAMP_NONE);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, true, false, true,
++                       KK_FRAGMENT_DEPTH_CLAMP_NONE);
++   check_fragment_mode(VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP, true, false, true,
++                       KK_FRAGMENT_DEPTH_CLAMP_NONE);
++
++   /* Compile shader emulation only when a matching state is reachable. */
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, false, false, false, false,
++                  true);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, true, false, false, true,
++                  true);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, false, false, false,
++                  false);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, true, false, false, true,
++                  false);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, true, false, false,
++                  true);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, true, false, true, false,
++                  true);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, false, true, true,
++                  true);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, true, true, false, true,
++                  true);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP, false, false, true,
++                  false, false);
++   check_possible(VK_MESA_DEPTH_CLIP_ENABLE_NOT_CLAMP, true, false, true, true,
++                  false);
++   check_all_pipeline_possibilities();
++
++   struct vk_graphics_pipeline_state dynamic_only = {};
++   BITSET_SET(dynamic_only.dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
++   BITSET_SET(dynamic_only.dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE);
++   assert(kk_is_possible_both_depth_clip_clamp(&dynamic_only, false));
++   assert(kk_is_possible_both_depth_clip_clamp(&dynamic_only, true));
++   assert(kk_fragment_depth_clamp_mode(&dynamic_only) ==
++          KK_FRAGMENT_DEPTH_CLAMP_DYNAMIC);
++
++   /* Native clip/clamp needs no additional viewport transform. */
++   check_transform(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, false, 0.25f, 0.75f, 1.0f,
++                   0.0f);
++   check_transform(VK_MESA_DEPTH_CLIP_ENABLE_TRUE, true, 0.25f, 0.75f, 1.0f,
++                   0.0f);
++
++   /* This follows the ordinary clip-range conversion, so both Vulkan clip
++    * ranges use the same final viewport transform.
++    */
++   check_transform(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, false, 0.25f, 0.75f, 0.5f,
++                   0.25f);
++   check_transform(VK_MESA_DEPTH_CLIP_ENABLE_FALSE, false, 0.75f, 0.25f, -0.5f,
++                   0.75f);
++
++   const struct kk_depth_clamp_range forward =
++      kk_depth_clamp_range(0.25f, 0.75f);
++   const struct kk_depth_clamp_range reverse =
++      kk_depth_clamp_range(0.75f, 0.25f);
++   assert(forward.min == 0.25f && forward.max == 0.75f);
++   assert(reverse.min == 0.25f && reverse.max == 0.75f);
++
++   return 0;
++}

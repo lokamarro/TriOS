@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 11:37:45 +0900
+Subject: [PATCH] kosmickrisp: cover emulated border colours in the Meson suite
+
+The custom border emulation reconstructs a Vulkan border colour from two
+Metal samples, and a depth-compare sample additionally reconstructs the
+comparison against that border.  Pin both shapes and the comparison
+contract they rely on: a sampler compare operation is a three-bit mask of
+the orderings that pass, and every non-constant operation has a reference
+value that the 0.0 and 1.0 Metal borders answer differently, which is what
+lets two probes recover the border's filter weight.
+
+The KosmicKrisp Meson suite only exists from "implement GPU geometry
+shaders and streams" onward, so the coverage lands here rather than in the
+border-colour topic itself.
+
+(cherry picked from commit 037fef4a0161344cb62a15bf9a44aaecb4cd9d64)
+(cherry picked from commit 9e2d7bb793a7c26af266ba749dad2513d8eb7054)
+---
+ src/kosmickrisp/vulkan/meson.build            |  22 ++
+ .../tests/test_custom_border_lowering.c       | 324 ++++++++++++++++++
+ 2 files changed, 346 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_custom_border_lowering.c
+
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 7da4c78ea345ac71d1d4318633c69563caecefda..fba8ae283dc86e6832c30a7c1326b1030c0b4d4e 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -696,6 +696,28 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_custom_border_lowering',
++    executable(
++      'test_kosmickrisp_custom_border_lowering',
++      files(
++        'tests/test_custom_border_lowering.c',
++        'kk_nir_lower_custom_border.c',
++        'kk_nir_lower_descriptors.c',
++      ),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_vulkan_runtime_headers,
++        idep_vulkan_util_headers,
++        idep_vulkan_wsi_headers,
++        idep_msl_to_nir,
++        idep_libkk_shaders_h,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_rgb32_texel_lowering',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_custom_border_lowering.c b/src/kosmickrisp/vulkan/tests/test_custom_border_lowering.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f657858d271b3d133f732d71586a4fa0c7b2032c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_custom_border_lowering.c
+@@ -0,0 +1,324 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Metal cannot express an arbitrary sampler border colour, so KosmicKrisp
++ * reconstructs one in the shader.  A depth-compare sample returns the
++ * comparison rather than the texel, so it needs its own reconstruction: these
++ * checks pin the shape the compiler emits and the comparison contract the
++ * emitted code relies on.
++ */
++
++#include "kosmickrisp/vulkan/kk_descriptor_types.h"
++#include "kosmickrisp/vulkan/kk_descriptor_set_layout.h"
++#include "vulkan/runtime/vk_pipeline.h"
++#include "kosmickrisp/vulkan/kk_shader.h"
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition)                                                     \
++   do {                                                                      \
++      if (!(condition)) {                                                    \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,    \
++                 #condition);                                                \
++         abort();                                                            \
++      }                                                                      \
++   } while (0)
++
++struct lowering_stats {
++   unsigned samples;
++   unsigned samples_with_comparator;
++   unsigned clamp_to_0_samples;
++   unsigned border_queries;
++   unsigned compare_op_queries;
++   unsigned has_border_queries;
++   unsigned ifs;
++};
++
++static void
++collect_stats(nir_shader *shader, struct lowering_stats *stats)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_tex)
++               continue;
++
++            nir_tex_instr *tex = nir_instr_as_tex(instr);
++            switch (tex->op) {
++            case nir_texop_custom_border_color_agx:
++               stats->border_queries++;
++               break;
++            case nir_texop_has_custom_border_color_agx:
++               stats->has_border_queries++;
++               break;
++            case nir_texop_sampler_descriptor_amd:
++               stats->compare_op_queries++;
++               break;
++            default:
++               stats->samples++;
++               if (nir_tex_instr_src_index(tex, nir_tex_src_comparator) >= 0)
++                  stats->samples_with_comparator++;
++               if (tex->backend_flags & KK_TEXTURE_FLAG_CLAMP_TO_0)
++                  stats->clamp_to_0_samples++;
++               break;
++            }
++         }
++      }
++
++      foreach_list_typed(nir_cf_node, node, node, &impl->body) {
++         if (node->type == nir_cf_node_if)
++            stats->ifs++;
++      }
++   }
++}
++
++static nir_shader *
++build_gather(bool shadow)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "custom border lowering test");
++
++   const struct glsl_type *sampler_type =
++      glsl_sampler_type(GLSL_SAMPLER_DIM_2D, shadow, false, GLSL_TYPE_FLOAT);
++   nir_variable *variable =
++      nir_variable_create(b.shader, nir_var_uniform, sampler_type, "sampler");
++   variable->data.descriptor_set = 0;
++   variable->data.binding = 0;
++
++   nir_deref_instr *deref = nir_build_deref_var(&b, variable);
++   nir_def *coord = nir_load_frag_coord(&b);
++   coord = nir_trim_vector(&b, coord, 2);
++
++   nir_tex_instr *tex = nir_tex_instr_create(b.shader, shadow ? 4 : 3);
++   tex->op = nir_texop_tg4;
++   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
++   tex->dest_type = nir_type_float32;
++   tex->coord_components = 2;
++   tex->is_shadow = shadow;
++   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
++   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
++   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
++   if (shadow) {
++      tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_comparator,
++                                        nir_imm_float(&b, 0.25f));
++   }
++   nir_def_init(&tex->instr, &tex->def, 4, 32);
++   nir_builder_instr_insert(&b, &tex->instr);
++
++   nir_variable *color = nir_variable_create(
++      b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
++   color->data.location = FRAG_RESULT_DATA0;
++   nir_store_var(&b, color, &tex->def, 0xf);
++
++   return b.shader;
++}
++
++static void
++check_descriptor_queries_are_lowered(nir_shader *shader)
++{
++   struct kk_descriptor_set_layout *layout =
++      calloc(1, sizeof(*layout) + sizeof(layout->binding[0]));
++   CHECK(layout != NULL);
++   layout->binding_count = 1;
++   layout->binding[0] = (struct kk_descriptor_set_binding_layout){
++      .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++      .array_size = 1,
++      .stride = sizeof(struct kk_sampled_image_descriptor),
++   };
++   struct vk_descriptor_set_layout *set_layouts[] = {&layout->vk};
++   const struct vk_pipeline_robustness_state robustness = {
++      .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
++   };
++   CHECK(kk_nir_lower_descriptors(shader, &robustness, 1, set_layouts, false));
++   nir_validate_shader(shader, "custom border descriptor lowering regression");
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++   CHECK(stats.compare_op_queries == 0);
++   CHECK(stats.has_border_queries == 0);
++   CHECK(stats.border_queries == 0);
++   free(layout);
++}
++
++static void
++check_shadow_gather_is_lowered(void)
++{
++   nir_shader *shader = build_gather(true);
++
++   CHECK(kk_nir_lower_custom_border(shader));
++   nir_validate_shader(shader, "custom border lowering regression");
++
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++
++   /* The white-border sample plus the two weight probes, and nothing that
++    * drops the depth comparison. */
++   CHECK(stats.samples == stats.samples_with_comparator);
++   CHECK(stats.samples_with_comparator == 3);
++   CHECK(stats.clamp_to_0_samples == 1);
++   CHECK(stats.has_border_queries == 1);
++   CHECK(stats.compare_op_queries == 1);
++   CHECK(stats.border_queries == 1);
++   CHECK(stats.ifs == 1);
++
++   check_descriptor_queries_are_lowered(shader);
++   ralloc_free(shader);
++   printf("custom border lowering PASS shadow-gather\n");
++}
++
++static void
++check_colour_gather_is_lowered(void)
++{
++   nir_shader *shader = build_gather(false);
++
++   CHECK(kk_nir_lower_custom_border(shader));
++   nir_validate_shader(shader, "custom border lowering regression");
++
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++
++   CHECK(stats.samples_with_comparator == 0);
++   CHECK(stats.samples == 2);
++   CHECK(stats.clamp_to_0_samples == 1);
++   CHECK(stats.has_border_queries == 1);
++   CHECK(stats.compare_op_queries == 0);
++   CHECK(stats.border_queries == 1);
++   CHECK(stats.ifs == 1);
++
++   check_descriptor_queries_are_lowered(shader);
++   ralloc_free(shader);
++   printf("custom border lowering PASS colour-gather\n");
++}
++
++static bool
++reference_compare(VkCompareOp op, float reference, float value)
++{
++   switch (op) {
++   case VK_COMPARE_OP_NEVER:
++      return false;
++   case VK_COMPARE_OP_LESS:
++      return reference < value;
++   case VK_COMPARE_OP_EQUAL:
++      return reference == value;
++   case VK_COMPARE_OP_LESS_OR_EQUAL:
++      return reference <= value;
++   case VK_COMPARE_OP_GREATER:
++      return reference > value;
++   case VK_COMPARE_OP_NOT_EQUAL:
++      return reference != value;
++   case VK_COMPARE_OP_GREATER_OR_EQUAL:
++      return reference >= value;
++   case VK_COMPARE_OP_ALWAYS:
++      return true;
++   default:
++      abort();
++   }
++}
++
++/* A builder that folds the NIR the lowering emits as it is built, so pieces
++ * of the reconstruction given immediate operands evaluate to constants. */
++static nir_builder
++folding_builder(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "custom border contract");
++   b.constant_fold_alu = true;
++   return b;
++}
++
++static nir_src
++folded(nir_def *def)
++{
++   const nir_src src = nir_src_for_ssa(def);
++   CHECK(nir_src_is_const(src));
++   return src;
++}
++
++static bool
++border_compare(nir_builder *b, VkCompareOp op, nir_def *reference,
++               float value)
++{
++   return nir_src_as_float(folded(kk_nir_border_compare(
++             b, nir_imm_int(b, op), reference, nir_imm_float(b, value)))) !=
++          0.0;
++}
++
++static void
++check_compare_contract(void)
++{
++   static const float values[] = {
++      -INFINITY, -0.5f, 0.0f, 0.25f, 0.5f, 1.0f, 1.25f, INFINITY,
++   };
++   nir_builder b = folding_builder();
++
++   for (uint32_t op = VK_COMPARE_OP_NEVER; op <= VK_COMPARE_OP_ALWAYS; op++) {
++      for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
++         for (unsigned j = 0; j < ARRAY_SIZE(values); j++) {
++            CHECK(border_compare(&b, op, nir_imm_float(&b, values[i]),
++                                 values[j]) ==
++                  reference_compare(op, values[i], values[j]));
++         }
++      }
++
++      /* The weight probe only works when the two Metal borders answer
++       * differently.  The constant operations need no weight because the
++       * emulated border cannot change their answer. */
++      nir_def *probe = kk_nir_border_probe_reference(&b, nir_imm_int(&b, op), 32);
++      folded(probe);
++      const bool differs =
++         border_compare(&b, op, probe, 0.0f) != border_compare(&b, op, probe, 1.0f);
++      const bool constant =
++         op == VK_COMPARE_OP_NEVER || op == VK_COMPARE_OP_ALWAYS;
++      CHECK(differs == !constant);
++   }
++
++   ralloc_free(b.shader);
++   printf("custom border lowering PASS compare-contract\n");
++}
++
++static void
++check_packing(void)
++{
++   nir_builder b = folding_builder();
++
++   for (uint32_t op = VK_COMPARE_OP_NEVER; op <= VK_COMPARE_OP_ALWAYS; op++) {
++      const uint32_t indices[] = {0, 1, 4095, KK_BORDER_SAMPLER_INDEX_MASK};
++
++      for (unsigned i = 0; i < ARRAY_SIZE(indices); i++) {
++         const int32_t packed = kk_pack_border_emulation(indices[i], op);
++
++         CHECK(packed >= 0);
++         /* The descriptor lowering masks the sampler index out of the low
++          * bits, and the reconstruction extracts the compare operation. */
++         CHECK(((uint32_t)packed & KK_BORDER_SAMPLER_INDEX_MASK) == indices[i]);
++         CHECK(nir_src_as_uint(folded(kk_nir_border_compare_op(
++                  &b, nir_imm_int(&b, packed)))) == op);
++      }
++   }
++
++   ralloc_free(b.shader);
++   printf("custom border lowering PASS packing\n");
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   check_packing();
++   check_compare_contract();
++   check_colour_gather_is_lowered();
++   check_shadow_gather_is_lowered();
++
++   glsl_type_singleton_decref();
++   return 0;
++}

@@ -1,0 +1,1042 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 19:31:13 +0900
+Subject: [PATCH] zink: support Venus implicit native dma-bufs
+
+A paired Metal renderer without DRM format modifiers shares an optimal image
+as the native MTLHeap that backs it, and the dma-buf then names that
+allocation, not a layout. Guest Zink imports such a DRM_FORMAT_MOD_INVALID
+dma-buf as the same optimal image over the same heap: it keeps the image
+optimal, withholds host-image-copy usage, which could change the Metal layout,
+reports the logical stride of the window system's envelope, and releases
+ownership to the external queue family where the renderer has no
+VK_EXT_queue_family_foreign.
+
+Venus common WSI makes the matching share under the same condition. Its
+swapchain images stay on the direct scanout path, bounded by the renderer's
+per-image budget, with the logical row pitch the implicit envelope needs
+supplied only through the private WSI layout query, and a virtio-mmio DRM node
+is recognized as the device itself so that Xwayland's DRI3 fd does not force a
+PRIME copy.
+
+A renderer with DRM format modifiers names the layout it shares. Zink then
+shares every image as DRM_FORMAT_MOD_LINEAR and reads an implicit import as
+linear, as upstream Venus does, so Venus WSI offers the modifiers and takes
+the explicit-modifier path, or its linear prime blit, rather than an implicit
+native share that an importer would read as linear rows. The Venus predicate is
+a header-only helper the native test covers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_batch.c        |  10 +-
+ src/gallium/drivers/zink/zink_context.c      |   2 +-
+ src/gallium/drivers/zink/zink_resource.c     |  91 ++++++++--
+ src/gallium/drivers/zink/zink_resource.h     |   7 +
+ src/gallium/drivers/zink/zink_screen.c       |   3 +-
+ src/gallium/drivers/zink/zink_screen.h       |  26 +++
+ src/gallium/drivers/zink/zink_types.h        |   1 +
+ src/virtio/vulkan/meson.build                |  18 ++
+ src/virtio/vulkan/tests/vn_wsi_drm_test.c    |  65 +++++++
+ src/virtio/vulkan/tests/vn_wsi_native_test.c | 171 +++++++++++++++++++
+ src/virtio/vulkan/vn_image.c                 |  13 ++
+ src/virtio/vulkan/vn_image.h                 |   3 +
+ src/virtio/vulkan/vn_wsi.c                   | 107 +++++++++++-
+ src/virtio/vulkan/vn_wsi_drm.h               |  30 ++++
+ src/virtio/vulkan/vn_wsi_native.h            | 118 +++++++++++++
+ 15 files changed, 640 insertions(+), 25 deletions(-)
+ create mode 100644 src/virtio/vulkan/tests/vn_wsi_drm_test.c
+ create mode 100644 src/virtio/vulkan/tests/vn_wsi_native_test.c
+ create mode 100644 src/virtio/vulkan/vn_wsi_drm.h
+ create mode 100644 src/virtio/vulkan/vn_wsi_native.h
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index 29925bd915aece6265f98dbb2d70d6a79fe3e775..ea099054ee425bb1fe66edd7448637e72dac16ed 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -919,7 +919,7 @@ zink_end_batch(struct zink_context *ctx)
+          VkImageMemoryBarrier2 imb;
+          zink_resource_image_barrier2_init(&imb, res, res->layout, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+          imb.srcQueueFamilyIndex = screen->gfx_queue;
+-         imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
++         imb.dstQueueFamilyIndex = zink_dmabuf_queue_family(screen);
+          VkDependencyInfo dep = {
+             VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+             NULL,
+@@ -936,7 +936,7 @@ zink_end_batch(struct zink_context *ctx)
+          VkImageMemoryBarrier imb;
+          zink_resource_image_barrier_init(&imb, res, res->layout, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+          imb.srcQueueFamilyIndex = screen->gfx_queue;
+-         imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
++         imb.dstQueueFamilyIndex = zink_dmabuf_queue_family(screen);
+          VKCTX(CmdPipelineBarrier)(
+             bs->cmdbuf,
+             res->obj->access_stage,
+@@ -947,10 +947,10 @@ zink_end_batch(struct zink_context *ctx)
+             1, &imb
+          );
+       }
+-      res->queue = VK_QUEUE_FAMILY_FOREIGN_EXT;
++      res->queue = zink_dmabuf_queue_family(screen);
+ 
+-      /* We just transitioned to VK_QUEUE_FAMILY_FOREIGN_EXT.  We'll need a
+-       * barrier to transition back to our queue before we can use this
++      /* We just released ownership to the dma-buf queue family.  We'll need
++       * a barrier to transition back to our queue before we can use this
+        * resource again.  Set need_barriers if bound.
+        */
+       for (unsigned i = 0; i < ARRAY_SIZE(ctx->need_barriers); i++) {
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 1aa86b9e4918a4fc51d05ff407488180c1eb4f63..24c9461f62497b263bb025ff0e623a31fbb4247c 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -4869,7 +4869,7 @@ zink_flush_resource(struct pipe_context *pctx,
+       }
+       ctx->swapchain = res;
+    } else if (res->dmabuf)
+-      res->queue = VK_QUEUE_FAMILY_FOREIGN_EXT;
++      res->queue = zink_dmabuf_queue_family(zink_screen(pctx->screen));
+ }
+ 
+ static struct pipe_stream_output_target *
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index af3035dc729d387c46ac1f81a3029685f36cfa8b..08e71cf6034ce6fe806e4aebe2bbd25f94e3fe57 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -471,10 +471,19 @@ get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feat
+    if (bind & PIPE_BIND_STREAM_OUTPUT)
+       usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+ 
++   /* Native Venus dma-bufs must use the same Metal image layout in the
++    * producer and every importer.  Host-image-copy usage can change that
++    * layout based on the external-image query, while these images already
++    * use GPU copies for staging and never need the host-image-copy path.
++    */
++   const bool venus_implicit_dmabuf =
++      zink_use_venus_implicit_dmabuf(screen) && zink_bind_shares_dmabuf(bind);
++
+    /* Add host transfer if not sparse */
+    if (!(templ->flags & PIPE_RESOURCE_FLAG_SPARSE) &&
+        screen->info.have_EXT_host_image_copy &&
+-       feats & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT)
++       feats & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT &&
++       !venus_implicit_dmabuf)
+       usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+ 
+    return usage;
+@@ -809,7 +818,9 @@ found:
+ }
+ 
+ static void
+-init_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count)
++init_ici(struct zink_screen *screen, VkImageCreateInfo *ici,
++         const struct pipe_resource *templ, unsigned bind,
++         unsigned modifiers_count, bool venus_implicit_dmabuf)
+ {
+    ici->sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici->format = zink_get_format(screen, templ->format);
+@@ -887,7 +898,8 @@ init_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_r
+ 
+    if (screen->info.have_EXT_image_drm_format_modifier && modifiers_count)
+       ici->tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+-   else if (bind & (PIPE_BIND_LINEAR | ZINK_BIND_DMABUF))
++   else if ((bind & PIPE_BIND_LINEAR) ||
++            ((bind & ZINK_BIND_DMABUF) && !venus_implicit_dmabuf))
+       ici->tiling = VK_IMAGE_TILING_LINEAR;
+    else
+       ici->tiling = VK_IMAGE_TILING_OPTIMAL;
+@@ -996,8 +1008,25 @@ struct mem_alloc_info {
+    const void *user_mem;
+    VkExternalMemoryHandleTypeFlags external;
+    VkExternalMemoryHandleTypeFlags export_types;
++   bool venus_implicit_dmabuf;
+ };
+ 
++static bool
++use_venus_implicit_dmabuf(struct zink_screen *screen,
++                          const struct pipe_resource *templ,
++                          const struct winsys_handle *whandle)
++{
++   if (!zink_use_venus_implicit_dmabuf(screen) ||
++       templ->target == PIPE_BUFFER)
++      return false;
++
++   if (whandle)
++      return whandle->type == WINSYS_HANDLE_TYPE_FD &&
++             whandle->modifier == DRM_FORMAT_MOD_INVALID;
++
++   return templ->bind & PIPE_BIND_SHARED;
++}
++
+ static inline bool
+ get_export_flags(struct zink_screen *screen, const struct pipe_resource *templ, struct mem_alloc_info *alloc_info)
+ {
+@@ -1065,8 +1094,13 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
+       mai.pNext = &ded_alloc_info;
+    }
+ 
++   const bool needs_export_info =
++      (templ->bind & ZINK_BIND_VIDEO) ||
++      ((templ->bind & PIPE_BIND_SHARED) && alloc_info->shared) ||
++      (templ->bind & ZINK_BIND_DMABUF);
+    VkExportMemoryAllocateInfo emai;
+-   if ((templ->bind & ZINK_BIND_VIDEO) || ((templ->bind & PIPE_BIND_SHARED) && alloc_info->shared) || (templ->bind & ZINK_BIND_DMABUF)) {
++   if (needs_export_info &&
++       !(alloc_info->venus_implicit_dmabuf && alloc_info->whandle)) {
+       emai.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+       emai.handleTypes = alloc_info->export_types;
+ 
+@@ -1074,6 +1108,11 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
+       mai.pNext = &emai;
+       obj->exportable = true;
+       obj->exportable_dmabuf = !!(alloc_info->export_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
++   } else if (alloc_info->venus_implicit_dmabuf && alloc_info->whandle) {
++      /* Venus can re-export the attached virtio-gpu resource without asking
++       * the renderer to export an imported MTLHeap again.
++       */
++      obj->exportable = true;
+    }
+ 
+ #ifdef ZINK_USE_DMABUF
+@@ -1469,9 +1508,10 @@ setup_image_pnext(struct zink_screen *screen, const struct pipe_resource *templ,
+ 
+    obj->render_target = (ici->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+ 
+-   if (ici->tiling == VK_IMAGE_TILING_OPTIMAL) {
+-      alloc_info->external &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   if (ici->tiling == VK_IMAGE_TILING_OPTIMAL &&
++       !alloc_info->venus_implicit_dmabuf) {
+       alloc_info->export_types &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      alloc_info->external &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    }
+ 
+    filter_external_image_export_types(screen, ici, mod, alloc_info);
+@@ -1481,7 +1521,8 @@ setup_image_pnext(struct zink_screen *screen, const struct pipe_resource *templ,
+       s->emici.pNext = ici->pNext;
+       s->emici.handleTypes = alloc_info->export_types;
+       assert(!(s->emici.handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) ||
+-             ici->tiling != VK_IMAGE_TILING_OPTIMAL);
++             ici->tiling != VK_IMAGE_TILING_OPTIMAL ||
++             alloc_info->venus_implicit_dmabuf);
+       ici->pNext = &s->emici;
+ 
+       assert(ici->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT || mod != DRM_FORMAT_MOD_INVALID);
+@@ -1511,7 +1552,8 @@ setup_image_pnext(struct zink_screen *screen, const struct pipe_resource *templ,
+          s->idfmlci.drmFormatModifierCount = modifiers_count;
+          s->idfmlci.pDrmFormatModifiers = modifiers;
+          ici->pNext = &s->idfmlci;
+-      } else if (ici->tiling == VK_IMAGE_TILING_OPTIMAL) {
++      } else if (ici->tiling == VK_IMAGE_TILING_OPTIMAL &&
++                 !alloc_info->venus_implicit_dmabuf) {
+          alloc_info->shared = false;
+       }
+    } else if (alloc_info->user_mem) {
+@@ -1615,7 +1657,8 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+    VkFormat formats[4] = {VK_FORMAT_UNDEFINED};
+    VkImageFormatListCreateInfo format_list;
+    enum pipe_format srgb = setup_format_list(screen, templ, alloc_info, formats, &format_list, &ici);
+-   init_ici(screen, &ici, templ, templ->bind, ici_modifier_count);
++   init_ici(screen, &ici, templ, templ->bind, ici_modifier_count,
++            alloc_info->venus_implicit_dmabuf);
+ 
+    bool success = false;
+    VkImageFormatListCreateInfo *fmtlist = (formats[0] && formats[1]) ? &format_list : NULL;
+@@ -1737,9 +1780,13 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
+       .need_dedicated = false,
+       .export_types = ZINK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_BIT,
+       .shared = templ->bind & PIPE_BIND_SHARED,
+-      .user_mem = user_mem
++      .user_mem = user_mem,
++      .venus_implicit_dmabuf =
++         use_venus_implicit_dmabuf(screen, templ, whandle),
+    };
+ 
++   obj->venus_implicit_dmabuf = alloc_info.venus_implicit_dmabuf;
++
+    /* figure out aux plane count */
+    if (whandle && whandle->plane >= util_format_get_num_planes(whandle->format))
+       obj->is_aux = true;
+@@ -1910,7 +1957,7 @@ resource_create(struct pipe_screen *pscreen,
+       }
+       res->dmabuf = whandle && whandle->type == WINSYS_HANDLE_TYPE_FD;
+       if (res->dmabuf)
+-         res->queue = VK_QUEUE_FAMILY_FOREIGN_EXT;
++         res->queue = zink_dmabuf_queue_family(screen);
+       res->layout = res->dmabuf ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED;
+       res->linear = linear;
+       res->aspect = aspect_from_format(templ->format);
+@@ -1969,7 +2016,8 @@ resource_create(struct pipe_screen *pscreen,
+       res->base.buffer_id_unique = util_idalloc_mt_alloc(&screen->buffer_ids);
+    } else {
+       /* immediately switch to GENERAL layout if possible to avoid extra sync */
+-      if (res->obj->image && res->queue != VK_QUEUE_FAMILY_FOREIGN_EXT && screen->driver_workarounds.general_layout)
++      if (res->obj->image && !res->dmabuf &&
++          screen->driver_workarounds.general_layout)
+          zink_resource_image_hic_transition(screen, res, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (res->obj->exportable)
+@@ -2127,6 +2175,11 @@ zink_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
+          break;
+       }
+ #endif
++      if (obj->venus_implicit_dmabuf) {
++         *value = util_format_get_stride(
++            pres->format, u_minify(pres->width0, level));
++         break;
++      }
+       VkImageSubresource sub_res = {0};
+       VkSubresourceLayout sub_res_layout = {0};
+ 
+@@ -2145,6 +2198,10 @@ zink_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
+             break;
+          }
+ #endif
++         if (obj->venus_implicit_dmabuf) {
++            *value = obj->offset;
++            break;
++         }
+          VkImageSubresource isr = {
+             aspect,
+             level,
+@@ -2328,14 +2385,18 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
+    if (templ->format == PIPE_FORMAT_NONE)
+       templ2.format = whandle->format;
+ 
+-   uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+-   int modifier_count = 1;
++   const bool venus_implicit_dmabuf =
++      use_venus_implicit_dmabuf(screen, &templ2, whandle);
++   uint64_t modifier = venus_implicit_dmabuf
++                          ? DRM_FORMAT_MOD_INVALID
++                          : DRM_FORMAT_MOD_LINEAR;
++   int modifier_count = venus_implicit_dmabuf ? 0 : 1;
+    if (templ->target == PIPE_BUFFER) {
+       modifier_count = 0;
+    } else {
+       if (whandle->modifier != DRM_FORMAT_MOD_INVALID)
+          modifier = whandle->modifier;
+-      else {
++      else if (!venus_implicit_dmabuf) {
+          if (!zink_screen(pscreen)->driver_workarounds.can_do_invalid_linear_modifier) {
+             mesa_loge("zink: display server doesn't support DRI3 modifiers and driver can't handle INVALID<->LINEAR!");
+             return NULL;
+diff --git a/src/gallium/drivers/zink/zink_resource.h b/src/gallium/drivers/zink/zink_resource.h
+index 7521675413356572803ee938f67b9f1a4e7d42a7..e3ac6d8dbf23d3e56edc74ee2340db223bb09897 100644
+--- a/src/gallium/drivers/zink/zink_resource.h
++++ b/src/gallium/drivers/zink/zink_resource.h
+@@ -34,6 +34,13 @@
+ #define ZINK_BIND_TRANSIENT (1u << 30) //transient fb attachment
+ #define ZINK_BIND_VIDEO (1u << 31)
+ 
++/* A resource with one of these binds leaves the driver as a dma-buf. */
++static inline bool
++zink_bind_shares_dmabuf(unsigned bind)
++{
++   return (bind & (PIPE_BIND_SHARED | ZINK_BIND_DMABUF)) != 0;
++}
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 89107e78a17d5800ac26b9447e250f3dfc94ef6e..99383884a6510456cb6e665e0f87ead05e88a2fc 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1153,7 +1153,8 @@ zink_init_screen_caps(struct zink_screen *screen)
+ #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
+       screen->info.have_KHR_external_memory_fd &&
+       screen->info.have_EXT_external_memory_dma_buf &&
+-      screen->info.have_EXT_queue_family_foreign
++      (screen->info.have_EXT_queue_family_foreign ||
++       zink_use_venus_implicit_dmabuf(screen))
+       ? DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT : 0;
+ #else
+       0;
+diff --git a/src/gallium/drivers/zink/zink_screen.h b/src/gallium/drivers/zink/zink_screen.h
+index d0d502af8f2a99f50bf2e189b527fa5e57936452..83662746a7cf5b50e2eefb339a7baa388461d292 100644
+--- a/src/gallium/drivers/zink/zink_screen.h
++++ b/src/gallium/drivers/zink/zink_screen.h
+@@ -147,6 +147,32 @@ zink_driver_is_venus(const struct zink_screen *screen)
+    return screen->info.driver_props.driverID == VK_DRIVER_ID_MESA_VENUS;
+ }
+ 
++/* Venus shares an image with its renderer as a dma-buf that virtio-gpu
++ * exports and imports again.
++ */
++static inline bool
++zink_venus_shares_dmabuf(const struct zink_screen *screen)
++{
++   return zink_driver_is_venus(screen) &&
++          screen->info.have_KHR_external_memory_fd &&
++          screen->info.have_EXT_external_memory_dma_buf;
++}
++
++static inline bool
++zink_use_venus_implicit_dmabuf(const struct zink_screen *screen)
++{
++   return zink_venus_shares_dmabuf(screen) &&
++          !screen->info.have_EXT_image_drm_format_modifier;
++}
++
++static inline uint32_t
++zink_dmabuf_queue_family(const struct zink_screen *screen)
++{
++   return screen->info.have_EXT_queue_family_foreign
++             ? VK_QUEUE_FAMILY_FOREIGN_EXT
++             : VK_QUEUE_FAMILY_EXTERNAL;
++}
++
+ void
+ zink_screen_lock_context(struct zink_screen *screen);
+ void
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index aab4bacb95dc77d2c459a740ec9b07f4bb64e5cc..34549f339f0b8f28694987f965e219ef49094108 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1234,6 +1234,7 @@ struct zink_resource_object {
+    bool is_buffer;
+    bool exportable;
+    bool exportable_dmabuf;
++   bool venus_implicit_dmabuf;
+ 
+    /* TODO: this should be a union */
+    int handle;
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index fda382d17e6c304766a96fe6c660869bcd105956..df85f0a040939c6622b8758fe52dbc41e00ccbb5 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -166,3 +166,21 @@ libvulkan_virtio = shared_library(
+   gnu_symbol_visibility : 'hidden',
+   install : true,
+ )
++
++if with_tests and system_has_kms_drm
++  test(
++    'vn_wsi_drm',
++    executable('vn_wsi_drm_test', 'tests/vn_wsi_drm_test.c',
++               include_directories : inc_include),
++    suite : ['venus'],
++  )
++endif
++
++if with_tests
++  test(
++    'vn_wsi_native',
++    executable('vn_wsi_native_test', 'tests/vn_wsi_native_test.c',
++               include_directories : inc_include),
++    suite : ['venus'],
++  )
++endif
+diff --git a/src/virtio/vulkan/tests/vn_wsi_drm_test.c b/src/virtio/vulkan/tests/vn_wsi_drm_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f269ccf0f3ef0d1fcd3127f317c830b146e96a98
+--- /dev/null
++++ b/src/virtio/vulkan/tests/vn_wsi_drm_test.c
+@@ -0,0 +1,65 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "../vn_wsi_drm.h"
++
++#include <fcntl.h>
++#include <stdio.h>
++#include <unistd.h>
++
++#define CHECK(expr)                                                           \
++   do {                                                                      \
++      if (!(expr)) {                                                         \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr);             \
++         return 1;                                                           \
++      }                                                                      \
++   } while (0)
++
++int
++main(void)
++{
++   int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
++   CHECK(fd >= 0);
++   struct stat st;
++   CHECK(!fstat(fd, &st));
++   const VkPhysicalDeviceDrmPropertiesEXT identity = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
++      .hasPrimary = true,
++      .primaryMajor = major(st.st_rdev),
++      .primaryMinor = minor(st.st_rdev),
++   };
++   VkPhysicalDeviceDrmPropertiesEXT props = identity;
++   CHECK(vn_wsi_drm_fd_matches_device(&props, fd));
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, -1));
++   props.hasPrimary = false;
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, fd));
++   props.hasRender = true;
++   props.renderMajor = identity.primaryMajor;
++   props.renderMinor = identity.primaryMinor;
++   CHECK(vn_wsi_drm_fd_matches_device(&props, fd));
++   props.renderMajor++;
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, fd));
++   props.renderMajor--;
++   props.renderMinor++;
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, fd));
++   props = identity;
++   props.primaryMinor++;
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, fd));
++   props.primaryMinor--;
++   props.primaryMajor++;
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, fd));
++   props.primaryMajor--;
++   props.hasRender = true;
++   props.renderMajor = identity.primaryMajor + 1;
++   props.renderMinor = identity.primaryMinor;
++   CHECK(vn_wsi_drm_fd_matches_device(&props, fd));
++   FILE *regular = tmpfile();
++   CHECK(regular != NULL);
++   CHECK(!vn_wsi_drm_fd_matches_device(&props, fileno(regular)));
++   fclose(regular);
++   close(fd);
++   puts("Venus WSI DRM fd identity tests passed");
++   return 0;
++}
+diff --git a/src/virtio/vulkan/tests/vn_wsi_native_test.c b/src/virtio/vulkan/tests/vn_wsi_native_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..01c76b2e1a1af8acaf718cc07a873e1e8846fb3c
+--- /dev/null
++++ b/src/virtio/vulkan/tests/vn_wsi_native_test.c
+@@ -0,0 +1,171 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "../vn_wsi_native.h"
++
++#include <stdio.h>
++
++#define CHECK(expr)                                                           \
++   do {                                                                      \
++      if (!(expr)) {                                                         \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr);             \
++         return 1;                                                           \
++      }                                                                      \
++   } while (0)
++
++int
++main(void)
++{
++   const VkImageCreateInfo base = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_B8G8R8A8_UNORM,
++      .extent = {400, 300, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++   };
++   VkImageCreateInfo info = base;
++   uint32_t pitch = 0;
++   CHECK(vn_wsi_native_heap_row_pitch(&info, 573440, &pitch));
++   CHECK(pitch == 1600);
++   CHECK(vn_wsi_native_heap_row_pitch(&info, 480000, &pitch));
++   CHECK(!vn_wsi_native_heap_row_pitch(&info, 479999, &pitch));
++   CHECK(!vn_wsi_native_heap_row_pitch(&info, 0, &pitch));
++   CHECK(!vn_wsi_native_heap_row_pitch(&info, (uint64_t)UINT32_MAX + 1, &pitch));
++
++   static const struct {
++      VkFormat format;
++      uint32_t bytes_per_pixel;
++   } formats[] = {
++      {VK_FORMAT_R5G6B5_UNORM_PACK16, 2},
++      {VK_FORMAT_B5G6R5_UNORM_PACK16, 2},
++      {VK_FORMAT_R8G8B8A8_UNORM, 4},
++      {VK_FORMAT_R8G8B8A8_SRGB, 4},
++      {VK_FORMAT_B8G8R8A8_UNORM, 4},
++      {VK_FORMAT_B8G8R8A8_SRGB, 4},
++      {VK_FORMAT_A8B8G8R8_UNORM_PACK32, 4},
++      {VK_FORMAT_A8B8G8R8_SRGB_PACK32, 4},
++      {VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4},
++      {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4},
++      {VK_FORMAT_R16G16B16A16_UNORM, 8},
++      {VK_FORMAT_R16G16B16A16_SFLOAT, 8},
++   };
++   for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
++      info = base;
++      info.format = formats[i].format;
++      CHECK(vn_wsi_native_heap_row_pitch(&info, 400 * 300 * 8, &pitch));
++      CHECK(pitch == 400 * formats[i].bytes_per_pixel);
++      info.extent = (VkExtent3D){UINT16_MAX / formats[i].bytes_per_pixel,
++                                UINT16_MAX, 1};
++      CHECK(vn_wsi_native_heap_row_pitch(&info, UINT32_MAX, &pitch));
++      CHECK(pitch == info.extent.width * formats[i].bytes_per_pixel);
++      /* A row that no longer fits sixteen bits still has an envelope: only
++       * the legacy DRI3 v1.0 pixmap request is that narrow, and refusing the
++       * image would fail vkCreateSwapchainKHR on every window system.
++       */
++      info.extent.width++;
++      CHECK(vn_wsi_native_heap_row_pitch(&info, UINT32_MAX, &pitch));
++      CHECK(pitch == info.extent.width * formats[i].bytes_per_pixel);
++      CHECK(pitch > UINT16_MAX);
++      /* The allocation still has to cover that wider envelope. */
++      CHECK(!vn_wsi_native_heap_row_pitch(&info, (uint64_t)pitch *
++                                                       info.extent.height - 1,
++                                          &pitch));
++   }
++
++   /* A wide image still has an envelope, whatever the renderer can back. */
++   info = base;
++   info.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++   info.extent = (VkExtent3D){16384, 16384, 1};
++   CHECK(vn_wsi_native_heap_row_pitch(&info, 16384ull * 16384u * 4u, &pitch));
++   CHECK(pitch == 16384 * 4);
++
++   /* The budget is what the surface advertises, and it must not be exceeded
++    * by an image at that advertised extent in any envelope format.
++    */
++   CHECK(!vn_wsi_native_image_within_budget(&info, 16384ull * 16384u * 4u));
++   for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
++      info = base;
++      info.format = formats[i].format;
++      info.extent = (VkExtent3D){VN_WSI_NATIVE_MAX_IMAGE_DIMENSION,
++                                 VN_WSI_NATIVE_MAX_IMAGE_DIMENSION, 1};
++      const uint64_t size = (uint64_t)info.extent.width *
++                            info.extent.height * formats[i].bytes_per_pixel;
++      CHECK(size <= VN_WSI_NATIVE_MAX_IMAGE_SIZE);
++      CHECK(vn_wsi_native_image_within_budget(&info, size));
++      CHECK(vn_wsi_native_heap_row_pitch(&info, size, &pitch));
++      CHECK(pitch == info.extent.width * formats[i].bytes_per_pixel);
++      /* Padding the renderer adds on top of that envelope still fits. */
++      CHECK(vn_wsi_native_image_within_budget(&info, size + size / 4));
++   }
++
++   /* Each bound of the budget is refused on its own. */
++   info = base;
++   info.extent = (VkExtent3D){VN_WSI_NATIVE_MAX_IMAGE_DIMENSION,
++                              VN_WSI_NATIVE_MAX_IMAGE_DIMENSION, 1};
++   CHECK(vn_wsi_native_image_within_budget(&info,
++                                           VN_WSI_NATIVE_MAX_IMAGE_SIZE));
++   CHECK(!vn_wsi_native_image_within_budget(&info,
++                                            VN_WSI_NATIVE_MAX_IMAGE_SIZE + 1));
++   info.extent.width++;
++   CHECK(!vn_wsi_native_image_within_budget(&info, 4096));
++   info.extent.width--;
++   info.extent.height++;
++   CHECK(!vn_wsi_native_image_within_budget(&info, 4096));
++
++   /* The budget stays inside the renderer's one-gibibyte blob window. */
++   CHECK(VN_WSI_NATIVE_MAX_IMAGE_SIZE < 1024ull * 1024ull * 1024ull);
++   CHECK((uint64_t)VN_WSI_NATIVE_MAX_IMAGE_DIMENSION *
++            VN_WSI_NATIVE_MAX_IMAGE_DIMENSION * 8u <=
++         VN_WSI_NATIVE_MAX_IMAGE_SIZE);
++
++   static const VkFormat excluded[] = {
++      VK_FORMAT_UNDEFINED, VK_FORMAT_D32_SFLOAT, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
++      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_R8G8B8_UNORM,
++   };
++   for (unsigned i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++) {
++      info = base;
++      info.format = excluded[i];
++      pitch = 0x12345678;
++      CHECK(!vn_wsi_native_heap_row_pitch(&info, UINT32_MAX, &pitch));
++      CHECK(pitch == 0x12345678);
++   }
++
++#define EXCLUDE(field, value)                                                 \
++   do {                                                                      \
++      info = base;                                                           \
++      info.field = value;                                                    \
++      CHECK(!vn_wsi_native_heap_row_pitch(&info, UINT32_MAX, &pitch));          \
++   } while (0)
++   EXCLUDE(imageType, VK_IMAGE_TYPE_1D);
++   EXCLUDE(imageType, VK_IMAGE_TYPE_3D);
++   EXCLUDE(tiling, VK_IMAGE_TILING_LINEAR);
++   EXCLUDE(tiling, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
++   EXCLUDE(extent.width, 0);
++   EXCLUDE(extent.width, UINT32_MAX);
++   EXCLUDE(extent.height, 0);
++   EXCLUDE(extent.height, UINT16_MAX + 1);
++   EXCLUDE(extent.depth, 2);
++   EXCLUDE(mipLevels, 2);
++   EXCLUDE(arrayLayers, 2);
++   EXCLUDE(samples, VK_SAMPLE_COUNT_4_BIT);
++   EXCLUDE(flags, VK_IMAGE_CREATE_DISJOINT_BIT);
++   EXCLUDE(flags, VK_IMAGE_CREATE_SPARSE_BINDING_BIT);
++   EXCLUDE(flags, VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT);
++   EXCLUDE(flags, VK_IMAGE_CREATE_SPARSE_ALIASED_BIT);
++#undef EXCLUDE
++   /* An implicit native heap share is made only where guest Zink imports one
++    * as such: a native heap and no DRM format modifiers.
++    */
++   CHECK(vn_wsi_native_heap_scanout(false, true));
++   CHECK(!vn_wsi_native_heap_scanout(true, true));
++   CHECK(!vn_wsi_native_heap_scanout(false, false));
++   CHECK(!vn_wsi_native_heap_scanout(true, false));
++
++   puts("Venus WSI native-heap envelope tests passed");
++   return 0;
++}
+diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
+index 931cf79e691c0727eb5e67a6dd082a7cfdd40707..9341c5c194437b744363899af3d2347732d23afe 100644
+--- a/src/virtio/vulkan/vn_image.c
++++ b/src/virtio/vulkan/vn_image.c
+@@ -471,6 +471,7 @@ struct vn_image_create_info {
+    VkExternalMemoryImageCreateInfo external;
+    VkImageFormatListCreateInfo format_list;
+    VkImageStencilUsageCreateInfo stencil;
++   VkImageCompressionControlEXT compression;
+    VkImageDrmFormatModifierListCreateInfoEXT modifier_list;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_explicit;
+ };
+@@ -501,6 +502,11 @@ vn_image_fix_create_info(
+          memcpy(&local_info->stencil, src, sizeof(local_info->stencil));
+          next = &local_info->stencil;
+          break;
++      case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT:
++         memcpy(&local_info->compression, src,
++                sizeof(local_info->compression));
++         next = &local_info->compression;
++         break;
+       case VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT:
+          memcpy(&local_info->modifier_list, src,
+                 sizeof(local_info->modifier_list));
+@@ -586,6 +592,13 @@ vn_CreateImage(VkDevice device,
+     * Will have to fix more when renderer handle type is no longer dma_buf.
+     */
+    if (wsi_info) {
++      struct vn_image_create_info local_info;
++      if (external_info &&
++          external_info->handleTypes != renderer_handle_type) {
++         pCreateInfo = vn_image_fix_create_info(
++            pCreateInfo, renderer_handle_type, &local_info);
++      }
++
+       result = vn_wsi_create_image(dev, pCreateInfo, wsi_info, alloc, &img);
+    } else if (anb_info) {
+       result = vn_android_image_from_anb(dev, pCreateInfo, alloc, &img);
+diff --git a/src/virtio/vulkan/vn_image.h b/src/virtio/vulkan/vn_image.h
+index 74bdeeda3b948744f4a6ea070f2a1d51f7d05a0b..143971103dd0b74fa9bd64bfea71045fbd989969 100644
+--- a/src/virtio/vulkan/vn_image.h
++++ b/src/virtio/vulkan/vn_image.h
+@@ -56,6 +56,9 @@ struct vn_image {
+    struct {
+       bool is_prime_blit_src;
+ 
++      /* Logical DRI3 envelope, not the native heap's physical row layout. */
++      uint32_t native_heap_row_pitch;
++
+       /* memory backing the prime blit dst buffer */
+       struct vn_device_memory *blit_mem;
+    } wsi;
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+index e73ab48c2fe5716bc5286d3d32dcd9fce11bed53..5993eca5e5458e82c41cee812ac4bf6c605b55d3 100644
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -18,6 +18,20 @@
+ #include "vn_instance.h"
+ #include "vn_physical_device.h"
+ #include "vn_queue.h"
++#include "vn_wsi_native.h"
++
++#ifdef HAVE_LIBDRM
++#include "vn_wsi_drm.h"
++
++static bool
++vn_wsi_can_present_on_device(VkPhysicalDevice physical_device, int fd)
++{
++   struct vn_physical_device *physical_dev =
++      vn_physical_device_from_handle(physical_device);
++   return vn_wsi_drm_fd_matches_device(
++      &physical_dev->instance->renderer->info.drm.props, fd);
++}
++#endif
+ 
+ #ifndef DRM_FORMAT_MOD_LINEAR
+ #define DRM_FORMAT_MOD_LINEAR 0
+@@ -44,6 +58,9 @@
+  * VK_IMAGE_TILING_LINEAR (or trigger the prime blit path).  But the fallback
+  * can be problematic when the memory is scanned out directly and special
+  * requirements (e.g., alignments) must be met.
++ * A paired native-heap renderer without DRM format modifiers instead
++ * preserves optimal tiling and supplies the implicit import's logical
++ * envelope only through the private WSI query.
+  *
+  * For venus, implicit fencing is broken (and there is no explicit fencing
+  * support yet).  The kernel driver assumes everything is in the same fence
+@@ -128,6 +145,19 @@ vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+       &physical_dev->instance->base.vk, pName);
+ }
+ 
++static VKAPI_ATTR void VKAPI_CALL
++vn_wsi_get_image_subresource_layout(VkDevice device, VkImage image,
++                                   const VkImageSubresource *subresource,
++                                   VkSubresourceLayout *layout)
++{
++   vn_GetImageSubresourceLayout(device, image, subresource, layout);
++   const struct vn_image *img = vn_image_from_handle(image);
++   if (img->wsi.native_heap_row_pitch &&
++       subresource->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
++       !subresource->mipLevel && !subresource->arrayLayer)
++      layout->rowPitch = img->wsi.native_heap_row_pitch;
++}
++
+ VkResult
+ vn_wsi_init(struct vn_physical_device *physical_dev)
+ {
+@@ -186,9 +216,48 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   physical_dev->wsi_device.supports_scanout = false;
+-   physical_dev->wsi_device.supports_modifiers =
++   const bool supports_drm_format_modifier =
+       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
++
++   /* A paired Metal renderer without DRM format modifiers can share optimal
++    * swapchain images as native MTLHeaps, which guest Zink imports with the
++    * same implicit layout.  Keep common WSI on its direct image path there
++    * instead of exporting a linear prime-blit buffer that an importing Vulkan
++    * client would have to reinterpret with a different Metal image layout.
++    * A renderer with modifiers names the layout it shares, and every importer
++    * reads an implicit dma-buf as linear, so its swapchain images take the
++    * explicit-modifier path or the prime blit.
++    */
++   physical_dev->wsi_device.supports_scanout = vn_wsi_native_heap_scanout(
++      supports_drm_format_modifier,
++      physical_dev->external_memory.renderer_supports_metal_heap);
++   if (physical_dev->external_memory.renderer_supports_metal_heap) {
++      /* Only common WSI sees the logical implicit-import envelope.  Public
++       * Vulkan layout queries still return the renderer's actual result.
++       */
++      physical_dev->wsi_device.GetImageSubresourceLayout =
++         vn_wsi_get_image_subresource_layout;
++
++      /* A surface advertises this as its maximum image extent.  Keep it
++       * inside the renderer's per-image budget so that a swapchain never asks
++       * for a blob resource the renderer would decline asynchronously.
++       */
++      physical_dev->wsi_device.maxImageDimension2D =
++         MIN2(physical_dev->wsi_device.maxImageDimension2D,
++              VN_WSI_NATIVE_MAX_IMAGE_DIMENSION);
++   }
++#ifdef HAVE_LIBDRM
++   if (physical_dev->external_memory.renderer_supports_metal_heap) {
++      /* Common WSI's default device comparison only recognizes PCI GPUs.
++       * A virtio-mmio DRM node is still the same guest device as Xwayland's
++       * DRI3 fd.  Misclassifying it as a different GPU puts a PRIME copy
++       * behind every present instead of sharing the presented image itself.
++       */
++      physical_dev->wsi_device.can_present_on_device =
++         vn_wsi_can_present_on_device;
++   }
++#endif
++   physical_dev->wsi_device.supports_modifiers = supports_drm_format_modifier;
+    physical_dev->base.vk.wsi_device = &physical_dev->wsi_device;
+ 
+    return VK_SUCCESS;
+@@ -227,7 +296,8 @@ vn_wsi_create_image(struct vn_device *dev,
+     * a workaround here, venus can once again force linear tiling when legacy
+     * scanout is requested outside of common wsi.
+     */
+-   if (wsi_info->scanout) {
++   if (wsi_info->scanout &&
++       !dev->physical_device->external_memory.renderer_supports_metal_heap) {
+       if (create_info != &local_create_info) {
+          local_create_info = *create_info;
+          local_create_info.tiling = VK_IMAGE_TILING_LINEAR;
+@@ -242,6 +312,37 @@ vn_wsi_create_image(struct vn_device *dev,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   const VkExternalMemoryImageCreateInfo *external_info =
++      vk_find_struct_const(create_info->pNext,
++                           EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
++   if (wsi_info->scanout && !wsi_info->blit_src &&
++       create_info->tiling == VK_IMAGE_TILING_OPTIMAL &&
++       dev->physical_device->external_memory.renderer_supports_metal_heap &&
++       external_info && external_info->handleTypes ==
++                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT) {
++      const VkDeviceSize size =
++         img->requirements[0].memory.memoryRequirements.size;
++      /* Refuse an image the renderer cannot back before its memory is
++       * allocated.  The allocating ioctl cannot report the renderer's own
++       * refusal, so an image accepted here would present a dma-buf with no
++       * resource behind it.
++       */
++      if (!vn_wsi_native_image_within_budget(create_info, size)) {
++         vn_DestroyImage(vn_device_to_handle(dev), vn_image_to_handle(img),
++                         alloc);
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      }
++      if (!vn_wsi_native_heap_row_pitch(create_info, size,
++                                        &img->wsi.native_heap_row_pitch)) {
++         vn_DestroyImage(vn_device_to_handle(dev), vn_image_to_handle(img),
++                         alloc);
++         /* This result reaches the application from vkCreateSwapchainKHR,
++          * which has no error code for an unshareable image.
++          */
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++   }
++
+    img->wsi.is_prime_blit_src = wsi_info->blit_src;
+    if (VN_DEBUG(WSI)) {
+       vn_log(dev->instance, "%s: legacy_scanout=%d, prime_blit=%d", __func__,
+diff --git a/src/virtio/vulkan/vn_wsi_drm.h b/src/virtio/vulkan/vn_wsi_drm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fc35f202bf11bc420253bf4d3bf049e7e06d741
+--- /dev/null
++++ b/src/virtio/vulkan/vn_wsi_drm.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VN_WSI_DRM_H
++#define VN_WSI_DRM_H
++
++#include <stdbool.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <vulkan/vulkan_core.h>
++
++static inline bool
++vn_wsi_drm_fd_matches_device(const VkPhysicalDeviceDrmPropertiesEXT *props,
++                            int fd)
++{
++   struct stat st;
++   if (fstat(fd, &st) || !S_ISCHR(st.st_mode))
++      return false;
++
++   const unsigned device_major = major(st.st_rdev);
++   const unsigned device_minor = minor(st.st_rdev);
++   return (props->hasPrimary && props->primaryMajor == device_major &&
++           props->primaryMinor == device_minor) ||
++          (props->hasRender && props->renderMajor == device_major &&
++           props->renderMinor == device_minor);
++}
++
++#endif /* VN_WSI_DRM_H */
+diff --git a/src/virtio/vulkan/vn_wsi_native.h b/src/virtio/vulkan/vn_wsi_native.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b234327e3f72ffe3ccb23e4ba5ae51e844d2fd8
+--- /dev/null
++++ b/src/virtio/vulkan/vn_wsi_native.h
+@@ -0,0 +1,118 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VN_WSI_NATIVE_H
++#define VN_WSI_NATIVE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan_core.h>
++
++/* One native swapchain image is backed by one renderer blob resource, and a
++ * paired renderer bounds a single blob by its guest-visible blob window (one
++ * gibibyte).  That refusal is reported asynchronously, long after the guest
++ * kernel has answered the allocating ioctl, so an image the renderer declines
++ * would still be published to the window system as a dma-buf with no resource
++ * behind it and would wedge whichever compositor imports it.  Keep a native
++ * swapchain image inside a budget the renderer can always serve instead: the
++ * dimension bound keeps even an eight-byte envelope format at half the
++ * window, and the size bound covers the renderer's own image padding.  The
++ * budget applies to what a surface advertises as its maximum image extent; an
++ * ordinary image keeps the device's own maxImageDimension2D.
++ */
++#define VN_WSI_NATIVE_MAX_IMAGE_DIMENSION 8192u
++#define VN_WSI_NATIVE_MAX_IMAGE_SIZE (768ull * 1024ull * 1024ull)
++
++static inline bool
++vn_wsi_native_image_within_budget(const VkImageCreateInfo *info,
++                                  VkDeviceSize allocation_size)
++{
++   return info->extent.width <= VN_WSI_NATIVE_MAX_IMAGE_DIMENSION &&
++          info->extent.height <= VN_WSI_NATIVE_MAX_IMAGE_DIMENSION &&
++          allocation_size <= VN_WSI_NATIVE_MAX_IMAGE_SIZE;
++}
++
++/* Implicit native-heap imports preserve the opaque image layout.  The window
++ * system's legacy envelope nevertheless requires a logical row pitch and an
++ * allocation large enough for that envelope.  Both linux-dmabuf and DRI3
++ * bound the image's width, height and total allocation, and both carry the
++ * pitch itself as a 32-bit value.  A legacy DRI3 v1.0 pixmap request that
++ * cannot express a wide image's stride is a common-WSI limitation shared with
++ * its own prime images, so the envelope does not bound the pitch further.
++ * This is not a Vulkan linear subresource layout or a DRM format modifier.
++ */
++static inline bool
++vn_wsi_native_heap_row_pitch(const VkImageCreateInfo *info,
++                            VkDeviceSize allocation_size,
++                            uint32_t *row_pitch)
++{
++   if (info->imageType != VK_IMAGE_TYPE_2D ||
++       info->tiling != VK_IMAGE_TILING_OPTIMAL || info->extent.depth != 1 ||
++       info->mipLevels != 1 || info->arrayLayers != 1 ||
++       info->samples != VK_SAMPLE_COUNT_1_BIT ||
++       (info->flags & (VK_IMAGE_CREATE_DISJOINT_BIT |
++                       VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++                       VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
++                       VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) ||
++       !info->extent.width || !info->extent.height ||
++       info->extent.width > UINT16_MAX || info->extent.height > UINT16_MAX ||
++       allocation_size > UINT32_MAX)
++      return false;
++
++   /* Only the single-plane, uncompressed color formats used by native WSI
++    * have this envelope.  In particular, depth, block-compressed and YCbCr
++    * images must not acquire an invented layout through this helper.
++    */
++   uint32_t bytes_per_pixel;
++   switch (info->format) {
++   case VK_FORMAT_R5G6B5_UNORM_PACK16:
++   case VK_FORMAT_B5G6R5_UNORM_PACK16:
++      bytes_per_pixel = 2;
++      break;
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++   case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
++   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++      bytes_per_pixel = 4;
++      break;
++   case VK_FORMAT_R16G16B16A16_UNORM:
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++      bytes_per_pixel = 8;
++      break;
++   default:
++      return false;
++   }
++
++   const uint64_t stride = (uint64_t)info->extent.width * bytes_per_pixel;
++   const uint64_t size = stride * info->extent.height;
++   if (size > allocation_size)
++      return false;
++
++   *row_pitch = (uint32_t)stride;
++   return true;
++}
++
++/* A dma-buf shared with DRM_FORMAT_MOD_INVALID names no layout, so its
++ * producer and every importer have to agree on one without it.  Guest Zink
++ * reads such an import as the optimal native heap image only while the
++ * renderer has no DRM format modifiers; once it has them, Zink shares every
++ * image as DRM_FORMAT_MOD_LINEAR and reads an implicit import as linear, as
++ * upstream Venus does.  Common WSI shares an optimal native heap image
++ * implicitly through its scanout path, so take that path exactly where Zink
++ * expects one, and otherwise leave common WSI on its explicit-modifier path
++ * or its linear prime blit.
++ */
++static inline bool
++vn_wsi_native_heap_scanout(bool supports_drm_format_modifier,
++                           bool renderer_supports_metal_heap)
++{
++   return renderer_supports_metal_heap && !supports_drm_format_modifier;
++}
++
++#endif /* VN_WSI_NATIVE_H */

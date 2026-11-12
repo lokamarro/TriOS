@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:27:28 +0900
+Subject: [PATCH] kosmickrisp: give a pooled device its first geometry heap
+ whatever the pool says
+
+The device-memory pool lets a device's first geometry heap take its 1 MiB
+floor however little headroom is left, so that its draws record. The
+reservation could still be refused, when the pool had less than the floor
+to spare, and a device with no heap fails the recording of the first draw
+that needs one: vkEndCommandBuffer reports it, and a Venus guest, whose
+vkEndCommandBuffer is asynchronous, submitted the invalid command buffer
+and lost all of it without an error anywhere.
+
+The floor heap is now essential: the device makes it although the pool
+refused the reservation, and the pool's usage counts it once Metal does,
+as it counts the device's other small storage. Growth past the floor
+stays within the pool, so a draw that needs more than the floor loses its
+output and reports it, as it does on any heap too small for it, but its
+command buffer is whole. The process can hold one floor per device more
+than the pool's limit, only while the pool is full.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 50 +++++++++++++------
+ .../vulkan/kk_device_memory_pool.h            |  8 ++-
+ .../vulkan/tests/test_heap_growth.c           | 21 ++++++++
+ 3 files changed, 61 insertions(+), 18 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07a9ad2d64 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1168,14 +1168,17 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+  * heap to it: it reserves a heap's size before creating the heap and never
+  * creates one the pool refuses, so the heap never takes the pool past its
+  * limit. A heap takes at most half of what the pool can still hold, except
+- * that a device's first heap may take 1 MiB of it. The host's bound can
++ * that a device's first heap may take 1 MiB of it, which the pool counts but
++ * cannot refuse: a device with no heap fails the recording of every draw that
++ * needs one, and the guest that recorded it is not told. The host's bound can
+  * overstate a draw's need, by up to 4096 times for levels the TCS computes,
+  * so a bound grows the heap no further than the cap; refusals the GPU
+  * counted, which are what draws needed, grow it as far as the pool allows,
+  * up to what the header and a Metal buffer can hold. A heap the pool refuses
+- * leaves the device with the one it has, or with none until the pool has
+- * room, and a draw that finds no heap fails its command buffer as when Metal
+- * refuses one. When the recording reset, freed or re-recorded holds none of
++ * leaves the device with the one it has, and a device that has none makes
++ * its first at the floor all the same, so that only Metal's refusal of a
++ * 1 MiB buffer fails a draw's command buffer. When the recording reset,
++ * freed or re-recorded holds none of
+  * them, a pooled device frees a heap that grew past the starting size once
+  * the pool's headroom has fallen below half its size, and the next draw that
+  * needs a heap creates one at what it then needs and the pool leaves it.
+@@ -1183,9 +1186,9 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+  * them is, with or without a pool. */
+ #define KK_HEAP_START_MIB   16u
+ #define KK_HEAP_MIN_CAP_MIB 128u
+-/* A pooled device's first heap may take this much of the pool's headroom
+- * however little is left, so that its draws record and the GPU reports what
+- * they need. */
++/* A pooled device's first heap takes this much of the pool's headroom
++ * however little is left, and the pool cannot refuse it, so that its draws
++ * record and the GPU reports what they need. */
+ #define KK_HEAP_POOL_FLOOR_B (1ull << 20)
+ /* Heaps sized to what the pool leaves are rounded down to this. */
+ #define KK_HEAP_POOL_ALIGN_B (64ull << 10)
+@@ -1223,16 +1226,23 @@ kk_heap_pool_share_B(const struct kk_device *dev)
+ 
+ /* Creates a heap of size_B, charged to the device's pool when it has one.
+  * Returns NULL, with *pool_refused set, when the pool cannot hold it, and
+- * NULL when Metal refuses it. */
++ * NULL when Metal refuses it. An essential heap is made although the pool
++ * cannot hold it: the pool's usage counts it once Metal does, and it is the
++ * device's way to record a draw, so a refusal would lose the whole command
++ * buffer. */
+ static struct kk_geometry_heap *
+ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+-                        bool *pool_refused)
++                        bool essential, bool *pool_refused)
+ {
+    *pool_refused = false;
+    const bool pooled = kk_heap_pooled(dev);
+-   if (pooled && !kk_device_pool_reserve(dev, size_B)) {
+-      *pool_refused = true;
+-      return NULL;
++   bool reserved = false;
++   if (pooled) {
++      reserved = kk_device_pool_reserve(dev, size_B);
++      if (!reserved && !essential) {
++         *pool_refused = true;
++         return NULL;
++      }
+    }
+ 
+    struct kk_geometry_heap *heap = calloc(1, sizeof(*heap));
+@@ -1242,7 +1252,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+       heap = NULL;
+    }
+    /* Metal counts the heap now, or it was refused. */
+-   if (pooled)
++   if (reserved)
+       kk_device_pool_release(dev, size_B);
+    if (heap == NULL)
+       return NULL;
+@@ -1375,9 +1385,17 @@ kk_heap_create_first_locked(struct kk_device *dev, uint64_t bound_B)
+       MIN2(kk_heap_size_for(dev, start_B, bound_B),
+            MAX2(kk_heap_pool_share_B(dev), KK_HEAP_POOL_FLOOR_B));
+    bool pool_refused;
+-   dev->heap = kk_geometry_heap_create(dev, size_B, &pool_refused);
++   dev->heap = kk_geometry_heap_create(dev, size_B, false, &pool_refused);
+    if (dev->heap == NULL && !pool_refused && size_B > start_B)
+-      dev->heap = kk_geometry_heap_create(dev, start_B, &pool_refused);
++      dev->heap =
++         kk_geometry_heap_create(dev, start_B, false, &pool_refused);
++   /* A pool with less than the floor to spare still gives the device a heap
++    * at the floor: the draws that need one record, and what they need that
++    * the floor cannot hold is lost and reported, which later heaps follow
++    * where the pool has room. */
++   if (dev->heap == NULL && pool_refused)
++      dev->heap = kk_geometry_heap_create(dev, KK_HEAP_POOL_FLOOR_B, true,
++                                          &pool_refused);
+    /* Metal's refusal is final; the pool's lasts until the pool has room. */
+    dev->heap_attempted = dev->heap != NULL || !pool_refused;
+ }
+@@ -1407,7 +1425,7 @@ kk_heap_grow_locked(struct kk_device *dev, uint64_t bound_B)
+ 
+    bool pool_refused;
+    struct kk_geometry_heap *heap =
+-      kk_geometry_heap_create(dev, size_B, &pool_refused);
++      kk_geometry_heap_create(dev, size_B, false, &pool_refused);
+    if (heap == NULL) {
+       if (!pool_refused)
+          dev->heap_cap_B = dev->heap_measured_cap_B = old_B;
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+index bc9493f65a4d4fa7cb9b90c9588036c7274e551d..f4f6b6a01d8b777d28647d2e93b7301f3851e8fa 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -15,8 +15,12 @@
+  *
+  * The device charges its geometry heap this way. A heap it creates or grows
+  * takes at most half of the pool's headroom, and one that no recording holds
+- * is freed when the headroom has fallen below half its size. A device
+- * created without a pool bounds its heap by a fixed size instead.
++ * is freed when the headroom has fallen below half its size. The one
++ * exception is a device's first heap, at the floor of 1 MiB: a device with no
++ * heap fails the recording of every draw that needs one, so a refused
++ * reservation does not stop it, and the pool's usage counts it once Metal
++ * does, as it counts the device's other small storage. A device created
++ * without a pool bounds its heap by a fixed size instead.
+  *
+  * The callbacks may be called from any thread, with device locks held, so
+  * they must not call back into the device. The structure is copied when the
+diff --git a/src/kosmickrisp/vulkan/tests/test_heap_growth.c b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+index a3d11418489754f54c507dcee33470281785c744..c7239b6097f73247cd148fbd5614cd748350b8fc 100644
+--- a/src/kosmickrisp/vulkan/tests/test_heap_growth.c
++++ b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+@@ -902,6 +902,27 @@ main(void)
+          o.live_after_B == 0u && o.over_B == 0u);
+    free_pool(pool);
+ 
++   /* A pool with nothing to spare refuses even the 1 MiB first heap, and the
++    * device makes it all the same: a device with no heap fails the recording
++    * of its first draw that needs one, and the guest that recorded it, whose
++    * vkEndCommandBuffer was asynchronous, was never told. The fan fits the
++    * floor and renders whole. The 24 MB fan does not, so it loses its output
++    * as on any heap too small for its draw, the loss is reported, and the
++    * recording is whole. The pool admits no larger heap while it has no room,
++    * and counts the floor, which is the only heap past it. */
++   pool = new_pool(0u, NO_GUEST, 0u);
++   o = report(&t, &(struct draw_case){FAN, 3, 1, 0, false, false, 1, pool});
++   CHECK(o.red[0] == full && o.heap_B == MIB(1) && o.peak_B == MIB(1) &&
++         !o.loss_reported && pool->heap_refusals != 0u &&
++         o.over_B <= MIB(1));
++   free_pool(pool);
++   pool = new_pool(0u, NO_GUEST, 0u);
++   o = report(&t, &(struct draw_case){FAN, FAN_VERTICES, 1, 0, false, false, 1,
++                                      pool});
++   CHECK(o.red[0] < full && o.heap_B == MIB(1) && o.peak_B == MIB(1) &&
++         o.loss_reported && pool->heap_refusals != 0u && o.over_B <= MIB(1));
++   free_pool(pool);
++
+    kk_test_destroy(&t);
+    printf("the geometry heap grows for the draws that need it\n");
+    return 0;

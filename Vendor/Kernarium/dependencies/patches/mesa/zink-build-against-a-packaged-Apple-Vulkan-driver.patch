@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 10:11:01 +0900
+Subject: [PATCH] zink: build against a packaged Apple Vulkan driver
+
+An Apple host that packages one in-process Vulkan driver has no MoltenVK SDK
+and no Vulkan loader, so zink could neither configure nor find an entry point
+there. Make the MoltenVK SDK optional on Apple, gating every MoltenVK-private
+header and code path on its presence, and add zink-vulkan-library-file: when
+it names a Vulkan implementation, zink links against that library and takes
+vkGetInstanceProcAddr from the dynamic linker instead of loading a loader at
+run time. The device entry point is an instance-level query there, so it is
+resolved once the instance exists.
+
+A driver reached without a loader also reports no instance layers, because
+layer enumeration is the loader's service. Treat vkEnumerateInstanceLayerProperties
+as optional rather than refusing to create the instance without it.
+---
+ meson.build                               |  1 +
+ meson.options                             | 10 ++++++++++
+ src/gallium/drivers/zink/meson.build      | 16 ++++++++++++----
+ src/gallium/drivers/zink/zink_instance.py | 12 +++++++-----
+ src/gallium/drivers/zink/zink_resource.c  |  4 ++--
+ src/gallium/drivers/zink/zink_screen.c    | 23 +++++++++++++++++++++--
+ 6 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 32c620b997d8ec9d4392ffadc8bd1b685491f44a..bda93d65d0d28cf6f06785b616949320f18ad4a8 100644
+--- a/meson.build
++++ b/meson.build
+@@ -101,6 +101,7 @@ cpp_args = []
+ 
+ with_moltenvk_dir = get_option('moltenvk-dir')
+ with_vulkan_loader_rpath = get_option('vulkan-loader-rpath')
++with_zink_vulkan_library = get_option('zink-vulkan-library-file')
+ with_vulkan_icd_dir = get_option('vulkan-icd-dir')
+ with_tests = get_option('build-tests')
+ with_glcpp_tests = get_option('enable-glcpp-tests')
+diff --git a/meson.options b/meson.options
+index 92dfd10dafecbc5850eee3fde73e9ca648ea2a7b..4716f09d8666c9124c32afce34b20808cf6ee40f 100644
+--- a/meson.options
++++ b/meson.options
+@@ -321,6 +321,16 @@ option(
+                 'Defaults to /usr/local/lib since that is where the Vulkan SDK installs it to by default.'
+ )
+ 
++option(
++  'zink-vulkan-library-file',
++  type : 'string',
++  value : '',
++  description : 'Path of a Vulkan implementation zink links against directly ' +
++                'instead of loading a Vulkan loader at run time. Apple hosts ' +
++                'that package a single in-process driver use this to keep the ' +
++                'entry point resolved by the dynamic linker.'
++)
++
+ option(
+   'vulkan-layers',
+   type : 'array',
+diff --git a/src/gallium/drivers/zink/meson.build b/src/gallium/drivers/zink/meson.build
+index 073f0a4b236d4af42b6e0de66cbb1299bbcaaa87..e42275e80c979ea2c2d60959fdd0f790b16d8df6 100644
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -60,7 +60,9 @@ zink_link_args = []
+ 
+ if host_machine.system() == 'darwin'
+ 
+-  # MoltenVK options
++  # MoltenVK options. A packaged Apple host may instead supply its own Vulkan
++  # implementation, in which case no MoltenVK SDK is present and every
++  # MoltenVK-private code path stays out of the build.
+   if with_moltenvk_dir != ''
+     # Vulkan SDK 1.3.250 to 1.3.268 support
+     moltenvk_includes = join_paths(with_moltenvk_dir, 'MoltenVK', 'include')
+@@ -76,8 +78,9 @@ if host_machine.system() == 'darwin'
+       endif
+     endif
+     inc_zink_vk += include_directories(moltenvk_includes)
+-  else
+-    error('moltenvk-dir is required but not set.')
++    zink_c_args += '-DZINK_USE_MOLTENVK'
++  elif with_zink_vulkan_library == ''
++    error('either moltenvk-dir or zink-vulkan-library-file is required.')
+   endif
+ 
+   zink_c_args += ['-x','objective-c'] # Put compiler into objective-C mode to allow for MacOS types, like IOSurface and CAMetalLayer
+@@ -87,7 +90,12 @@ if host_machine.system() == 'darwin'
+   # "@rpath/..." path at runtime (see VK_LIBNAME in zink_screen.c).  This linker
+   # argument ensures the mach-o of the libvulkan.1.dylib client dyld contains
+   # the proper load commands to locate libvulkan.1.dylib at runtime.
+-  if with_vulkan_loader_rpath != ''
++  # A packaged Vulkan implementation is linked directly instead, so that the
++  # dynamic linker resolves vkGetInstanceProcAddr and no loader is searched.
++  if with_zink_vulkan_library != ''
++    zink_c_args += '-DZINK_VULKAN_DIRECT_ENTRYPOINT'
++    zink_link_args += [with_zink_vulkan_library]
++  elif with_vulkan_loader_rpath != ''
+     zink_link_args += ['-Wl,-rpath,' + with_vulkan_loader_rpath]
+   endif
+ 
+diff --git a/src/gallium/drivers/zink/zink_instance.py b/src/gallium/drivers/zink/zink_instance.py
+index e9c8f3329bbf76248c6f61ecb35fa6d001a28bd9..f0eafec5829bd1b2e68af8076a168c96249528ac 100755
+--- a/src/gallium/drivers/zink/zink_instance.py
++++ b/src/gallium/drivers/zink/zink_instance.py
+@@ -81,11 +81,11 @@ header_code = """
+ 
+ #include <vulkan/vulkan_core.h>
+ 
+-#ifdef __APPLE__
++#ifdef ZINK_USE_MOLTENVK
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+-#endif /* __APPLE__ */
++#endif /* ZINK_USE_MOLTENVK */
+ 
+ struct pipe_screen;
+ struct zink_screen;
+@@ -154,8 +154,8 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
+ 
+    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceExtensionProperties);
+    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceLayerProperties);
+-   if (!vk_EnumerateInstanceExtensionProperties ||
+-       !vk_EnumerateInstanceLayerProperties)
++   /* A driver reached directly, without a Vulkan loader, reports no layers. */
++   if (!vk_EnumerateInstanceExtensionProperties)
+       return NULL;
+ 
+    // Build up the extensions from the reported ones but only for the unnamed layer
+@@ -185,7 +185,9 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
+     // Build up the layers from the reported ones
+     uint32_t layer_count = 0;
+ 
+-    if (vk_EnumerateInstanceLayerProperties(&layer_count, NULL) != VK_SUCCESS) {
++    if (!vk_EnumerateInstanceLayerProperties) {
++        layer_count = 0;
++    } else if (vk_EnumerateInstanceLayerProperties(&layer_count, NULL) != VK_SUCCESS) {
+         if (!screen->driver_name_is_inferred)
+            mesa_loge("ZINK: vkEnumerateInstanceLayerProperties failed");
+     } else {
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 3ce373d857608ca86a8b3a76e16f76ec64779424..f15ab731833411f38069fd55cdb73831f8bf5e3e 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -60,11 +60,11 @@
+ #define DRM_FORMAT_MOD_LINEAR 0
+ #endif
+ 
+-#ifdef __APPLE__
++#ifdef ZINK_USE_MOLTENVK
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+-#endif /* __APPLE__ */
++#endif /* ZINK_USE_MOLTENVK */
+ 
+ #define ZINK_EXTERNAL_MEMORY_HANDLE 999
+ 
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 99383884a6510456cb6e665e0f87ead05e88a2fc..928c0a4c6c0f0a31513f1f60481839501741728e 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -80,14 +80,14 @@ bool zink_tracing = false;
+ #endif
+ #endif
+ 
+-#ifdef __APPLE__
++#ifdef ZINK_USE_MOLTENVK
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+ #define VK_NO_PROTOTYPES
+ #include "MoltenVK/mvk_deprecated_api.h"
+ #include "MoltenVK/mvk_private_api.h"
+-#endif /* __APPLE__ */
++#endif /* ZINK_USE_MOLTENVK */
+ 
+ #ifdef HAVE_LIBDRM
+ #include "drm-uapi/dma-buf.h"
+@@ -3443,6 +3443,14 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    u_trace_state_init();
+ 
++#ifdef ZINK_VULKAN_DIRECT_ENTRYPOINT
++   /* The packaged Vulkan implementation is a link-time dependency, so the
++    * dynamic linker has already resolved the one exported entry point. Its
++    * device counterpart is an instance-level query and is resolved once the
++    * instance exists.
++    */
++   screen->vk_GetInstanceProcAddr = vkGetInstanceProcAddr;
++#else
+    screen->loader_lib = util_dl_open(VK_LIBNAME);
+    if (!screen->loader_lib) {
+       if (!screen->driver_name_is_inferred)
+@@ -3458,6 +3466,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+          mesa_loge("ZINK: failed to get proc address");
+       goto fail;
+    }
++#endif
+ 
+    if (config) {
+       driParseConfigFiles(config->options, config->options_info,
+@@ -3485,6 +3494,16 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+    screen->instance_info = &instance_info;
+    simple_mtx_unlock(&instance_lock);
+ 
++#ifdef ZINK_VULKAN_DIRECT_ENTRYPOINT
++   screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)
++      screen->vk_GetInstanceProcAddr(screen->instance, "vkGetDeviceProcAddr");
++   if (!screen->vk_GetDeviceProcAddr) {
++      if (!screen->driver_name_is_inferred)
++         mesa_loge("ZINK: failed to get proc address");
++      goto fail;
++   }
++#endif
++
+    if (zink_debug & ZINK_DEBUG_VALIDATION) {
+       if (!screen->instance_info->have_layer_KHRONOS_validation &&
+           !screen->instance_info->have_layer_LUNARG_standard_validation) {

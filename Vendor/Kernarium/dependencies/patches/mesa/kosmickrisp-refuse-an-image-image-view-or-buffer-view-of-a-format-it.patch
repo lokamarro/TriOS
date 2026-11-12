@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:34:32 +0900
+Subject: [PATCH] kosmickrisp: refuse an image, image view or buffer view of a
+ format it has no description for
+
+A Venus guest passes the create info of its application to the host driver as
+it is, and the host driver runs in the process the guest's machine lives in.
+vkCreateImage with VK_FORMAT_UNDEFINED, which is valid only for an image that
+names an external format, reached the layout of the image's first plane, where
+the format's entry in the driver's format table is read to choose the Metal
+pixel format. The table has no entry for it, and the missing entry was
+dereferenced: a guest that sent the format bare ended the host process with a
+segmentation fault.
+
+Answer it with an error before the entry is read. The other formats the table
+does not describe are refused the same way.
+
+The same entry is read when a view is created, and there the check was an
+assert, which a release build compiles out. vkCreateBufferView with
+VK_FORMAT_UNDEFINED or VK_FORMAT_R8G8B8_UNORM ended the host in
+kk_CreateBufferView, and vkCreateImageView of an RGBA8 image with
+VK_FORMAT_R8G8B8_UNORM in kk_image_view_init, while the guest's call returned
+success, since Venus creates views asynchronously. Both now release what they
+made and return VK_ERROR_FORMAT_NOT_SUPPORTED; the handle is never registered,
+so the first command that names it ends that guest context's decoder, and the
+host and every other context keep running.
+
+test_undescribed_format (the former test_undefined_image_format) creates an
+image of the undefined format with both tilings, views of R8G8B8_UNORM and
+R8G8B8_SRGB over a mutable RGBA8 image, and buffer views of UNDEFINED and
+R8G8B8_UNORM, and requires an error and a null handle for each; a view of the
+same image in RGBA8 SRGB and a buffer view in R32_UINT must still be created.
+It ends the test process on the previous driver.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_buffer_view.c       |  12 +-
+ src/kosmickrisp/vulkan/kk_image_layout.c      |   9 ++
+ src/kosmickrisp/vulkan/kk_image_view.c        |  12 +-
+ src/kosmickrisp/vulkan/meson.build            |   1 +
+ .../vulkan/tests/test_undescribed_format.c    | 146 ++++++++++++++++++
+ 5 files changed, 178 insertions(+), 2 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_undescribed_format.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index dc3d39977a31268a5c6c9eddb959153d537bb0a6..3998a631bb2b367447dd21397cbef9583133375f 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -93,7 +93,17 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+       supported_format = kk_get_va_format(p_format);
+    }
+ 
+-   assert(supported_format != NULL);
++   /* A format the driver has no description of, and no sibling to stand in
++    * for it, has no Metal pixel format to read texels in.  VK_FORMAT_UNDEFINED
++    * and the three-component 8-bit formats are such; a Venus guest passes its
++    * create info to the host driver as it is, so it has to be answered with an
++    * error rather than by dereferencing the missing description. */
++   if (supported_format == NULL) {
++      vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
++      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                       "no Metal format describes buffer view format %d",
++                       (int)view->vk.format);
++   }
+ 
+    /* If we reached here, we support reading at least */
+    enum mtl_texture_usage usage = MTL_TEXTURE_USAGE_SHADER_READ;
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.c b/src/kosmickrisp/vulkan/kk_image_layout.c
+index 880b23c72df84448bb8b9e8efb3324cbc25ffc5f..8cb371445b100e658440d0f70708ecfbbb8305d6 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.c
++++ b/src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -244,6 +244,15 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
+                      const uint8_t height_scale, struct kk_image_layout *layout)
+ {
+    const struct kk_va_format *supported_format = kk_get_va_format(format);
++
++   /* A format this driver has no description of has no Metal pixel format to
++    * lay an image out in. VK_FORMAT_UNDEFINED is one: it is valid only with
++    * an external format, which a Venus guest resolves before the call reaches
++    * this driver, so a guest that sends it bare must be answered with an
++    * error rather than by dereferencing the missing description. */
++   if (supported_format == NULL)
++      return VK_ERROR_INITIALIZATION_FAILED;
++
+    layout->type = vk_image_to_mtl_texture_type(image);
+    layout->width_px = image->extent.width / width_scale;
+    layout->height_px = image->extent.height / height_scale;
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index 2839fb35f7ebd2f921f2e3d318d71694e74fdcb0..5e1fa330a9212010b3c33dd6e0a4b76ade8e8fc8 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -118,7 +118,17 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+ 
+       view->planes[view_plane].format = p_format;
+       const struct kk_va_format *supported_format = kk_get_va_format(p_format);
+-      assert(supported_format);
++
++      /* A view format the driver has no description of has no Metal pixel
++       * format either; a Venus guest passes its create info to the host
++       * driver as it is, and may name one (a three-component 8-bit format
++       * over an RGBA8 image, say).  Refuse it before the entry is read. */
++      if (supported_format == NULL) {
++         kk_image_view_finish(dev, view);
++         return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                          "no Metal format describes image view format %d",
++                          (int)plane_format);
++      }
+ 
+       struct kk_view_layout view_layout = {
+          .view_type = kk_image_view_metal_type(image, view),
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 76c613fa4b392c41dcef031ec3dc727e490fb127..388628cb754022a955d779cda7b11fcbd25311a5 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -403,6 +403,7 @@ if with_tests
+       ['texel_buffer_bounds', []],
+       ['address_binding_planes', []],
+       ['drm_plane_offset', []],
++      ['undescribed_format', []],
+       ['query_pool_lifetime', ['NSZombieEnabled=YES']],
+     ]
+       test(
+diff --git a/src/kosmickrisp/vulkan/tests/test_undescribed_format.c b/src/kosmickrisp/vulkan/tests/test_undescribed_format.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7620f3c01008c7f1421e7597eef354830beebf5c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_undescribed_format.c
+@@ -0,0 +1,146 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A format is described by this driver's format table, and some Vulkan
++ * formats have no entry: VK_FORMAT_UNDEFINED, which is valid only for an image
++ * that names an external format, and the three-component 8-bit formats. A
++ * Venus guest passes the create info of its application through to the host
++ * driver as it is, so a guest that names one reaches vkCreateImage,
++ * vkCreateImageView and vkCreateBufferView. Each has to be answered with an
++ * error and a null handle: the driver runs in the host process, which a guest
++ * must not be able to end. A format it does describe is still accepted. */
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "kk_test.h"
++
++int
++main(void)
++{
++   struct kk_test_device t;
++   kk_test_create_instance(&t, NULL);
++   kk_test_create_device(&t, NULL, NULL, 0, NULL);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkCreateBufferView);
++   LOAD_D(vkDestroyBufferView);
++
++   const VkImageTiling tilings[] = {
++      VK_IMAGE_TILING_OPTIMAL,
++      VK_IMAGE_TILING_LINEAR,
++   };
++   for (unsigned i = 0; i < 2; i++) {
++      const VkImageCreateInfo info = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++         .imageType = VK_IMAGE_TYPE_2D,
++         .format = VK_FORMAT_UNDEFINED,
++         .extent = {64, 64, 1},
++         .mipLevels = 1,
++         .arrayLayers = 1,
++         .samples = VK_SAMPLE_COUNT_1_BIT,
++         .tiling = tilings[i],
++         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      };
++      VkImage image = VK_NULL_HANDLE;
++      VkResult result = vkCreateImage(device, &info, NULL, &image);
++      fprintf(stderr, "tiling %d: vkCreateImage = %d\n", tilings[i], result);
++      CHECK(result != VK_SUCCESS);
++      CHECK(image == VK_NULL_HANDLE);
++   }
++
++   /* A view of a format with no entry over an image that has one: the image
++    * is mutable so that its views may name another format. */
++   const VkImageCreateInfo mutable_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {64, 64, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateImage(device, &mutable_info, NULL, &image));
++   VkDeviceMemory image_memory =
++      kk_test_image_memory(&t, image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++
++   const VkFormat image_view_formats[] = {
++      VK_FORMAT_R8G8B8_UNORM,
++      VK_FORMAT_R8G8B8_SRGB,
++   };
++   for (unsigned i = 0; i < 2; i++) {
++      VkImageViewCreateInfo info = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++         .image = image,
++         .viewType = VK_IMAGE_VIEW_TYPE_2D,
++         .format = image_view_formats[i],
++         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++      };
++      VkImageView view = VK_NULL_HANDLE;
++      VkResult result = vkCreateImageView(device, &info, NULL, &view);
++      fprintf(stderr, "format %d: vkCreateImageView = %d\n", info.format,
++              result);
++      CHECK(result != VK_SUCCESS);
++      CHECK(view == VK_NULL_HANDLE);
++   }
++
++   /* The same image still has the views it can have. */
++   VkImageView view = kk_test_image_view(&t, image, VK_IMAGE_VIEW_TYPE_2D,
++                                         VK_FORMAT_R8G8B8A8_SRGB,
++                                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, image_memory, NULL);
++
++   VkBuffer buffer = VK_NULL_HANDLE;
++   VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
++   kk_test_buffer(&t, 65536, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
++                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &buffer,
++                  &buffer_memory, NULL);
++
++   const VkFormat buffer_view_formats[] = {
++      VK_FORMAT_UNDEFINED,
++      VK_FORMAT_R8G8B8_UNORM,
++   };
++   for (unsigned i = 0; i < 2; i++) {
++      const VkBufferViewCreateInfo info = {
++         .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
++         .buffer = buffer,
++         .format = buffer_view_formats[i],
++         .range = VK_WHOLE_SIZE,
++      };
++      VkBufferView buffer_view = VK_NULL_HANDLE;
++      VkResult result = vkCreateBufferView(device, &info, NULL, &buffer_view);
++      fprintf(stderr, "format %d: vkCreateBufferView = %d\n", info.format,
++              result);
++      CHECK(result != VK_SUCCESS);
++      CHECK(buffer_view == VK_NULL_HANDLE);
++   }
++
++   /* And the buffer still has the views it can have. */
++   const VkBufferViewCreateInfo control = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
++      .buffer = buffer,
++      .format = VK_FORMAT_R32_UINT,
++      .range = VK_WHOLE_SIZE,
++   };
++   VkBufferView buffer_view = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateBufferView(device, &control, NULL, &buffer_view));
++   vkDestroyBufferView(device, buffer_view, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, buffer_memory, NULL);
++
++   kk_test_destroy(&t);
++   printf("an image, image view or buffer view of an undescribed format is "
++          "refused\n");
++   return 0;
++}

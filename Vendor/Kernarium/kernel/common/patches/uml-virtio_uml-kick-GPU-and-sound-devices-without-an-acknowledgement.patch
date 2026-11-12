@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:02:55 +0900
+Subject: [PATCH] uml: virtio_uml: kick GPU and sound devices without an
+ acknowledgement
+
+With in-band notifications every kick was a round trip on the main
+socket: the kicking CPU held sock_lock with its interrupts off until
+the backend acknowledged the kick. A backend that reads the kick only
+after the request it is running, such as a graphics submission that
+runs for hundreds of milliseconds, kept that CPU off its interrupts for
+as long, and every other CPU that kicked the device spun on the lock.
+Under user-mode Linux every device interrupt is taken on CPU 0, so a
+kick from CPU 0 also stalled every other device, sound among them.
+
+Send a kick to a Virtio GPU or sound device as a message that asks for
+no reply. sock_lock still keeps it whole and out of another request's
+round trip, ordering on the socket still puts it ahead of any later
+request, and a backend that has gone still shows as a failed send. The
+backend must accept a kick that asks for no acknowledgement, as the
+protocol allows.
+
+Every other kick still waits for its acknowledgement and serves the
+backend's requests meanwhile. The console driver spins on its output
+queue with interrupts off after a kick, and its backend reads nothing
+more until the guest has answered a configuration change it sent:
+without the wait, a writer spinning on CPU 0 kept the interrupt that
+answers from ever running. The GPU and sound drivers sleep while they
+wait for their device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/virtio_uml.c | 50 ++++++++++++++++++++++++++++++------
+ 1 file changed, 42 insertions(+), 8 deletions(-)
+
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index 61c5ef5b7f2f9b8a2c30a45235331818c74ed613..02f91c9f544d4ec14b2da24b70bd1a1fbe3bf2d1 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -29,6 +29,7 @@
+ #include <linux/string.h>
+ #include <linux/virtio.h>
+ #include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
+ #include <linux/virtio_ring.h>
+ #include <linux/time-internal.h>
+ #include <linux/virtio-uml.h>
+@@ -347,11 +348,12 @@ static int vhost_user_recv_req(struct virtio_uml_device *vu_dev,
+  *
+  * Only their order pairs a reply with its request, so nothing else may be
+  * sent on the socket between the two: sock_lock covers the whole round trip.
+- * In-band notifications make every kick such a round trip, sent from any CPU
++ * In-band notifications make most kicks such a round trip, sent from any CPU
+  * and from atomic context, while another CPU may be reading the device's
+  * configuration. A reply read after sock_lock was dropped could be taken by
+  * that kick, which would then report a healthy backend as gone, and the
+- * reader would take the kick's acknowledgement in its place.
++ * reader would take the kick's acknowledgement in its place. A kick that asks
++ * for no reply is kept whole and out of another request's round trip too.
+  */
+ static int vhost_user_round_trip(struct virtio_uml_device *vu_dev,
+ 				 struct vhost_user_msg *msg,
+@@ -1050,6 +1052,39 @@ static int vhost_user_set_vring_state(struct virtio_uml_device *vu_dev,
+ 	return vhost_user_send(vu_dev, &msg, NULL, 0);
+ }
+ 
++/*
++ * Notify the backend in-band that @index has new buffers.
++ *
++ * A kick to a Virtio GPU or sound device asks for no acknowledgement: its
++ * backend may be running a long request when it reads the kick, and the
++ * kicking CPU, which holds sock_lock with its interrupts off, would wait for
++ * the whole request. A disconnect still shows here.
++ *
++ * Any other kick waits for its acknowledgement, and serves the backend's
++ * requests while it waits (vhost_user_wait_resp()). Drivers such as the
++ * console's spin on their queue with interrupts off after a kick, and a
++ * backend may wait for the answer to a request of its own, such as a
++ * configuration change, before it reads the kick: a CPU 0 spinning there would
++ * never take the interrupt that answers. The GPU and sound drivers sleep
++ * while they wait for their device.
++ */
++static int vhost_user_kick_inband(struct virtio_uml_device *vu_dev, u32 index)
++{
++	struct vhost_user_msg msg = {
++		.header.request = VHOST_USER_VRING_KICK,
++		.header.size = sizeof(msg.payload.vring_state),
++		.payload.vring_state.index = index,
++	};
++
++	switch (vu_dev->vdev.id.device) {
++	case VIRTIO_ID_GPU:
++	case VIRTIO_ID_SOUND:
++		return vhost_user_round_trip(vu_dev, &msg, NULL, 0, NULL, 0);
++	default:
++		return vhost_user_send(vu_dev, &msg, NULL, 0);
++	}
++}
++
+ static int vhost_user_set_vring_num(struct virtio_uml_device *vu_dev,
+ 				    u32 index, u32 num)
+ {
+@@ -1143,13 +1178,12 @@ static bool vu_notify(struct virtqueue *vq)
+ 
+ 	if (info->kick_fd < 0) {
+ 		/*
+-		 * An in-band notification is a synchronous round trip on the
+-		 * main socket. Its transient failures are already retried or
+-		 * waited out inside that round trip, so anything it reports
+-		 * here is a genuine transport failure.
++		 * An in-band notification is a message on the main socket,
++		 * and for most devices a synchronous round trip. Its transient
++		 * failures are already retried or waited out inside it, so
++		 * anything it reports here is a genuine transport failure.
+ 		 */
+-		rc = vhost_user_set_vring_state(vu_dev, VHOST_USER_VRING_KICK,
+-						vq->index, 0);
++		rc = vhost_user_kick_inband(vu_dev, vq->index);
+ 		if (!rc)
+ 			return true;
+ 	} else {

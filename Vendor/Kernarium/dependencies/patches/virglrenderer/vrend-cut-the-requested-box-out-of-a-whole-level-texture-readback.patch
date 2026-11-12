@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 15:43:53 +0900
+Subject: [PATCH] vrend: cut the requested box out of a whole-level texture
+ readback
+
+glGetTexImage and glGetCompressedTexImage can only read a whole mip level,
+but write_transfer_data() expects its source buffer to hold exactly the
+requested box with no gap between rows.  vrend_transfer_send_getteximage()
+handed it the level unchanged, so any transfer of a sub-box was answered
+with the level's top left corner, re-cut at the box's own row length: the
+box origin was ignored and every row after the first came from the wrong
+place.
+
+Only formats that cannot be rendered to take this path, because everything
+else is read back through vrend_transfer_send_readpixels(), which asks the
+host for the box itself.  In practice that makes it the compressed formats,
+and KHR-GL46.get_texture_sub_image.functional_test fails on every target it
+covers with glGetCompressedTextureSubImage while the uncompressed half of
+the same test passes.
+
+Copy the box out of the level, at the level's own row stride, before the
+data is written to the guest.
+
+The cut counts whole blocks, so it holds only for a box that covers whole
+blocks. A compressed box whose origin splits a block, or whose far edge does
+neither end a block nor reach the level's edge, would be cut out past the
+end of the level and those heap bytes sent to the guest. GL refuses such a
+box for a compressed sub-image, so a transfer refuses it too, in both
+directions.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_renderer.c | 64 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 1885376799e6cccd4402b61607ffcfeec06d1c1d..625843bd1eb08489cde196eb1fa2c41b4b174963 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -9861,6 +9861,33 @@ static inline bool resource_contains_box(struct vrend_resource *res,
+    return true;
+ }
+ 
++/* Whether a transfer box of a compressed format covers whole blocks: its
++ * origin on a block boundary, and each far edge on one or at the level's own
++ * edge, which is GL's rule for a compressed sub-image. Blocks are the unit
++ * both directions move, so a box that splits one names bytes that no block
++ * layout of the box holds; the whole-level readback would cut such a box out
++ * past the end of the level. Every box of an uncompressed format qualifies.
++ * The caller has already checked that the box lies inside the level. */
++static inline bool transfer_box_is_block_aligned(const struct vrend_resource *res,
++                                                 const struct pipe_box *box,
++                                                 uint32_t level)
++{
++   const enum virgl_formats format = res->base.format;
++   if (!util_format_is_compressed(format))
++      return true;
++
++   const uint32_t block_width = util_format_get_blockwidth(format);
++   const uint32_t block_height = util_format_get_blockheight(format);
++   const uint32_t width = u_minify(res->base.width0, level);
++   const uint32_t height = u_minify(res->base.height0, level);
++   const uint32_t x = box->x, y = box->y;
++   const uint32_t box_width = box->width, box_height = box->height;
++
++   return x % block_width == 0 && y % block_height == 0 &&
++          (box_width % block_width == 0 || x + box_width == width) &&
++          (box_height % block_height == 0 || y + box_height == height);
++}
++
+ /* Calculate the size of the memory needed to hold all the data of a
+  * transfer for particular stride values.
+  */
+@@ -10430,6 +10457,37 @@ static int vrend_transfer_send_getteximage(struct vrend_resource *res,
+ 
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+ 
++   /* glGetTexImage and glGetCompressedTexImage can only read a whole level, but
++    * write_transfer_data() expects a buffer holding just the requested box with
++    * no gap between its rows. Cut the box out of the level first; otherwise a
++    * sub-box is answered with the level's top left corner, re-cut at the box's
++    * own row length. */
++   uint32_t level_rows = util_format_get_nblocksy(res->base.format,
++                                                  u_minify(res->base.height0, info->level));
++   uint32_t level_stride = util_format_get_nblocksx(res->base.format,
++                                                    u_minify(res->base.width0, info->level)) * elsize;
++   uint32_t box_rows = util_format_get_nblocksy(res->base.format, info->box->height);
++   uint32_t box_stride = util_format_get_nblocksx(res->base.format, info->box->width) * elsize;
++
++   if (box_stride != level_stride || box_rows != level_rows ||
++       info->box->x || info->box->y) {
++      uint32_t skip_x = util_format_get_nblocksx(res->base.format, info->box->x) * elsize;
++      uint32_t skip_y = util_format_get_nblocksy(res->base.format, info->box->y);
++      char *dst = data;
++
++      for (int slice = 0; slice < info->box->depth; slice++) {
++         const char *src = data + send_offset +
++                           (size_t)slice * level_stride * level_rows +
++                           (size_t)skip_y * level_stride + skip_x;
++         for (uint32_t row = 0; row < box_rows; row++) {
++            memmove(dst, src, box_stride);
++            dst += box_stride;
++            src += level_stride;
++         }
++      }
++      send_offset = 0;
++   }
++
+    write_transfer_data(&res->base, iov, num_iovs, data + send_offset,
+                        info->stride, info->box, info->level, info->offset,
+                        false);
+@@ -10798,7 +10856,8 @@ static int vrend_renderer_transfer_internal(struct vrend_context *ctx,
+    }
+ #endif
+ 
+-   if (!resource_contains_box(res, info->box, info->level)) {
++   if (!resource_contains_box(res, info->box, info->level) ||
++       !transfer_box_is_block_aligned(res, info->box, info->level)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_TRANSFER_IOV_BOUNDS, res->gl_id);
+       return EINVAL;
+    }
+@@ -10870,7 +10929,8 @@ int vrend_transfer_inline_write(struct vrend_context *ctx,
+       return EINVAL;
+    }
+ 
+-   if (!resource_contains_box(res, info->box, info->level)) {
++   if (!resource_contains_box(res, info->box, info->level) ||
++       !transfer_box_is_block_aligned(res, info->box, info->level)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, dst_handle);
+       return EINVAL;
+    }

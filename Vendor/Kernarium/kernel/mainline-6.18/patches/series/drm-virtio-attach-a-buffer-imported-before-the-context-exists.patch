@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 04:49:54 +0900
+Subject: [PATCH] drm/virtio: attach a buffer imported before the context
+ exists
+
+A file on a device that supports context initialization has no context
+until it asks for one or first needs one: DRM_IOCTL_VIRTGPU_CONTEXT_INIT,
+or the first transfer, submission, or resource creation. A handle the
+file opens before that, typically a PRIME import, joined no context,
+because gem_object_open() only attaches to a context that exists, and
+creating the context later attached nothing it already held.
+
+Android's gralloc mapper is such a file. screencap imports the screenshot
+buffer SurfaceFlinger rendered, locks it for reading, and the lock's
+TRANSFER_FROM_HOST_3D creates the context and names the buffer in it.
+The host has never seen the buffer attached to that context, answers
+VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, and the mapper hands the caller
+the untouched guest pages: every screenshot is transparent black, and
+every other process whose first lock is of an imported buffer fails the
+same way.
+
+Keep a handle opened before its file has a context on a pending list,
+holding the object array its attachment will carry, and attach the
+file's pending handles when its context is created, right after
+CTX_CREATE on the same queue. Closing a pending handle drops it from
+the list instead of detaching it from a context it never joined; that
+check, made under the context lock, replaces the unlocked one upstream
+added in 6.18.42. The file's context lock orders the three, so a handle
+is attached exactly once however its open races the context's
+creation. Few handles ever wait, and only until their file's first
+context-creating ioctl, so one list serves every file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../gpu/drm/virtio/virtgpu_context_attach.h   |  23 ++++
+ drivers/gpu/drm/virtio/virtgpu_gem.c          | 124 ++++++++++++++++--
+ drivers/gpu/drm/virtio/virtgpu_ioctl.c        |   4 +-
+ 3 files changed, 137 insertions(+), 14 deletions(-)
+ create mode 100644 drivers/gpu/drm/virtio/virtgpu_context_attach.h
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_context_attach.h b/drivers/gpu/drm/virtio/virtgpu_context_attach.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a06095966c8125bd3498819b72f89b22fbc581f0
+--- /dev/null
++++ b/drivers/gpu/drm/virtio/virtgpu_context_attach.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Context attachment of handles opened before their file's context existed.
++ *
++ * A file on a device that supports context initialization creates its context
++ * only when it asks for one or first needs one, so it can open a handle, most
++ * often by importing a buffer, while it has no context to attach the handle
++ * to. Such a handle waits until the context is created and is attached then.
++ */
++#ifndef VIRTGPU_CONTEXT_ATTACH_H
++#define VIRTGPU_CONTEXT_ATTACH_H
++
++struct virtio_gpu_device;
++struct virtio_gpu_fpriv;
++
++/*
++ * Attach every handle the file opened while it had no context. Called with
++ * the file's context_lock held, once the context has been created.
++ */
++void virtio_gpu_attach_pending_handles(struct virtio_gpu_device *vgdev,
++				       struct virtio_gpu_fpriv *vfpriv);
++
++#endif
+diff --git a/drivers/gpu/drm/virtio/virtgpu_gem.c b/drivers/gpu/drm/virtio/virtgpu_gem.c
+index aea5e1b60e7f331b5d1cb9a4bb357ace6511631e..ff2339a0e05832a57c3caebf229852b2885e617a 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_gem.c
++++ b/drivers/gpu/drm/virtio/virtgpu_gem.c
+@@ -26,6 +26,7 @@
+ #include <drm/drm_file.h>
+ #include <drm/drm_fourcc.h>
+ 
++#include "virtgpu_context_attach.h"
+ #include "virtgpu_drv.h"
+ 
+ static int virtio_gpu_gem_create(struct drm_file *file,
+@@ -99,12 +100,87 @@ int virtio_gpu_mode_dumb_create(struct drm_file *file_priv,
+ 	return ret;
+ }
+ 
++/*
++ * A handle opened while its file had no context, holding the object array
++ * that carries its attachment once the context exists. Few handles ever
++ * wait, and only until their file's first context-creating ioctl, so one
++ * list serves every file.
++ */
++struct virtio_gpu_pending_handle {
++	struct list_head link;
++	struct virtio_gpu_fpriv *vfpriv;
++	struct virtio_gpu_object_array *objs;
++};
++
++/* Nests inside virtio_gpu_fpriv.context_lock. */
++static DEFINE_MUTEX(virtio_gpu_pending_lock);
++static LIST_HEAD(virtio_gpu_pending_handles);
++
++void virtio_gpu_attach_pending_handles(struct virtio_gpu_device *vgdev,
++				       struct virtio_gpu_fpriv *vfpriv)
++{
++	struct virtio_gpu_pending_handle *pending, *next;
++	LIST_HEAD(attach);
++
++	mutex_lock(&virtio_gpu_pending_lock);
++	list_for_each_entry_safe(pending, next, &virtio_gpu_pending_handles,
++				 link) {
++		if (pending->vfpriv == vfpriv)
++			list_move_tail(&pending->link, &attach);
++	}
++	mutex_unlock(&virtio_gpu_pending_lock);
++
++	list_for_each_entry_safe(pending, next, &attach, link) {
++		virtio_gpu_cmd_context_attach_resource(vgdev, vfpriv->ctx_id,
++						       pending->objs);
++		list_del(&pending->link);
++		kfree(pending);
++	}
++}
++
++static int virtio_gpu_defer_handle(struct virtio_gpu_fpriv *vfpriv,
++				   struct virtio_gpu_object_array *objs)
++{
++	struct virtio_gpu_pending_handle *pending;
++
++	pending = kmalloc(sizeof(*pending), GFP_KERNEL);
++	if (!pending)
++		return -ENOMEM;
++	pending->vfpriv = vfpriv;
++	pending->objs = objs;
++	mutex_lock(&virtio_gpu_pending_lock);
++	list_add_tail(&pending->link, &virtio_gpu_pending_handles);
++	mutex_unlock(&virtio_gpu_pending_lock);
++	return 0;
++}
++
++static void virtio_gpu_forget_handle(struct virtio_gpu_fpriv *vfpriv,
++				     struct drm_gem_object *obj)
++{
++	struct virtio_gpu_pending_handle *pending, *found = NULL;
++
++	mutex_lock(&virtio_gpu_pending_lock);
++	list_for_each_entry(pending, &virtio_gpu_pending_handles, link) {
++		if (pending->vfpriv == vfpriv && pending->objs->objs[0] == obj) {
++			list_del(&pending->link);
++			found = pending;
++			break;
++		}
++	}
++	mutex_unlock(&virtio_gpu_pending_lock);
++	if (found) {
++		virtio_gpu_array_put_free(found->objs);
++		kfree(found);
++	}
++}
++
+ int virtio_gpu_gem_object_open(struct drm_gem_object *obj,
+ 			       struct drm_file *file)
+ {
+ 	struct virtio_gpu_device *vgdev = obj->dev->dev_private;
+ 	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
+ 	struct virtio_gpu_object_array *objs;
++	int ret;
+ 
+ 	if (!vgdev->has_virgl_3d)
+ 		goto out_notify;
+@@ -115,14 +191,29 @@ int virtio_gpu_gem_object_open(struct drm_gem_object *obj,
+ 	if (!vgdev->has_context_init)
+ 		virtio_gpu_create_context(obj->dev, file);
+ 
+-	if (vfpriv->context_created) {
+-		objs = virtio_gpu_array_alloc(1);
+-		if (!objs)
+-			return -ENOMEM;
+-		virtio_gpu_array_add_obj(objs, obj);
++	objs = virtio_gpu_array_alloc(1);
++	if (!objs)
++		return -ENOMEM;
++	virtio_gpu_array_add_obj(objs, obj);
+ 
++	mutex_lock(&vfpriv->context_lock);
++	if (vfpriv->context_created) {
+ 		virtio_gpu_cmd_context_attach_resource(vgdev, vfpriv->ctx_id, objs);
++		mutex_unlock(&vfpriv->context_lock);
++		goto out_notify;
+ 	}
++	/*
++	 * A file that initializes its context explicitly, or creates it on its
++	 * first transfer or submission, can import a buffer before it has a
++	 * context. The context must still see the buffer once it exists, or
++	 * every command naming the buffer through this file refers to a
++	 * resource the host never attached to it.
++	 */
++	ret = virtio_gpu_defer_handle(vfpriv, objs);
++	mutex_unlock(&vfpriv->context_lock);
++	if (ret)
++		virtio_gpu_array_put_free(objs);
++	return ret;
+ 
+ out_notify:
+ 	virtio_gpu_notify(vgdev);
+@@ -139,15 +230,22 @@ void virtio_gpu_gem_object_close(struct drm_gem_object *obj,
+ 	if (!vgdev->has_virgl_3d)
+ 		return;
+ 
+-	if (vfpriv->context_created) {
+-		objs = virtio_gpu_array_alloc(1);
+-		if (!objs)
+-			return;
+-		virtio_gpu_array_add_obj(objs, obj);
+-
+-		virtio_gpu_cmd_context_detach_resource(vgdev, vfpriv->ctx_id,
+-						       objs);
++	mutex_lock(&vfpriv->context_lock);
++	if (!vfpriv->context_created) {
++		/* It never joined a context, so there is nothing to detach. */
++		virtio_gpu_forget_handle(vfpriv, obj);
++		mutex_unlock(&vfpriv->context_lock);
++		return;
+ 	}
++	mutex_unlock(&vfpriv->context_lock);
++
++	objs = virtio_gpu_array_alloc(1);
++	if (!objs)
++		return;
++	virtio_gpu_array_add_obj(objs, obj);
++
++	virtio_gpu_cmd_context_detach_resource(vgdev, vfpriv->ctx_id,
++					       objs);
+ 	virtio_gpu_notify(vgdev);
+ }
+ 
+diff --git a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+index efa20d6f698f35db8cad695ba36f1ad9f860b044..c6ec38f37f492b9aaeb3b8ae7e27fc40dad34217 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+@@ -32,6 +32,7 @@
+ #include <drm/drm_file.h>
+ #include <drm/virtgpu_drm.h>
+ 
++#include "virtgpu_context_attach.h"
+ #include "virtgpu_drv.h"
+ 
+ #define VIRTGPU_BLOB_FLAG_USE_MASK (VIRTGPU_BLOB_FLAG_USE_MAPPABLE | \
+@@ -65,7 +66,7 @@ static void virtio_gpu_name_context_owner(char *buf, size_t size,
+ 	scnprintf(buf, size, "%.*s%s", (int)room, name, suffix);
+ }
+ 
+-/* Must be called with &virtio_gpu_fpriv.struct_mutex held. */
++/* Must be called with &virtio_gpu_fpriv.context_lock held. */
+ static void virtio_gpu_create_context_locked(struct virtio_gpu_device *vgdev,
+ 					     struct virtio_gpu_fpriv *vfpriv)
+ {
+@@ -84,6 +85,7 @@ static void virtio_gpu_create_context_locked(struct virtio_gpu_device *vgdev,
+ 				      name);
+ 
+ 	vfpriv->context_created = true;
++	virtio_gpu_attach_pending_handles(vgdev, vfpriv);
+ }
+ 
+ void virtio_gpu_create_context(struct drm_device *dev, struct drm_file *file)

@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 07:28:46 +0900
+Subject: [PATCH] v4l2: queue packed RGB frames to the device as they are
+
+The framework maps RGBA_8888 and RGBX_8888 blocks, which is what a Surface
+input from GLES delivers, as RGB, and the component converted every RGB
+frame to NV12 on the CPU. Before the first frame, ask the encoder to take
+the block's own format when the device lists it, so the device converts the
+colours instead; an encoder whose device does not list the format keeps NV12
+and the converter, as before.
+
+The block layout had called every RGB block ARGB, which in libyuv's naming is
+the bytes blue, green, red, alpha, while the blocks the framework maps hold
+red, green, blue, alpha, which is ABGR (V4L2 RGBA32). Name them by their
+byte order, so the V4L2 format that matches is the one the encoder asks for.
+
+A frame that a GPU producer rendered exists only in the host's copy of the
+buffer, and the device reads the guest memory. The first frame of a GLES
+Surface reached the device and every later one was black. Before the device
+takes a frame the component now locks the buffer for reading when the producer
+rendered it with the GPU and no CPU write lock applies, which pulls the frame
+into the guest memory, as the write lock does for a CPU producer.
+---
+ components/EncodeComponent.cpp                | 43 ++++++++++++---
+ .../v4l2_codec2/components/VideoEncoder.h     |  6 +++
+ v4l2/V4L2Encoder.cpp                          | 54 +++++++++++++++++--
+ v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h   |  3 ++
+ 4 files changed, 96 insertions(+), 10 deletions(-)
+
+diff --git a/components/EncodeComponent.cpp b/components/EncodeComponent.cpp
+index 27762166ed9afa414bcf283d37c5965b99b40293..f2f5b6b6935df694579b630cb0f7820e959d5a99 100644
+--- a/components/EncodeComponent.cpp
++++ b/components/EncodeComponent.cpp
+@@ -38,6 +38,13 @@ using android::hardware::graphics::common::V1_0::BufferUsage;
+ namespace android {
+ 
+ namespace {
++// Whether |format| is a packed RGB format.
++bool isPackedRgbFormat(VideoPixelFormat format) {
++    return format == VideoPixelFormat::ARGB || format == VideoPixelFormat::ABGR ||
++           format == VideoPixelFormat::XRGB || format == VideoPixelFormat::XBGR ||
++           format == VideoPixelFormat::BGRA || format == VideoPixelFormat::RGBA;
++}
++
+ // Create an input frame from the specified graphic block.
+ std::unique_ptr<VideoEncoder::InputFrame> createInputFrame(
+         const C2ConstGraphicBlock& block, VideoPixelFormat format,
+@@ -81,6 +88,13 @@ std::optional<std::vector<VideoFramePlane>> getVideoFrameLayout(const C2ConstGra
+         layout.planes[C2PlanarLayout::PLANE_R].rowInc = idMap->rowInc();
+     }
+ 
++    // The framework maps RGBA_8888 and RGBX_8888 blocks as RGB, with their bytes in the order red,
++    // green, blue and alpha, and a block whose layout is not filled in is the same. Only a layout
++    // that puts blue before red is the other order.
++    const bool blueFirst = layout.planes[C2PlanarLayout::PLANE_B].offset != 0 &&
++                           layout.planes[C2PlanarLayout::PLANE_R].offset >
++                                   layout.planes[C2PlanarLayout::PLANE_B].offset;
++
+     std::vector<uint32_t> offsets(layout.numPlanes, 0u);
+     std::vector<uint32_t> strides(layout.numPlanes, 0u);
+     switch (layout.type) {
+@@ -136,7 +150,9 @@ std::optional<std::vector<VideoFramePlane>> getVideoFrameLayout(const C2ConstGra
+         offsets[C2PlanarLayout::PLANE_R] = layout.planes[C2PlanarLayout::PLANE_R].offset;
+         strides[C2PlanarLayout::PLANE_R] =
+                 static_cast<uint32_t>(layout.planes[C2PlanarLayout::PLANE_R].rowInc);
+-        *format = VideoPixelFormat::ARGB;
++        // The names are libyuv's, which lists the bytes of the little-endian word backwards: ARGB
++        // is the bytes blue, green, red, alpha and ABGR is red, green, blue, alpha.
++        *format = blueFirst ? VideoPixelFormat::ARGB : VideoPixelFormat::ABGR;
+         break;
+     }
+     default:
+@@ -476,12 +492,18 @@ void EncodeComponent::queueTask(std::unique_ptr<C2Work> work) {
+     // support the requested input format.
+     if ((mInputPixelFormat == VideoPixelFormat::UNKNOWN) && !work->input.buffers.empty()) {
+         VideoPixelFormat format = VideoPixelFormat::UNKNOWN;
+-        if (!getVideoFrameLayout(work->input.buffers.front()->data().graphicBlocks().front(),
+-                                 &format)) {
++        std::optional<std::vector<VideoFramePlane>> layout = getVideoFrameLayout(
++                work->input.buffers.front()->data().graphicBlocks().front(), &format);
++        if (!layout) {
+             ALOGE("Failed to get input block's layout");
+             reportError(C2_CORRUPTED);
+             return;
+         }
++        // RGB frames are costly to convert on the CPU, so let the device take them as they are if
++        // it lists their format. It keeps its format if it does not.
++        if (isPackedRgbFormat(format) && mEncoder->inputFormat() != format && !layout->empty()) {
++            mEncoder->setInputFormat(format, layout->front().mStride);
++        }
+         if (mEncoder->inputFormat() != format) {
+             ALOG_ASSERT(!mInputFormatConverter);
+             ALOGV("Creating input format convertor (%s)",
+@@ -526,14 +548,23 @@ void EncodeComponent::queueTask(std::unique_ptr<C2Work> work) {
+             // buffer. Whenever there is no format conversion, this causes
+             // sync issue on ARCVM since host side buffers never get updated.
+             // Fix this by explicitly calling lock/unlock before sending buffer
+-            // to encoder.
++            // to encoder. A producer that renders with the GPU, such as GLES on a Surface, writes
++            // a frame in the host's copy and nowhere else; reading the buffer pulls the frame into
++            // the guest memory the device takes it from.
+             const C2Handle* handle = inputBlock.handle();
+             uint32_t width, height, format, stride, generation, igbpSlot;
+             uint64_t usage, igbpId;
+             _UnwrapNativeCodec2GrallocMetadata(handle, &width, &height, &format, &usage, &stride,
+                                                &generation, &igbpId, &igbpSlot);
+             do {
+-                if (!(usage & GRALLOC_USAGE_SW_WRITE_MASK)) break;
++                uint64_t lockUsage;
++                if (usage & GRALLOC_USAGE_SW_WRITE_MASK) {
++                    lockUsage = GRALLOC_USAGE_SW_WRITE_OFTEN;
++                } else if ((usage & GRALLOC_USAGE_HW_RENDER) && (usage & GRALLOC_USAGE_SW_READ_MASK)) {
++                    lockUsage = GRALLOC_USAGE_SW_READ_OFTEN;
++                } else {
++                    break;
++                }
+                 native_handle_t* gralloc_handle = UnwrapNativeCodec2GrallocHandle(handle);
+                 if (nullptr == gralloc_handle) break;
+                 sp<GraphicBuffer> buffer =
+@@ -541,7 +572,7 @@ void EncodeComponent::queueTask(std::unique_ptr<C2Work> work) {
+                                           height, format, 1, usage, stride);
+                 native_handle_delete(gralloc_handle);
+                 void* pixels;
+-                if (buffer->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, &pixels)) break;
++                if (buffer->lock(lockUsage, &pixels)) break;
+                 buffer->unlock();
+             } while (0);
+         }
+diff --git a/components/include/v4l2_codec2/components/VideoEncoder.h b/components/include/v4l2_codec2/components/VideoEncoder.h
+index d05f1caa5e6624e5ac1a237f6a6ab2486f500df1..28a3de53f2d306600d2cbecf820a8003bdaabd5a 100644
+--- a/components/include/v4l2_codec2/components/VideoEncoder.h
++++ b/components/include/v4l2_codec2/components/VideoEncoder.h
+@@ -113,6 +113,12 @@ public:
+     // Request the next frame encoded to be a key frame, will affect the next non-processed frame.
+     virtual void requestKeyframe() = 0;
+ 
++    // Change the pixel format of the frames the encoder takes to |format|, whose first plane has a
++    // line of |stride| bytes, so the client's frames need no conversion. This is only possible
++    // before the first frame, and when the device takes |format|. Returns whether the encoder now
++    // takes |format|, which is not an error if it does not: it then keeps its format.
++    virtual bool setInputFormat(VideoPixelFormat format, uint32_t stride) = 0;
++
+     virtual VideoPixelFormat inputFormat() const = 0;
+     virtual const ui::Size& visibleSize() const = 0;
+     virtual const ui::Size& codedSize() const = 0;
+diff --git a/v4l2/V4L2Encoder.cpp b/v4l2/V4L2Encoder.cpp
+index a3c4b336558451e14dad3c1e4977b7043bef29c4..773cb294a921b32da7bb96e79e56a1f9cfc1a607 100644
+--- a/v4l2/V4L2Encoder.cpp
++++ b/v4l2/V4L2Encoder.cpp
+@@ -48,6 +48,23 @@ size_t GetMaxOutputBufferSize(const ui::Size& size) {
+     return kMaxBitstreamBufferSizeInBytes;
+ }
+ 
++// Whether V4L2 names |format| with the fourcc of a single buffer: packed RGB, whose pixels share one
++// plane, and P010, whose Y and CbCr planes share one buffer.
++bool isSingleBufferFormat(VideoPixelFormat format) {
++    switch (format) {
++    case VideoPixelFormat::ARGB:
++    case VideoPixelFormat::ABGR:
++    case VideoPixelFormat::XRGB:
++    case VideoPixelFormat::XBGR:
++    case VideoPixelFormat::BGRA:
++    case VideoPixelFormat::RGBA:
++    case VideoPixelFormat::P010:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ // Define V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR control code if not present in header files.
+ #ifndef V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR
+ #define V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR (V4L2_CID_MPEG_BASE + 644)
+@@ -226,6 +243,36 @@ void V4L2Encoder::requestKeyframe() {
+     mKeyFrameCounter = 0;
+ }
+ 
++bool V4L2Encoder::setInputFormat(VideoPixelFormat format, uint32_t stride) {
++    ALOGV("%s()", __func__);
++    ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
++
++    if (inputFormat() == format) return true;
++    // The input buffers are created for a format, and a frame fixes it by starting the stream.
++    if (mState != State::WAITING_FOR_INPUT_FRAME || !mEncodeRequests.empty() ||
++        mInputQueue->isStreaming()) {
++        return false;
++    }
++
++    // Leave the format as it is unless the device lists the one asked for, as the caller then
++    // converts the frames.
++    auto fourcc = Fourcc::fromVideoPixelFormat(format, isSingleBufferFormat(format));
++    if (!fourcc || !mInputQueue->tryFormat(fourcc->toV4L2PixFmt(), mVisibleSize, 0)) {
++        return false;
++    }
++
++    destroyInputBuffers();
++    const V4L2Colorimetry colorimetry = V4L2Device::c2ColorAspectsToV4L2Colorimetry(
++            mParams.colorRange, mParams.colorPrimaries, mParams.colorTransfer,
++            mParams.colorMatrix);
++    if (!configureInputFormat(format, stride, colorimetry) || !createInputBuffers()) {
++        ALOGE("Failed to change the input format to %s", videoPixelFormatToString(format).c_str());
++        onError();
++        return false;
++    }
++    return inputFormat() == format;
++}
++
+ VideoPixelFormat V4L2Encoder::inputFormat() const {
+     return mInputLayout ? mInputLayout.value().mFormat : VideoPixelFormat::UNKNOWN;
+ }
+@@ -239,6 +286,7 @@ bool V4L2Encoder::initialize(C2Config::profile_t outputProfile, std::optional<ui
+     ALOG_ASSERT(keyFramePeriod > 0);
+ 
+     mVisibleSize = visibleSize;
++    mParams = params;
+     mKeyFramePeriod = keyFramePeriod;
+     mKeyFrameCounter = 0;
+ 
+@@ -491,15 +539,13 @@ bool V4L2Encoder::configureInputFormat(VideoPixelFormat inputFormat, uint32_t st
+                                        const V4L2Colorimetry& colorimetry) {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
+-    ALOG_ASSERT(mState == State::UNINITIALIZED);
++    ALOG_ASSERT(mState == State::UNINITIALIZED || mState == State::WAITING_FOR_INPUT_FRAME);
+     ALOG_ASSERT(!mInputQueue->isStreaming());
+     ALOG_ASSERT(!isEmpty(mVisibleSize));
+ 
+     // First try to use the requested pixel format directly.
+     std::optional<struct v4l2_format> format;
+-    // P010 is one buffer holding both colour planes, which V4L2 names with the fourcc of a
+-    // single-planar format.
+-    auto fourcc = Fourcc::fromVideoPixelFormat(inputFormat, inputFormat == VideoPixelFormat::P010);
++    auto fourcc = Fourcc::fromVideoPixelFormat(inputFormat, isSingleBufferFormat(inputFormat));
+     if (fourcc) {
+         format = mInputQueue->setFormat(fourcc->toV4L2PixFmt(), mVisibleSize, 0, stride,
+                                         colorimetry);
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
+index 607148a47219614324b8808307a597aa8cc68e48..4f34dbb261b6bd86a6808151f9acdc7da4d17c7b 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
+@@ -47,6 +47,7 @@ public:
+     bool setFramerate(uint32_t framerate) override;
+     void requestKeyframe() override;
+ 
++    bool setInputFormat(VideoPixelFormat format, uint32_t stride) override;
+     VideoPixelFormat inputFormat() const override;
+     const ui::Size& visibleSize() const override { return mVisibleSize; }
+     const ui::Size& codedSize() const override { return mInputCodedSize; }
+@@ -192,6 +193,8 @@ private:
+ 
+     // How often we want to request the V4L2 device to create a key frame.
+     uint32_t mKeyFramePeriod = 0;
++    // The parameters the encoder was created with.
++    EncodingParams mParams;
+     // Key frame counter, a key frame will be requested each time it reaches zero.
+     uint32_t mKeyFrameCounter = 0;
+ 

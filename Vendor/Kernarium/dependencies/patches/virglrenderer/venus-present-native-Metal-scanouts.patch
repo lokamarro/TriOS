@@ -1,0 +1,887 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 18:25:14 +0900
+Subject: [PATCH] venus: present native Metal scanouts
+
+---
+ src/mesa/util/anon_file.c     |  40 +++++++++
+ src/mesa/util/anon_file.h     |   2 +
+ src/venus/vkr_device.c        |   8 ++
+ src/venus/vkr_device.h        |   6 ++
+ src/venus/vkr_device_memory.c |  88 +++++++++++++-----
+ src/venus/vkr_device_memory.h |   4 +
+ src/venus/vkr_image.c         | 156 ++++++++++++++++++++++++++++++++
+ src/venus/vkr_image.h         |   2 +
+ src/virgl_resource.c          | 162 ++++++++++++++++++++++++++++++++++
+ src/virgl_resource.h          |  16 ++++
+ src/virglrenderer.c           |  57 ++++++++++++
+ src/virglrenderer.h           |  54 +++++++++++-
+ 12 files changed, 572 insertions(+), 23 deletions(-)
+
+diff --git a/src/mesa/util/anon_file.c b/src/mesa/util/anon_file.c
+index 1c22514f9ab6c5cbaa35b576fc0a901d299f2725..062f3ced7e9e2fea3a4feb7a84bc15b242d0ebdf 100644
+--- a/src/mesa/util/anon_file.c
++++ b/src/mesa/util/anon_file.c
+@@ -31,6 +31,8 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <limits.h>
++#include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+@@ -96,6 +98,44 @@ create_tmpfile_cloexec(char *tmpname)
+ }
+ #endif
+ 
++/*
++ * Create an unlinked regular file of the given size under TMPDIR, or /tmp
++ * when TMPDIR is unset, and return a close-on-exec descriptor for it. Unlike
++ * anonymous shared memory it has a real vnode identity (st_dev, st_ino), and
++ * it maps MAP_SHARED like any file. The tag prefixes the temporary name.
++ * Returns -1 with errno set on failure.
++ */
++int
++os_create_unlinked_file(off_t size, const char *tag)
++{
++   const char *tmpdir = getenv("TMPDIR");
++   if (!tmpdir || !tmpdir[0])
++      tmpdir = "/tmp";
++   const char *separator = tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/";
++   char path[PATH_MAX];
++   const int written =
++      snprintf(path, sizeof(path), "%s%s%s-XXXXXX", tmpdir, separator, tag);
++   if (written < 0 || (size_t)written >= sizeof(path)) {
++      errno = ENAMETOOLONG;
++      return -1;
++   }
++
++   const int fd = mkstemp(path);
++   if (fd < 0)
++      return -1;
++
++   int flags;
++   if (unlink(path) < 0 || (flags = fcntl(fd, F_GETFD)) < 0 ||
++       fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0 || ftruncate(fd, size) < 0) {
++      const int saved_errno = errno;
++      close(fd);
++      errno = saved_errno;
++      return -1;
++   }
++
++   return fd;
++}
++
+ /*
+  * Create a new, unique, anonymous file of the given size, and
+  * return the file descriptor for it. The file descriptor is set
+diff --git a/src/mesa/util/anon_file.h b/src/mesa/util/anon_file.h
+index 790537b7aee6f27f9d34d06e0e5c746a8d016453..25d2481e88132f6f226da83ef84db8d775b6c52e 100644
+--- a/src/mesa/util/anon_file.h
++++ b/src/mesa/util/anon_file.h
+@@ -30,4 +30,6 @@
+ 
+ int os_create_anonymous_file(off_t size, const char *debug_name);
+ 
++int os_create_unlinked_file(off_t size, const char *tag);
++
+ #endif
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index ace87a08779068a7c0db24c4d0abe048c2311e95..4445734e763f7101ba3750df7dba029927a5a95c 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -107,6 +107,14 @@ vkr_device_init_renderer_procs(struct vkr_device *dev)
+          return false;
+    }
+ 
++   if (physical_dev->EXT_metal_objects) {
++      dev->ExportMetalObjectsEXT =
++         (PFN_vkExportMetalObjectsEXT)vk->GetDeviceProcAddr(
++            handle, "vkExportMetalObjectsEXT");
++      if (!dev->ExportMetalObjectsEXT)
++         return false;
++   }
++
+    return true;
+ }
+ 
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index fcf875c2c3fcc242342034a04ad1ab1bd0e81673..980b6877f18409fe5cc5e4e99d1febc30796e480 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -30,6 +30,12 @@ struct vkr_device {
+    PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
+    PFN_vkGetMemoryMetalHandlePropertiesEXT GetMemoryMetalHandlePropertiesEXT;
+    PFN_vkGetMemoryMetalHandleEXT GetMemoryMetalHandleEXT;
++   PFN_vkExportMetalObjectsEXT ExportMetalObjectsEXT;
++
++   /* Whether this device has already reported a native scanout publication
++    * failure.  Repeating one would flood the console the guest shares.
++    */
++   bool metal_scanout_failure_reported;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index f01e1020296faed1bce5c5fce17a63534c3820d9..7233e6024606d0c1ea1afadc903dbd376e96d03c 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -269,6 +269,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    };
+    VkImportMemoryResourceInfoMESA *res_info = NULL;
+    struct vkr_shm_mapping *host_mapping = NULL;
++   uint64_t imported_native_resource_id = 0;
+    void *prev_of_res_info = vkr_find_prev_struct(
+       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+    if (prev_of_res_info) {
+@@ -312,6 +313,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+          local_metal_import.handle = res->native_handle;
+          vkr_pnext_set_next(prev_of_res_info, &local_metal_import);
+          alloc_info->allocationSize = res->size;
++         imported_native_resource_id =
++            virgl_resource_native_retain(res->native_resource_id);
++         if (!imported_native_resource_id) {
++            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
+       } else if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
+          if (!physical_dev->EXT_external_memory_host || !res->u.data ||
+              alloc_info->allocationSize > res->size ||
+@@ -530,6 +537,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+ 
+    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
+    if (!mem) {
++      virgl_resource_native_release(imported_native_resource_id);
+       if (local_import_info.fd >= 0)
+          close(local_import_info.fd);
+       if (gbm_bo)
+@@ -548,6 +556,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    mem->host_shm = host_shm;
+    mem->host_mapping = host_mapping;
+    mem->metal_heap_exportable = export_metal_heap;
++   mem->metal_heap_fd = -1;
++   mem->native_resource_id = imported_native_resource_id;
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = host_mem_type_index;
+ }
+@@ -685,6 +695,8 @@ void
+ vkr_device_memory_release(struct vkr_device_memory *mem)
+ {
+    virgl_resource_native_release(mem->native_resource_id);
++   if (mem->metal_heap_fd >= 0)
++      close(mem->metal_heap_fd);
+    vkr_host_shm_free(mem->host_shm);
+    vkr_shm_mapping_release(mem->host_mapping);
+    if (mem->gbm_bo)
+@@ -693,6 +705,56 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
+       close(mem->udmabuf_fd);
+ }
+ 
++bool
++vkr_device_memory_prepare_metal_heap_export(struct vkr_device_memory *mem)
++{
++   if (mem->native_resource_id)
++      return true;
++   if (!mem->metal_heap_exportable)
++      return false;
++
++   const VkMemoryGetMetalHandleInfoEXT handle_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
++      .memory = mem->base.handle.device_memory,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
++   };
++   void *metal_heap = NULL;
++   VkResult ret = mem->device->GetMemoryMetalHandleEXT(
++      mem->device->base.handle.device, &handle_info, &metal_heap);
++   if (ret != VK_SUCCESS || !metal_heap) {
++      vkr_log("mem Metal heap export failed (vk ret %d)", ret);
++      return false;
++   }
++
++   const uint64_t page_size = (uint64_t)getpagesize();
++   if (mem->allocation_size > INT64_MAX - (page_size - 1))
++      return false;
++   const uint64_t fd_size = align64(mem->allocation_size, page_size);
++   /* macOS reports st_dev == st_ino == 0 for every POSIX shared-memory
++    * descriptor.  Native resources use that identity to reconnect the fd
++    * returned to virtio-gpu with its in-process Metal object, so the fd is an
++    * unlinked file with a real vnode identity instead.  It is sized to the
++    * allocation but never holds the image payload.
++    */
++   int fd = os_create_unlinked_file((off_t)fd_size, "vkr-metal-heap");
++   if (fd < 0) {
++      vkr_log("Metal heap identity file creation failed (%s)", strerror(errno));
++      return false;
++   }
++
++   const uint64_t native_resource_id = virgl_resource_native_publish(
++      fd, VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP, metal_heap);
++   if (!native_resource_id) {
++      vkr_log("Metal heap native-resource publication failed");
++      close(fd);
++      return false;
++   }
++
++   mem->metal_heap_fd = fd;
++   mem->native_resource_id = native_resource_id;
++   return true;
++}
++
+ bool
+ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+                               uint64_t blob_size,
+@@ -737,35 +799,19 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+    }
+ 
+    if (mem->metal_heap_exportable) {
+-      const VkMemoryGetMetalHandleInfoEXT handle_info = {
+-         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
+-         .memory = mem->base.handle.device_memory,
+-         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+-      };
+-      void *metal_heap = NULL;
+-      VkResult ret = mem->device->GetMemoryMetalHandleEXT(
+-         mem->device->base.handle.device, &handle_info, &metal_heap);
+-      if (ret != VK_SUCCESS || !metal_heap) {
+-         vkr_log("mem Metal heap export failed (vk ret %d)", ret);
++      if (!vkr_device_memory_prepare_metal_heap_export(mem))
+          return false;
+-      }
+ 
+       const uint64_t page_size = (uint64_t)getpagesize();
+       if (blob_size > INT64_MAX - (page_size - 1))
+          return false;
+-      const uint64_t fd_size = align64(blob_size, page_size);
+-      int fd = os_create_anonymous_file((off_t)fd_size, "vkr-metal-heap");
+-      if (fd < 0)
++      if (align64(blob_size, page_size) >
++          align64(mem->allocation_size, page_size))
+          return false;
+-
+-      const uint64_t native_resource_id = virgl_resource_native_publish(
+-         fd, VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP, metal_heap);
+-      if (!native_resource_id) {
+-         close(fd);
++      int fd = os_dupfd_cloexec(mem->metal_heap_fd);
++      if (fd < 0)
+          return false;
+-      }
+ 
+-      mem->native_resource_id = native_resource_id;
+       mem->exported = true;
+       *out_blob = (struct virgl_context_blob) {
+          .type = VIRGL_RESOURCE_FD_SHM,
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index 19456f74a27f6c787decc9c5a5a0b809c5a1bcdd..c695c7de3ee0297e82318076af207abf6c3f7c2d 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -36,6 +36,7 @@ struct vkr_device_memory {
+ 
+    /* Renderer-private MTLHeap export retained by the fd identity registry. */
+    bool metal_heap_exportable;
++   int metal_heap_fd;
+    uint64_t native_resource_id;
+ 
+    uint64_t allocation_size;
+@@ -51,6 +52,9 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx);
+ void
+ vkr_device_memory_release(struct vkr_device_memory *mem);
+ 
++bool
++vkr_device_memory_prepare_metal_heap_export(struct vkr_device_memory *mem);
++
+ bool
+ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+                               uint64_t blob_size,
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a..0ec9ccc144668c58f5fefc6a0c32e9f05e6ab491 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -6,13 +6,132 @@
+ #include "vkr_image.h"
+ 
+ #include "vkr_image_gen.h"
++#include "vkr_device_memory.h"
+ #include "vkr_physical_device.h"
+ 
++static bool
++vkr_image_should_export_metal_texture(
++   const struct vkr_device *dev, const VkImageCreateInfo *create_info)
++{
++   if (!dev->physical_device->EXT_metal_objects ||
++       !dev->physical_device->EXT_external_memory_metal)
++      return false;
++
++   const VkExternalMemoryImageCreateInfo *external_info =
++      vkr_find_struct(create_info->pNext,
++                      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
++   if (external_info &&
++       (external_info->handleTypes &
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT))
++      return true;
++
++   /* Venus can export the allocation as a virtio-gpu blob without exposing
++    * the renderer's Metal handle type in the guest image create chain.  Make
++    * color-render targets exportable up front so a later MTLHeap bind can
++    * publish the native texture for zero-copy scanout: every optimal one,
++    * and every one created for external memory whatever its tiling.  A
++    * compositor's GBM scanout buffer is the latter: a DRM_FORMAT_MOD_LINEAR
++    * image that names the renderer's host-allocation handle type, while the
++    * guest allocates its dedicated device-local memory as an MTLHeap.
++    * Publication still occurs only for allocations backed by a native Metal
++    * heap.
++    */
++   if (!(create_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
++      return false;
++
++   return create_info->tiling == VK_IMAGE_TILING_OPTIMAL ||
++          (external_info && external_info->handleTypes);
++}
++
++/* A bind that cannot publish its native texture repeats as often as the guest
++ * binds one, and the renderer's stderr shares the guest console with whatever
++ * the guest is writing.  Each device therefore reports the first publication
++ * failure with its own reason and stays quiet about the rest.
++ */
++static bool
++vkr_image_first_scanout_failure(struct vkr_device *dev)
++{
++   if (dev->metal_scanout_failure_reported)
++      return false;
++
++   dev->metal_scanout_failure_reported = true;
++   return true;
++}
++
++static void
++vkr_image_publish_metal_texture(struct vkr_device *dev,
++                                const struct vkr_image *image,
++                                struct vkr_device_memory *mem,
++                                VkDeviceSize memory_offset)
++{
++   if (!image->export_metal_texture)
++      return;
++
++   if (!mem->native_resource_id) {
++      /* Color targets vkr_image_should_export_metal_texture marks are
++       * exportable up front, but only an allocation the guest asked to
++       * export as an MTLHeap owns one.  An ordinary render target on
++       * ordinary device memory is the designed outcome of that marking, not
++       * a failure, and it is the common case: a conformance run binds one
++       * for every test.
++       */
++      if (!mem->metal_heap_exportable)
++         return;
++      if (!vkr_device_memory_prepare_metal_heap_export(mem)) {
++         if (vkr_image_first_scanout_failure(dev))
++            vkr_log("failed to prepare Metal heap for scanout texture");
++         return;
++      }
++   }
++
++   VkExportMetalTextureInfoEXT texture_info = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
++      .image = image->base.handle.image,
++      .plane = VK_IMAGE_ASPECT_COLOR_BIT,
++   };
++   VkExportMetalObjectsInfoEXT objects_info = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
++      .pNext = &texture_info,
++   };
++   dev->ExportMetalObjectsEXT(dev->base.handle.device, &objects_info);
++   if (!texture_info.mtlTexture) {
++      if (vkr_image_first_scanout_failure(dev))
++         vkr_log("native scanout texture export returned null for %ux%u",
++                 image->extent.width, image->extent.height);
++      return;
++   }
++
++   if (!virgl_resource_native_set_metal_texture(
++          mem->native_resource_id, texture_info.mtlTexture, memory_offset,
++          image->extent.width, image->extent.height)) {
++      if (vkr_image_first_scanout_failure(dev))
++         vkr_log("failed to publish Metal scanout texture");
++   }
++}
++
+ static void
+ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCreateImage *args)
+ {
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
+    const VkImageTiling tiling = args->pCreateInfo->tiling;
++   const VkExtent3D extent = args->pCreateInfo->extent;
++   const bool export_metal_texture =
++      vkr_image_should_export_metal_texture(dev, args->pCreateInfo);
++   VkImageCreateInfo local_create_info;
++   VkExportMetalObjectCreateInfoEXT local_export_info;
++   if (export_metal_texture) {
++      local_create_info = *args->pCreateInfo;
++      local_export_info = (VkExportMetalObjectCreateInfoEXT) {
++         .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++         .pNext = local_create_info.pNext,
++         .exportObjectType =
++            VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
++      };
++      local_create_info.pNext = &local_export_info;
++      args->pCreateInfo = &local_create_info;
++   }
++
+    /* XXX If VkExternalMemoryImageCreateInfo is chained by the app, all is
+     * good.  If it is not chained, we might still bind an external memory to
+     * the image, because vkr_dispatch_vkAllocateMemory makes any HOST_VISIBLE
+@@ -39,6 +158,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+       image->format = format;
+       image->array_layers = array_layers;
+       image->tiling = tiling;
++      image->extent = extent;
++      image->export_metal_texture = export_metal_texture;
+    }
+ }
+ 
+@@ -118,12 +239,24 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
++   struct vkr_image *image = vkr_image_from_handle(args->image);
++   struct vkr_device_memory *mem =
++      vkr_device_memory_from_handle(args->memory);
++   const VkDeviceSize memory_offset = args->memoryOffset;
+ 
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
++   if (args->ret == VK_SUCCESS)
++      vkr_image_publish_metal_texture(dev, image, mem, memory_offset);
+ }
+ 
++struct vkr_metal_image_binding {
++   struct vkr_image *image;
++   struct vkr_device_memory *memory;
++   VkDeviceSize memory_offset;
++};
++
+ static void
+ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkBindImageMemory2 *args)
+@@ -131,8 +264,31 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   STACK_ARRAY(struct vkr_metal_image_binding, bindings,
++               args->bindInfoCount);
++   if (!bindings) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
++      bindings[i] = (struct vkr_metal_image_binding) {
++         .image = vkr_image_from_handle(args->pBindInfos[i].image),
++         .memory =
++            vkr_device_memory_from_handle(args->pBindInfos[i].memory),
++         .memory_offset = args->pBindInfos[i].memoryOffset,
++      };
++   }
++
+    vn_replace_vkBindImageMemory2_args_handle(args);
+    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++   if (args->ret == VK_SUCCESS) {
++      for (uint32_t i = 0; i < args->bindInfoCount; i++) {
++         vkr_image_publish_metal_texture(
++            dev, bindings[i].image, bindings[i].memory,
++            bindings[i].memory_offset);
++      }
++   }
++   STACK_ARRAY_FINISH(bindings);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
+index f098dc3ccbf5093c370d3d843f0fcd880745bbd9..886ed62a32fbe8082b425dd0bdc11df88cd91665 100644
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -14,6 +14,8 @@ struct vkr_image {
+    VkFormat format;
+    uint32_t array_layers;
+    VkImageTiling tiling;
++   VkExtent3D extent;
++   bool export_metal_texture;
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index dbc803cfc50910e474e481cdeeec87a26a1f7183..e555eda8f16a55e7719d359bdcc734bcafd75503 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -54,6 +54,15 @@ struct virgl_native_resource {
+    enum virgl_resource_native_handle_type type;
+    void *handle;
+    uint32_t refcount;
++   struct list_head metal_textures;
++   struct list_head head;
++};
++
++struct virgl_native_metal_texture {
++   void *handle;
++   uint64_t offset;
++   uint32_t width;
++   uint32_t height;
+    struct list_head head;
+ };
+ 
+@@ -120,6 +129,7 @@ virgl_resource_native_publish(int fd,
+    resource->type = type;
+    resource->handle = virgl_metal_retain_object(handle);
+    resource->refcount = 1;
++   list_inithead(&resource->metal_textures);
+    list_addtail(&resource->head, &native_resources);
+    mtx_unlock(&native_resource_mutex);
+ 
+@@ -132,6 +142,152 @@ virgl_resource_native_publish(int fd,
+ #endif
+ }
+ 
++uint64_t
++virgl_resource_native_retain(uint64_t id)
++{
++#if defined(ENABLE_METAL) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER)
++   if (!id)
++      return 0;
++
++   call_once(&native_resource_once, virgl_resource_native_init_once);
++   if (!native_resource_ready)
++      return 0;
++
++   uint64_t retained_id = 0;
++   mtx_lock(&native_resource_mutex);
++   list_for_each_entry (struct virgl_native_resource, resource,
++                        &native_resources, head) {
++      if (resource->id == id && resource->refcount != UINT32_MAX) {
++         resource->refcount++;
++         retained_id = id;
++         break;
++      }
++   }
++   mtx_unlock(&native_resource_mutex);
++   return retained_id;
++#else
++   (void)id;
++   return 0;
++#endif
++}
++
++bool
++virgl_resource_native_set_metal_texture(uint64_t id,
++                                        void *texture,
++                                        uint64_t offset,
++                                        uint32_t width,
++                                        uint32_t height)
++{
++#if defined(ENABLE_METAL) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER)
++   if (!id || !texture || !width || !height)
++      return false;
++
++   struct virgl_native_metal_texture *new_texture =
++      calloc(1, sizeof(*new_texture));
++   if (!new_texture)
++      return false;
++
++   new_texture->handle = virgl_metal_retain_object(texture);
++   new_texture->offset = offset;
++   new_texture->width = width;
++   new_texture->height = height;
++
++   call_once(&native_resource_once, virgl_resource_native_init_once);
++   if (!native_resource_ready) {
++      virgl_metal_release_object(new_texture->handle);
++      free(new_texture);
++      return false;
++   }
++
++   void *replaced_handle = NULL;
++   bool found = false;
++   mtx_lock(&native_resource_mutex);
++   list_for_each_entry (struct virgl_native_resource, resource,
++                        &native_resources, head) {
++      if (resource->id != id)
++         continue;
++
++      list_for_each_entry (struct virgl_native_metal_texture, existing,
++                           &resource->metal_textures, head) {
++         if (existing->offset == offset && existing->width == width &&
++             existing->height == height) {
++            replaced_handle = existing->handle;
++            existing->handle = new_texture->handle;
++            new_texture->handle = NULL;
++            found = true;
++            break;
++         }
++      }
++
++      if (!found) {
++         list_addtail(&new_texture->head, &resource->metal_textures);
++         new_texture = NULL;
++      }
++      found = true;
++      break;
++   }
++   mtx_unlock(&native_resource_mutex);
++
++   if (replaced_handle)
++      virgl_metal_release_object(replaced_handle);
++   if (new_texture) {
++      if (new_texture->handle)
++         virgl_metal_release_object(new_texture->handle);
++      free(new_texture);
++   }
++   return found;
++#else
++   (void)id;
++   (void)texture;
++   (void)offset;
++   (void)width;
++   (void)height;
++   return false;
++#endif
++}
++
++void *
++virgl_resource_native_acquire_metal_texture(uint64_t id,
++                                            uint64_t offset,
++                                            uint32_t width,
++                                            uint32_t height)
++{
++#if defined(ENABLE_METAL) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER)
++   if (!id)
++      return NULL;
++
++   call_once(&native_resource_once, virgl_resource_native_init_once);
++   if (!native_resource_ready)
++      return NULL;
++
++   void *handle = NULL;
++   mtx_lock(&native_resource_mutex);
++   list_for_each_entry (struct virgl_native_resource, resource,
++                        &native_resources, head) {
++      if (resource->id != id)
++         continue;
++
++      list_for_each_entry (struct virgl_native_metal_texture, texture,
++                           &resource->metal_textures, head) {
++         if (texture->offset == offset && texture->width == width &&
++             texture->height == height) {
++            handle = virgl_metal_retain_object(texture->handle);
++            break;
++         }
++      }
++      break;
++   }
++   mtx_unlock(&native_resource_mutex);
++   return handle;
++#else
++   (void)id;
++   (void)offset;
++   (void)width;
++   (void)height;
++   return NULL;
++#endif
++}
++
+ uint64_t
+ virgl_resource_native_acquire(int fd,
+                               enum virgl_resource_native_handle_type *out_type,
+@@ -199,6 +355,12 @@ virgl_resource_native_release(uint64_t id)
+    mtx_unlock(&native_resource_mutex);
+ 
+    if (released) {
++      list_for_each_entry_safe (struct virgl_native_metal_texture, texture,
++                                &released->metal_textures, head) {
++         list_del(&texture->head);
++         virgl_metal_release_object(texture->handle);
++         free(texture);
++      }
+       virgl_metal_release_object(released->handle);
+       free(released);
+    }
+diff --git a/src/virgl_resource.h b/src/virgl_resource.h
+index 5d90e60f4429e2f31094141c2850334ea893391b..e0339eff62b0db4742b973adc63e68db3c9eec8b 100644
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -196,6 +196,22 @@ virgl_resource_native_acquire(int fd,
+                               enum virgl_resource_native_handle_type *out_type,
+                               void **out_handle);
+ 
++uint64_t
++virgl_resource_native_retain(uint64_t id);
++
++bool
++virgl_resource_native_set_metal_texture(uint64_t id,
++                                        void *texture,
++                                        uint64_t offset,
++                                        uint32_t width,
++                                        uint32_t height);
++
++void *
++virgl_resource_native_acquire_metal_texture(uint64_t id,
++                                            uint64_t offset,
++                                            uint32_t width,
++                                            uint32_t height);
++
+ void
+ virgl_resource_native_release(uint64_t id);
+ 
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 80d848d46beb6b0f3ec4be3e7437cb51fa762adf..14cd3de9da7180ef5229a799249234325687f671 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -54,6 +54,7 @@
+ #include "util/libsync.h"
+ #endif
+ 
++#include "virgl_metal.h"
+ #include "virglrenderer.h"
+ #include "virtgpu_drm.h"
+ 
+@@ -1596,6 +1597,62 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
+    return 0;
+ }
+ 
++enum virgl_renderer_native_handle_type
++virgl_renderer_create_handle_for_scanout(uint32_t res_id,
++                                         uint32_t width,
++                                         uint32_t height,
++                                         uint32_t virgl_format,
++                                         uint32_t padding,
++                                         uint32_t stride,
++                                         uint32_t offset,
++                                         virgl_renderer_native_handle *handle)
++{
++   TRACE_FUNC();
++   (void)virgl_format;
++   (void)padding;
++   (void)stride;
++#ifdef ENABLE_METAL
++   struct virgl_resource *res = virgl_resource_lookup(res_id);
++
++   if (!res)
++      return VIRGL_NATIVE_HANDLE_NONE;
++
++   /* A Venus context that allocated this blob out of a Metal heap registered
++    * the texture it wrote into; that texture is the scanout, and handing it
++    * out is what keeps presentation a zero-copy path. Every other blob is
++    * read back, which is the caller's fallback. */
++   void *native_texture = virgl_resource_native_acquire_metal_texture(
++      res->native_resource_id, offset, width, height);
++   if (native_texture) {
++      *handle = native_texture;
++      return VIRGL_NATIVE_HANDLE_METAL_TEXTURE;
++   }
++
++   return VIRGL_NATIVE_HANDLE_NONE;
++#else
++   (void)res_id;
++   (void)width;
++   (void)height;
++   (void)offset;
++   (void)handle;
++   return VIRGL_NATIVE_HANDLE_NONE;
++#endif
++}
++
++void
++virgl_renderer_release_handle_for_scanout(enum virgl_renderer_native_handle_type type,
++                                          virgl_renderer_native_handle handle)
++{
++   TRACE_FUNC();
++#ifdef ENABLE_METAL
++   if (type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE)
++      virgl_metal_release_object(handle);
++#else
++   (void)type;
++   (void)handle;
++#endif
++}
++
+ int
+ virgl_renderer_export_fence(uint64_t client_fence_id, int *fd)
+ {
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 0bcafef4ced1cc6b2f372fc4460bd5d0243ff3a9..7c6969d9385d4726470146f970e119ecf53ce5b8 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -363,7 +363,23 @@ struct virgl_renderer_resource_info {
+    int fd;
+ };
+ 
+-#define VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION 0
++#define VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION 1
++
++/**
++ * The graphics-API object a renderer can hand a presenter for a resource.
++ */
++enum virgl_renderer_native_handle_type {
++   VIRGL_NATIVE_HANDLE_NONE,
++   /* handle is a valid pointer to a ID3D11Texture2D */
++   VIRGL_NATIVE_HANDLE_D3D_TEX2D,
++   /* handle is a valid pointer to a MTLTexture */
++   VIRGL_NATIVE_HANDLE_METAL_TEXTURE,
++};
++
++/**
++ * The actual type is determined by `enum virgl_renderer_native_handle_type`
++ */
++typedef void *virgl_renderer_native_handle;
+ 
+ struct virgl_renderer_resource_info_ext {
+    int version;
+@@ -371,7 +387,12 @@ struct virgl_renderer_resource_info_ext {
+    bool has_dmabuf_export;
+    int planes;
+    uint64_t modifiers;
+-   void *d3d_tex2d;
++   union {
++      /* kept for callers written against the D3D-only spelling */
++      void *d3d_tex2d;
++      virgl_renderer_native_handle native_handle;
++   };
++   enum virgl_renderer_native_handle_type native_type;
+ };
+ 
+ VIRGL_EXPORT int virgl_renderer_resource_get_info(int res_handle,
+@@ -510,6 +531,35 @@ virgl_renderer_submit_cmd2(void *buffer,
+                            uint64_t *in_fence_ids,
+                            uint32_t num_in_fences);
+ 
++/**
++ * A blob resource is untyped, and not every blob can be exported as a file
++ * descriptor, so a presenter that wants to scan one out cannot always go
++ * through `virgl_renderer_resource_export_blob`. Ask the renderer for the
++ * native graphics-API object it can scan out instead.
++ *
++ * The returned handle is immutable. `VIRGL_NATIVE_HANDLE_NONE` means the
++ * renderer has no such object and the caller must read the resource back.
++ *
++ * Any other return value obliges the caller to pass the handle and its type
++ * to `virgl_renderer_release_handle_for_scanout`, or the object leaks.
++ */
++VIRGL_EXPORT enum virgl_renderer_native_handle_type
++virgl_renderer_create_handle_for_scanout(uint32_t res_id,
++                                         uint32_t width,
++                                         uint32_t height,
++                                         uint32_t virgl_format,
++                                         uint32_t padding,
++                                         uint32_t stride,
++                                         uint32_t offset,
++                                         virgl_renderer_native_handle *handle);
++
++/**
++ * Release a handle `virgl_renderer_create_handle_for_scanout` returned.
++ */
++VIRGL_EXPORT void
++virgl_renderer_release_handle_for_scanout(enum virgl_renderer_native_handle_type type,
++                                          virgl_renderer_native_handle handle);
++
+ /* vtest semi-private APIs: */
+ VIRGL_EXPORT int virgl_renderer_attach_fence(int ctx_id, int fence_fd);
+ VIRGL_EXPORT int virgl_renderer_get_fence_fd(uint64_t fence_id);

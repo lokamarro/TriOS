@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 01:03:35 +0900
+Subject: [PATCH] bpf: run callbacks of interpreted programs
+
+Helpers such as bpf_loop(), bpf_for_each_map_elem(), bpf_find_vma(),
+bpf_user_ringbuf_drain() and the BPF timers call a program's callback
+as a native bpf_callback_t. A JIT hands them the compiled subprogram,
+but an interpreted subprogram has no code of its own, so
+fixup_call_args() rejects every interpreted program that loads a
+callback. A kernel that must not generate code at run time has no JIT
+to fall back on, and loses all of these helpers.
+
+Build a fixed pool of 1024 native entry points into the interpreter
+instead. Each entry point looks up its slot and enters the interpreter
+at the bound callback subprogram with that subprogram's stack frame,
+exactly as BPF_CALL_ARGS enters it for a bpf-to-bpf call. The verifier
+binds one slot to each callback subprogram of an interpreted program,
+and bpf_prog_free_deferred() releases them once the program can no
+longer run, which also covers a load that fails after binding. A load
+that finds every slot bound fails with -ENOSPC. The helpers are
+unchanged, so every present and future callback site works.
+
+The verifier's call depth, stack, recursion and bpf_loop inlining rules
+are enforced before fixup_call_args() and are unchanged. Tail calls
+reachable from a subprogram, including a callback, and kfunc calls stay
+rejected for interpreted programs. Offloaded programs keep rejecting
+callbacks.
+
+An instruction dump shows a bound callback load as jit_subprogs() leaves
+it, as the subprogram's relative offset and number, never an entry
+point address. When jit_subprogs() falls back to the interpreter it now
+restores callback loads as well as calls.
+---
+ include/linux/bpf.h   |  15 ++++
+ kernel/bpf/core.c     | 159 ++++++++++++++++++++++++++++++++++++++++++
+ kernel/bpf/syscall.c  |   6 ++
+ kernel/bpf/verifier.c |  45 ++++++++++--
+ 4 files changed, 220 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index d018a74a882d087a6bcc6664248ff5e850c7e5d2..fe5db34581dd14cc3383dcd6704137e5ff654e34 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1600,6 +1600,7 @@ struct bpf_prog_aux {
+ 	u32 id;
+ 	u32 func_cnt; /* used by non-func prog as the number of func progs */
+ 	u32 real_func_cnt; /* includes hidden progs, only used for JIT and freeing progs */
++	u32 interp_callbacks; /* interpreter callback slots bound to this prog */
+ 	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
+ 	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
+ 	u32 attach_st_ops_member_off;
+@@ -2739,6 +2740,20 @@ int bpf_check(struct bpf_prog **fp, union bpf_attr *attr, bpfptr_t uattr, u32 ua
+ 
+ #ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ void bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth);
++int bpf_interp_callback_bind(struct bpf_prog *prog, u32 start, u32 subprog,
++			     u32 stack_depth, bpf_callback_t *entry);
++void bpf_interp_callbacks_release(struct bpf_prog_aux *aux);
++void bpf_interp_callback_dump(const struct bpf_prog *prog,
++			      struct bpf_insn *insn, u32 idx);
++#else
++static inline void bpf_interp_callbacks_release(struct bpf_prog_aux *aux)
++{
++}
++
++static inline void bpf_interp_callback_dump(const struct bpf_prog *prog,
++					    struct bpf_insn *insn, u32 idx)
++{
++}
+ #endif
+ 
+ struct btf *bpf_get_btf_vmlinux(void);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index c99d3f396fdc0cdaae18bd1cd1bbd127d95b9bf7..c1e64a00ab470ebbb27ff17e93e3a80f08cfd77d 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2412,6 +2412,164 @@ void bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth)
+ 		__bpf_call_base_args;
+ 	insn->code = BPF_JMP | BPF_CALL_ARGS;
+ }
++
++/*
++ * Helpers such as bpf_loop(), bpf_for_each_map_elem() and the BPF timers call
++ * a program's callback as a native bpf_callback_t. A JIT passes them its
++ * compiled subprogram. An interpreted subprogram has no code of its own, and
++ * this kernel must not generate any at run time, so it carries a fixed pool
++ * of native entry points instead. Each entry point enters the interpreter at
++ * the callback bound to its slot, as BPF_CALL_ARGS does for a bpf-to-bpf call.
++ * The verifier binds one slot to each callback subprogram of a program, and
++ * freeing the program releases them. A load that finds every slot bound
++ * fails with -ENOSPC.
++ */
++#define BPF_INTERP_CALLBACK_SLOTS 1024
++
++struct bpf_interp_callback {
++	struct bpf_prog_aux *owner;
++	u64 (*run)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5,
++		   const struct bpf_insn *insn);
++	u32 start;
++	u32 subprog;
++};
++
++static struct bpf_interp_callback bpf_interp_callbacks[BPF_INTERP_CALLBACK_SLOTS];
++static DEFINE_MUTEX(bpf_interp_callback_lock);
++
++static noinline u64 bpf_interp_callback_run(u64 r1, u64 r2, u64 r3, u64 r4,
++					    u64 r5,
++					    const struct bpf_interp_callback *cb)
++{
++	return cb->run(r1, r2, r3, r4, r5, cb->owner->prog->insnsi + cb->start);
++}
++
++#define BPF_INTERP_CALLBACKS_16(n)					\
++	BPF_INTERP_CALLBACK(n##0) BPF_INTERP_CALLBACK(n##1)		\
++	BPF_INTERP_CALLBACK(n##2) BPF_INTERP_CALLBACK(n##3)		\
++	BPF_INTERP_CALLBACK(n##4) BPF_INTERP_CALLBACK(n##5)		\
++	BPF_INTERP_CALLBACK(n##6) BPF_INTERP_CALLBACK(n##7)		\
++	BPF_INTERP_CALLBACK(n##8) BPF_INTERP_CALLBACK(n##9)		\
++	BPF_INTERP_CALLBACK(n##a) BPF_INTERP_CALLBACK(n##b)		\
++	BPF_INTERP_CALLBACK(n##c) BPF_INTERP_CALLBACK(n##d)		\
++	BPF_INTERP_CALLBACK(n##e) BPF_INTERP_CALLBACK(n##f)
++#define BPF_INTERP_CALLBACKS_256(n)					\
++	BPF_INTERP_CALLBACKS_16(n##0) BPF_INTERP_CALLBACKS_16(n##1)	\
++	BPF_INTERP_CALLBACKS_16(n##2) BPF_INTERP_CALLBACKS_16(n##3)	\
++	BPF_INTERP_CALLBACKS_16(n##4) BPF_INTERP_CALLBACKS_16(n##5)	\
++	BPF_INTERP_CALLBACKS_16(n##6) BPF_INTERP_CALLBACKS_16(n##7)	\
++	BPF_INTERP_CALLBACKS_16(n##8) BPF_INTERP_CALLBACKS_16(n##9)	\
++	BPF_INTERP_CALLBACKS_16(n##a) BPF_INTERP_CALLBACKS_16(n##b)	\
++	BPF_INTERP_CALLBACKS_16(n##c) BPF_INTERP_CALLBACKS_16(n##d)	\
++	BPF_INTERP_CALLBACKS_16(n##e) BPF_INTERP_CALLBACKS_16(n##f)
++#define BPF_INTERP_CALLBACKS						\
++	BPF_INTERP_CALLBACKS_256(0) BPF_INTERP_CALLBACKS_256(1)		\
++	BPF_INTERP_CALLBACKS_256(2) BPF_INTERP_CALLBACKS_256(3)
++
++#define BPF_INTERP_CALLBACK(n)						\
++static u64 bpf_interp_callback_##n(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) \
++{									\
++	return bpf_interp_callback_run(r1, r2, r3, r4, r5,		\
++				       &bpf_interp_callbacks[0x##n]);	\
++}
++BPF_INTERP_CALLBACKS
++#undef BPF_INTERP_CALLBACK
++
++#define BPF_INTERP_CALLBACK(n) bpf_interp_callback_##n,
++static const bpf_callback_t bpf_interp_callback_entries[] = {
++	BPF_INTERP_CALLBACKS
++};
++#undef BPF_INTERP_CALLBACK
++static_assert(ARRAY_SIZE(bpf_interp_callback_entries) ==
++	      BPF_INTERP_CALLBACK_SLOTS);
++
++/**
++ * bpf_interp_callback_bind - bind a native entry point to a callback
++ * @prog: the program being verified
++ * @start: index of the callback subprogram's first instruction
++ * @subprog: the callback's subprogram number
++ * @stack_depth: stack depth of the callback subprogram
++ *
++ * @entry: receives the native entry point
++ *
++ * A program that refers to one callback more than once shares its slot.
++ *
++ * Return: 0, or -ENOSPC when every slot is bound.
++ */
++int bpf_interp_callback_bind(struct bpf_prog *prog, u32 start, u32 subprog,
++			     u32 stack_depth, bpf_callback_t *entry)
++{
++	struct bpf_interp_callback *cb;
++	int i, slot = -1;
++
++	stack_depth = max_t(u32, stack_depth, 1);
++	mutex_lock(&bpf_interp_callback_lock);
++	for (i = 0; i < BPF_INTERP_CALLBACK_SLOTS; i++) {
++		cb = &bpf_interp_callbacks[i];
++		if (cb->owner == prog->aux && cb->start == start) {
++			slot = i;
++			goto out;
++		}
++		if (!cb->owner && slot < 0)
++			slot = i;
++	}
++	if (slot < 0) {
++		mutex_unlock(&bpf_interp_callback_lock);
++		return -ENOSPC;
++	}
++	cb = &bpf_interp_callbacks[slot];
++	cb->run = interpreters_args[(round_up(stack_depth, 32) / 32) - 1];
++	cb->start = start;
++	cb->subprog = subprog;
++	cb->owner = prog->aux;
++	prog->aux->interp_callbacks++;
++out:
++	mutex_unlock(&bpf_interp_callback_lock);
++	*entry = bpf_interp_callback_entries[slot];
++	return 0;
++}
++
++/* Release the slots of a program that can no longer run. */
++void bpf_interp_callbacks_release(struct bpf_prog_aux *aux)
++{
++	int i;
++
++	if (!aux->interp_callbacks)
++		return;
++	mutex_lock(&bpf_interp_callback_lock);
++	for (i = 0; i < BPF_INTERP_CALLBACK_SLOTS; i++)
++		if (bpf_interp_callbacks[i].owner == aux)
++			bpf_interp_callbacks[i] = (struct bpf_interp_callback){};
++	mutex_unlock(&bpf_interp_callback_lock);
++	aux->interp_callbacks = 0;
++}
++
++/*
++ * Rewrite a callback load in an instruction dump the way jit_subprogs()
++ * leaves it: the relative offset of the subprogram and its number, never an
++ * entry point address.
++ */
++void bpf_interp_callback_dump(const struct bpf_prog *prog,
++			      struct bpf_insn *insn, u32 idx)
++{
++	u64 entry = (u64)(u32)insn[1].imm << 32 | (u32)insn[0].imm;
++	const struct bpf_interp_callback *cb;
++	int i;
++
++	insn[0].imm = 0;
++	insn[1].imm = 0;
++	for (i = 0; i < BPF_INTERP_CALLBACK_SLOTS; i++) {
++		if ((u64)(unsigned long)bpf_interp_callback_entries[i] != entry)
++			continue;
++		/* The program holds its slots until it is freed. */
++		cb = &bpf_interp_callbacks[i];
++		if (cb->owner == prog->aux) {
++			insn[0].imm = cb->start - idx - 1;
++			insn[1].imm = cb->subprog;
++		}
++		return;
++	}
++}
+ #endif
+ #endif
+ 
+@@ -2953,6 +3111,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
+ #ifdef CONFIG_BPF_SYSCALL
+ 	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
+ 	bpf_prog_stream_free(aux->prog);
++	bpf_interp_callbacks_release(aux);
+ #endif
+ #ifdef CONFIG_CGROUP_BPF
+ 	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 144d8b1183a98e470f91e43fed493c683a97b1ab..9c647cb4566102df78d1d2b6783c21fe40851728 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4950,6 +4950,12 @@ static struct bpf_insn *bpf_insn_prepare_dump(const struct bpf_prog *prog,
+ 		if (code != (BPF_LD | BPF_IMM | BPF_DW))
+ 			continue;
+ 
++		if (insns[i].src_reg == BPF_PSEUDO_FUNC) {
++			if (!prog->jited)
++				bpf_interp_callback_dump(prog, &insns[i], i);
++			continue;
++		}
++
+ 		imm = ((u64)insns[i + 1].imm << 32) | (u32)insns[i].imm;
+ 		map = bpf_map_from_imm(prog, imm, &off, &type);
+ 		if (map) {
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index b89a5d717e42212206125cd8168d14d570159457..c49d74b001abc755c79618528dbce34944a69ff1 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -22406,6 +22406,12 @@ static int jit_subprogs(struct bpf_verifier_env *env)
+ 	prog->jit_requested = 0;
+ 	prog->blinding_requested = 0;
+ 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
++		if (bpf_pseudo_func(insn)) {
++			insn[0].imm = env->insn_aux_data[i].call_imm;
++			insn[1].imm = 0;
++			insn->off = 0;
++			continue;
++		}
+ 		if (!bpf_pseudo_call(insn))
+ 			continue;
+ 		insn->off = 0;
+@@ -22415,6 +22421,32 @@ static int jit_subprogs(struct bpf_verifier_env *env)
+ 	return err;
+ }
+ 
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
++/* Load a native entry point into the interpreter for a callback. */
++static int bind_interp_callback(struct bpf_verifier_env *env,
++				struct bpf_insn *insn, int idx)
++{
++	int start = idx + insn->imm + 1;
++	int subprog = find_subprog(env, start);
++	bpf_callback_t entry;
++	int err;
++
++	if (verifier_bug_if(subprog < 0, env, "no callback at insn %d", start))
++		return -EFAULT;
++	err = bpf_interp_callback_bind(env->prog, start, subprog,
++				       env->subprog_info[subprog].stack_depth,
++				       &entry);
++	if (err) {
++		verbose(env, "no free interpreter callback slot for subprog %d\n",
++			subprog);
++		return err;
++	}
++	insn[0].imm = (u32)(unsigned long)entry;
++	insn[1].imm = (u64)(unsigned long)entry >> 32;
++	return 0;
++}
++#endif
++
+ static int fixup_call_args(struct bpf_verifier_env *env)
+ {
+ #ifndef CONFIG_BPF_JIT_ALWAYS_ON
+@@ -22447,11 +22479,14 @@ static int fixup_call_args(struct bpf_verifier_env *env)
+ 	}
+ 	for (i = 0; i < prog->len; i++, insn++) {
+ 		if (bpf_pseudo_func(insn)) {
+-			/* When JIT fails the progs with callback calls
+-			 * have to be rejected, since interpreter doesn't support them yet.
+-			 */
+-			verbose(env, "callbacks are not allowed in non-JITed programs\n");
+-			return -EINVAL;
++			if (bpf_prog_is_offloaded(prog->aux)) {
++				verbose(env, "callbacks are not allowed in non-JITed programs\n");
++				return -EINVAL;
++			}
++			err = bind_interp_callback(env, insn, i);
++			if (err)
++				return err;
++			continue;
+ 		}
+ 
+ 		if (!bpf_pseudo_call(insn))

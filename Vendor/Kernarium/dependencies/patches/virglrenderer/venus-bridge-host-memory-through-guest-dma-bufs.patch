@@ -1,0 +1,999 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 12:17:23 +0900
+Subject: [PATCH] venus: bridge host memory through guest dma-bufs
+
+A shared-memory resource a Venus context imports is consumed as a host
+pointer: VkImportMemoryResourceInfoMESA naming one becomes a
+VK_EXT_external_memory_host import of the resource's own mapping. That
+extension requires the range to stay mapped for as long as the memory
+lives, and the driver reaches it through the CPU as well as the GPU, for a
+host image copy of a linear image bound to it, while the guest destroys the
+resource whenever it likes. The mapping is therefore reference counted: the
+resource holds one reference, each memory that imports it holds another,
+and the pages are unmapped when the last of them is released.
+
+Importing a shared-memory resource into the context ends the request's
+ownership of its descriptor: the import path closes it once the mapping is
+made, so the descriptor no longer outlives the request. Creating a
+shared-memory blob returns the descriptor to its caller and leaves it open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_context.c         | 124 +++++++++++++++---
+ src/venus/vkr_context.h         |  26 ++++
+ src/venus/vkr_device.c          |  12 ++
+ src/venus/vkr_device.h          |   2 +
+ src/venus/vkr_device_memory.c   | 226 +++++++++++++++++++++++++++-----
+ src/venus/vkr_device_memory.h   |   8 ++
+ src/venus/vkr_physical_device.c |  17 +++
+ src/venus/vkr_renderer.c        |   4 +-
+ src/virgl_resource.c            | 171 ++++++++++++++++++++++++
+ src/virgl_resource.h            |  25 ++++
+ src/virglrenderer.c             |   2 +-
+ 11 files changed, 569 insertions(+), 48 deletions(-)
+
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index cc82c42de8af9c4844d71ef23b88809a054fade9..14302e1c0d44a6f2972b7f8d297a27cb1c33bcaf 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -185,14 +185,33 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
+    return true;
+ }
+ 
++struct vkr_shm_mapping *
++vkr_shm_mapping_retain(struct vkr_shm_mapping *mapping)
++{
++   atomic_fetch_add_explicit(&mapping->refcount, 1, memory_order_relaxed);
++   return mapping;
++}
++
++void
++vkr_shm_mapping_release(struct vkr_shm_mapping *mapping)
++{
++   if (!mapping ||
++       atomic_fetch_sub_explicit(&mapping->refcount, 1, memory_order_acq_rel) != 1)
++      return;
++
++   munmap(mapping->data, mapping->size);
++   free(mapping);
++}
++
+ static inline void
+ vkr_context_free_resource(struct hash_entry *entry)
+ {
+    struct vkr_resource *res = entry->data;
+    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+-      munmap(res->u.data, res->size);
++      vkr_shm_mapping_release(res->shm_mapping);
+    else if (res->u.fd >= 0)
+       close(res->u.fd);
++   virgl_resource_native_release(res->native_resource_id);
+    free(res);
+ }
+ 
+@@ -226,26 +245,49 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
+                                      uint64_t blob_size,
+                                      enum virgl_resource_fd_type fd_type,
+                                      int fd,
+-                                     void *mmap_ptr)
++                                     void *mmap_ptr,
++                                     uint64_t native_resource_id,
++                                     enum virgl_resource_native_handle_type native_handle_type,
++                                     void *native_handle)
+ {
+    assert(!vkr_context_get_resource(ctx, res_id));
+ 
+    struct vkr_resource *res = malloc(sizeof(*res));
+-   if (!res)
++   if (!res) {
++      virgl_resource_native_release(native_resource_id);
+       return false;
++   }
+ 
+    res->res_id = res_id;
+    res->fd_type = fd_type;
+    res->size = blob_size;
++   res->native_resource_id = native_resource_id;
++   res->native_handle_type = native_handle_type;
++   res->native_handle = native_handle;
++   res->shm_mapping = NULL;
+ 
+    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
+    assert(fd < 0 || !mmap_ptr);
+-   if (mmap_ptr)
++   if (mmap_ptr) {
++      /* The mapping belongs to the resource only once it is added; until
++       * then a failure leaves it to the caller. */
++      res->shm_mapping = malloc(sizeof(*res->shm_mapping));
++      if (!res->shm_mapping) {
++         virgl_resource_native_release(native_resource_id);
++         free(res);
++         return false;
++      }
++      res->shm_mapping->data = mmap_ptr;
++      res->shm_mapping->size = blob_size;
++      atomic_init(&res->shm_mapping->refcount, 1);
+       res->u.data = mmap_ptr;
+-   else
++   } else {
+       res->u.fd = fd;
++   }
+ 
+    if (!vkr_context_add_resource(ctx, res)) {
++      virgl_resource_native_release(native_resource_id);
++      free(res->shm_mapping);
+       free(res);
+       return false;
+    }
+@@ -257,21 +299,30 @@ static bool
+ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
+                                      uint32_t res_id,
+                                      uint64_t blob_size,
+-                                     int fd)
++                                     int fd,
++                                     uint64_t native_resource_id,
++                                     enum virgl_resource_native_handle_type native_handle_type,
++                                     void *native_handle)
+ {
+    assert(!vkr_context_get_resource(ctx, res_id));
+ 
++   /* The caller retains ownership of fd.  The mapping has its own lifetime
++    * and remains valid after the render-server request descriptor is closed.
++    */
+    void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+-   if (mmap_ptr == MAP_FAILED)
++   if (mmap_ptr == MAP_FAILED) {
++      virgl_resource_native_release(native_resource_id);
+       return false;
++   }
+ 
+    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
+-                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
++                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr,
++                                             native_resource_id,
++                                             native_handle_type, native_handle)) {
+       munmap(mmap_ptr, blob_size);
+       return false;
+    }
+ 
+-   close(fd);
+    return true;
+ }
+ 
+@@ -300,7 +351,9 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
+    }
+ 
+    if (!vkr_context_import_resource_internal(ctx, res_id, alloc_size,
+-                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
++                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr,
++                                             0, VIRGL_RESOURCE_NATIVE_HANDLE_NONE,
++                                             NULL)) {
+       munmap(mmap_ptr, alloc_size);
+       close(fd);
+       return false;
+@@ -333,6 +386,29 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
+       return false;
+ 
++   /* SHM resources are consumed as host pointers, so retain a mapping in the
++    * context instead of retaining an fd in the union.  This also covers
++    * ordinary mappable allocations, which need a context resource even when
++    * the Vulkan memory was not explicitly exportable.
++    */
++   if (blob.type == VIRGL_RESOURCE_FD_SHM) {
++      enum virgl_resource_native_handle_type native_handle_type =
++         VIRGL_RESOURCE_NATIVE_HANDLE_NONE;
++      void *native_handle = NULL;
++      uint64_t native_resource_id = virgl_resource_native_acquire(
++         blob.u.fd, &native_handle_type, &native_handle);
++      if (!vkr_context_import_resource_from_shm(ctx, res_id, blob_size,
++                                                blob.u.fd, native_resource_id,
++                                                native_handle_type,
++                                                native_handle)) {
++         close(blob.u.fd);
++         return false;
++      }
++
++      *out_blob = blob;
++      return true;
++   }
++
+    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+     * - vkAllocateMemory for dma_buf import
+     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
+@@ -346,8 +422,9 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+       }
+    }
+ 
+-   if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
+-                                             NULL)) {
++   if (!vkr_context_import_resource_internal(
++          ctx, res_id, blob_size, blob.type, res_fd, NULL, 0,
++          VIRGL_RESOURCE_NATIVE_HANDLE_NONE, NULL)) {
+       if (res_fd >= 0)
+          close(res_fd);
+       close(blob.u.fd);
+@@ -384,10 +461,27 @@ vkr_context_import_resource(struct vkr_context *ctx,
+                             int fd,
+                             uint64_t size)
+ {
+-   if (fd_type == VIRGL_RESOURCE_FD_SHM)
+-      return vkr_context_import_resource_from_shm(ctx, res_id, size, fd);
++   if (fd_type == VIRGL_RESOURCE_FD_SHM) {
++      enum virgl_resource_native_handle_type native_handle_type =
++         VIRGL_RESOURCE_NATIVE_HANDLE_NONE;
++      void *native_handle = NULL;
++      uint64_t native_resource_id = virgl_resource_native_acquire(
++         fd, &native_handle_type, &native_handle);
++      if (!vkr_context_import_resource_from_shm(
++             ctx, res_id, size, fd, native_resource_id, native_handle_type,
++             native_handle))
++         return false;
++
++      /* The mapping outlives the descriptor, and a successful import is the
++       * end of the request's ownership of it.
++       */
++      close(fd);
++      return true;
++   }
+ 
+-   return vkr_context_import_resource_internal(ctx, res_id, size, fd_type, fd, NULL);
++   return vkr_context_import_resource_internal(
++      ctx, res_id, size, fd_type, fd, NULL, 0,
++      VIRGL_RESOURCE_NATIVE_HANDLE_NONE, NULL);
+ }
+ 
+ void
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 3867f138fdfd6cedca49c7de4ceca01d76546d43..7607063f95d93c16820d8f222f17659948722409 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -15,6 +15,24 @@
+ 
+ #include "vkr_cs.h"
+ 
++/*
++ * The mapping of a shared-memory resource. The resource holds one reference,
++ * and so does each device memory that imports the mapping as host memory:
++ * VK_EXT_external_memory_host requires the range to stay mapped for as long
++ * as the memory lives, and the guest destroys the resource whenever it likes.
++ */
++struct vkr_shm_mapping {
++   void *data;
++   size_t size;
++   atomic_uint refcount;
++};
++
++struct vkr_shm_mapping *
++vkr_shm_mapping_retain(struct vkr_shm_mapping *mapping);
++
++void
++vkr_shm_mapping_release(struct vkr_shm_mapping *mapping);
++
+ /*
+  * When vkr_context_create_resource or vkr_context_import_resource is called, a
+  * vkr_resource is created, and is valid until vkr_context_destroy_resource.
+@@ -32,6 +50,14 @@ struct vkr_resource {
+    } u;
+ 
+    size_t size;
++
++   /* Retains a same-process native allocation in the fd identity registry. */
++   uint64_t native_resource_id;
++   enum virgl_resource_native_handle_type native_handle_type;
++   void *native_handle;
++
++   /* The reference that keeps u.data mapped, valid when fd_type is shm. */
++   struct vkr_shm_mapping *shm_mapping;
+ };
+ 
+ enum vkr_context_validate_level {
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index caa4ce691f8270877be222b752260bc1f269fc65..ace87a08779068a7c0db24c4d0abe048c2311e95 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -95,6 +95,18 @@ vkr_device_init_renderer_procs(struct vkr_device *dev)
+          return false;
+    }
+ 
++   if (physical_dev->EXT_external_memory_metal) {
++      dev->GetMemoryMetalHandlePropertiesEXT =
++         (PFN_vkGetMemoryMetalHandlePropertiesEXT)vk->GetDeviceProcAddr(
++            handle, "vkGetMemoryMetalHandlePropertiesEXT");
++      dev->GetMemoryMetalHandleEXT =
++         (PFN_vkGetMemoryMetalHandleEXT)vk->GetDeviceProcAddr(
++            handle, "vkGetMemoryMetalHandleEXT");
++      if (!dev->GetMemoryMetalHandlePropertiesEXT ||
++          !dev->GetMemoryMetalHandleEXT)
++         return false;
++   }
++
+    return true;
+ }
+ 
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index a8c185c6807c5ffc8be7b01b9d23a5b58ea4dc39..fcf875c2c3fcc242342034a04ad1ab1bd0e81673 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -28,6 +28,8 @@ struct vkr_device {
+    struct list_head objects;
+ 
+    PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
++   PFN_vkGetMemoryMetalHandlePropertiesEXT GetMemoryMetalHandlePropertiesEXT;
++   PFN_vkGetMemoryMetalHandleEXT GetMemoryMetalHandleEXT;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 82acbc43a7c0a465a1f6050dc46869889cfa883a..f01e1020296faed1bce5c5fce17a63534c3820d9 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -7,6 +7,7 @@
+ 
+ #include <math.h>
+ 
++#include "util/anon_file.h"
+ #include "vn_protocol_renderer_transport.h"
+ 
+ #include "vkr_device_memory_gen.h"
+@@ -14,17 +15,10 @@
+ #include "vkr_physical_device.h"
+ 
+ static bool
+-vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+-                                   const VkImportMemoryResourceInfoMESA *res_info,
+-                                   VkImportMemoryFdInfoKHR *out)
++vkr_get_fd_info_from_resource(const struct vkr_resource *res,
++                              const void *pnext,
++                              VkImportMemoryFdInfoKHR *out)
+ {
+-   struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
+-   if (!res) {
+-      vkr_log("failed to import resource: invalid res_id %u", res_info->resourceId);
+-      vkr_context_set_fatal(ctx);
+-      return false;
+-   }
+-
+    VkExternalMemoryHandleTypeFlagBits handle_type;
+    switch (res->fd_type) {
+    case VIRGL_RESOURCE_FD_DMABUF:
+@@ -43,7 +37,7 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+ 
+    *out = (VkImportMemoryFdInfoKHR){
+       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+-      .pNext = res_info->pNext,
++      .pNext = pnext,
+       .fd = fd,
+       .handleType = handle_type,
+    };
+@@ -265,19 +259,107 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                                                      guest_mem_type_index);
+    alloc_info->memoryTypeIndex = host_mem_type_index;
+ 
+-   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
++   /* Translate VkImportMemoryResourceInfoMESA into the native handle type. */
+    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
++   VkImportMemoryHostPointerInfoEXT local_host_import = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++   };
++   VkImportMemoryMetalHandleInfoEXT local_metal_import = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
++   };
+    VkImportMemoryResourceInfoMESA *res_info = NULL;
++   struct vkr_shm_mapping *host_mapping = NULL;
+    void *prev_of_res_info = vkr_find_prev_struct(
+       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+    if (prev_of_res_info) {
+       res_info = (VkImportMemoryResourceInfoMESA *)vkr_pnext_get_next(prev_of_res_info);
+-      if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
++      struct vkr_resource *res =
++         vkr_context_get_resource(ctx, res_info->resourceId);
++      if (!res) {
++         vkr_log("failed to import resource: invalid res_id %u",
++                 res_info->resourceId);
++         vkr_context_set_fatal(ctx);
+          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+          return;
+       }
+ 
+-      vkr_pnext_set_next(prev_of_res_info, &local_import_info);
++      if (res->native_handle_type ==
++          VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP) {
++         if (!physical_dev->EXT_external_memory_metal ||
++             !res->native_handle ||
++             alloc_info->allocationSize > res->size) {
++            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
++
++         VkMemoryMetalHandlePropertiesEXT metal_props = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
++         };
++         args->ret = dev->GetMemoryMetalHandlePropertiesEXT(
++            dev->base.handle.device,
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
++            res->native_handle, &metal_props);
++         if (args->ret != VK_SUCCESS ||
++             !(metal_props.memoryTypeBits & (1u << host_mem_type_index))) {
++            if (args->ret == VK_SUCCESS)
++               args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
++
++         local_metal_import.pNext = res_info->pNext;
++         local_metal_import.handleType =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
++         local_metal_import.handle = res->native_handle;
++         vkr_pnext_set_next(prev_of_res_info, &local_metal_import);
++         alloc_info->allocationSize = res->size;
++      } else if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
++         if (!physical_dev->EXT_external_memory_host || !res->u.data ||
++             alloc_info->allocationSize > res->size ||
++             (uintptr_t)res->u.data %
++                physical_dev->min_imported_host_pointer_alignment) {
++            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
++
++         VkMemoryHostPointerPropertiesEXT host_props = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
++         };
++         args->ret = dev->GetMemoryHostPointerPropertiesEXT(
++            dev->base.handle.device,
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++            res->u.data, &host_props);
++         if (args->ret != VK_SUCCESS ||
++             !(host_props.memoryTypeBits & (1u << host_mem_type_index))) {
++            if (args->ret == VK_SUCCESS)
++               args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
++
++         local_host_import.pNext = res_info->pNext;
++         local_host_import.handleType =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++         local_host_import.pHostPointer = res->u.data;
++         vkr_pnext_set_next(prev_of_res_info, &local_host_import);
++         alloc_info->allocationSize = res->size;
++         /* The memory names these pages until it is freed, so it keeps them
++          * mapped: the driver reads and writes them through the CPU as well,
++          * for a host image copy, and the guest may destroy the resource
++          * first. */
++         host_mapping = vkr_shm_mapping_retain(res->shm_mapping);
++      } else {
++         const bool fd_import_supported =
++            physical_dev->KHR_external_memory_fd &&
++            (res->fd_type != VIRGL_RESOURCE_FD_DMABUF ||
++             physical_dev->EXT_external_memory_dma_buf);
++         if (!fd_import_supported ||
++             !vkr_get_fd_info_from_resource(res, res_info->pNext,
++                                            &local_import_info)) {
++            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
++
++         vkr_pnext_set_next(prev_of_res_info, &local_import_info);
++      }
+    }
+ 
+    VkExportMemoryAllocateInfo *export_info =
+@@ -285,6 +367,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+ 
+    /* track if driver has requested export allocation */
+    const bool might_export = export_info && export_info->handleTypes;
++   const bool export_metal_heap =
++      physical_dev->EXT_external_memory_metal && export_info &&
++      export_info->handleTypes ==
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+ 
+    /* Make host-visible memory shareable with the virtio-gpu blob transport.
+     * VK_EXT_external_memory_host supplies the direct import path on unified-memory
+@@ -305,17 +391,27 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    void *gbm_bo = NULL;
+    struct vkr_host_shm *host_shm = NULL;
+    VkExportMemoryAllocateInfo local_export_info;
+-   VkImportMemoryHostPointerInfoEXT local_host_import;
+-
+    /* VK_EXT_external_memory_host is renderer-internal.  It gives a unified-memory
+     * host a real Vulkan import of the same anonymous file that virtio-gpu maps into
+     * the guest, without pretending that the file is a dma-buf or opaque Vulkan fd.
+     */
+    const bool force_host_import =
+       physical_dev->EXT_external_memory_host && !res_info &&
+-      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
++      ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || might_export) &&
++      !export_metal_heap;
+ 
+    if (force_host_import) {
++      if (export_info) {
++         /* HOST_ALLOCATION is an import-only native handle.  The SHM fd is
++          * exported by virtio-gpu, not by the native Vulkan implementation.
++          */
++         VkBaseInStructure *prev_of_export_info = vkr_find_prev_struct(
++            alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++         assert(prev_of_export_info);
++         prev_of_export_info->pNext = export_info->pNext;
++         export_info = NULL;
++      }
++
+       host_shm = vkr_host_shm_alloc(
+          alloc_info->allocationSize,
+          physical_dev->min_imported_host_pointer_alignment);
+@@ -439,6 +535,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       if (gbm_bo)
+          vkr_gbm_bo_destroy(gbm_bo);
+       vkr_host_shm_free(host_shm);
++      vkr_shm_mapping_release(host_mapping);
+       return;
+    }
+ 
+@@ -449,6 +546,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    mem->udmabuf_fd = udmabuf_fd;
+    mem->gbm_bo = gbm_bo;
+    mem->host_shm = host_shm;
++   mem->host_mapping = host_mapping;
++   mem->metal_heap_exportable = export_metal_heap;
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = host_mem_type_index;
+ }
+@@ -507,27 +606,53 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
+       return;
+    }
+ 
+-   if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
++   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
++
++   uint32_t host_memory_type_bits = 0;
++   bool allow_external_host_memory = true;
++   if (res->fd_type == VIRGL_RESOURCE_FD_SHM &&
++       res->native_handle_type ==
++          VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP &&
++       dev->physical_device->EXT_external_memory_metal &&
++       res->native_handle) {
++      VkMemoryMetalHandlePropertiesEXT metal_props = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
++      };
++      args->ret = dev->GetMemoryMetalHandlePropertiesEXT(
++         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
++         res->native_handle, &metal_props);
++      host_memory_type_bits = metal_props.memoryTypeBits;
++      allow_external_host_memory = false;
++   } else if (res->fd_type == VIRGL_RESOURCE_FD_SHM &&
++              dev->physical_device->EXT_external_memory_host && res->u.data) {
++      VkMemoryHostPointerPropertiesEXT host_props = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
++      };
++      args->ret = dev->GetMemoryHostPointerPropertiesEXT(
++         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++         res->u.data, &host_props);
++      host_memory_type_bits = host_props.memoryTypeBits;
++   } else if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF &&
++              dev->physical_device->EXT_external_memory_dma_buf) {
++      const VkExternalMemoryHandleTypeFlagBits handle_type =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      VkMemoryFdPropertiesKHR fd_props = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
++      };
++      args->ret = vk->GetMemoryFdPropertiesKHR(args->device, handle_type,
++                                               res->u.fd, &fd_props);
++      host_memory_type_bits = fd_props.memoryTypeBits;
++   } else {
+       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       return;
+    }
+-
+-   static const VkExternalMemoryHandleTypeFlagBits handle_type =
+-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+-   VkMemoryFdPropertiesKHR mem_fd_props = {
+-      .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+-      .pNext = NULL,
+-      .memoryTypeBits = 0,
+-   };
+-   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
+-   args->ret =
+-      vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
+    if (args->ret != VK_SUCCESS)
+       return;
+ 
+    args->pMemoryResourceProperties->memoryTypeBits =
+       vkr_physical_device_get_guest_memory_type_bits(
+-         dev->physical_device, mem_fd_props.memoryTypeBits, true);
++         dev->physical_device, host_memory_type_bits,
++         allow_external_host_memory);
+ 
+    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
+       vkr_find_struct(args->pMemoryResourceProperties->pNext,
+@@ -559,7 +684,9 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
+ void
+ vkr_device_memory_release(struct vkr_device_memory *mem)
+ {
++   virgl_resource_native_release(mem->native_resource_id);
+    vkr_host_shm_free(mem->host_shm);
++   vkr_shm_mapping_release(mem->host_mapping);
+    if (mem->gbm_bo)
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+    if (mem->udmabuf_fd >= 0)
+@@ -609,6 +736,45 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+       return true;
+    }
+ 
++   if (mem->metal_heap_exportable) {
++      const VkMemoryGetMetalHandleInfoEXT handle_info = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
++         .memory = mem->base.handle.device_memory,
++         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
++      };
++      void *metal_heap = NULL;
++      VkResult ret = mem->device->GetMemoryMetalHandleEXT(
++         mem->device->base.handle.device, &handle_info, &metal_heap);
++      if (ret != VK_SUCCESS || !metal_heap) {
++         vkr_log("mem Metal heap export failed (vk ret %d)", ret);
++         return false;
++      }
++
++      const uint64_t page_size = (uint64_t)getpagesize();
++      if (blob_size > INT64_MAX - (page_size - 1))
++         return false;
++      const uint64_t fd_size = align64(blob_size, page_size);
++      int fd = os_create_anonymous_file((off_t)fd_size, "vkr-metal-heap");
++      if (fd < 0)
++         return false;
++
++      const uint64_t native_resource_id = virgl_resource_native_publish(
++         fd, VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP, metal_heap);
++      if (!native_resource_id) {
++         close(fd);
++         return false;
++      }
++
++      mem->native_resource_id = native_resource_id;
++      mem->exported = true;
++      *out_blob = (struct virgl_context_blob) {
++         .type = VIRGL_RESOURCE_FD_SHM,
++         .u.fd = fd,
++         .map_info = VIRGL_RENDERER_MAP_CACHE_NONE,
++      };
++      return true;
++   }
++
+    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
+    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
+    enum virgl_resource_fd_type fd_type;
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index b82e8786c059919c83d06eeb961ac1a3b315cb44..19456f74a27f6c787decc9c5a5a0b809c5a1bcdd 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -30,6 +30,14 @@ struct vkr_device_memory {
+    /* Anonymous shared memory imported through VK_EXT_external_memory_host. */
+    struct vkr_host_shm *host_shm;
+ 
++   /* A shared-memory resource's mapping this memory imports as host memory,
++    * held so the range outlives the resource. */
++   struct vkr_shm_mapping *host_mapping;
++
++   /* Renderer-private MTLHeap export retained by the fd identity registry. */
++   bool metal_heap_exportable;
++   uint64_t native_resource_id;
++
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+ 
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 6efa397a866dcf3a3ca3b4356213a3151fb3cb35..204473cb224c9a82b1841884607689ac106eb39d 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -388,6 +388,23 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          if (props->specVersion > spec_ver)
+             props->specVersion = spec_ver;
+          exts[advertised_count++] = exts[i];
++      } else if (!strcmp(props->extensionName,
++                         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
++         /* The command stream never exposes VK_EXT_external_memory_host to
++          * the guest.  Advertising the real renderer extension lets a paired
++          * Venus guest select the SHM-backed transport path without claiming
++          * dma-buf support from the native Vulkan driver.
++          */
++         exts[advertised_count++] = exts[i];
++#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++      } else if (!strcmp(props->extensionName,
++                         VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME)) {
++         /* The guest translates its fd API to this renderer-private handle.
++          * A Metal heap cannot cross a process boundary, so advertise this
++          * transport capability only for the thread render server.
++          */
++         exts[advertised_count++] = exts[i];
++#endif
+       }
+    }
+ 
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index d04f11b3437152ab8ccd76a9090df98faa41d597..3a69b928c507bb87ab0b8af5f7eac49d3fb53897 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -220,8 +220,8 @@ vkr_renderer_import_resource(uint32_t ctx_id,
+    TRACE_FUNC();
+ 
+    assert(res_id);
+-   assert(fd_type == VIRGL_RESOURCE_FD_DMABUF || fd_type == VIRGL_RESOURCE_FD_OPAQUE ||
+-          fd_type == VIRGL_RESOURCE_FD_SHM);
++   assert(fd_type == VIRGL_RESOURCE_FD_SHM || fd_type == VIRGL_RESOURCE_FD_DMABUF ||
++          fd_type == VIRGL_RESOURCE_FD_OPAQUE);
+    assert(fd >= 0);
+    assert(size);
+ 
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index 0ee546883a982c54a328179b77a11dc45496c3f0..dbc803cfc50910e474e481cdeeec87a26a1f7183 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -22,23 +22,191 @@
+  *
+  **************************************************************************/
+ 
++#include "config.h"
+ #include "virgl_resource.h"
+ 
+ #include <assert.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <string.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include "c11/threads.h"
++#include "util/list.h"
+ #include "util/os_file.h"
+ #include "util/u_hash_table.h"
+ #include "util/u_pointer.h"
+ #include "virgl_util.h"
+ #include "virgl_context.h"
+ 
++#ifdef ENABLE_METAL
++#include "virgl_metal.h"
++#endif
++
+ static struct util_hash_table *virgl_resource_table;
+ static struct virgl_resource_pipe_callbacks pipe_callbacks;
+ 
++struct virgl_native_resource {
++   uint64_t id;
++   dev_t device;
++   ino_t inode;
++   enum virgl_resource_native_handle_type type;
++   void *handle;
++   uint32_t refcount;
++   struct list_head head;
++};
++
++static once_flag native_resource_once = ONCE_FLAG_INIT;
++static mtx_t native_resource_mutex;
++static struct list_head native_resources;
++static uint64_t next_native_resource_id = 1;
++static bool native_resource_ready;
++
++static void
++virgl_resource_native_init_once(void)
++{
++   list_inithead(&native_resources);
++   native_resource_ready = mtx_init(&native_resource_mutex, mtx_plain) == thrd_success;
++}
++
++static bool
++virgl_resource_native_fd_identity(int fd, dev_t *device, ino_t *inode)
++{
++   struct stat stat_buffer;
++   if (fd < 0 || fstat(fd, &stat_buffer))
++      return false;
++
++   *device = stat_buffer.st_dev;
++   *inode = stat_buffer.st_ino;
++   return true;
++}
++
++uint64_t
++virgl_resource_native_publish(int fd,
++                              enum virgl_resource_native_handle_type type,
++                              void *handle)
++{
++#if defined(ENABLE_METAL) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER)
++   dev_t device;
++   ino_t inode;
++   if (type != VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP || !handle ||
++       !virgl_resource_native_fd_identity(fd, &device, &inode))
++      return 0;
++
++   call_once(&native_resource_once, virgl_resource_native_init_once);
++   if (!native_resource_ready)
++      return 0;
++
++   struct virgl_native_resource *resource = calloc(1, sizeof(*resource));
++   if (!resource)
++      return 0;
++
++   mtx_lock(&native_resource_mutex);
++   list_for_each_entry (struct virgl_native_resource, existing,
++                        &native_resources, head) {
++      if (existing->device == device && existing->inode == inode) {
++         mtx_unlock(&native_resource_mutex);
++         free(resource);
++         return 0;
++      }
++   }
++
++   if (!next_native_resource_id)
++      next_native_resource_id++;
++   resource->id = next_native_resource_id++;
++   resource->device = device;
++   resource->inode = inode;
++   resource->type = type;
++   resource->handle = virgl_metal_retain_object(handle);
++   resource->refcount = 1;
++   list_addtail(&resource->head, &native_resources);
++   mtx_unlock(&native_resource_mutex);
++
++   return resource->id;
++#else
++   (void)fd;
++   (void)type;
++   (void)handle;
++   return 0;
++#endif
++}
++
++uint64_t
++virgl_resource_native_acquire(int fd,
++                              enum virgl_resource_native_handle_type *out_type,
++                              void **out_handle)
++{
++#if defined(ENABLE_METAL) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER)
++   dev_t device;
++   ino_t inode;
++   if (!virgl_resource_native_fd_identity(fd, &device, &inode))
++      return 0;
++
++   call_once(&native_resource_once, virgl_resource_native_init_once);
++   if (!native_resource_ready)
++      return 0;
++
++   uint64_t id = 0;
++   mtx_lock(&native_resource_mutex);
++   list_for_each_entry (struct virgl_native_resource, resource,
++                        &native_resources, head) {
++      if (resource->device == device && resource->inode == inode &&
++          resource->refcount != UINT32_MAX) {
++         resource->refcount++;
++         if (out_type)
++            *out_type = resource->type;
++         if (out_handle)
++            *out_handle = resource->handle;
++         id = resource->id;
++         break;
++      }
++   }
++   mtx_unlock(&native_resource_mutex);
++   return id;
++#else
++   (void)fd;
++   (void)out_type;
++   (void)out_handle;
++   return 0;
++#endif
++}
++
++void
++virgl_resource_native_release(uint64_t id)
++{
++#if defined(ENABLE_METAL) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER)
++   if (!id)
++      return;
++
++   call_once(&native_resource_once, virgl_resource_native_init_once);
++   if (!native_resource_ready)
++      return;
++
++   struct virgl_native_resource *released = NULL;
++   mtx_lock(&native_resource_mutex);
++   list_for_each_entry (struct virgl_native_resource, resource,
++                        &native_resources, head) {
++      if (resource->id == id) {
++         assert(resource->refcount);
++         if (!--resource->refcount) {
++            list_del(&resource->head);
++            released = resource;
++         }
++         break;
++      }
++   }
++   mtx_unlock(&native_resource_mutex);
++
++   if (released) {
++      virgl_metal_release_object(released->handle);
++      free(released);
++   }
++#else
++   assert(!id);
++#endif
++}
++
+ static void
+ virgl_resource_destroy_func(void *val)
+ {
+@@ -49,6 +217,7 @@ virgl_resource_destroy_func(void *val)
+    if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
+       close(res->fd);
++   virgl_resource_native_release(res->native_resource_id);
+ 
+    free(res);
+ }
+@@ -151,6 +320,8 @@ virgl_resource_create_from_fd(uint32_t res_id,
+    res->fd_type = fd_type;
+    /* take ownership */
+    res->fd = fd;
++   res->native_resource_id =
++      virgl_resource_native_acquire(fd, NULL, NULL);
+ 
+    res->iov = iov;
+    res->iov_count = iov_count;
+diff --git a/src/virgl_resource.h b/src/virgl_resource.h
+index 8eb770e78e69dffd54746cd89ffdd8816c2be329..5d90e60f4429e2f31094141c2850334ea893391b 100644
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -60,6 +60,11 @@ struct virgl_resource_vulkan_info {
+    uint32_t memory_type_index;
+ };
+ 
++enum virgl_resource_native_handle_type {
++   VIRGL_RESOURCE_NATIVE_HANDLE_NONE = 0,
++   VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP = 1,
++};
++
+ /**
+  * A global cross-context resource.  A virgl_resource is not directly usable
+  * by renderer contexts, but must be attached and imported into renderer
+@@ -105,6 +110,9 @@ struct virgl_resource {
+ 
+    struct virgl_resource_vulkan_info vulkan_info;
+ 
++   /* Reference into the same-process native-resource registry, or zero. */
++   uint64_t native_resource_id;
++
+    void *private_data;
+ };
+ 
+@@ -174,4 +182,21 @@ virgl_resource_detach_iov(struct virgl_resource *res);
+ enum virgl_resource_fd_type
+ virgl_resource_export_fd(struct virgl_resource *res, int *fd);
+ 
++/* Associate a native object with a kernel-validated fd identity.  These are
++ * available only to same-process renderers; callers own one reference for
++ * every nonzero id returned by publish/acquire.
++ */
++uint64_t
++virgl_resource_native_publish(int fd,
++                              enum virgl_resource_native_handle_type type,
++                              void *handle);
++
++uint64_t
++virgl_resource_native_acquire(int fd,
++                              enum virgl_resource_native_handle_type *out_type,
++                              void **out_handle);
++
++void
++virgl_resource_native_release(uint64_t id);
++
+ #endif /* VIRGL_RESOURCE_H */
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index ce2b03d72ecee68c97bac77668e8a0a8a9b2d8fa..80d848d46beb6b0f3ec4be3e7437cb51fa762adf 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1243,7 +1243,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+    TRACE_FUNC();
+    struct virgl_resource *res;
+    struct virgl_context *ctx;
+-   struct virgl_context_blob blob;
++   struct virgl_context_blob blob = { 0 };
+    bool has_host_storage;
+    bool has_guest_storage;
+    int ret;

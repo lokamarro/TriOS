@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 14:19:35 +0900
+Subject: [PATCH] um: share compat task infrastructure between userspace ABIs
+
+A task that runs 32-bit code on a 64-bit UML kernel needs the same
+core support whatever its instruction set: a per-task flag, its own
+address-space limits, ABI-specific 32-bit types and a way to select
+its syscall table. The x86_64 slice builds that for i386 tasks; this
+moves the parts that do not encode an ISA into arch/um, so that a port
+can add a second 32-bit ABI without a second copy. Nothing changes
+unless a port enables CONFIG_COMPAT.
+
+- TIF_32BIT is a thread flag under CONFIG_COMPAT.
+- TASK_SIZE, TASK_SIZE_OF, STACK_TOP and TASK_UNMAPPED_BASE follow the
+  task. The port gives UML_COMPAT_TASK_SIZE, UML_COMPAT_STACK_TOP and
+  UML_COMPAT_TASK_UNMAPPED_BASE. STACK_TOP_MAX and the page
+  directory's USER_PTRS_PER_PGD use the largest task, task_size, so a
+  directory built by one task serves every later one.
+- asm/compat.h is no longer generic-y. With CONFIG_COMPAT it includes
+  the port's asm/compat-abi.h for the 32-bit ABI types and defines
+  is_compat_task(), is_compat_thread(), compat_user_stack_pointer()
+  and COMPAT_MINSIGSTKSZ on top of TIF_32BIT.
+- handle_syscall() reads the number through UPT_SYSCALL_ARCH_NR() and
+  picks its table, its size, its sched_yield number and its result for
+  a number past the table through UML_SYSCALL_* hooks, whose defaults
+  are the one native table.
+- A restarted restart_syscall() writes PT_REGS_RESTART_SYSCALL_NR(),
+  and signal delivery and clone read and write the user stack pointer
+  through user_stack_pointer() and PT_REGS_SET_USER_SP(), for a port
+  whose 32-bit tasks number and stack differently.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/include/asm/Kbuild              |  1 -
+ arch/um/include/asm/compat.h            | 40 +++++++++++++++++++++
+ arch/um/include/asm/pgtable-2level.h    |  3 +-
+ arch/um/include/asm/pgtable-4level.h    |  3 +-
+ arch/um/include/asm/processor-generic.h | 33 ++++++++++++++++++
+ arch/um/include/asm/ptrace-generic.h    |  8 +++++
+ arch/um/include/asm/thread_info.h       |  6 ++++
+ arch/um/kernel/process.c                |  2 +-
+ arch/um/kernel/signal.c                 | 13 +++++--
+ arch/um/kernel/skas/syscall.c           | 46 ++++++++++++++++++++-----
+ 10 files changed, 140 insertions(+), 15 deletions(-)
+ create mode 100644 arch/um/include/asm/compat.h
+
+diff --git a/arch/um/include/asm/Kbuild b/arch/um/include/asm/Kbuild
+index ef01d6006da988e31168473ef9bcbc643de009b7..424190cc8fce471fff02fca7353c8ce595f9a95f 100644
+--- a/arch/um/include/asm/Kbuild
++++ b/arch/um/include/asm/Kbuild
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+ generic-y += bug.h
+-generic-y += compat.h
+ generic-y += device.h
+ generic-y += dma-mapping.h
+ generic-y += emergency-restart.h
+diff --git a/arch/um/include/asm/compat.h b/arch/um/include/asm/compat.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b70b8823331e8b3b018af8fd5d24772cd96f79b7
+--- /dev/null
++++ b/arch/um/include/asm/compat.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_COMPAT_H
++#define __UM_COMPAT_H
++
++#ifndef CONFIG_COMPAT
++#include <asm-generic/compat.h>
++
++struct thread_info;
++
++static inline int is_compat_thread(struct thread_info *thread)
++{
++	return 0;
++}
++#else
++/*
++ * The port's 32-bit ABI types.  The header includes asm-generic/compat.h
++ * itself, after the overrides its ABI needs, and defines COMPAT_UTS_MACHINE.
++ */
++#include <asm/compat-abi.h>
++
++#include <linux/sched.h>
++#include <linux/sched/task_stack.h>
++#include <asm/processor.h>
++
++#define compat_user_stack_pointer() \
++	(user_stack_pointer(task_pt_regs(current)))
++#define COMPAT_MINSIGSTKSZ 2048
++
++static inline int is_compat_task(void)
++{
++	return test_thread_flag(TIF_32BIT);
++}
++
++static inline int is_compat_thread(struct thread_info *thread)
++{
++	return test_ti_thread_flag(thread, TIF_32BIT);
++}
++#endif
++
++#endif
+diff --git a/arch/um/include/asm/pgtable-2level.h b/arch/um/include/asm/pgtable-2level.h
+index 14ec16f92ce4086eafa5ca774f52c79df2b0b88c..10464cc3488b63b51a02c7100bb38ed9ff8e0d47 100644
+--- a/arch/um/include/asm/pgtable-2level.h
++++ b/arch/um/include/asm/pgtable-2level.h
+@@ -21,7 +21,8 @@
+  * we don't really have any PMD directory physically.
+  */
+ #define PTRS_PER_PTE	1024
+-#define USER_PTRS_PER_PGD ((TASK_SIZE + (PGDIR_SIZE - 1)) / PGDIR_SIZE)
++/* The page directory spans the largest task, not the current one. */
++#define USER_PTRS_PER_PGD ((task_size + (PGDIR_SIZE - 1)) / PGDIR_SIZE)
+ #define PTRS_PER_PGD	1024
+ 
+ #define pte_ERROR(e) \
+diff --git a/arch/um/include/asm/pgtable-4level.h b/arch/um/include/asm/pgtable-4level.h
+index 17649aefd6922012de5f30349361bf2dc50466e7..a575316839b60ae0d3e8cce5a034e9ff6547d3d4 100644
+--- a/arch/um/include/asm/pgtable-4level.h
++++ b/arch/um/include/asm/pgtable-4level.h
+@@ -42,7 +42,8 @@
+ #define PTRS_PER_PUD (1U << UML_PGTABLE_SHIFT)
+ #define PTRS_PER_PGD (1U << UML_PGTABLE_SHIFT)
+ 
+-#define USER_PTRS_PER_PGD ((TASK_SIZE + (PGDIR_SIZE - 1)) / PGDIR_SIZE)
++/* The page directory spans the largest task, not the current one. */
++#define USER_PTRS_PER_PGD ((task_size + (PGDIR_SIZE - 1)) / PGDIR_SIZE)
+ 
+ #define pte_ERROR(e) \
+         printk("%s:%d: bad pte %p(%016lx).\n", __FILE__, __LINE__, &(e), \
+diff --git a/arch/um/include/asm/processor-generic.h b/arch/um/include/asm/processor-generic.h
+index 9e9f2c7f127f78532c554ee958d458884077d630..3cb295c8f05371e697cb5d184dc3830cfa7d110a 100644
+--- a/arch/um/include/asm/processor-generic.h
++++ b/arch/um/include/asm/processor-generic.h
+@@ -50,7 +50,27 @@ struct thread_struct {
+  */
+ extern unsigned long task_size;
+ 
++#ifdef CONFIG_COMPAT
++/*
++ * A TIF_32BIT task sees a smaller address space with its own stack top and
++ * mmap base.  A compat-capable port defines these in asm/processor.h before
++ * it includes this file:
++ *
++ *   UML_COMPAT_TASK_SIZE		first address a 32-bit task cannot use
++ *   UML_COMPAT_STACK_TOP		top of its stack mapping
++ *   UML_COMPAT_TASK_UNMAPPED_BASE	where its legacy mmap area starts
++ *
++ * task_size stays the largest task, which sizes the page directory.
++ */
++#define TASK_SIZE \
++	(test_thread_flag(TIF_32BIT) ? UML_COMPAT_TASK_SIZE : task_size)
++#define TASK_SIZE_OF(task) \
++	(test_tsk_thread_flag((task), TIF_32BIT) ? \
++	 UML_COMPAT_TASK_SIZE : task_size)
++#else
+ #define TASK_SIZE (task_size)
++#define TASK_SIZE_OF(task) TASK_SIZE
++#endif
+ 
+ #undef STACK_TOP
+ #undef STACK_TOP_MAX
+@@ -58,8 +78,15 @@ extern unsigned long task_size;
+ extern unsigned long stacksizelim;
+ 
+ #define STACK_ROOM	(stacksizelim)
++#ifdef CONFIG_COMPAT
++#define STACK_TOP \
++	(test_thread_flag(TIF_32BIT) ? UML_COMPAT_STACK_TOP : \
++	 task_size - 2 * PAGE_SIZE)
++#define STACK_TOP_MAX	(task_size - 2 * PAGE_SIZE)
++#else
+ #define STACK_TOP	(TASK_SIZE - 2 * PAGE_SIZE)
+ #define STACK_TOP_MAX	STACK_TOP
++#endif
+ 
+ /* This decides where the kernel will search for a free chunk of vm
+  * space during mmap's.
+@@ -71,7 +98,13 @@ extern unsigned long stacksizelim;
+  * above that host reservation.  Linux still owns the guest virtual address
+  * space; the Darwin shadow-MMU maps these addresses into this process.
+  */
++#ifdef CONFIG_COMPAT
++#define TASK_UNMAPPED_BASE \
++	(test_thread_flag(TIF_32BIT) ? UML_COMPAT_TASK_UNMAPPED_BASE : \
++	 UML_DARWIN_TASK_UNMAPPED_BASE)
++#else
+ #define TASK_UNMAPPED_BASE	(UML_DARWIN_TASK_UNMAPPED_BASE)
++#endif
+ #else
+ #define TASK_UNMAPPED_BASE	(0x40000000)
+ #endif
+diff --git a/arch/um/include/asm/ptrace-generic.h b/arch/um/include/asm/ptrace-generic.h
+index 86d74f9d33cf2d14879398b8d9daf3a3994d685e..d7275885bc003bde8a98c0a7652f9061c664da10 100644
+--- a/arch/um/include/asm/ptrace-generic.h
++++ b/arch/um/include/asm/ptrace-generic.h
+@@ -21,6 +21,14 @@ struct pt_regs {
+ #define PT_REGS_IP(r) UPT_IP(&(r)->regs)
+ #define PT_REGS_SP(r) UPT_SP(&(r)->regs)
+ 
++/*
++ * The stack pointer the user program sees.  A port whose 32-bit tasks keep it
++ * in another register overrides user_stack_pointer() and this setter.
++ */
++#ifndef PT_REGS_SET_USER_SP
++#define PT_REGS_SET_USER_SP(r, val) (PT_REGS_SP(r) = (val))
++#endif
++
+ #define PT_REGS_RESTART_SYSCALL(r) UPT_RESTART_SYSCALL(&(r)->regs)
+ 
+ #define PT_REGS_SYSCALL_NR(r) UPT_SYSCALL_NR(&(r)->regs)
+diff --git a/arch/um/include/asm/thread_info.h b/arch/um/include/asm/thread_info.h
+index 7a6f4dc99fa1639a259b12baccbad2218b43c3d9..f16b3b64d7b90b824a6d9b688227db446dab7a2a 100644
+--- a/arch/um/include/asm/thread_info.h
++++ b/arch/um/include/asm/thread_info.h
+@@ -44,6 +44,9 @@ struct thread_info {
+ #define TIF_SECCOMP		9	/* secure computing */
+ #define TIF_SINGLESTEP		10	/* single stepping userspace */
+ #define TIF_SYSCALL_TRACEPOINT	11	/* syscall tracepoint instrumentation */
++#ifdef CONFIG_COMPAT
++#define TIF_32BIT		12	/* 32-bit userspace task */
++#endif
+ 
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+@@ -55,6 +58,9 @@ struct thread_info {
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
++#ifdef CONFIG_COMPAT
++#define _TIF_32BIT		(1 << TIF_32BIT)
++#endif
+ 
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL | \
+ 				 _TIF_NOTIFY_RESUME)
+diff --git a/arch/um/kernel/process.c b/arch/um/kernel/process.c
+index e04b03437b9a89c2f8e9edd02af04953a5e4d255..87e977b5254f987d44d5ad7d929d61520b6eef17 100644
+--- a/arch/um/kernel/process.c
++++ b/arch/um/kernel/process.c
+@@ -189,7 +189,7 @@ int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)
+ #endif
+ 		PT_REGS_SET_SYSCALL_RETURN(&p->thread.regs, 0);
+ 		if (sp != 0)
+-			REGS_SP(p->thread.regs.regs.gp) = sp;
++			PT_REGS_SET_USER_SP(&p->thread.regs, sp);
+ 
+ 		handler = fork_handler;
+ 
+diff --git a/arch/um/kernel/signal.c b/arch/um/kernel/signal.c
+index a56b44522766fec85a945ad8788b2b3019b4673b..b1bda9aa701f912895b8d4eb8bfefa29008e77da 100644
+--- a/arch/um/kernel/signal.c
++++ b/arch/um/kernel/signal.c
+@@ -14,6 +14,14 @@
+ #include <kern_util.h>
+ #include <os.h>
+ 
++/*
++ * The number a restart_syscall() restart puts in the syscall-number register.
++ * A port whose 32-bit tasks number it differently defines the macro.
++ */
++#ifndef PT_REGS_RESTART_SYSCALL_NR
++#define PT_REGS_RESTART_SYSCALL_NR(regs) __NR_restart_syscall
++#endif
++
+ EXPORT_SYMBOL(block_signals);
+ EXPORT_SYMBOL(unblock_signals);
+ 
+@@ -78,7 +86,7 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 		}
+ 	}
+ 
+-	sp = PT_REGS_SP(regs);
++	sp = user_stack_pointer(regs);
+ 	if ((ksig->ka.sa.sa_flags & SA_ONSTACK) && (sas_ss_flags(sp) == 0))
+ 		sp = current->sas_ss_sp + current->sas_ss_size;
+ 
+@@ -114,7 +122,8 @@ void do_signal(struct pt_regs *regs)
+ 			PT_REGS_RESTART_SYSCALL(regs);
+ 			break;
+ 		case -ERESTART_RESTARTBLOCK:
+-			PT_REGS_ORIG_SYSCALL(regs) = __NR_restart_syscall;
++			PT_REGS_ORIG_SYSCALL(regs) =
++				PT_REGS_RESTART_SYSCALL_NR(regs);
+ 			PT_REGS_RESTART_SYSCALL(regs);
+ 			break;
+ 		}
+diff --git a/arch/um/kernel/skas/syscall.c b/arch/um/kernel/skas/syscall.c
+index 99205d38d4299263f2f77288fd1ed12495cbd1c5..99cad951786d0aba68089f899382af1aa9434975 100644
+--- a/arch/um/kernel/skas/syscall.c
++++ b/arch/um/kernel/skas/syscall.c
+@@ -14,6 +14,30 @@
+ #include <asm/unistd.h>
+ #include <asm/delay.h>
+ 
++/*
++ * A port with more than one syscall ABI defines these in asm/syscall.h:
++ *
++ *   UML_SYSCALL_TABLE(r)		the table of the task's current ABI
++ *   UML_SYSCALL_COUNT(r)		its number of entries
++ *   UML_SYSCALL_SCHED_YIELD(r)		its sched_yield number
++ *   UML_SYSCALL_OUT_OF_TABLE(r, nr)	the result for a number past the
++ *					table (ARM's private syscalls)
++ *
++ * Each takes the task's struct uml_pt_regs.
++ *
++ * The number itself comes from UPT_SYSCALL_ARCH_NR().
++ */
++#ifndef UML_SYSCALL_TABLE
++#define UML_SYSCALL_TABLE(r) sys_call_table
++#define UML_SYSCALL_COUNT(r) __NR_syscalls
++#define UML_SYSCALL_SCHED_YIELD(r) __NR_sched_yield
++#define UML_SYSCALL_OUT_OF_TABLE(r, nr) (-ENOSYS)
++#endif
++
++#ifndef UPT_SYSCALL_ARCH_NR
++#define UPT_SYSCALL_ARCH_NR(regs) PT_SYSCALL_NR((regs)->gp)
++#endif
++
+ /*
+  * A port whose first argument register is also its return register (arm64's
+  * x0) defines these in sysdep/ptrace.h, so that the register holds the
+@@ -43,7 +67,7 @@ void handle_syscall(struct uml_pt_regs *r)
+ 	int syscall;
+ 
+ 	/* Initialize the syscall number and default return value. */
+-	UPT_SYSCALL_NR(r) = PT_SYSCALL_NR(r->gp);
++	UPT_SYSCALL_NR(r) = UPT_SYSCALL_ARCH_NR(r);
+ 	if (UPT_SYSCALL_PRESET_ENOSYS(r))
+ 		PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);
+ 
+@@ -63,18 +87,22 @@ void handle_syscall(struct uml_pt_regs *r)
+ 	 */
+ 	if ((time_travel_mode == TT_MODE_INFCPU ||
+ 	     time_travel_mode == TT_MODE_EXTERNAL) &&
+-	    syscall == __NR_sched_yield)
++	    syscall == UML_SYSCALL_SCHED_YIELD(r))
+ 		tt_extra_sched_jiffies += 1;
+ 
+-	if (syscall >= 0 && syscall < __NR_syscalls) {
++	if (syscall >= UML_SYSCALL_COUNT(r)) {
++		PT_REGS_SET_SYSCALL_RETURN(regs,
++					   UML_SYSCALL_OUT_OF_TABLE(r, syscall));
++	} else if (syscall >= 0) {
+ 		unsigned long ret;
++		const sys_call_ptr_t *table = UML_SYSCALL_TABLE(r);
+ 
+-		ret = (*sys_call_table[syscall])(UPT_SYSCALL_ARG1(&regs->regs),
+-						 UPT_SYSCALL_ARG2(&regs->regs),
+-						 UPT_SYSCALL_ARG3(&regs->regs),
+-						 UPT_SYSCALL_ARG4(&regs->regs),
+-						 UPT_SYSCALL_ARG5(&regs->regs),
+-						 UPT_SYSCALL_ARG6(&regs->regs));
++		ret = (*table[syscall])(UPT_SYSCALL_ARG1(&regs->regs),
++					UPT_SYSCALL_ARG2(&regs->regs),
++					UPT_SYSCALL_ARG3(&regs->regs),
++					UPT_SYSCALL_ARG4(&regs->regs),
++					UPT_SYSCALL_ARG5(&regs->regs),
++					UPT_SYSCALL_ARG6(&regs->regs));
+ 
+ 		PT_REGS_SET_SYSCALL_RETURN(regs, ret);
+ 

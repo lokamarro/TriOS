@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Host-side composition only.  Each architectural layer owns its source
+# manifest and targets in its own directory; this file states their order.
+
+add_subdirectory(include)
+add_subdirectory(api)
+add_subdirectory(platform)
+add_subdirectory(memory)
+add_subdirectory(cpu)
+add_subdirectory(device/sockets)
+add_subdirectory(device/guest_end)
+add_subdirectory(device/mconsole)
+add_subdirectory(device/block)
+add_subdirectory(device/network)
+add_subdirectory(device/input/vnc)
+add_subdirectory(device/vhost_user)
+add_subdirectory(device/console)
+add_subdirectory(device/input/virtio)
+add_subdirectory(device/battery)
+add_subdirectory(device/vsock)
+add_subdirectory(device/video)
+
+if(UML_BUILD_GPU)
+    add_subdirectory(device/gpu)
+endif()
+if(UML_BUILD_AUDIO)
+    add_subdirectory(device/audio)
+endif()
+
+add_subdirectory(runtime)
+add_subdirectory(emulator)
+
+if(UML_BUILD_CLI OR UML_BUILD_ANDROID17_CLI)
+    if(NOT UML_TARGET_MACOS)
+        message(FATAL_ERROR "The CLI is currently supported only for macOS")
+    endif()
+    if(NOT UML_BUILD_GPU)
+        message(FATAL_ERROR "macOS executables require UML_BUILD_GPU=ON")
+    endif()
+    if(NOT UML_BUILD_AUDIO)
+        message(FATAL_ERROR "macOS executables require UML_BUILD_AUDIO=ON")
+    endif()
+    add_subdirectory(app/macos)
+endif()
+if(UML_TARGET_MACOS)
+    add_subdirectory(app/initramfs)
+endif()

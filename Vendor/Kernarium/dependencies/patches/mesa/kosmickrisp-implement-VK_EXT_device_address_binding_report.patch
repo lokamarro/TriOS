@@ -1,0 +1,492 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 14:12:45 +0900
+Subject: [PATCH] kosmickrisp: implement VK_EXT_device_address_binding_report
+
+VP_ANDROID_17_requirements makes this extension mandatory. It asks an
+implementation to tell a debug-utils messenger when a GPU virtual address
+range becomes bound to, or unbound from, a Vulkan object, so a tool can name
+the object behind an address in a fault report.
+
+Metal hands out a GPU address for every heap-backed buffer, and this driver
+already keeps one for each allocation, buffer and image plane, so the reports
+are the addresses it has rather than anything new it has to track. Device
+memory is reported as it enters and leaves the device address space, a buffer
+as its Metal handle is bound and released, and an image once per plane,
+because a disjoint image's planes can come from different allocations.
+
+The common runtime's vk_address_binding_report does the rest: it marks a
+report internal when the object is not client visible, and returns at once
+when no messenger is listening, which is what keeps this off the cost of an
+ordinary allocation.
+
+Each plane is reported as it is bound. A disjoint image binds one plane per
+VkBindImageMemoryInfo, and a report of the whole image after each bind would
+announce the planes bound earlier a second time, leaving a tool with more
+binds than the image's destruction unbinds. An image bound to a swapchain
+image's memory is reported too, since its destruction reports it unbound. A
+test binds a disjoint two-plane image a plane at a time and finds one bind and
+one unbind for each plane.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_buffer.c            |  11 +
+ src/kosmickrisp/vulkan/kk_device_memory.c     |  10 +
+ src/kosmickrisp/vulkan/kk_image.c             |  41 +++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   4 +
+ src/kosmickrisp/vulkan/meson.build            |  13 +
+ .../tests/test_address_binding_planes.c       | 245 ++++++++++++++++++
+ 6 files changed, 324 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_address_binding_planes.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer.c b/src/kosmickrisp/vulkan/kk_buffer.c
+index f119907d7fed4cc9c6c51763296dbf9cc376eb5b..2a53a8e6ca7a5c1433388093bd2a740f43c4159d 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_buffer.c
+@@ -13,6 +13,8 @@
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
++#include "vk_debug_utils.h"
++
+ static uint64_t
+ kk_get_buffer_alignment(const struct kk_physical_device *pdev, uint64_t size,
+                         VkBufferUsageFlags2KHR usage_flags,
+@@ -61,6 +63,11 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
+    if (!buffer)
+       return;
+ 
++   if (buffer->vk.device_address)
++      vk_address_binding_report(dev->vk.physical->instance, &buffer->vk.base,
++                                buffer->vk.device_address, buffer->vk.size,
++                                VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
++
+    if (buffer->mtl_handle)
+       mtl_release(buffer->mtl_handle);
+ 
+@@ -173,6 +180,10 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
+     * data in the GPU debugger... */
+    mtl_get_contents(buffer->mtl_handle);
+ 
++   vk_address_binding_report(dev->vk.physical->instance, &buffer->vk.base,
++                             buffer->vk.device_address, buffer->vk.size,
++                             VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
++
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index a52d77379217813115cd017439af5e2f0f5c1544..f504640db6f92c217b934225cfebb4820d2e0581 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -18,6 +18,8 @@
+ #include "util/u_atomic.h"
+ #include "util/u_memory.h"
+ 
++#include "vk_debug_utils.h"
++
+ #include <inttypes.h>
+ #include <sys/mman.h>
+ 
+@@ -151,6 +153,10 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+    list_addtail(&mem->address_space_link, &dev->address_space.allocations);
+    simple_mtx_unlock(&dev->address_space.mutex);
+ 
++   vk_address_binding_report(dev->vk.physical->instance, &mem->vk.base,
++                             mem->bo->gpu, mem->bo->size_B,
++                             VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
++
+    *pMem = kk_device_memory_to_handle(mem);
+ 
+    return VK_SUCCESS;
+@@ -174,6 +180,10 @@ kk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
+    list_del(&mem->address_space_link);
+    simple_mtx_unlock(&dev->address_space.mutex);
+ 
++   vk_address_binding_report(dev->vk.physical->instance, &mem->vk.base,
++                             mem->bo->gpu, mem->bo->size_B,
++                             VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
++
+    kk_destroy_bo(dev, mem->bo);
+ 
+    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 30284d04c27c15a0ffb396ed66519192e1926933..18f693770298aff83c38df9b0ab94a4b7008bc5b 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -29,6 +29,12 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#include "vk_debug_utils.h"
++
++static void kk_image_report_address_binding(struct kk_device *dev,
++                                            const struct kk_image *image,
++                                            VkDeviceAddressBindingTypeEXT type);
++
+ #include <vulkan/vulkan_metal.h>
+ 
+ static VkFormatFeatureFlags2
+@@ -804,6 +810,9 @@ kk_DestroyImage(VkDevice device, VkImage _image,
+    if (!image)
+       return;
+ 
++   kk_image_report_address_binding(dev, image,
++                                   VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
++
+    kk_image_finish(dev, image, pAllocator);
+    vk_free2(&dev->vk.alloc, pAllocator, image);
+ }
+@@ -1018,6 +1027,22 @@ kk_image_plane_create_texture(struct kk_image_plane *plane,
+                                           mem_offset_B);
+ }
+ 
++/* Each plane is reported when it is bound, so a disjoint image's planes,
++ * bound one call at a time, are each reported once. */
++static void
++kk_image_plane_report_address_binding(struct kk_device *dev,
++                                      const struct kk_image *image,
++                                      const struct kk_image_plane *plane,
++                                      VkDeviceAddressBindingTypeEXT type)
++{
++   if (plane->addr == 0u)
++      return;
++
++   vk_address_binding_report(dev->vk.physical->instance,
++                             &((struct kk_image *)image)->vk.base, plane->addr,
++                             plane->layout.size_B, type);
++}
++
+ static VkResult
+ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+                     struct kk_image_plane *plane, struct kk_device_memory *mem,
+@@ -1071,9 +1096,23 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+ 
+    *offset_B += plane_size_B;
+ 
++   kk_image_plane_report_address_binding(dev, image, plane,
++                                         VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+    return VK_SUCCESS;
+ }
+ 
++static void
++kk_image_report_address_binding(struct kk_device *dev,
++                                const struct kk_image *image,
++                                VkDeviceAddressBindingTypeEXT type)
++{
++   /* An image occupies one range per plane, and a disjoint image's planes can
++    * come from different allocations, so each is reported on its own. */
++   for (uint8_t plane = 0u; plane < image->plane_count; ++plane)
++      kk_image_plane_report_address_binding(dev, image, &image->planes[plane],
++                                            type);
++}
++
+ static VkResult
+ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
+ {
+@@ -1107,6 +1146,8 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
+             ? mtl_retain(swapchain_plane->mtl_handle_array)
+             : NULL;
+       plane->addr = swapchain_plane->addr;
++      kk_image_plane_report_address_binding(
++         dev, image, plane, VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+ 
+       return VK_SUCCESS;
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index f2c96dbea7462a7fa3f73354c844b483bee82f3c..d63f71d45122df8396c2e5044fe140b56c704619 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -181,6 +181,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_metal_objects = true,
+       .EXT_hdr_metadata = true,
+       .EXT_image_2d_view_of_3d = true,
++      .EXT_device_address_binding_report = true,
+       .EXT_image_compression_control = true,
+       .EXT_image_compression_control_swapchain = true,
+       .EXT_image_drm_format_modifier = true,
+@@ -495,6 +496,9 @@ kk_get_device_features(
+       .image2DViewOf3D = true,
+       .sampler2DViewOf3D = true,
+ 
++      /* VK_EXT_device_address_binding_report */
++      .reportAddressBinding = true,
++
+       /* VK_EXT_image_compression_control and its swapchain companion.
+        * Metal never tells the driver whether it compressed a texture and
+        * offers no fixed-rate control, so every query answers "no
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 7bae9449c315318649d43677e8e051fd3dd85bc0..099a3a803a0f2fcbbc6923587954a60dcbc16236 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -880,6 +880,19 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_address_binding_planes',
++      executable(
++        'test_kosmickrisp_address_binding_planes',
++        files('tests/test_address_binding_planes.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_address_binding_planes.c b/src/kosmickrisp/vulkan/tests/test_address_binding_planes.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..11fa8afe051813bd62fed18c76ba58935a7a20ce
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_address_binding_planes.c
+@@ -0,0 +1,245 @@
++/* SPDX-License-Identifier: MIT */
++
++/* VK_EXT_device_address_binding_report lets a tool pair each range the driver
++ * binds with the unbind that releases it.  A disjoint image binds one plane
++ * per VkBindImageMemoryInfo, so each bind must report that plane alone: a
++ * report of the whole image would announce the earlier plane a second time,
++ * and the tool would see more binds than the image's destruction unbinds. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++#define MAX_REPORTS 16u
++
++struct report {
++   uint64_t address;
++   uint64_t size;
++   VkDeviceAddressBindingTypeEXT type;
++};
++
++static struct {
++   uint64_t image;
++   unsigned count;
++   struct report reports[MAX_REPORTS];
++} watched;
++
++static VKAPI_ATTR VkBool32 VKAPI_CALL
++on_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
++           VkDebugUtilsMessageTypeFlagsEXT types,
++           const VkDebugUtilsMessengerCallbackDataEXT *data, void *user)
++{
++   (void)severity;
++   (void)user;
++   if (!(types & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT))
++      return VK_FALSE;
++   if (watched.image == 0u || data->objectCount != 1u ||
++       data->pObjects[0].objectType != VK_OBJECT_TYPE_IMAGE ||
++       data->pObjects[0].objectHandle != watched.image)
++      return VK_FALSE;
++   for (const VkBaseInStructure *next = data->pNext; next; next = next->pNext) {
++      if (next->sType !=
++          VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT)
++         continue;
++      const VkDeviceAddressBindingCallbackDataEXT *binding =
++         (const VkDeviceAddressBindingCallbackDataEXT *)next;
++      CHECK(watched.count < MAX_REPORTS);
++      watched.reports[watched.count++] = (struct report){
++         .address = binding->baseAddress,
++         .size = binding->size,
++         .type = binding->bindingType,
++      };
++   }
++   return VK_FALSE;
++}
++
++static unsigned
++count_reports(VkDeviceAddressBindingTypeEXT type, uint64_t address)
++{
++   unsigned count = 0u;
++   for (unsigned i = 0u; i < watched.count; i++) {
++      if (watched.reports[i].type == type &&
++          (address == 0u || watched.reports[i].address == address))
++         count++;
++   }
++   return count;
++}
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   const char *instance_extensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++      .enabledExtensionCount = 1,
++      .ppEnabledExtensionNames = instance_extensions,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkCreateDebugUtilsMessengerEXT);
++   LOAD_I(vkDestroyDebugUtilsMessengerEXT);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceFormatProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
++      .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
++      .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
++      .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT,
++      .pfnUserCallback = on_message,
++   };
++   VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
++   CHECK(vkCreateDebugUtilsMessengerEXT(instance, &messenger_info, NULL,
++                                        &messenger) == VK_SUCCESS);
++
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++
++   const VkFormat format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
++   VkFormatProperties format_properties;
++   vkGetPhysicalDeviceFormatProperties(physical, format, &format_properties);
++   CHECK(format_properties.optimalTilingFeatures &
++         VK_FORMAT_FEATURE_DISJOINT_BIT);
++
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceAddressBindingReportFeaturesEXT report_features = {
++      .sType =
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT,
++      .reportAddressBinding = VK_TRUE,
++   };
++   const char *device_extensions[] = {
++      VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &report_features,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = 1,
++      .ppEnabledExtensionNames = device_extensions,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements2);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindImageMemory2);
++
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .flags = VK_IMAGE_CREATE_DISJOINT_BIT,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = {64, 64, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++   watched.image = (uint64_t)(uintptr_t)image;
++
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++   const VkImageAspectFlagBits aspects[2] = {VK_IMAGE_ASPECT_PLANE_0_BIT,
++                                             VK_IMAGE_ASPECT_PLANE_1_BIT};
++   VkDeviceMemory memory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++   uint64_t bound[2] = {0u, 0u};
++   for (unsigned plane = 0u; plane < 2u; plane++) {
++      VkImagePlaneMemoryRequirementsInfo plane_requirements = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
++         .planeAspect = aspects[plane],
++      };
++      VkImageMemoryRequirementsInfo2 requirements_info = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++         .pNext = &plane_requirements,
++         .image = image,
++      };
++      VkMemoryRequirements2 requirements = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++      };
++      vkGetImageMemoryRequirements2(device, &requirements_info, &requirements);
++      uint32_t type = 0u;
++      while (type < memory_properties.memoryTypeCount &&
++             !(requirements.memoryRequirements.memoryTypeBits & (1u << type)))
++         type++;
++      CHECK(type < memory_properties.memoryTypeCount);
++      VkMemoryAllocateInfo allocate_info = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++         .allocationSize = requirements.memoryRequirements.size,
++         .memoryTypeIndex = type,
++      };
++      CHECK(vkAllocateMemory(device, &allocate_info, NULL, &memory[plane]) ==
++            VK_SUCCESS);
++
++      /* One plane per bind, as a disjoint image allows. */
++      VkBindImagePlaneMemoryInfo plane_bind = {
++         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO,
++         .planeAspect = aspects[plane],
++      };
++      VkBindImageMemoryInfo bind = {
++         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++         .pNext = &plane_bind,
++         .image = image,
++         .memory = memory[plane],
++      };
++      const unsigned before = watched.count;
++      CHECK(vkBindImageMemory2(device, 1, &bind) == VK_SUCCESS);
++      fprintf(stderr, "plane %u bind: %u address reports\n", plane,
++              watched.count - before);
++      CHECK(watched.count == before + 1u);
++      CHECK(watched.reports[before].type ==
++            VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
++      CHECK(watched.reports[before].address != 0u);
++      CHECK(watched.reports[before].size != 0u);
++      bound[plane] = watched.reports[before].address;
++   }
++   CHECK(bound[0] != bound[1]);
++
++   /* Destruction unbinds exactly the ranges the binds announced. */
++   vkDestroyImage(device, image, NULL);
++   CHECK(count_reports(VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT, 0u) == 2u);
++   for (unsigned plane = 0u; plane < 2u; plane++) {
++      CHECK(count_reports(VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT,
++                          bound[plane]) == 1u);
++      CHECK(count_reports(VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT,
++                          bound[plane]) == 1u);
++   }
++   watched.image = 0u;
++
++   for (unsigned plane = 0u; plane < 2u; plane++)
++      vkFreeMemory(device, memory[plane], NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyDebugUtilsMessengerEXT(instance, messenger, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("each disjoint plane is reported bound once and unbound once\n");
++   return 0;
++}

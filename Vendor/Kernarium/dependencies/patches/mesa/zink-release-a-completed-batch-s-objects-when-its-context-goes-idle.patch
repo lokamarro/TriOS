@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:50:19 +0900
+Subject: [PATCH] zink: release a completed batch's objects when its context
+ goes idle
+
+A context that is flushed and left alone keeps its completed batch states, and
+every resource object they reference, until its next batch asks for a state;
+the states it has already handed to the screen wait for the next submission of
+any context.  With every context quiet, that is render targets and textures no
+live object names, held for minutes: the whole of Android's idle orphan heaps
+once the buffer cache no longer hides them.
+
+pipe_context::trim does now what that next batch would do.  It hands the
+context's completed batch states to the screen in submission order, polling
+the timeline for a state whose completion nobody has observed and stopping at
+the first that has not completed, so it never waits.  It then resets every
+state the screen holds, which submit_queue already does after every
+submission; the loop moves into a helper both use, under the same two locks.
+The states are kept and become free states, so a later batch reuses them.  A
+copy context's states are not interchangeable, so it does nothing.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_batch.c   | 65 +++++++++++++++++++++----
+ src/gallium/drivers/zink/zink_batch.h   |  3 ++
+ src/gallium/drivers/zink/zink_context.c |  8 +++
+ 3 files changed, 66 insertions(+), 10 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index 81e9a063ae3e0922ad2f7a898980997d8c6dd788..226d29a183b8dd795009515c1198c163c1bc34d4 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -457,6 +457,60 @@ find_completed_batch_state(struct zink_context *ctx)
+    return NULL;
+ }
+ 
++/* reset the completed states that contexts have handed to the screen and make
++ * them free, which every submission does once it has been queued */
++static void
++reset_active_batch_states(struct zink_screen *screen)
++{
++   simple_mtx_lock(&screen->active_batch_states_lock);
++   simple_mtx_lock(&screen->free_batch_states_lock);
++   for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
++      reset_batch_state_internal(screen, i);
++      zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
++   }
++   screen->active_batch_states = NULL;
++   screen->last_active_batch_state = NULL;
++   simple_mtx_unlock(&screen->free_batch_states_lock);
++   simple_mtx_unlock(&screen->active_batch_states_lock);
++}
++
++/* A context that is flushed and then left alone keeps its completed batch
++ * states, and every resource object they reference, until its next batch asks
++ * for a state; the states it already handed to the screen wait for the next
++ * submission of any context.  When the client says the context has gone idle,
++ * do now what that batch would do: hand over the states that have completed,
++ * in order and without waiting for any that has not, then reset every state
++ * the screen holds so that the objects they reference can be released. */
++void
++zink_batch_trim(struct zink_context *ctx)
++{
++   struct zink_screen *screen = zink_screen(ctx->base.screen);
++
++   /* a copy context's states cannot be used by another context */
++   if (ctx->flags & ZINK_CONTEXT_COPY_ONLY)
++      return;
++
++   struct zink_batch_state *i = ctx->batch_states;
++   while (i) {
++      struct zink_batch_state *j = i->next;
++      /* states complete in the order they were submitted, so the first that
++       * has not is the last that is looked at */
++      if (!p_atomic_read(&i->fence.submitted) ||
++          !(p_atomic_read(&i->fence.completed) ||
++            (i->fence.batch_id &&
++             zink_screen_timeline_wait(screen, i->fence.batch_id, 0))))
++         break;
++      pop_batch_state(ctx);
++      reset_batch_state_ctx(ctx, i);
++      simple_mtx_lock(&screen->active_batch_states_lock);
++      i->ctx = NULL;
++      zink_batch_state_append(&screen->active_batch_states, &screen->last_active_batch_state, i);
++      simple_mtx_unlock(&screen->active_batch_states_lock);
++      i = j;
++   }
++   reset_active_batch_states(screen);
++}
++
+ /* find a "free" batch state */
+ static struct zink_batch_state *
+ get_batch_state(struct zink_context *ctx)
+@@ -852,16 +906,7 @@ end:
+ 
+    p_atomic_set(&bs->fence.submitted, true);
+ 
+-   simple_mtx_lock(&screen->active_batch_states_lock);
+-   simple_mtx_lock(&screen->free_batch_states_lock);
+-   for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
+-      reset_batch_state_internal(screen, i);
+-      zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
+-   }
+-   screen->active_batch_states = NULL;
+-   screen->last_active_batch_state = NULL;
+-   simple_mtx_unlock(&screen->free_batch_states_lock);
+-   simple_mtx_unlock(&screen->active_batch_states_lock);
++   reset_active_batch_states(screen);
+ }
+ 
+ /* called during flush */
+diff --git a/src/gallium/drivers/zink/zink_batch.h b/src/gallium/drivers/zink/zink_batch.h
+index 027536d6873a057e01f4603cedbff01e91d1700e..35e41b099f102f086a064960a1aca1a89cab37ef 100644
+--- a/src/gallium/drivers/zink/zink_batch.h
++++ b/src/gallium/drivers/zink/zink_batch.h
+@@ -48,6 +48,9 @@ zink_clear_batch_state(struct zink_context *ctx, struct zink_batch_state *bs);
+ void
+ zink_batch_reset_all(struct zink_context *ctx);
+ 
++void
++zink_batch_trim(struct zink_context *ctx);
++
+ void
+ zink_batch_state_destroy(struct zink_screen *screen, struct zink_batch_state *bs);
+ 
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index ebd6b5414814b9babfa1274d1cec366afa2be5a8..a4382ff9d62b36bb4551d5df58eb509e05454230 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -4785,6 +4785,13 @@ zink_check_batch_completion(struct zink_context *ctx, uint64_t batch_id)
+    return success;
+ }
+ 
++/* the client has flushed this context and found it idle */
++static void
++zink_trim(struct pipe_context *pctx)
++{
++   zink_batch_trim(zink_context(pctx));
++}
++
+ static void
+ zink_texture_barrier(struct pipe_context *pctx, unsigned flags)
+ {
+@@ -6098,6 +6105,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+    ctx->base.flush = zink_flush;
+    ctx->base.memory_barrier = zink_memory_barrier;
+    ctx->base.texture_barrier = zink_texture_barrier;
++   ctx->base.trim = zink_trim;
+    ctx->base.evaluate_depth_buffer = zink_evaluate_depth_buffer;
+ 
+    ctx->base.resource_commit = zink_resource_commit;

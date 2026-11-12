@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:14:09 +0900
+Subject: [PATCH] ALSA: virtio: run the elapsed-period work on a real-time
+ worker
+
+A completed I/O message queued the substream's elapsed-period work on
+the system workqueue, so it ran in a nice-0 kworker bound to the CPU
+that took the interrupt. Under user-mode Linux every device interrupt
+lands on CPU 0, and with that CPU busy the work waited behind every
+other task there, the user interface's above all, while the writer of
+the next period could not run until the work had woken it. With five
+millisecond periods and a buffer of four, a wait of 15 ms was enough
+to let the device run dry: on a two-CPU guest scrolling its launcher,
+the work waited 5 ms after the interrupt at the 99th percentile and up
+to 50 ms.
+
+Give each device a kthread worker at the lowest real-time priority and
+queue the work there. It runs ahead of every normal task, on whichever
+CPU can run it first, and below the real-time audio threads it serves.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sound/virtio/virtio_card.c    | 21 +++++++++++++++++++--
+ sound/virtio/virtio_card.h    |  4 ++++
+ sound/virtio/virtio_pcm.c     |  5 +++--
+ sound/virtio/virtio_pcm.h     |  6 ++++--
+ sound/virtio/virtio_pcm_msg.c |  3 ++-
+ sound/virtio/virtio_pcm_ops.c |  2 +-
+ 6 files changed, 33 insertions(+), 8 deletions(-)
+
+diff --git a/sound/virtio/virtio_card.c b/sound/virtio/virtio_card.c
+index 56e3f49621ad1e9eacb84a2a41c6396db8096179..9eec4e924d5d104bb0e2d7503eec6e2c9060bc58 100644
+--- a/sound/virtio/virtio_card.c
++++ b/sound/virtio/virtio_card.c
+@@ -316,6 +316,22 @@ static int virtsnd_probe(struct virtio_device *vdev)
+ 
+ 	vdev->priv = snd;
+ 
++	/*
++	 * The elapsed-period work moves the substream on and wakes the writer
++	 * of the next period. Queued on the system workqueue it ran on the CPU
++	 * that took the interrupt, behind every task of that CPU, and a busy
++	 * CPU let the device run dry. A real-time worker runs it at once, on
++	 * whichever CPU can.
++	 */
++	snd->elapsed_worker = kthread_run_worker(0, "virtsnd-%s",
++						 dev_name(&vdev->dev));
++	if (IS_ERR(snd->elapsed_worker)) {
++		rc = PTR_ERR(snd->elapsed_worker);
++		snd->elapsed_worker = NULL;
++		return rc;
++	}
++	sched_set_fifo_low(snd->elapsed_worker->task);
++
+ 	for (i = 0; i < VIRTIO_SND_VQ_MAX; ++i)
+ 		spin_lock_init(&snd->queues[i].lock);
+ 
+@@ -361,10 +377,11 @@ static void virtsnd_remove(struct virtio_device *vdev)
+ 	for (i = 0; snd->substreams && i < snd->nsubstreams; ++i) {
+ 		struct virtio_pcm_substream *vss = &snd->substreams[i];
+ 
+-		cancel_work_sync(&vss->elapsed_period);
++		kthread_cancel_work_sync(&vss->elapsed_period);
+ 		virtsnd_pcm_msg_free(vss);
+ 	}
+ 
++	kthread_destroy_worker(snd->elapsed_worker);
+ 	kfree(snd->event_msgs);
+ }
+ 
+@@ -410,7 +427,7 @@ static int virtsnd_freeze(struct virtio_device *vdev)
+ 	vdev->config->del_vqs(vdev);
+ 
+ 	for (i = 0; i < snd->nsubstreams; ++i)
+-		cancel_work_sync(&snd->substreams[i].elapsed_period);
++		kthread_cancel_work_sync(&snd->substreams[i].elapsed_period);
+ 
+ 	kfree(snd->event_msgs);
+ 	snd->event_msgs = NULL;
+diff --git a/sound/virtio/virtio_card.h b/sound/virtio/virtio_card.h
+index 3ceee4e416fc7be8c016064bfe08f26f8fe86fb8..fa3f6c3e2dc334e09baf1185238b54fbf2b1ed46 100644
+--- a/sound/virtio/virtio_card.h
++++ b/sound/virtio/virtio_card.h
+@@ -6,6 +6,7 @@
+ #ifndef VIRTIO_SND_CARD_H
+ #define VIRTIO_SND_CARD_H
+ 
++#include <linux/kthread.h>
+ #include <linux/slab.h>
+ #include <linux/virtio.h>
+ #include <sound/core.h>
+@@ -58,6 +59,8 @@ struct virtio_kctl {
+  * @kctl_infos: VirtIO control element information.
+  * @kctls: VirtIO control elements.
+  * @nkctls: Number of control elements.
++ * @elapsed_worker: Real-time worker that runs the substreams' elapsed-period
++ *                  work.
+  */
+ struct virtio_snd {
+ 	struct virtio_device *vdev;
+@@ -75,6 +78,7 @@ struct virtio_snd {
+ 	struct virtio_snd_ctl_info *kctl_infos;
+ 	struct virtio_kctl *kctls;
+ 	u32 nkctls;
++	struct kthread_worker *elapsed_worker;
+ };
+ 
+ /* Message completion timeout in milliseconds (module parameter). */
+diff --git a/sound/virtio/virtio_pcm.c b/sound/virtio/virtio_pcm.c
+index fc98735d3c7e1bae6616605434a490006eff6ef8..4f46043a15fa4a299b1f689a0fdb3abdabc377ea 100644
+--- a/sound/virtio/virtio_pcm.c
++++ b/sound/virtio/virtio_pcm.c
+@@ -306,7 +306,7 @@ int virtsnd_pcm_validate(struct virtio_device *vdev)
+  *
+  * Context: Process context.
+  */
+-static void virtsnd_pcm_period_elapsed(struct work_struct *work)
++static void virtsnd_pcm_period_elapsed(struct kthread_work *work)
+ {
+ 	struct virtio_pcm_substream *vss =
+ 		container_of(work, struct virtio_pcm_substream, elapsed_period);
+@@ -379,7 +379,8 @@ int virtsnd_pcm_parse_cfg(struct virtio_snd *snd)
+ 
+ 		vss->snd = snd;
+ 		vss->sid = i;
+-		INIT_WORK(&vss->elapsed_period, virtsnd_pcm_period_elapsed);
++		kthread_init_work(&vss->elapsed_period,
++				  virtsnd_pcm_period_elapsed);
+ 		init_waitqueue_head(&vss->msg_empty);
+ 		spin_lock_init(&vss->lock);
+ 	}
+diff --git a/sound/virtio/virtio_pcm.h b/sound/virtio/virtio_pcm.h
+index 4fd4807ab99a7971ffb01812a08fe2c8bfbfbdeb..e0397353612285ee139e8518eed2c8b0e743e654 100644
+--- a/sound/virtio/virtio_pcm.h
++++ b/sound/virtio/virtio_pcm.h
+@@ -7,6 +7,7 @@
+ #define VIRTIO_SND_PCM_H
+ 
+ #include <linux/atomic.h>
++#include <linux/kthread.h>
+ #include <linux/virtio_config.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm-indirect.h>
+@@ -24,7 +25,8 @@ struct virtio_pcm_msg;
+  * @substream: Kernel ALSA substream.
+  * @pcm_indirect: Kernel indirect pcm structure.
+  * @hw: Kernel ALSA substream hardware descriptor.
+- * @elapsed_period: Kernel work to handle the elapsed period state.
++ * @elapsed_period: Work on the device's elapsed_worker to handle the elapsed
++ *                  period state.
+  * @lock: Spinlock that protects fields shared by interrupt handlers and
+  *        substream operators.
+  * @buffer_bytes: Current buffer size in bytes.
+@@ -54,7 +56,7 @@ struct virtio_pcm_substream {
+ 	struct snd_pcm_substream *substream;
+ 	struct snd_pcm_indirect pcm_indirect;
+ 	struct snd_pcm_hardware hw;
+-	struct work_struct elapsed_period;
++	struct kthread_work elapsed_period;
+ 	spinlock_t lock;
+ 	size_t buffer_bytes;
+ 	size_t hw_ptr;
+diff --git a/sound/virtio/virtio_pcm_msg.c b/sound/virtio/virtio_pcm_msg.c
+index b8c363b28c06674166e006b3830c20a46ec48334..2e73ba39473e5d4b8fcb17f164b7076c1941b0fa 100644
+--- a/sound/virtio/virtio_pcm_msg.c
++++ b/sound/virtio/virtio_pcm_msg.c
+@@ -343,7 +343,8 @@ static void virtsnd_pcm_msg_complete(struct virtio_pcm_msg *msg,
+ 			bytes_to_frames(runtime,
+ 					le32_to_cpu(msg->status.latency_bytes));
+ 
+-		schedule_work(&vss->elapsed_period);
++		kthread_queue_work(vss->snd->elapsed_worker,
++				   &vss->elapsed_period);
+ 	} else if (!vss->msg_count) {
+ 		wake_up_all(&vss->msg_empty);
+ 	}
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 5f9ea78fe9601ea7de3d42540dd7a03c454388eb..7e8c4911be01c8011ed6aac53ebc515f248f9d9c 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -447,7 +447,7 @@ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+ 
+-	cancel_work_sync(&vss->elapsed_period);
++	kthread_cancel_work_sync(&vss->elapsed_period);
+ 
+ 	if (!vss->stopped)
+ 		return 0;

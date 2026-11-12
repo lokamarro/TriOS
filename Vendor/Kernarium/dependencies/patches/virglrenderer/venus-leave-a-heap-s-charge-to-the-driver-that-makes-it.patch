@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:37:54 +0900
+Subject: [PATCH] venus: leave a heap's charge to the driver that makes it
+
+The renderer reserved every guest allocation from the host's device-memory pool
+before the driver made it, and chained the pool to each device it created so
+that the driver could charge the heaps it makes for itself. The host's OpenGL
+driver creates a device of its own, outside the renderer, and no one charged
+its allocations.
+
+The driver now holds the pool for the process, and the renderer states it
+there when the host states it to the renderer. Every heap of either path is
+then reserved once, where the driver makes it, and the renderer no longer
+chains the pool or reserves the allocation itself, which would charge a heap
+twice while it is made.
+
+The one allocation the driver cannot see is host-visible memory shared with the
+guest: the renderer makes the pages and the driver imports them. The renderer
+charges those pages before it makes them. An import of an existing resource is
+charged by no one.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_device.c        | 38 -----------------------------
+ src/venus/vkr_device_memory.c | 45 +++++++++++++++++++++--------------
+ src/venus/vkr_renderer.c      | 40 +++++++++++++++++++++++++++++--
+ src/virglrenderer.h           |  9 ++++---
+ 4 files changed, 71 insertions(+), 61 deletions(-)
+
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index c4f4abd5ef8fbdb387c0157711b2b2b7f3afe134..9343e4d77c5433eff6aeca41c135622bed6ac74f 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -5,8 +5,6 @@
+ 
+ #include "vkr_device.h"
+ 
+-#include <kosmickrisp/kk_device_memory_pool.h>
+-
+ #include <vn_protocol_renderer_device.h>
+ 
+ #include "vkr_command_buffer.h"
+@@ -120,24 +118,6 @@ vkr_device_init_renderer_procs(struct vkr_device *dev)
+    return true;
+ }
+ 
+-static VkBool32 VKAPI_PTR
+-vkr_device_memory_pool_reserve(UNUSED void *data, VkDeviceSize size)
+-{
+-   return vkr_renderer_device_memory_reserve(size);
+-}
+-
+-static void VKAPI_PTR
+-vkr_device_memory_pool_release(UNUSED void *data, VkDeviceSize size)
+-{
+-   vkr_renderer_device_memory_release(size);
+-}
+-
+-static VkDeviceSize VKAPI_PTR
+-vkr_device_memory_pool_headroom(UNUSED void *data)
+-{
+-   return vkr_renderer_get_device_memory_headroom();
+-}
+-
+ static void
+ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkCreateDevice *args)
+@@ -237,26 +217,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    }
+ 
+    vn_replace_vkCreateDevice_args_handle(args);
+-
+-   /* The driver charges the memory it allocates for itself, which no guest
+-    * allocation accounts for, to the pool the guest's allocations are
+-    * charged to. The guest cannot name this structure: the protocol decoder
+-    * rejects a chain member it does not know.
+-    */
+-   VkDeviceCreateInfo *create_info = (VkDeviceCreateInfo *)args->pCreateInfo;
+-   const void *guest_next = create_info->pNext;
+-   VkDeviceMemoryPoolCreateInfoKK pool_info = {
+-      .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK,
+-      .pNext = guest_next,
+-      .pfnReserve = vkr_device_memory_pool_reserve,
+-      .pfnRelease = vkr_device_memory_pool_release,
+-      .pfnHeadroom = vkr_device_memory_pool_headroom,
+-   };
+-   if (vkr_renderer_get_device_memory_limit())
+-      create_info->pNext = &pool_info;
+    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
+                                 &dev->base.handle.device);
+-   create_info->pNext = guest_next;
+    if (args->ret != VK_SUCCESS) {
+       free(exts);
+       free(dev);
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 65b58fca5172571b4fceb86606aa104e9a15ea8e..62e9470c76338eb9e84ebb0946f1c9ac38f56176 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -240,7 +240,8 @@ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *phys
+ 
+ static void
+ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+-                           struct vn_command_vkAllocateMemory *args)
++                           struct vn_command_vkAllocateMemory *args,
++                           VkDeviceSize *reserved)
+ {
+    struct vkr_context *ctx = dispatch->data;
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+@@ -417,6 +418,17 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+          export_info = NULL;
+       }
+ 
++      /* The driver sees these pages as memory to import, which it does not
++       * charge, so the renderer charges them before it makes them: the pool
++       * counts them once the driver has made a Metal buffer over them.
++       */
++      const VkDeviceSize charge = align(alloc_info->allocationSize, getpagesize());
++      if (!vkr_renderer_device_memory_reserve(charge)) {
++         args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         return;
++      }
++      *reserved = charge;
++
+       host_shm = virgl_host_shm_alloc(
+          alloc_info->allocationSize,
+          physical_dev->min_imported_host_pointer_alignment);
+@@ -560,31 +572,28 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+    mem->memory_type_index = host_mem_type_index;
+ }
+ 
+-/* A new allocation has to fit the device memory the host granted the guest,
+- * so it is reserved from the host's pool while the driver makes it, and the
+- * reservation is released once the driver has made it, when the pool's usage
+- * counts it, or has failed. Allocations the renderer admits concurrently, and
+- * those the driver makes for itself, therefore never pass the limit together.
+- * An import names memory that already exists, so it is not charged twice.
++/* A new allocation has to fit the device memory the host granted the guest.
++ * The driver charges every heap it makes to the host's pool, so the guest's
++ * allocations and the driver's own never pass the limit together, and a heap
++ * it cannot charge fails here with VK_ERROR_OUT_OF_DEVICE_MEMORY. What the
++ * driver cannot charge is host-visible memory the renderer shares with the
++ * guest: the pages are made first and the driver imports them, so the
++ * renderer reserves their size, and releases the reservation once the driver
++ * has made its buffer over them, when the pool's usage counts them, or has
++ * failed. An import of an existing resource names memory that exists already
++ * and is not charged.
+  */
+ static void
+ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkAllocateMemory *args)
+ {
+    TRACE_FUNC();
+-   const VkMemoryAllocateInfo *alloc_info = args->pAllocateInfo;
+-   const bool charged = !vkr_find_struct(
+-      alloc_info->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+-   const VkDeviceSize size = alloc_info->allocationSize;
+-   if (charged && !vkr_renderer_device_memory_reserve(size)) {
+-      args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+-      return;
+-   }
++   VkDeviceSize reserved = 0;
+ 
+-   vkr_device_memory_allocate(dispatch, args);
++   vkr_device_memory_allocate(dispatch, args, &reserved);
+ 
+-   if (charged)
+-      vkr_renderer_device_memory_release(size);
++   if (reserved)
++      vkr_renderer_device_memory_release(reserved);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index e6ca2dc0026df3ace1f0a1ff9cf3c2d7d80aeab1..1b39488843090e9ea3be81d131390fe6003ae559 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -11,6 +11,8 @@
+ 
+ #include "vkr_context.h"
+ 
++#include <kosmickrisp/kk_device_memory_pool.h>
++
+ struct vkr_renderer_state {
+    const struct vkr_renderer_callbacks *cbs;
+ 
+@@ -45,18 +47,52 @@ vkr_renderer_get_host_visible_aperture_size(void)
+    return vkr_state.host_visible_aperture_size;
+ }
+ 
++static VkBool32 VKAPI_PTR
++vkr_device_memory_pool_reserve(UNUSED void *data, VkDeviceSize size)
++{
++   return vkr_renderer_device_memory_reserve(size);
++}
++
++static void VKAPI_PTR
++vkr_device_memory_pool_release(UNUSED void *data, VkDeviceSize size)
++{
++   vkr_renderer_device_memory_release(size);
++}
++
++static VkDeviceSize VKAPI_PTR
++vkr_device_memory_pool_headroom(UNUSED void *data)
++{
++   return vkr_renderer_get_device_memory_headroom();
++}
++
+ /* Set before vkr_renderer_init, like the aperture: the share of memory the
+  * host grants the guest's GPU is a property of the host.
++ *
++ * The driver charges what it allocates to the same pool, for every device the
++ * process creates, the renderer's and those of the host's OpenGL driver
++ * alike, through the pool KosmicKrisp holds for the process. The driver's
++ * pool is cleared before the renderer's is changed: clearing it returns once
++ * no callback is running, so the callbacks never read a pool being rewritten.
+  */
+ void
+ vkr_renderer_set_device_memory_pool(
+    const struct vkr_renderer_device_memory_pool *pool)
+ {
+-   if (pool && pool->limit && pool->usage && pool->reserve && pool->release)
++   kk_set_device_memory_pool(NULL);
++
++   if (pool && pool->limit && pool->usage && pool->reserve && pool->release) {
+       vkr_state.device_memory_pool = *pool;
+-   else
++      const VkDeviceMemoryPoolCreateInfoKK driver_pool = {
++         .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_POOL_CREATE_INFO_KK,
++         .pfnReserve = vkr_device_memory_pool_reserve,
++         .pfnRelease = vkr_device_memory_pool_release,
++         .pfnHeadroom = vkr_device_memory_pool_headroom,
++      };
++      kk_set_device_memory_pool(&driver_pool);
++   } else {
+       memset(&vkr_state.device_memory_pool, 0,
+              sizeof(vkr_state.device_memory_pool));
++   }
+ }
+ 
+ uint64_t
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 2b9c5dab5e96c54f71940a69aebe475bd41c9659..7ba357cacc684d0e1374542c56fe3454fe372eef 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -616,9 +616,12 @@ struct virgl_renderer_device_memory_pool {
+  * most the limit, memory budgets leave the guest only what the pool has left,
+  * and a new allocation the pool cannot reserve fails with
+  * VK_ERROR_OUT_OF_DEVICE_MEMORY. An import names memory that already exists
+- * and is not charged. Every device the renderer creates for a guest charges
+- * the memory it allocates for itself to the same pool. The structure is
+- * copied, and `data` must outlive the renderer. Call this before
++ * and is not charged. The host's Vulkan driver charges the heaps of every
++ * device it creates in the process to the same pool, the devices the renderer
++ * creates for a guest and the one the host's OpenGL driver renders on alike,
++ * so a refused heap fails an allocation of either path. The structure is
++ * copied, and `data` must outlive the renderer: a call with NULL, or with a
++ * pool of zero limit, returns once no callback is running. Call this before
+  * `virgl_renderer_init`.
+  */
+ VIRGL_EXPORT void

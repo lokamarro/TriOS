@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 12:50:57 +0000
+Subject: [PATCH] um: load an initrd from a host-file range
+
+Let partition-backed Android ramdisks stay inside the immutable GPT image while UML reads only the selected boot-image payload.
+---
+ arch/um/kernel/initrd.c    | 48 ++++++++++++++++++++++++-
+ arch/um/kernel/load_file.c | 73 ++++++++++++++++++++++++++------------
+ arch/um/kernel/um_arch.h   |  2 ++
+ 3 files changed, 99 insertions(+), 24 deletions(-)
+
+diff --git a/arch/um/kernel/initrd.c b/arch/um/kernel/initrd.c
+index 99dba827461c8acfc9c87f1ba17ac985df86a711..dcb1e4770846f39ecd822f93103f542406182891 100644
+--- a/arch/um/kernel/initrd.c
++++ b/arch/um/kernel/initrd.c
+@@ -7,6 +7,7 @@
+ #include <linux/memblock.h>
+ #include <linux/initrd.h>
+ #include <asm/types.h>
++#include <linux/kstrtox.h>
+ #include <init.h>
+ #include <os.h>
+ 
+@@ -14,6 +15,11 @@
+ 
+ /* Changed by uml_initrd_setup, which is a setup */
+ static char *initrd __initdata = NULL;
++static unsigned long long initrd_offset __initdata;
++static unsigned long long initrd_size __initdata;
++static bool initrd_offset_set __initdata;
++static bool initrd_size_set __initdata;
++static bool initrd_range_invalid __initdata;
+ 
+ int __init read_initrd(void)
+ {
+@@ -23,7 +29,16 @@ int __init read_initrd(void)
+ 	if (!initrd)
+ 		return 0;
+ 
+-	area = uml_load_file(initrd, &size);
++	if (initrd_range_invalid || initrd_offset_set != initrd_size_set) {
++		printk(KERN_ERR "initrd_offset and initrd_size are invalid or incomplete\n");
++		return 0;
++	}
++
++	if (initrd_offset_set) {
++		size = initrd_size;
++		area = uml_load_file_range(initrd, initrd_offset, size);
++	} else
++		area = uml_load_file(initrd, &size);
+ 	if (!area)
+ 		return 0;
+ 
+@@ -39,8 +54,39 @@ static int __init uml_initrd_setup(char *line, int *add)
+ 	return 0;
+ }
+ 
++static int __init uml_initrd_offset_setup(char *line, int *add)
++{
++	*add = 0;
++	if (kstrtoull(line, 0, &initrd_offset))
++		initrd_range_invalid = true;
++	else
++		initrd_offset_set = true;
++	return 0;
++}
++
++static int __init uml_initrd_size_setup(char *line, int *add)
++{
++	*add = 0;
++	if (kstrtoull(line, 0, &initrd_size))
++		initrd_range_invalid = true;
++	else
++		initrd_size_set = true;
++	return 0;
++}
++
+ __uml_setup("initrd=", uml_initrd_setup,
+ "initrd=<initrd image>\n"
+ "    This is used to boot UML from an initrd image.  The argument is the\n"
+ "    name of the file containing the image.\n\n"
+ );
++
++__uml_setup("initrd_offset=", uml_initrd_offset_setup,
++"initrd_offset=<byte offset>\n"
++"    Load the initrd from this byte offset inside the initrd image. This must\n"
++"    be used together with initrd_size.\n\n"
++);
++
++__uml_setup("initrd_size=", uml_initrd_size_setup,
++"initrd_size=<byte size>\n"
++"    Load this many initrd bytes starting at initrd_offset.\n\n"
++);
+diff --git a/arch/um/kernel/load_file.c b/arch/um/kernel/load_file.c
+index cb9d178ab7d84236e8a528fdef2a1b23a73aa10e..bb2e5c4c756c28dae4193e7974a83aff98e47b94 100644
+--- a/arch/um/kernel/load_file.c
++++ b/arch/um/kernel/load_file.c
+@@ -2,14 +2,18 @@
+ /*
+  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+  */
++#include <linux/limits.h>
+ #include <linux/memblock.h>
+ #include <os.h>
+ 
+ #include "um_arch.h"
+ 
+-static int __init __uml_load_file(const char *filename, void *buf, int size)
++static int __init __uml_load_file(const char *filename, void *buf,
++				  unsigned long long offset,
++				  unsigned long long size)
+ {
+-	int fd, n;
++	unsigned long long completed = 0;
++	int fd;
+ 
+ 	fd = os_open_file(filename, of_read(OPENFLAGS()), 0);
+ 	if (fd < 0) {
+@@ -17,43 +21,66 @@ static int __init __uml_load_file(const char *filename, void *buf, int size)
+ 		       -fd);
+ 		return -1;
+ 	}
+-	n = os_read_file(fd, buf, size);
+-	if (n != size) {
+-		printk(KERN_ERR "Read of %d bytes from '%s' failed, "
+-		       "err = %d\n", size,
+-		       filename, -n);
+-		return -1;
++	while (completed < size) {
++		unsigned long long remaining = size - completed;
++		int chunk = remaining > INT_MAX ? INT_MAX : remaining;
++		int n = os_pread_file(fd, (char *)buf + completed, chunk,
++				      offset + completed);
++
++		if (n != chunk) {
++			printk(KERN_ERR
++			       "Read of %d bytes at %llu from '%s' failed, err = %d\n",
++			       chunk, offset + completed, filename, -n);
++			os_close_file(fd);
++			return -1;
++		}
++		completed += chunk;
+ 	}
+ 
+ 	os_close_file(fd);
+ 	return 0;
+ }
+ 
+-void *uml_load_file(const char *filename, unsigned long long *size)
++static void *__init uml_load_file_span(const char *filename,
++				       unsigned long long offset,
++				       unsigned long long size)
+ {
+ 	void *area;
+-	int err;
+ 
+-	*size = 0;
++	area = memblock_alloc_or_panic(size, SMP_CACHE_BYTES);
+ 
+-	if (!filename)
++	if (__uml_load_file(filename, area, offset, size)) {
++		memblock_free(area, size);
+ 		return NULL;
++	}
+ 
+-	err = os_file_size(filename, size);
+-	if (err)
+-		return NULL;
++	return area;
++}
+ 
+-	if (*size == 0) {
+-		printk(KERN_ERR "\"%s\" is empty\n", filename);
++void *uml_load_file_range(const char *filename, unsigned long long offset,
++			  unsigned long long size)
++{
++	unsigned long long file_size;
++
++	if (!filename || os_file_size(filename, &file_size))
++		return NULL;
++	if (size == 0 || offset > file_size || size > file_size - offset) {
++		printk(KERN_ERR "Requested range is outside \"%s\"\n", filename);
+ 		return NULL;
+ 	}
++	return uml_load_file_span(filename, offset, size);
++}
+ 
+-	area = memblock_alloc_or_panic(*size, SMP_CACHE_BYTES);
+-
+-	if (__uml_load_file(filename, area, *size)) {
+-		memblock_free(area, *size);
++void *uml_load_file(const char *filename, unsigned long long *size)
++{
++	*size = 0;
++	if (!filename)
++		return NULL;
++	if (os_file_size(filename, size))
++		return NULL;
++	if (*size == 0) {
++		printk(KERN_ERR "\"%s\" is empty\n", filename);
+ 		return NULL;
+ 	}
+-
+-	return area;
++	return uml_load_file_span(filename, 0, *size);
+ }
+diff --git a/arch/um/kernel/um_arch.h b/arch/um/kernel/um_arch.h
+index 46e731ab9dfcdebf842fbf4feafffdb6c4d74bed..23ed4c90bb6dd26cc7c5205de694abce676f13ea 100644
+--- a/arch/um/kernel/um_arch.h
++++ b/arch/um/kernel/um_arch.h
+@@ -4,6 +4,8 @@
+ #define __UML_ARCH_H__
+ 
+ extern void * __init uml_load_file(const char *filename, unsigned long long *size);
++extern void * __init uml_load_file_range(const char *filename,
++		unsigned long long offset, unsigned long long size);
+ 
+ #ifdef CONFIG_OF
+ extern void __init uml_dtb_init(void);

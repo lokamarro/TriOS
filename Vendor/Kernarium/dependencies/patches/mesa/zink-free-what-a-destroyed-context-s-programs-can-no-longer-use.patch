@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:58:46 +0900
+Subject: [PATCH] zink: free what a destroyed context's programs can no longer
+ use
+
+A gfx program is reachable only through the context that created it, but
+its shaders hold its references, and the screen's live shader cache shares
+one shader with every context that compiles the same source. Destroying a
+context marks its programs removed and leaves them to their shaders. A
+program with a shader another live context still uses then keeps every
+pipeline it built, its shader variants, its pipeline cache, its library
+set and the driver state behind them for as long as that shader lives,
+although nothing can ever bind it again.
+
+virglrenderer serves every guest GL client through one screen, and
+Android's UI toolkit compiles the same shaders in every app, so each app a
+guest started and closed left its pipelines behind for good: on
+KosmicKrisp about 25-35 Metal render pipelines, their compute prologues
+and the generated MSL per launch, without bound.
+
+Track each gfx program on its context's list, under a screen lock, and
+when the context is destroyed free the pipelines, pipeline cache, shader
+variants and library reference of every program still on it. The program
+itself still goes with its last shader.
+---
+ src/gallium/drivers/zink/zink_context.c |   2 +
+ src/gallium/drivers/zink/zink_program.c | 149 ++++++++++++++++++++++++
+ src/gallium/drivers/zink/zink_program.h |   3 +
+ src/gallium/drivers/zink/zink_screen.c  |   1 +
+ src/gallium/drivers/zink/zink_types.h   |   8 ++
+ 5 files changed, 163 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 1cf085015d81247e626341e2f10f30e606c3b7c5..ebd6b5414814b9babfa1274d1cec366afa2be5a8 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -194,6 +194,7 @@ zink_context_destroy(struct pipe_context *pctx)
+       }
+       simple_mtx_unlock((&ctx->mesh_lock[i]));
+    }
++   zink_context_release_programs(ctx);
+ 
+    if (ctx->blitter)
+       util_blitter_destroy(ctx->blitter);
+@@ -6013,6 +6014,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+       goto fail;
+ 
+    ctx->flags = flags;
++   list_inithead(&ctx->gfx_programs);
+    memset(ctx->pipeline_changed, 1, sizeof(ctx->pipeline_changed));
+    ctx->gfx_pipeline_state.dirty = ctx->gfx_pipeline_state.mesh_dirty = true;
+    ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch = 1;
+diff --git a/src/gallium/drivers/zink/zink_program.c b/src/gallium/drivers/zink/zink_program.c
+index 5f8d93e906daf07e80077aa00b096e6aa1c7b1f4..121b231475208dc8e0545ed4b37c1e9bd4cefa62 100644
+--- a/src/gallium/drivers/zink/zink_program.c
++++ b/src/gallium/drivers/zink/zink_program.c
+@@ -1140,6 +1140,12 @@ create_program(struct zink_context *ctx, bool is_compute)
+    pg->is_compute = is_compute;
+    pg->precompile_done = true;
+    pg->ctx = ctx;
++   if (!is_compute) {
++      struct zink_screen *screen = zink_screen(ctx->base.screen);
++      simple_mtx_lock(&screen->program_owner_lock);
++      list_addtail(&pg->ctx_link, &ctx->gfx_programs);
++      simple_mtx_unlock(&screen->program_owner_lock);
++   }
+    return (void*)pg;
+ }
+ 
+@@ -1846,10 +1852,153 @@ deinit_program(struct zink_screen *screen, struct zink_program *pg)
+    zink_descriptor_program_deinit(screen, pg);
+ }
+ 
++/* Frees everything only a bound program could use, and leaves what
++ * gfx_shader_prune() and zink_destroy_gfx_program() still read. */
++static void
++release_gfx_program_state(struct zink_screen *screen,
++                          struct zink_gfx_program *prog)
++{
++   util_queue_fence_wait(&prog->base.cache_fence);
++   for (int i = 0; i < ARRAY_SIZE(prog->pipelines); ++i) {
++      hash_table_foreach(&prog->pipelines[i], entry) {
++         struct zink_gfx_pipeline_cache_entry *pc_entry = entry->data;
++
++         util_queue_fence_wait(&pc_entry->fence);
++         VKSCR(DestroyPipeline)(screen->dev, pc_entry->pipeline, NULL);
++         VKSCR(DestroyPipeline)(screen->dev, pc_entry->gpl.unoptimized_pipeline, NULL);
++         free(pc_entry);
++      }
++      _mesa_hash_table_clear(&prog->pipelines[i], NULL);
++   }
++   memset(prog->last_finalized_hash, 0, sizeof(prog->last_finalized_hash));
++   memset(prog->last_pipeline, 0, sizeof(prog->last_pipeline));
++   if (prog->base.pipeline_cache) {
++      VKSCR(DestroyPipelineCache)(screen->dev, prog->base.pipeline_cache, NULL);
++      prog->base.pipeline_cache = VK_NULL_HANDLE;
++   }
++   if (!prog->is_separable) {
++      for (int i = 0; i < MESA_SHADER_MESH_STAGES; ++i) {
++         destroy_shader_cache(screen, &prog->shader_cache[i][0][0]);
++         destroy_shader_cache(screen, &prog->shader_cache[i][0][1]);
++         destroy_shader_cache(screen, &prog->shader_cache[i][1][0]);
++         destroy_shader_cache(screen, &prog->shader_cache[i][1][1]);
++         blob_finish(&prog->blobs[i]);
++         blob_init(&prog->blobs[i]);
++      }
++   }
++   /* the libraries of a shader set only this program still names */
++   if (prog->libs) {
++      zink_gfx_lib_cache_unref(screen, prog->libs);
++      prog->libs = NULL;
++   }
++}
++
++/* Takes the dead context's programs out of the shaders' program sets and
++ * hands them back with the reference each set held.
++ *
++ * The shaders to look in are the screen's live ones: the cache's lock lets no
++ * reference go while it is held, so none of them is being freed, and a shader
++ * that is, already left the cache, runs gfx_shader_prune() on whatever its
++ * set still names and keeps the program valid until then.  So a program
++ * that is detached here no longer has the shader in its slot, and one that is
++ * not keeps it, which that prune clears.
++ *
++ * Only programs of a vertex and a fragment shader are detached: no other
++ * shader is generated for them, so gfx_shader_prune() on another of their
++ * shaders reads no slot this clears.
++ */
++static void
++detach_programs_from_shaders(struct zink_screen *screen,
++                             struct zink_context *ctx,
++                             struct util_dynarray *detached)
++{
++   const unsigned stages = BITFIELD_BIT(MESA_SHADER_VERTEX) |
++                           BITFIELD_BIT(MESA_SHADER_FRAGMENT);
++
++   simple_mtx_lock(&screen->shaders.lock);
++   hash_table_foreach(screen->shaders.hashtable, he) {
++      struct zink_shader *zs = he->data;
++      if (zs->info.stage != MESA_SHADER_VERTEX &&
++          zs->info.stage != MESA_SHADER_FRAGMENT)
++         continue;
++      simple_mtx_lock(&zs->lock);
++      set_foreach(zs->programs, se) {
++         struct zink_gfx_program *prog = (void*)se->key;
++         if (prog->base.ctx != ctx || (prog->stages_present & ~stages))
++            continue;
++         _mesa_set_remove(zs->programs, se);
++         prog->shaders[zs->info.stage] = NULL;
++         util_dynarray_append(detached, prog);
++      }
++      simple_mtx_unlock(&zs->lock);
++   }
++   simple_mtx_unlock(&screen->shaders.lock);
++}
++
++/* A gfx program is reachable only through the context that created it, but
++ * its shaders keep it alive, and the screen's live shader cache shares a
++ * shader with every context that compiles the same source.  So when a context
++ * is destroyed, each of its programs that has a shader another live context
++ * still uses would keep every pipeline it built, and all the driver state
++ * behind them, for as long as that shader lives, although nothing can bind
++ * the program again.  A host that serves many short-lived clients through one
++ * screen, as virglrenderer does, then grows with every client it ever served.
++ * Free its pipelines, shader variants and libraries now, and let go of the
++ * shaders that name it: a program of a vertex and a fragment shader then goes
++ * with the last reference of its batches, and any other with its last shader.
++ */
++void
++zink_context_release_programs(struct zink_context *ctx)
++{
++   struct zink_screen *screen = zink_screen(ctx->base.screen);
++   struct util_dynarray held;
++   util_dynarray_init(&held, NULL);
++
++   simple_mtx_lock(&screen->program_owner_lock);
++   list_for_each_entry_safe(struct zink_program, pg, &ctx->gfx_programs, ctx_link) {
++      list_del(&pg->ctx_link);
++      pg->orphaned = true;
++      /* a program whose last reference is gone is already being destroyed */
++      int32_t count = p_atomic_read(&pg->reference.count);
++      while (count > 0) {
++         int32_t seen = p_atomic_cmpxchg(&pg->reference.count, count, count + 1);
++         if (seen == count)
++            break;
++         count = seen;
++      }
++      if (count > 0)
++         util_dynarray_append(&held, (struct zink_gfx_program *)pg);
++   }
++   simple_mtx_unlock(&screen->program_owner_lock);
++
++   util_dynarray_foreach(&held, struct zink_gfx_program *, entry)
++      release_gfx_program_state(screen, *entry);
++
++   struct util_dynarray detached;
++   util_dynarray_init(&detached, NULL);
++   detach_programs_from_shaders(screen, ctx, &detached);
++   util_dynarray_foreach(&detached, struct zink_gfx_program *, entry) {
++      struct zink_gfx_program *prog = *entry;
++      zink_gfx_program_reference(screen, &prog, NULL);
++   }
++   util_dynarray_fini(&detached);
++
++   util_dynarray_foreach(&held, struct zink_gfx_program *, entry) {
++      struct zink_gfx_program *prog = *entry;
++      zink_gfx_program_reference(screen, &prog, NULL);
++   }
++   util_dynarray_fini(&held);
++}
++
+ void
+ zink_destroy_gfx_program(struct zink_screen *screen,
+                          struct zink_gfx_program *prog)
+ {
++   simple_mtx_lock(&screen->program_owner_lock);
++   if (!prog->base.orphaned)
++      list_del(&prog->base.ctx_link);
++   simple_mtx_unlock(&screen->program_owner_lock);
++
+    if (prog->is_separable)
+       zink_gfx_program_reference(screen, &prog->full_prog, NULL);
+    for (int i = 0; i < ARRAY_SIZE(prog->pipelines); ++i) {
+diff --git a/src/gallium/drivers/zink/zink_program.h b/src/gallium/drivers/zink/zink_program.h
+index 5d48b7eec5c4c33e031fd9b4fe14a942071df7ea..9d7bf91f3d62af662fff1ab00ec4ead4b1b2ca9b 100644
+--- a/src/gallium/drivers/zink/zink_program.h
++++ b/src/gallium/drivers/zink/zink_program.h
+@@ -193,6 +193,9 @@ void
+ zink_destroy_compute_program(struct zink_screen *screen,
+                              struct zink_compute_program *comp);
+ 
++void
++zink_context_release_programs(struct zink_context *ctx);
++
+ void
+ debug_describe_zink_compute_program(char* buf, const struct zink_compute_program *ptr);
+ 
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 928c0a4c6c0f0a31513f1f60481839501741728e..c7d4283fd13a4fe387bf2d50796fcd9ded1056a4 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -3844,6 +3844,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    simple_mtx_init(&screen->free_batch_states_lock, mtx_plain);
+    simple_mtx_init(&screen->submit_lock, mtx_plain);
++   simple_mtx_init(&screen->program_owner_lock, mtx_plain);
+    simple_mtx_init(&screen->active_batch_states_lock, mtx_plain);
+    simple_mtx_init(&screen->dt_lock, mtx_plain);
+ 
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index 34549f339f0b8f28694987f965e219ef49094108..3bf10e877ee28a6150e0f4e9bd010de636d39948 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1035,6 +1035,10 @@ struct zink_program {
+    unsigned num_dsl;
+ 
+    bool removed;
++   /* gfx only: on its context's gfx_programs list until either is destroyed;
++    * both are protected by the screen's program_owner_lock */
++   struct list_head ctx_link;
++   bool orphaned;
+ };
+ 
+ #define STAGE_MASK_OPTIMAL (1<<16)
+@@ -1395,6 +1399,8 @@ struct zink_screen {
+    struct zink_batch_state *last_free_batch_state; //for appending
+    simple_mtx_t free_batch_states_lock;
+    simple_mtx_t submit_lock;
++   /* protects every context's gfx_programs list */
++   simple_mtx_t program_owner_lock;
+ 
+    struct zink_batch_state *active_batch_states; //active batch states
+    struct zink_batch_state *last_active_batch_state; //for appending
+@@ -1811,6 +1817,8 @@ struct zink_context {
+     */
+    struct hash_table program_cache[8];
+    simple_mtx_t program_lock[8];
++   /* every gfx program this context created that still exists */
++   struct list_head gfx_programs;
+    uint32_t gfx_hash;
+    struct zink_gfx_program *curr_program;
+    struct set gfx_inputs;

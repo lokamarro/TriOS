@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 14:50:52 +0900
+Subject: [PATCH] kosmickrisp: present a single-invocation subgroup outside the
+ SIMD stages
+
+Metal declares the SIMD-group attributes and the SIMD- and quad-group
+functions in kernel and fragment functions only, which is why the driver
+advertises subgroupSupportedStages as compute plus fragment.  The MSL
+translation nevertheless emitted [[thread_index_in_simdgroup]] and
+[[threads_per_simdgroup]] for a vertex, tessellation or geometry shader
+that reads the subgroup builtins.  A plain vertex and fragment pipeline
+then failed to create with VK_ERROR_INVALID_SHADER_NV, because a Metal
+vertex function rejects those attributes, while the same vertex shader
+inside a tessellation or geometry pipeline compiled -- those stages run
+as Metal kernels -- and reported the lane of the kernel that emulates the
+stage, which has nothing to do with the stage's own invocations.
+
+A client that follows the advertised properties reads the opposite: zink
+compiles the GL ARB_shader_ballot builtins with a subgroup size of one in
+those stages while still reading SubgroupLocalInvocationId, so the masks
+it derives disagreed with the size it assumed and
+KHR-GL46.shader_ballot_tests.ShaderBallotBitmasks failed in every run.
+
+Lower every subgroup intrinsic in those stages to the single-invocation
+value the properties imply: size and count one, invocation and subgroup
+index zero, the equal, greater-equal and less-equal masks set for that
+one invocation, and every group operation the value this invocation
+contributed.  Compute and fragment shaders keep the real SIMD group.
+
+Covered by kosmickrisp_subgroup_stages.
+---
+ .../compiler/msl_nir_lower_subgroups.c        | 128 ++++++++++-
+ src/kosmickrisp/vulkan/meson.build            |  14 ++
+ .../vulkan/tests/test_subgroup_stages.c       | 211 ++++++++++++++++++
+ 3 files changed, 352 insertions(+), 1 deletion(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_subgroup_stages.c
+
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_subgroups.c b/src/kosmickrisp/compiler/msl_nir_lower_subgroups.c
+index 87a46649370856ba4fdf2c801dcab1b574f555bd..01bfbe41a9bda83c48a2e3d8f66a309a5766522b 100644
+--- a/src/kosmickrisp/compiler/msl_nir_lower_subgroups.c
++++ b/src/kosmickrisp/compiler/msl_nir_lower_subgroups.c
+@@ -51,11 +51,132 @@ lower_bool_ops(nir_builder *b, nir_intrinsic_instr *intrin, void *_unused)
+    return true;
+ }
+ 
++/* Metal declares the SIMD-group attributes ([[thread_index_in_simdgroup]],
++ * [[threads_per_simdgroup]]) and the SIMD- and quad-group functions in kernel
++ * and fragment functions only, which is what the driver advertises through
++ * VkPhysicalDeviceVulkan11Properties::subgroupSupportedStages.  The remaining
++ * stages still have to translate, and the values they observe have to be the
++ * single-invocation subgroup those properties imply.  A Metal vertex function
++ * does not compile with the attributes at all, and a stage this driver
++ * emulates with a kernel would otherwise report the lane of the kernel that
++ * runs it, which has nothing to do with the stage's own invocations. */
++static bool
++msl_stage_has_simd_group(mesa_shader_stage stage)
++{
++   return stage == MESA_SHADER_FRAGMENT || stage == MESA_SHADER_COMPUTE ||
++          stage == MESA_SHADER_KERNEL;
++}
++
++static bool
++lower_single_invocation(nir_builder *b, nir_intrinsic_instr *intrin,
++                        void *_unused)
++{
++   nir_def *replacement = NULL;
++
++   b->cursor = nir_before_instr(&intrin->instr);
++
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_load_subgroup_size:
++   case nir_intrinsic_load_num_subgroups:
++      replacement = nir_imm_intN_t(b, 1, intrin->def.bit_size);
++      break;
++
++   case nir_intrinsic_load_subgroup_invocation:
++   case nir_intrinsic_load_subgroup_id:
++   case nir_intrinsic_first_invocation:
++   case nir_intrinsic_last_invocation:
++      replacement = nir_imm_intN_t(b, 0, intrin->def.bit_size);
++      break;
++
++   /* The one invocation is its own subgroup: it is equal to, not greater
++    * than, and not less than itself. */
++   case nir_intrinsic_load_subgroup_eq_mask:
++   case nir_intrinsic_load_subgroup_ge_mask:
++   case nir_intrinsic_load_subgroup_le_mask:
++      replacement =
++         nir_pad_vector_imm_int(b, nir_imm_intN_t(b, 1, intrin->def.bit_size),
++                                0, intrin->def.num_components);
++      break;
++
++   case nir_intrinsic_load_subgroup_gt_mask:
++   case nir_intrinsic_load_subgroup_lt_mask:
++      replacement =
++         nir_imm_zero(b, intrin->def.num_components, intrin->def.bit_size);
++      break;
++
++   case nir_intrinsic_elect:
++   case nir_intrinsic_vote_ieq:
++   case nir_intrinsic_vote_feq:
++      replacement = nir_imm_true(b);
++      break;
++
++   /* Every group operation observes this invocation alone, so it returns the
++    * value this invocation contributed. */
++   case nir_intrinsic_vote_all:
++   case nir_intrinsic_vote_any:
++   case nir_intrinsic_quad_vote_all:
++   case nir_intrinsic_quad_vote_any:
++   case nir_intrinsic_read_invocation:
++   case nir_intrinsic_read_first_invocation:
++   case nir_intrinsic_shuffle:
++   case nir_intrinsic_shuffle_up:
++   case nir_intrinsic_shuffle_down:
++   case nir_intrinsic_shuffle_xor:
++   case nir_intrinsic_rotate:
++   case nir_intrinsic_quad_broadcast:
++   case nir_intrinsic_quad_swap_horizontal:
++   case nir_intrinsic_quad_swap_vertical:
++   case nir_intrinsic_quad_swap_diagonal:
++   case nir_intrinsic_reduce:
++   case nir_intrinsic_inclusive_scan:
++      replacement = intrin->src[0].ssa;
++      break;
++
++   /* An exclusive scan covers the invocations before this one: none. */
++   case nir_intrinsic_exclusive_scan: {
++      nir_const_value identity = nir_alu_binop_identity(
++         nir_intrinsic_reduction_op(intrin), intrin->def.bit_size);
++      replacement = nir_replicate(
++         b, nir_build_imm(b, 1, intrin->def.bit_size, &identity),
++         intrin->def.num_components);
++      break;
++   }
++
++   case nir_intrinsic_ballot:
++   case nir_intrinsic_ballot_relaxed:
++      replacement = nir_pad_vector_imm_int(
++         b, nir_b2iN(b, intrin->src[0].ssa, intrin->def.bit_size), 0,
++         intrin->def.num_components);
++      break;
++
++   case nir_intrinsic_inverse_ballot:
++      replacement = nir_ine_imm(
++         b, nir_iand_imm(b, nir_channel(b, intrin->src[0].ssa, 0), 1), 0);
++      break;
++
++   default:
++      return false;
++   }
++
++   nir_def_replace(&intrin->def, replacement);
++   return true;
++}
++
+ void
+ msl_nir_lower_subgroups(nir_shader *nir)
+ {
++   const bool simd_group = msl_stage_has_simd_group(nir->info.stage);
++
++   /* Lower the group operations first so that the ones nir_lower_subgroups
++    * expands into shuffles and ballots never appear, then lower again to
++    * retire the subgroup size and invocation reads that its own lowering of
++    * the remaining ballot arithmetic introduces. */
++   if (!simd_group)
++      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_single_invocation,
++               nir_metadata_control_flow, NULL);
++
+    const nir_lower_subgroups_options subgroups_options = {
+-      .subgroup_size = 32,
++      .subgroup_size = simd_group ? 32 : 1,
+       .ballot_bit_size = 32,
+       .ballot_components = 1,
+       .lower_subgroup_masks = true,
+@@ -71,6 +192,11 @@ msl_nir_lower_subgroups(nir_shader *nir)
+       .lower_rotate_clustered_to_shuffle = true,
+    };
+    NIR_PASS(_, nir, nir_lower_subgroups, &subgroups_options);
++
++   if (!simd_group)
++      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_single_invocation,
++               nir_metadata_control_flow, NULL);
++
+    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_bool_ops,
+             nir_metadata_control_flow, NULL);
+ }
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index d189f090a3f999a531f039721c7e9f156fda535f..214ef3aedca7e94295f41d810c46f2f957382c13 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1077,6 +1077,20 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_subgroup_stages',
++    executable(
++      'test_kosmickrisp_subgroup_stages',
++      files('tests/test_subgroup_stages.c'),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_msl_to_nir,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_pipeline_statistics',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_subgroup_stages.c b/src/kosmickrisp/vulkan/tests/test_subgroup_stages.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8d38bd1cb8083e69d7d84ccd8f26de60b2a552b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_subgroup_stages.c
+@@ -0,0 +1,211 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Metal has SIMD groups in kernel and fragment functions only, which is what
++ * the driver advertises as subgroupSupportedStages.  A vertex, tessellation or
++ * geometry shader that reads the subgroup builtins must therefore observe the
++ * single-invocation subgroup those properties imply: reading a SIMD lane there
++ * either fails to compile as a Metal vertex function or reports the lane of
++ * the kernel that emulates the stage.  Compute and fragment shaders must keep
++ * the real SIMD group.
++ */
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/msl_private.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition)                                                     \
++   do {                                                                      \
++      if (!(condition)) {                                                    \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,    \
++                 #condition);                                                \
++         abort();                                                            \
++      }                                                                      \
++   } while (0)
++
++enum slot {
++   SLOT_INVOCATION,
++   SLOT_SIZE,
++   SLOT_EQ_MASK,
++   SLOT_GE_MASK,
++   SLOT_GT_MASK,
++   SLOT_LE_MASK,
++   SLOT_LT_MASK,
++   SLOT_COUNT,
++};
++
++/* Every subgroup value the GL ARB_shader_ballot builtins reach the driver
++ * with, plus the group operations that back ballotARB() and
++ * readFirstInvocationARB(), written to global memory. */
++static nir_shader *
++build_ballot_shader(mesa_shader_stage stage)
++{
++   nir_builder b = nir_builder_init_simple_shader(stage, &kk_nir_options,
++                                                  "subgroup stages");
++   nir_shader *nir = b.shader;
++   nir->info.workgroup_size[0] = 1;
++   nir->info.workgroup_size[1] = 1;
++   nir->info.workgroup_size[2] = 1;
++
++   nir_def *base = nir_imm_int64(&b, 4096);
++   nir_def *source = nir_load_global(&b, 1, 32, base, .align_mul = 4);
++
++   nir_def *value[SLOT_COUNT];
++   value[SLOT_INVOCATION] = nir_load_subgroup_invocation(&b);
++   value[SLOT_SIZE] = nir_load_subgroup_size(&b);
++   value[SLOT_EQ_MASK] = nir_load_subgroup_eq_mask(&b, 1, 32);
++   value[SLOT_GE_MASK] = nir_load_subgroup_ge_mask(&b, 1, 32);
++   value[SLOT_GT_MASK] = nir_load_subgroup_gt_mask(&b, 1, 32);
++   value[SLOT_LE_MASK] = nir_load_subgroup_le_mask(&b, 1, 32);
++   value[SLOT_LT_MASK] = nir_load_subgroup_lt_mask(&b, 1, 32);
++
++   for (unsigned i = 0; i < SLOT_COUNT; i++) {
++      nir_def *to = nir_iadd_imm(&b, base, 4 * i);
++      nir_store_global(&b, value[i], to, .write_mask = 0x1, .align_mul = 4);
++   }
++
++   nir_def *ballot = nir_ballot(&b, 1, 32, nir_ine_imm(&b, source, 0));
++   nir_store_global(&b, ballot, nir_iadd_imm(&b, base, 1024), .write_mask = 0x1,
++                    .align_mul = 4);
++   nir_def *first = nir_read_first_invocation(&b, source);
++   nir_store_global(&b, first, nir_iadd_imm(&b, base, 1028), .write_mask = 0x1,
++                    .align_mul = 4);
++
++   nir_validate_shader(nir, "subgroup stages");
++   return nir;
++}
++
++static bool
++is_subgroup_intrinsic(nir_intrinsic_op op)
++{
++   const nir_intrinsic_info *info = &nir_intrinsic_infos[op];
++
++   return (info->flags & NIR_INTRINSIC_SUBGROUP) != 0 ||
++          (info->flags & NIR_INTRINSIC_QUADGROUP) != 0;
++}
++
++static unsigned
++count_subgroup_intrinsics(nir_shader *nir)
++{
++   unsigned found = 0;
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            if (is_subgroup_intrinsic(nir_instr_as_intrinsic(instr)->intrinsic))
++               found++;
++         }
++      }
++   }
++
++   return found;
++}
++
++/* The constant a slot was folded to, or -1 when it did not fold. */
++static int64_t
++folded_value(nir_shader *nir, enum slot slot)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++            if (intrin->intrinsic != nir_intrinsic_store_global)
++               continue;
++
++            nir_const_value *offset = nir_src_as_const_value(intrin->src[1]);
++            if (offset == NULL ||
++                nir_const_value_as_uint(*offset, 64) != 4096 + 4 * slot)
++               continue;
++
++            nir_const_value *stored = nir_src_as_const_value(intrin->src[0]);
++            if (stored == NULL)
++               return -1;
++            return (int64_t)nir_const_value_as_uint(*stored, 32);
++         }
++      }
++   }
++
++   return -1;
++}
++
++static nir_shader *
++lower(mesa_shader_stage stage)
++{
++   nir_shader *nir = build_ballot_shader(stage);
++
++   msl_nir_lower_subgroups(nir);
++   nir_opt_constant_folding(nir);
++   nir_opt_dce(nir);
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   return nir;
++}
++
++static void
++check_single_invocation_stage(mesa_shader_stage stage)
++{
++   nir_shader *nir = lower(stage);
++
++   /* No Metal SIMD-group attribute or function is left to translate. */
++   CHECK(count_subgroup_intrinsics(nir) == 0);
++   CHECK(!BITSET_TEST(nir->info.system_values_read,
++                      SYSTEM_VALUE_SUBGROUP_INVOCATION));
++   CHECK(!BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_SUBGROUP_SIZE));
++
++   /* The invocation is alone in a subgroup of one, so it is equal to itself
++    * and neither greater nor less than itself. */
++   CHECK(folded_value(nir, SLOT_INVOCATION) == 0);
++   CHECK(folded_value(nir, SLOT_SIZE) == 1);
++   CHECK(folded_value(nir, SLOT_EQ_MASK) == 1);
++   CHECK(folded_value(nir, SLOT_GE_MASK) == 1);
++   CHECK(folded_value(nir, SLOT_GT_MASK) == 0);
++   CHECK(folded_value(nir, SLOT_LE_MASK) == 1);
++   CHECK(folded_value(nir, SLOT_LT_MASK) == 0);
++
++   ralloc_free(nir);
++}
++
++static void
++check_simd_group_stage(mesa_shader_stage stage)
++{
++   nir_shader *nir = lower(stage);
++
++   /* The real SIMD group: the masks still come from the lane index, which is
++    * read from Metal. */
++   CHECK(BITSET_TEST(nir->info.system_values_read,
++                     SYSTEM_VALUE_SUBGROUP_INVOCATION));
++   CHECK(folded_value(nir, SLOT_INVOCATION) == -1);
++   CHECK(folded_value(nir, SLOT_EQ_MASK) == -1);
++   CHECK(folded_value(nir, SLOT_SIZE) == 32);
++   CHECK(count_subgroup_intrinsics(nir) > 0);
++
++   ralloc_free(nir);
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   check_single_invocation_stage(MESA_SHADER_VERTEX);
++   check_single_invocation_stage(MESA_SHADER_TESS_CTRL);
++   check_single_invocation_stage(MESA_SHADER_TESS_EVAL);
++   check_single_invocation_stage(MESA_SHADER_GEOMETRY);
++
++   check_simd_group_stage(MESA_SHADER_FRAGMENT);
++   check_simd_group_stage(MESA_SHADER_COMPUTE);
++
++   glsl_type_singleton_decref();
++   return 0;
++}

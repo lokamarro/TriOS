@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:06:59 +0900
+Subject: [PATCH] um: send a run of Darwin user PTEs as one host call
+
+A user mm's replay walks every PTE of its pending ranges and made one
+host call per PTE: a map for a present one, an unmap for an absent
+one. A 4 KiB guest therefore makes four times as many calls as a
+16 KiB guest for the same memory, and most of its unmaps come in long
+runs of empty PTEs that a munmap() or an exit left behind.
+
+Gather neighbouring user PTEs that one call can carry, all absent or
+all mapping consecutive offsets of one backing with one protection,
+and send the run when the next PTE breaks it, when the walk of a PMD
+ends or when the batch is full. A walk that stops early drops its run
+and is walked again from its start. Kernel PTEs keep their per-page
+calls, which record each applied PTE.
+---
+ arch/um/kernel/tlb.c | 79 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 90cdda698b812d9019eb9c237d3123f9754052d5..56bc2c1dfb863fdccf832eba4e7a2afea18a7780 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -35,6 +35,15 @@ struct vm_ops {
+ 	 */
+ 	unsigned int budget;
+ 	unsigned long resume;
++	/* The user PTEs [run_start, run_end) that one host call will carry:
++	 * all absent when @run_prot is negative, otherwise mapping consecutive
++	 * offsets of @run_fd from @run_offset with @run_prot.
++	 */
++	unsigned long run_start;
++	unsigned long run_end;
++	unsigned long long run_offset;
++	int run_fd;
++	int run_prot;
+ #endif
+ };
+ 
+@@ -473,6 +482,51 @@ void report_enomem(void)
+ 			"vm.max_map_count has been reached.\n");
+ }
+ 
++#ifdef UML_HOST_DARWIN
++/* Send the pending run of user PTEs, if any, as one host call. */
++static int darwin_send_pte_run(struct vm_ops *ops)
++{
++	unsigned long start = ops->run_start;
++	unsigned long length = ops->run_end - start;
++
++	if (length == 0)
++		return 0;
++	ops->run_end = start;
++	if (ops->run_prot < 0)
++		return ops->unmap(ops->mm_idp, start, length);
++	return ops->mmap(ops->mm_idp, start, length, ops->run_prot,
++			 ops->run_fd, ops->run_offset);
++}
++
++/*
++ * Add the user PTE at @addr to the pending run, or send the run and start a
++ * new one; a negative @prot is an absent PTE. A walk otherwise makes one
++ * host call per page, and most of its unmaps come in long runs of empty PTEs.
++ */
++static int darwin_queue_pte(struct vm_ops *ops, unsigned long addr, int prot,
++			    int fd, unsigned long long offset)
++{
++	int ret;
++
++	if (ops->run_end != ops->run_start && ops->run_end == addr &&
++	    ops->run_prot == prot &&
++	    (prot < 0 || (ops->run_fd == fd &&
++			  ops->run_offset + (addr - ops->run_start) == offset))) {
++		ops->run_end += PAGE_SIZE;
++		return 0;
++	}
++	ret = darwin_send_pte_run(ops);
++	if (ret)
++		return ret;
++	ops->run_start = addr;
++	ops->run_end = addr + PAGE_SIZE;
++	ops->run_prot = prot;
++	ops->run_fd = fd;
++	ops->run_offset = offset;
++	return 0;
++}
++#endif
++
+ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 				   unsigned long end,
+ 				   struct vm_ops *ops)
+@@ -487,6 +541,10 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ #ifdef UML_HOST_DARWIN
+ 	if (unlikely(ops->mm == &init_mm))
+ 		return update_init_mm_pte_range(pmd, addr, end, ops);
++	/* A run never outlives this PMD's walk: a walk that stops early is
++	 * walked again from its start.
++	 */
++	ops->run_end = ops->run_start;
+ #endif
+ 	do {
+ #ifdef UML_HOST_DARWIN
+@@ -564,6 +622,12 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 						       vma_protection);
+ #endif
+ 
++#ifdef UML_HOST_DARWIN
++			if (ops->mm != &init_mm)
++				ret = darwin_queue_pte(ops, addr, prot, fd,
++						       offset);
++			else
++#endif
+ 			ret = ops->mmap(ops->mm_idp, addr, PAGE_SIZE,
+ 					prot, fd, offset);
+ #ifdef UML_HOST_DARWIN
+@@ -575,7 +639,12 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 			if (unlikely(ret && ops->mm == &init_mm))
+ 				(void)ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
+ #endif
+-		} else
++		}
++#ifdef UML_HOST_DARWIN
++		else if (ops->mm != &init_mm)
++			ret = darwin_queue_pte(ops, addr, -1, -1, 0);
++#endif
++		else
+ 			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
+ 
+ #ifdef UML_HOST_DARWIN
+@@ -588,6 +657,12 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 			ret = UML_TLB_SYNC_BATCH_FULL;
+ 		}
+ 	} while (addr += PAGE_SIZE, ((addr < end) && !ret));
++	if (ops->mm != &init_mm && (!ret || ret == UML_TLB_SYNC_BATCH_FULL)) {
++		int sent = darwin_send_pte_run(ops);
++
++		if (sent)
++			ret = sent;
++	}
+ #else
+ 		*pte = pte_mkuptodate(*pte);
+ 	} while (pte++, addr += PAGE_SIZE, ((addr < end) && !ret));
+@@ -915,6 +990,8 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ #ifdef UML_HOST_DARWIN
+ 	ops.budget = 0;
+ 	ops.resume = 0;
++	ops.run_start = 0;
++	ops.run_end = 0;
+ #endif
+ 	if (mm == &init_mm) {
+ 		ops.mmap = kern_map;

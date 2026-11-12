@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+include_guard(GLOBAL)
+
+function(_uml_manifest_product_rows path product output)
+    if(NOT EXISTS "${path}" OR IS_SYMLINK "${path}")
+        message(FATAL_ERROR "Dependency manifest is missing or unsafe: ${path}")
+    endif()
+    file(STRINGS "${path}" _rows)
+    set(_selected)
+    set(_header_count 0)
+    set(_dependency_count 0)
+    foreach(_row IN LISTS _rows)
+        if(_row MATCHES "^#" OR _row STREQUAL "")
+            continue()
+        endif()
+        string(REPLACE "\t" ";" _fields "${_row}")
+        list(LENGTH _fields _field_count)
+        if(NOT _field_count EQUAL 7)
+            message(FATAL_ERROR "Malformed dependency manifest row: ${_row}")
+        endif()
+        list(GET _fields 0 _name)
+        list(GET _fields 2 _products_value)
+        # The products column only records which prefixes share a row, so a
+        # product added to or dropped from a shared row changes no prefix.
+        list(REMOVE_AT _fields 2)
+        string(JOIN "\t" _identity ${_fields})
+        if(_name STREQUAL "name")
+            math(EXPR _header_count "${_header_count} + 1")
+            list(APPEND _selected "${_identity}")
+            continue()
+        endif()
+        string(REPLACE "," ";" _products "${_products_value}")
+        list(FIND _products "${product}" _product_index)
+        if(NOT _product_index EQUAL -1)
+            list(APPEND _selected "${_identity}")
+            math(EXPR _dependency_count "${_dependency_count} + 1")
+        endif()
+    endforeach()
+    if(NOT _header_count EQUAL 1 OR _dependency_count EQUAL 0)
+        message(FATAL_ERROR
+            "Dependency manifest does not define product ${product}: ${path}")
+    endif()
+    set(${output} "${_selected}" PARENT_SCOPE)
+endfunction()
+
+function(uml_verify_dependency_manifest_product)
+    cmake_parse_arguments(ARG "" "SOURCE;INSTALLED;PRODUCT;LABEL" "" ${ARGN})
+    if(NOT ARG_SOURCE OR NOT ARG_INSTALLED OR NOT ARG_PRODUCT OR NOT ARG_LABEL)
+        message(FATAL_ERROR
+            "uml_verify_dependency_manifest_product requires SOURCE, "
+            "INSTALLED, PRODUCT, and LABEL")
+    endif()
+    _uml_manifest_product_rows("${ARG_SOURCE}" "${ARG_PRODUCT}" _source_rows)
+    _uml_manifest_product_rows("${ARG_INSTALLED}" "${ARG_PRODUCT}" _installed_rows)
+    if(NOT "${_source_rows}" STREQUAL "${_installed_rows}")
+        message(FATAL_ERROR
+            "${ARG_LABEL} dependency manifest rows do not match")
+    endif()
+endfunction()
+
+# uml_manifest_patch_series(MANIFEST <file> SOURCE_ROOT <dir> [PRODUCT <name>]
+#     [OWNED <var>] [LAYERS <var>])
+# Reads the patch series of every manifest row that has one, or of PRODUCT's
+# rows only. OWNED receives "<name>;<series.tsv>" pairs naming each row's last
+# layer, whose recorded tree is that of the whole stack. LAYERS receives every
+# layer's series.tsv in manifest and stacking order. series-field.sh owns the
+# field grammar: layers join with "+", a "rootfs-vulkan:PATH" layer is below
+# tools/rootfs/vulkan, and any other layer is below dependencies.
+function(uml_manifest_patch_series)
+    cmake_parse_arguments(PARSE_ARGV 0 _arg ""
+        "MANIFEST;SOURCE_ROOT;PRODUCT;OWNED;LAYERS" "")
+    if(NOT EXISTS "${_arg_MANIFEST}" OR IS_SYMLINK "${_arg_MANIFEST}")
+        message(FATAL_ERROR
+            "Dependency manifest is missing or unsafe: ${_arg_MANIFEST}")
+    endif()
+    file(STRINGS "${_arg_MANIFEST}" _rows)
+    set(_owned)
+    set(_layers)
+    foreach(_row IN LISTS _rows)
+        if(_row MATCHES "^#" OR _row STREQUAL "")
+            continue()
+        endif()
+        string(REPLACE "\t" ";" _fields "${_row}")
+        list(LENGTH _fields _field_count)
+        if(NOT _field_count EQUAL 7)
+            message(FATAL_ERROR "Malformed dependency manifest row: ${_row}")
+        endif()
+        list(GET _fields 0 _name)
+        list(GET _fields 2 _products)
+        list(GET _fields 6 _series)
+        string(REPLACE "," ";" _products "${_products}")
+        list(FIND _products "${_arg_PRODUCT}" _product_index)
+        if(_name STREQUAL "name" OR _series STREQUAL "-" OR
+           (_arg_PRODUCT AND _product_index EQUAL -1))
+            continue()
+        endif()
+        string(REPLACE "+" ";" _series_layers "${_series}")
+        foreach(_layer IN LISTS _series_layers)
+            if(_layer MATCHES "^rootfs-vulkan:(.+)$")
+                set(_path
+                    "${_arg_SOURCE_ROOT}/tools/rootfs/vulkan/${CMAKE_MATCH_1}")
+            else()
+                set(_path "${_arg_SOURCE_ROOT}/dependencies/${_layer}")
+            endif()
+            list(APPEND _layers "${_path}")
+        endforeach()
+        list(APPEND _owned "${_name}" "${_path}")
+    endforeach()
+    if(_arg_OWNED)
+        set(${_arg_OWNED} "${_owned}" PARENT_SCOPE)
+    endif()
+    if(_arg_LAYERS)
+        set(${_arg_LAYERS} "${_layers}" PARENT_SCOPE)
+    endif()
+endfunction()

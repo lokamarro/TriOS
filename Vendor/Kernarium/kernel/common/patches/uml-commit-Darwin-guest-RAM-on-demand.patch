@@ -1,0 +1,459 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:27:10 +0900
+Subject: [PATCH] uml: commit Darwin guest RAM on demand
+
+The Darwin runtime backs guest RAM with anonymous memory, and nothing
+gives it back, so a guest that once peaked keeps that memory for the rest
+of the boot. On physical iOS the whole of mem= is wired before the guest
+starts, so the footprint never moves at all.
+
+Make the guest tell the host which RAM it uses. Guest RAM starts
+uncommitted; mem_init() commits what memblock handed out before the page
+allocator existed, and arch_alloc_page() commits a chunk the first time
+the allocator hands out one of its pages, outside the zone lock and
+before the caller can touch it. A host that wires guest RAM wires it
+then. Free-page reporting releases free chunks: the host drops them from
+the process footprint and unwires them on iOS. The host keeps a released
+range's contents only until it wants the memory and does not count it,
+so it has to be committed again before reuse; skipping that would let
+the emulator exceed its memory limit unseen and leave reused guest pages
+unwired. One bit per 32-page chunk records what the host holds, and the
+hook costs the allocation fast path one load once every chunk is
+committed.
+
+Reporting hands each free list over a sixteenth at a time, two seconds
+apart, so a large release reaches the host over half a minute.
+uml_physmem_release_free() runs it at once, pass after pass, for a
+caller about to let the host stop scheduling the guest.
+
+This adds darwin_uml_physmem_release() and darwin_uml_physmem_commit()
+to the bridge, version 12.
+---
+ arch/um/include/asm/page.h                  |  13 ++
+ arch/um/include/shared/os.h                 |   4 +
+ arch/um/kernel/mem.c                        |   2 +
+ arch/um/kernel/physmem.c                    | 242 ++++++++++++++++++++
+ arch/um/os-Darwin/mem.c                     |  24 ++
+ arch/um/os-Darwin/skas/process.c            |   4 +-
+ arch/um/os-Darwin/uml_darwin_abi.h          |   4 +-
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |   4 +-
+ arch/um/os-Darwin/uml_darwin_memory.h       |   9 +
+ 9 files changed, 300 insertions(+), 6 deletions(-)
+
+diff --git a/arch/um/include/asm/page.h b/arch/um/include/asm/page.h
+index 6f54254aaf443d0420bc02e6e67e3285ce99c68e..74ffbeb857a75e2f670033d24906f300a875cd7c 100644
+--- a/arch/um/include/asm/page.h
++++ b/arch/um/include/asm/page.h
+@@ -15,6 +15,19 @@
+ 
+ struct page;
+ 
++#if defined(UML_HOST_DARWIN) && defined(CONFIG_PAGE_REPORTING)
++/* Commit guest RAM with the host before the allocator gives it out. */
++#define HAVE_ARCH_ALLOC_PAGE
++void arch_alloc_page(struct page *page, int order);
++void uml_physmem_commit_init(void);
++void uml_physmem_commit_reserved(void);
++unsigned long uml_physmem_release_free(void);
++#else
++static inline void uml_physmem_commit_init(void) { }
++static inline void uml_physmem_commit_reserved(void) { }
++static inline unsigned long uml_physmem_release_free(void) { return 0; }
++#endif
++
+ #include <linux/pfn.h>
+ #include <linux/types.h>
+ #include <asm/vm-flags.h>
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 8914ece2ca2d81399169f75c2c1aa0ca5851c374..1abe4b56b3ba15b32dbea0577976d1efe8a38ca6 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -202,6 +202,10 @@ extern void uml_rtc_stop_alarm_thread(void);
+ 
+ /* mem.c */
+ extern int create_mem_file(unsigned long long len);
++extern int os_physmem_release(unsigned long long offset,
++			      unsigned long long length);
++extern int os_physmem_commit(unsigned long long offset,
++			     unsigned long long length);
+ 
+ /* tlb.c */
+ extern void report_enomem(void);
+diff --git a/arch/um/kernel/mem.c b/arch/um/kernel/mem.c
+index a8cd49bd5cc95f9ab038ab184b25766f1320a08c..bbd1872f3c26d629f54198b9309185196cd2f627 100644
+--- a/arch/um/kernel/mem.c
++++ b/arch/um/kernel/mem.c
+@@ -84,10 +84,12 @@ void __init arch_mm_preinit(void)
+ 	uml_reserved = brk_end;
+ 	min_low_pfn = PFN_UP(__pa(uml_reserved));
+ 	max_pfn = max_low_pfn;
++	uml_physmem_commit_init();
+ }
+ 
+ void __init mem_init(void)
+ {
++	uml_physmem_commit_reserved();
+ 	kmalloc_ok = 1;
+ }
+ 
+diff --git a/arch/um/kernel/physmem.c b/arch/um/kernel/physmem.c
+index e739fa5ab8f956ab8802ee7a759eb2134a03be4b..140b50af8ea238e32614f2c1f340745343fa1246 100644
+--- a/arch/um/kernel/physmem.c
++++ b/arch/um/kernel/physmem.c
+@@ -4,10 +4,14 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/bitmap.h>
+ #include <linux/memblock.h>
+ #include <linux/mm.h>
++#include <linux/page_reporting.h>
+ #include <linux/pfn.h>
++#include <linux/scatterlist.h>
+ #include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ #include <asm/page.h>
+ #include <asm/sections.h>
+ #include <as-layout.h>
+@@ -342,6 +346,244 @@ void __init setup_physmem(unsigned long start, unsigned long reserve_end,
+ 	max_low_pfn = min_low_pfn + (map_size >> PAGE_SHIFT);
+ }
+ 
++#ifdef CONFIG_PAGE_REPORTING
++/*
++ * Guest RAM on demand.
++ *
++ * mem= is a ceiling, not a reservation. The host backs guest RAM with
++ * anonymous memory: macOS faults it in on first touch, and physical iOS wires
++ * it so that it is never compressed. Either way nothing gave pages back, so a
++ * guest that once peaked stayed expensive for the rest of its life, which is
++ * the wrong shape for a phone.
++ *
++ * Guest RAM therefore starts uncommitted. mem_init() commits what memblock
++ * handed out before the page allocator existed, and arch_alloc_page() commits
++ * a chunk the first time the allocator hands out one of its pages, outside
++ * the zone lock and before the caller can touch it. A host that wires guest
++ * RAM wires it then, so the footprint follows what the guest has used rather
++ * than what it was offered.
++ *
++ * The buddy allocator also knows which pages are free again. Free-page
++ * reporting hands them back to the host, which drops them from the process
++ * footprint and, on iOS, unwires them. A released range has to be committed
++ * again before the guest uses it: the host keeps its contents only until it
++ * needs the memory, counts it as free until then, and leaves it unwired.
++ *
++ * Releases and commits cover whole chunks of 2^UML_PHYSMEM_CHUNK_ORDER pages,
++ * the minimum reporting order, so one bit per chunk records what the host
++ * holds. The order is deliberately well below pageblock_order. A pageblock
++ * is 4 MiB, and a busy guest rarely has a whole one free; 128 KiB still
++ * amortizes one host call over 32 pages. A larger
++ * page_reporting.page_reporting_order= still works. A smaller one reports
++ * ranges this code leaves committed.
++ */
++#define UML_PAGE_REPORTING_ORDER 5
++#define UML_PHYSMEM_CHUNK_ORDER UML_PAGE_REPORTING_ORDER
++#define UML_PHYSMEM_CHUNK_PAGES (1UL << UML_PHYSMEM_CHUNK_ORDER)
++
++/* One bit per chunk the host does not hold for the guest. */
++static unsigned long *physmem_uncommitted;
++static unsigned long physmem_chunks;
++static atomic_long_t physmem_uncommitted_chunks = ATOMIC_LONG_INIT(0);
++static bool physmem_release_failed;
++static bool physmem_reporting;
++/* Ranges reporting has handed over, and chunks released, since boot. */
++static atomic_long_t physmem_reported_ranges = ATOMIC_LONG_INIT(0);
++static atomic_long_t physmem_released_chunks = ATOMIC_LONG_INIT(0);
++
++static void physmem_commit(unsigned long chunk, unsigned long count)
++{
++	unsigned long long offset = PFN_PHYS(chunk << UML_PHYSMEM_CHUNK_ORDER);
++	unsigned long long length =
++		(unsigned long long)count << (UML_PHYSMEM_CHUNK_ORDER + PAGE_SHIFT);
++	int err = os_physmem_commit(offset, length);
++
++	/*
++	 * The pages are usable either way; the host only failed to count or
++	 * wire them. Say so once rather than on every allocation.
++	 */
++	if (err)
++		pr_warn_once("Darwin guest RAM: host could not commit %llu bytes at %llx (%d)\n",
++			     length, offset, err);
++}
++
++void __init uml_physmem_commit_init(void)
++{
++	physmem_chunks = DIV_ROUND_UP(max_pfn, UML_PHYSMEM_CHUNK_PAGES);
++	physmem_uncommitted = memblock_alloc(
++		BITS_TO_LONGS(physmem_chunks) * sizeof(unsigned long),
++		SMP_CACHE_BYTES);
++	if (!physmem_uncommitted)
++		panic("Darwin guest RAM: no chunk map for %lu chunks\n",
++		      physmem_chunks);
++	bitmap_fill(physmem_uncommitted, physmem_chunks);
++}
++
++/*
++ * Called after memblock_free_all(), while memblock still describes what it
++ * handed out: the kernel image, the memory map, early page tables and every
++ * other allocation made before the page allocator existed. None of it passes
++ * arch_alloc_page(), so it is committed here.
++ */
++void __init uml_physmem_commit_reserved(void)
++{
++	phys_addr_t start, end;
++	unsigned long chunk, last;
++	u64 index;
++
++	for_each_reserved_mem_range(index, &start, &end) {
++		if (start >= end)
++			continue;
++		chunk = PHYS_PFN(start) >> UML_PHYSMEM_CHUNK_ORDER;
++		last = min((PHYS_PFN(end - 1) >> UML_PHYSMEM_CHUNK_ORDER) + 1,
++			   physmem_chunks);
++		while (chunk < last) {
++			unsigned long run;
++
++			chunk = find_next_bit(physmem_uncommitted, last, chunk);
++			if (chunk >= last)
++				break;
++			run = find_next_zero_bit(physmem_uncommitted, last,
++						 chunk) - chunk;
++			bitmap_clear(physmem_uncommitted, chunk, run);
++			physmem_commit(chunk, run);
++			chunk += run;
++		}
++	}
++	atomic_long_set(&physmem_uncommitted_chunks,
++			bitmap_weight(physmem_uncommitted, physmem_chunks));
++}
++
++void arch_alloc_page(struct page *page, int order)
++{
++	unsigned long pfn, chunk, last;
++
++	/* Once every chunk is committed and none is released, the allocation
++	 * fast path is one load. */
++	if (!atomic_long_read(&physmem_uncommitted_chunks))
++		return;
++	pfn = page_to_pfn(page);
++	chunk = pfn >> UML_PHYSMEM_CHUNK_ORDER;
++	last = (pfn + (1UL << order) - 1) >> UML_PHYSMEM_CHUNK_ORDER;
++	for (; chunk <= last && chunk < physmem_chunks; chunk++) {
++		if (!test_bit(chunk, physmem_uncommitted) ||
++		    !test_and_clear_bit(chunk, physmem_uncommitted))
++			continue;
++		atomic_long_dec(&physmem_uncommitted_chunks);
++		physmem_commit(chunk, 1);
++	}
++}
++
++static int uml_report_free_pages(struct page_reporting_dev_info *prdev,
++				 struct scatterlist *sgl, unsigned int nents)
++{
++	struct scatterlist *sg;
++	unsigned int index;
++
++	if (READ_ONCE(physmem_release_failed))
++		return 0;
++	atomic_long_add(nents, &physmem_reported_ranges);
++	for_each_sg(sgl, sg, nents, index) {
++		unsigned long pfn = page_to_pfn(sg_page(sg));
++		unsigned long pages = sg->length >> PAGE_SHIFT;
++		unsigned long chunk, count;
++		unsigned long long offset = PFN_PHYS(pfn);
++		int err;
++
++		/*
++		 * Only whole chunks of guest RAM are released. A reported range
++		 * is a free buddy block, so it is aligned to its own size; a
++		 * smaller one than a chunk stays committed.
++		 */
++		if (!IS_ALIGNED(pfn, UML_PHYSMEM_CHUNK_PAGES) ||
++		    !IS_ALIGNED(pages, UML_PHYSMEM_CHUNK_PAGES) ||
++		    offset + sg->length > physmem_size)
++			continue;
++		chunk = pfn >> UML_PHYSMEM_CHUNK_ORDER;
++		count = pages >> UML_PHYSMEM_CHUNK_ORDER;
++		if (chunk + count > physmem_chunks)
++			continue;
++		err = os_physmem_release(offset, sg->length);
++		if (err) {
++			/*
++			 * Stop trying rather than failing a reporting cycle
++			 * every two seconds for the rest of the boot. Losing
++			 * the optimization must not cost the guest anything
++			 * else.
++			 */
++			WRITE_ONCE(physmem_release_failed, true);
++			pr_warn("Darwin free-page reporting disabled: host refused to release %x bytes at %llx (%d)\n",
++				sg->length, offset, err);
++			return 0;
++		}
++		/*
++		 * The pages are isolated from the free lists until this callback
++		 * returns, and the zone lock orders these bits before any
++		 * allocation of them.
++		 */
++		for (; count; count--, chunk++) {
++			if (!test_and_set_bit(chunk, physmem_uncommitted)) {
++				atomic_long_inc(&physmem_uncommitted_chunks);
++				atomic_long_inc(&physmem_released_chunks);
++			}
++		}
++	}
++	return 0;
++}
++
++static struct page_reporting_dev_info uml_page_reporting = {
++	.report = uml_report_free_pages,
++	.order = UML_PAGE_REPORTING_ORDER,
++};
++
++static int __init uml_page_reporting_init(void)
++{
++	int err = page_reporting_register(&uml_page_reporting);
++
++	if (err) {
++		pr_warn("Darwin free-page reporting unavailable (%d)\n", err);
++		return 0;
++	}
++	WRITE_ONCE(physmem_reporting, true);
++	pr_info("Darwin free-page reporting returns free guest memory to the host\n");
++	return 0;
++}
++late_initcall(uml_page_reporting_init);
++
++/* Bounds uml_physmem_release_free() on a guest that keeps freeing memory. */
++#define UML_PHYSMEM_RELEASE_PASSES 64
++
++/*
++ * Reporting hands each free list over a sixteenth at a time, two seconds
++ * apart, so what a large reclaim frees reaches the host over half a minute.
++ * A host about to stop scheduling the guest cannot wait that long, and a
++ * system suspend freezes the reporting work. This runs reporting now, pass
++ * after pass, until one finds nothing left to hand over, and returns the
++ * bytes the host took back.
++ */
++unsigned long uml_physmem_release_free(void)
++{
++	long released = atomic_long_read(&physmem_released_chunks);
++	long reported;
++	int pass;
++
++	if (!READ_ONCE(physmem_reporting))
++		return 0;
++	/* Pages in per-CPU lists are not on the free lists reporting reads. */
++	drain_all_pages(NULL);
++	for (pass = 0; pass < UML_PHYSMEM_RELEASE_PASSES; pass++) {
++		reported = atomic_long_read(&physmem_reported_ranges);
++		mod_delayed_work(system_freezable_wq, &uml_page_reporting.work, 0);
++		flush_delayed_work(&uml_page_reporting.work);
++		if (READ_ONCE(physmem_release_failed) ||
++		    atomic_long_read(&physmem_reported_ranges) == reported)
++			break;
++	}
++	return (unsigned long)(atomic_long_read(&physmem_released_chunks) -
++			       released) << (UML_PHYSMEM_CHUNK_ORDER + PAGE_SHIFT);
++}
++#endif /* CONFIG_PAGE_REPORTING */
++
+ int phys_mapping(unsigned long phys, unsigned long long *offset_out)
+ {
+ 	int fd = -1;
+diff --git a/arch/um/os-Darwin/mem.c b/arch/um/os-Darwin/mem.c
+index 182e71b7517618d359bdb9a25526d18c5dc7951c..12e4934ffda251dc11e4aaefde4bd645f6cfbe78 100644
+--- a/arch/um/os-Darwin/mem.c
++++ b/arch/um/os-Darwin/mem.c
+@@ -22,3 +22,27 @@ int create_mem_file(unsigned long long length)
+ 	}
+ 	return fd;
+ }
++
++/*
++ * Hand a free range of guest RAM back to the host, or take a released one
++ * back before the guest uses it. The offsets are physical addresses, which is
++ * what the physical-memory backing is indexed by; the host decides what
++ * releasing and committing mean for its memory (iOS also unwires and wires).
++ */
++int os_physmem_release(unsigned long long offset, unsigned long long length)
++{
++	if (length == 0)
++		return 0;
++	if (darwin_uml_physmem_release(offset, length) < 0)
++		return -errno;
++	return 0;
++}
++
++int os_physmem_commit(unsigned long long offset, unsigned long long length)
++{
++	if (length == 0)
++		return 0;
++	if (darwin_uml_physmem_commit(offset, length) < 0)
++		return -errno;
++	return 0;
++}
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 4acb0c1a5ab78fa2965c29f8b523981744cd6f9d..f7e902e4c2d826156278182b2fc7df005be946af 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -23,8 +23,8 @@
+  * These checks make an ABI drift fail at the kernel compiler rather than at a
+  * guest boundary after register state has been reinterpreted. */
+ _Static_assert(sizeof(unsigned long) == 8, "Darwin UML ABI requires LP64");
+-_Static_assert(DARWIN_UML_ABI_VERSION == 11U, "unexpected ABI version");
+-_Static_assert(DARWIN_UML_ABI_FINGERPRINT == 0xa54125de28365272ULL,
++_Static_assert(DARWIN_UML_ABI_VERSION == 12U, "unexpected ABI version");
++_Static_assert(DARWIN_UML_ABI_FINGERPRINT == 0xefee2a66cbe8be89ULL,
+ 	       "unexpected ABI fingerprint");
+ _Static_assert(offsetof(struct uml_pt_regs, orig_x0) ==
+ 	      DARWIN_UML_ABI_GUEST_REGISTERS_ORIGINAL_X0_OFFSET,
+diff --git a/arch/um/os-Darwin/uml_darwin_abi.h b/arch/um/os-Darwin/uml_darwin_abi.h
+index 087c2c135ac056f8e28c9887278d638e82feaef6..bf40d80441b776417e83504ac732fcd5d7bb163b 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi.h
++++ b/arch/um/os-Darwin/uml_darwin_abi.h
+@@ -121,8 +121,8 @@ struct darwin_uml_guest_fp_registers {
+ 
+ #if defined(__cplusplus)
+ #include <stddef.h>
+-static_assert(DARWIN_UML_ABI_VERSION == 11U);
+-static_assert(DARWIN_UML_ABI_FINGERPRINT == 0xa54125de28365272ULL);
++static_assert(DARWIN_UML_ABI_VERSION == 12U);
++static_assert(DARWIN_UML_ABI_FINGERPRINT == 0xefee2a66cbe8be89ULL);
+ static_assert(DARWIN_UML_EVENT_FLOATING_POINT_TRAP == 7);
+ static_assert(DARWIN_UML_EVENT_PC_ALIGNMENT == 8);
+ static_assert(DARWIN_UML_EVENT_STOP == 9);
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index 9353f8d8277e6cfaf1c5fe9fb15037b8d888ca29..e183d98c2733cedd9f471b7cb832f1f94c4f229d 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 11U
+-#define DARWIN_UML_ABI_FINGERPRINT 0xa54125de28365272ULL
++#define DARWIN_UML_ABI_VERSION 12U
++#define DARWIN_UML_ABI_FINGERPRINT 0xefee2a66cbe8be89ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_memory.h b/arch/um/os-Darwin/uml_darwin_memory.h
+index 355527f5cd346d385c78620208d9b110472f72cc..e00d77ecfd814c31015132da7bac3082f06547a8 100644
+--- a/arch/um/os-Darwin/uml_darwin_memory.h
++++ b/arch/um/os-Darwin/uml_darwin_memory.h
+@@ -43,6 +43,15 @@ int darwin_uml_vm_retry_fault(unsigned long address, int execute, int write);
+ int darwin_uml_begin_write_single_step(unsigned long address,
+ 				       unsigned long guest_pc);
+ 
++/* Guest RAM commitment. Ranges are byte offsets into the anonymous physical-
++ * memory backing, aligned to the host page. Release hands a range the guest
++ * no longer uses back to the host; commit makes a released range the guest's
++ * again before the guest uses it. Both are idempotent per host page. */
++int darwin_uml_physmem_release(unsigned long long offset,
++			       unsigned long long length);
++int darwin_uml_physmem_commit(unsigned long long offset,
++			      unsigned long long length);
++
+ #ifdef __cplusplus
+ }
+ #endif

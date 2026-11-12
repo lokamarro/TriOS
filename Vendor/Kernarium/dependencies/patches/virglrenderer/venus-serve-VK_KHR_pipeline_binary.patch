@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 14:29:09 +0900
+Subject: [PATCH] venus: serve VK_KHR_pipeline_binary
+
+The local protocol series gives the extension's five commands their command
+ids and codecs, so the renderer can now dispatch them. Four are plain
+forwards; vkCreatePipelineBinariesKHR creates objects and needs the renderer's
+object tracking, because the guest names each VkPipelineBinaryKHR by an id it
+chose and later destroys it by that id.
+
+The command is unusual in two ways the dispatch has to respect. Its count is
+in-out inside VkPipelineBinaryHandlesInfoKHR, and a driver asks how many
+binaries a pipeline yields by passing no handle array at all, so a query
+carries no object ids and must create nothing. And when the guest does offer
+handles, the driver may fill fewer than it was given, so only the entries the
+driver wrote become objects; the rest are released and returned as
+VK_NULL_HANDLE. VK_INCOMPLETE is a success for this purpose: it means the
+driver filled every handle it was offered and has more to give.
+
+VkPipelineBinaryKHR joins the object handle union and the recognized object
+types, and the device teardown path destroys any binary the guest left behind.
+
+vkGetPipelineKeyKHR refuses a request whose VkPipelineCreateInfoKHR carries no
+chain. The driver reads that chain for the pipeline it is asked to key and
+does not check it first, and the specification gives the command no form that
+names no pipeline, so an empty request is one no renderer may forward. The
+protocol now carries the chain, so this guards against a guest that sends
+something the specification forbids rather than against the transport.
+
+vkGetPipelineBinaryDataKHR drops the blob from a reply whose data size grew
+across the call. Every other command that returns a blob beside an in-out size
+can only shrink it, so the codec measures the reply's blob by the size the
+driver reports and reserves room for it from the size the guest offered. This
+command breaks that: a buffer too small for the binary is answered with
+VK_ERROR_NOT_ENOUGH_SPACE_KHR, the size the caller needs, and no data at all.
+Encoding a blob of the grown size then writes past the reply region the guest
+reserved, and the guest decodes a blob longer than its own reply stream, which
+aborts the process. A reply that carries no blob is what the specification
+describes and what the existing codec already reads, so the guest learns the
+size it needs and its buffer is left alone.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/venus/vkr_common.c   |   1 +
+ src/venus/vkr_common.h   |   3 +
+ src/venus/vkr_context.c  |   1 +
+ src/venus/vkr_device.c   |   3 +
+ src/venus/vkr_pipeline.c | 173 +++++++++++++++++++++++++++++++++++++++
+ src/venus/vkr_pipeline.h |  10 +++
+ 6 files changed, 191 insertions(+)
+
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index fc526b6f2877fb983f5cc5d64105ef7138c5671c..7a4436330a70f4c42ca08b39f46e72912e8f1132 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -127,6 +127,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
+    .KHR_maintenance9 = true,
+    .KHR_maintenance10 = true,
+    .KHR_maintenance11 = true,
++   .KHR_pipeline_binary = true,
+    .KHR_pipeline_library = true,
+    .KHR_ray_query = true,
+    .KHR_ray_tracing_maintenance1 = true,
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index fd23df9d0eba15d3ab57ffd3ab77f4b3191da1d3..bb541e91ffc3104f1ccafe32051506f917329f63 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -160,6 +160,7 @@ struct vkr_object {
+       VkDescriptorUpdateTemplate descriptor_update_template;
+ 
+       VkAccelerationStructureKHR acceleration_structure;
++      VkPipelineBinaryKHR pipeline_binary;
+    } handle;
+ 
+    struct list_head track_head;
+@@ -299,6 +300,8 @@ vkr_is_recognized_object_type(VkObjectType type)
+    case VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE:
+    /* VK_KHR_acceleration_structure */
+    case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
++   /* VK_KHR_pipeline_binary */
++   case VK_OBJECT_TYPE_PIPELINE_BINARY_KHR:
+       return true;
+    default:
+       vkr_log("unrecognized object type %u", type);
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 479199d9d10120eeef9868b3934763beab1a7785..e5bd69651d45c66c3e30c237c068ba953973b3ff 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -118,6 +118,7 @@ vkr_context_init_dispatch(struct vkr_context *ctx)
+    vkr_context_init_pipeline_layout_dispatch(ctx);
+    vkr_context_init_pipeline_cache_dispatch(ctx);
+    vkr_context_init_pipeline_dispatch(ctx);
++   vkr_context_init_pipeline_binary_dispatch(ctx);
+ 
+    vkr_context_init_command_pool_dispatch(ctx);
+    vkr_context_init_command_buffer_dispatch(ctx);
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 0711db10d5a38eca6a049a654a5c86b7861cad40..9343e4d77c5433eff6aeca41c135622bed6ac74f 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -343,6 +343,9 @@ vkr_device_object_destroy(struct vkr_context *ctx,
+          vk->DestroyAccelerationStructureKHR(device, obj->handle.acceleration_structure,
+                                              NULL);
+          break;
++      case VK_OBJECT_TYPE_PIPELINE_BINARY_KHR:
++         vk->DestroyPipelineBinaryKHR(device, obj->handle.pipeline_binary, NULL);
++         break;
+       default:
+          vkr_log("Unhandled vkr_object(%p) with VkObjectType(%u)", obj,
+                  (uint32_t)obj->type);
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index d0d6f8364bf6c109bc31e5d01940853ce42669cc..2de45dfe961ac34d07bca680c924c909c82cea5a 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -199,6 +199,163 @@ vkr_dispatch_vkGetRayTracingShaderGroupStackSizeKHR(
+                                                         args->group, args->groupShader);
+ }
+ 
++static void
++vkr_dispatch_vkCreatePipelineBinariesKHR(
++   struct vn_dispatch_context *dispatch,
++   struct vn_command_vkCreatePipelineBinariesKHR *args)
++{
++   TRACE_FUNC();
++   struct vkr_context *ctx = dispatch->data;
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   struct object_array arr;
++
++   /* The count is an in-out parameter, and the driver asks how many binaries
++    * a pipeline has before it names any, so a query carries no handles and
++    * creates no objects. */
++   if (!args->pBinaries->pPipelineBinaries) {
++      vn_replace_vkCreatePipelineBinariesKHR_args_handle(args);
++      args->ret = vk->CreatePipelineBinariesKHR(args->device, args->pCreateInfo, NULL,
++                                                args->pBinaries);
++      return;
++   }
++
++   const uint32_t count = args->pBinaries->pipelineBinaryCount;
++   if (!object_array_init(ctx, &arr, count, VK_OBJECT_TYPE_PIPELINE_BINARY_KHR,
++                          sizeof(struct vkr_pipeline_binary),
++                          sizeof(*args->pBinaries->pPipelineBinaries),
++                          args->pBinaries->pPipelineBinaries)) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++
++   VkPipelineBinaryHandlesInfoKHR handles = *args->pBinaries;
++   handles.pPipelineBinaries = arr.handle_storage;
++
++   vn_replace_vkCreatePipelineBinariesKHR_args_handle(args);
++   args->ret =
++      vk->CreatePipelineBinariesKHR(args->device, args->pCreateInfo, NULL, &handles);
++   if (args->ret != VK_SUCCESS && args->ret != VK_INCOMPLETE) {
++      object_array_fini(&arr);
++      return;
++   }
++
++   /* The driver may have produced fewer binaries than the guest offered
++    * handles for; the objects it did not fill are not created. */
++   args->pBinaries->pipelineBinaryCount = handles.pipelineBinaryCount;
++
++   for (uint32_t i = 0; i < count; i++) {
++      struct vkr_pipeline_binary *obj = arr.objects[i];
++
++      obj->base.handle.pipeline_binary =
++         i < handles.pipelineBinaryCount
++            ? ((VkPipelineBinaryKHR *)arr.handle_storage)[i]
++            : VK_NULL_HANDLE;
++
++      if (obj->base.handle.pipeline_binary == VK_NULL_HANDLE) {
++         free(obj);
++         arr.objects[i] = NULL;
++         args->pBinaries->pPipelineBinaries[i] = VK_NULL_HANDLE;
++      } else {
++         vkr_device_add_object(ctx, dev, &obj->base);
++      }
++   }
++
++   arr.objects_stolen = true;
++   object_array_fini(&arr);
++}
++
++static void
++vkr_dispatch_vkDestroyPipelineBinaryKHR(
++   struct vn_dispatch_context *dispatch,
++   struct vn_command_vkDestroyPipelineBinaryKHR *args)
++{
++   struct vkr_context *ctx = dispatch->data;
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   struct vkr_pipeline_binary *obj =
++      vkr_pipeline_binary_from_handle(args->pipelineBinary);
++   if (!obj)
++      return;
++
++   vn_replace_vkDestroyPipelineBinaryKHR_args_handle(args);
++   vk->DestroyPipelineBinaryKHR(args->device, args->pipelineBinary, NULL);
++
++   vkr_device_remove_object(ctx, dev, &obj->base);
++}
++
++static void
++vkr_dispatch_vkGetPipelineKeyKHR(UNUSED struct vn_dispatch_context *dispatch,
++                                 struct vn_command_vkGetPipelineKeyKHR *args)
++{
++   TRACE_FUNC();
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   /* A pipeline key is derived from the pipeline create info the caller
++    * chains onto VkPipelineCreateInfoKHR, and the driver reads that chain
++    * without checking it.  The protocol carries the chain, so a request that
++    * still arrives empty is one the driver cannot be handed.  Only a key for
++    * the device itself names no pipeline, and the specification does not give
++    * this command such a form.  VK_ERROR_UNKNOWN, not one of the
++    * out-of-memory codes the command otherwise returns: an out-of-memory
++    * result tells a caller that retrying may work and makes a test suite
++    * abandon its whole run, while this request can never be served. */
++   if (args->pPipelineCreateInfo == NULL ||
++       args->pPipelineCreateInfo->pNext == NULL) {
++      args->ret = VK_ERROR_UNKNOWN;
++      return;
++   }
++
++   vn_replace_vkGetPipelineKeyKHR_args_handle(args);
++   args->ret = vk->GetPipelineKeyKHR(args->device, args->pPipelineCreateInfo,
++                                     args->pPipelineKey);
++}
++
++static void
++vkr_dispatch_vkGetPipelineBinaryDataKHR(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkGetPipelineBinaryDataKHR *args)
++{
++   TRACE_FUNC();
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   /* The data size is in-out, and this is the one command whose out value can
++    * exceed the in value: a buffer smaller than the binary is answered with
++    * VK_ERROR_NOT_ENOUGH_SPACE_KHR, the size the caller needs, and no data.
++    * The reply's blob is measured by the size the driver reports, while the
++    * room for it was reserved from the size the driver was offered, so a grown
++    * size describes a blob neither side has: it runs past the reply region the
++    * guest set and past the guest's own buffer.  The specification writes no
++    * data in that case, so the reply carries no blob and the guest reads only
++    * the size it asked for.
++    */
++   const size_t offered =
++      args->pPipelineBinaryDataSize ? *args->pPipelineBinaryDataSize : 0;
++
++   vn_replace_vkGetPipelineBinaryDataKHR_args_handle(args);
++   args->ret = vk->GetPipelineBinaryDataKHR(args->device, args->pInfo,
++                                            args->pPipelineBinaryKey,
++                                            args->pPipelineBinaryDataSize,
++                                            args->pPipelineBinaryData);
++
++   if (args->pPipelineBinaryData && *args->pPipelineBinaryDataSize > offered)
++      args->pPipelineBinaryData = NULL;
++}
++
++static void
++vkr_dispatch_vkReleaseCapturedPipelineDataKHR(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkReleaseCapturedPipelineDataKHR *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   vn_replace_vkReleaseCapturedPipelineDataKHR_args_handle(args);
++   args->ret = vk->ReleaseCapturedPipelineDataKHR(args->device, args->pInfo, NULL);
++}
++
+ void
+ vkr_context_init_shader_module_dispatch(struct vkr_context *ctx)
+ {
+@@ -247,3 +404,19 @@ vkr_context_init_pipeline_dispatch(struct vkr_context *ctx)
+    dispatch->dispatch_vkGetRayTracingShaderGroupStackSizeKHR =
+       vkr_dispatch_vkGetRayTracingShaderGroupStackSizeKHR;
+ }
++
++void
++vkr_context_init_pipeline_binary_dispatch(struct vkr_context *ctx)
++{
++   struct vn_dispatch_context *dispatch = &ctx->dispatch;
++
++   dispatch->dispatch_vkCreatePipelineBinariesKHR =
++      vkr_dispatch_vkCreatePipelineBinariesKHR;
++   dispatch->dispatch_vkDestroyPipelineBinaryKHR =
++      vkr_dispatch_vkDestroyPipelineBinaryKHR;
++   dispatch->dispatch_vkGetPipelineKeyKHR = vkr_dispatch_vkGetPipelineKeyKHR;
++   dispatch->dispatch_vkGetPipelineBinaryDataKHR =
++      vkr_dispatch_vkGetPipelineBinaryDataKHR;
++   dispatch->dispatch_vkReleaseCapturedPipelineDataKHR =
++      vkr_dispatch_vkReleaseCapturedPipelineDataKHR;
++}
+diff --git a/src/venus/vkr_pipeline.h b/src/venus/vkr_pipeline.h
+index a356ebfc6dc9ce5cd01b8eb790026b12da5fc1e3..a64db1f52ab3af3c4092310aab1dc65187e1d83a 100644
+--- a/src/venus/vkr_pipeline.h
++++ b/src/venus/vkr_pipeline.h
+@@ -28,6 +28,13 @@ struct vkr_pipeline {
+ };
+ VKR_DEFINE_OBJECT_CAST(pipeline, VK_OBJECT_TYPE_PIPELINE, VkPipeline)
+ 
++struct vkr_pipeline_binary {
++   struct vkr_object base;
++};
++VKR_DEFINE_OBJECT_CAST(pipeline_binary,
++                       VK_OBJECT_TYPE_PIPELINE_BINARY_KHR,
++                       VkPipelineBinaryKHR)
++
+ void
+ vkr_context_init_shader_module_dispatch(struct vkr_context *ctx);
+ 
+@@ -40,4 +47,7 @@ vkr_context_init_pipeline_cache_dispatch(struct vkr_context *ctx);
+ void
+ vkr_context_init_pipeline_dispatch(struct vkr_context *ctx);
+ 
++void
++vkr_context_init_pipeline_binary_dispatch(struct vkr_context *ctx);
++
+ #endif /* VKR_PIPELINE_H */

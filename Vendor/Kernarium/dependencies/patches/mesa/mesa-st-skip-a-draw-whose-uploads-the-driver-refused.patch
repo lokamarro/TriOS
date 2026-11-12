@@ -1,0 +1,718 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:35:26 +0900
+Subject: [PATCH] mesa/st: skip a draw whose uploads the driver refused
+
+A state update that uploads to a buffer the driver allocates for it
+assumed the allocation succeeds. The constants update and the update
+of zero-stride vertex attributes used the pointer u_upload_alloc()
+returns without looking at it, as does pipe_upload_constant_buffer0().
+A driver with a bounded memory budget refuses the uploader's next
+buffer once its budget is full, the pointer is NULL, and the copy that
+follows faults the host.
+
+st_validate_state() now returns false, after raising GL_OUT_OF_MEMORY,
+when an update could not get its upload memory. The update marks its
+own state dirty again, so the next draw runs it once more, and does
+not touch the pipe. Every caller that draws or dispatches skips the
+work: st_prepare_draw() returns whether the draw may go on, and so do
+the compute dispatches, glDrawPixels, glCopyPixels, glBitmap and
+glDrawTex. The vertex-state playback of a display list gives back the
+reference it took before the skipped draw.
+
+The zero-stride attribute update still lays out its vertex elements
+and leaves the slot without a buffer, which a draw never sees.
+
+pipe_upload_constant_buffer0() returns false when it bound nothing.
+The pixel-buffer draw and download, hardware GL_SELECT and the clear
+quad fall back or skip: glClear raises GL_OUT_OF_MEMORY as it already
+does when the quad's vertices are refused. The HUD, which no host
+context shows, ignores the result.
+
+Other callers of u_upload_alloc() and u_upload_data() on the host's
+paths already handle a refusal: the quad and texture-draw helpers,
+the blitter, u_vbuf, u_primconvert, util_upload_index_buffer() and
+the threaded context's uploads.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/util/u_inlines.h     | 11 ++++++-
+ src/mesa/main/compute.c                    | 19 ++++++++---
+ src/mesa/main/draw.c                       | 24 +++++++++-----
+ src/mesa/main/mesh_shader.c                |  3 +-
+ src/mesa/state_tracker/st_atom_array.cpp   | 20 ++++++++++--
+ src/mesa/state_tracker/st_atom_constbuf.c  | 38 ++++++++++++++++++++++
+ src/mesa/state_tracker/st_cb_bitmap.c      |  3 +-
+ src/mesa/state_tracker/st_cb_clear.c       | 15 ++++++---
+ src/mesa/state_tracker/st_cb_drawpixels.c  |  6 ++--
+ src/mesa/state_tracker/st_cb_drawtex.c     |  3 +-
+ src/mesa/state_tracker/st_cb_rasterpos.c   |  4 +--
+ src/mesa/state_tracker/st_context.h        |  6 ++++
+ src/mesa/state_tracker/st_draw.c           | 22 +++++++++++--
+ src/mesa/state_tracker/st_draw.h           |  2 +-
+ src/mesa/state_tracker/st_draw_hw_select.c |  3 +-
+ src/mesa/state_tracker/st_pbo.c            |  5 ++-
+ src/mesa/state_tracker/st_pbo_compute.c    |  3 +-
+ src/mesa/state_tracker/st_util.h           | 29 +++++++++++++++++
+ src/mesa/vbo/vbo_exec_draw.c               | 11 +++----
+ src/mesa/vbo/vbo_save_draw.c               | 14 +++++---
+ 20 files changed, 196 insertions(+), 45 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_inlines.h b/src/gallium/auxiliary/util/u_inlines.h
+index ec5631f68dd8e458bfd5d55f82a02daa75b40af0..935f2b72324794fa6045c0df3928d7e1a95c3296 100644
+--- a/src/gallium/auxiliary/util/u_inlines.h
++++ b/src/gallium/auxiliary/util/u_inlines.h
+@@ -710,7 +710,11 @@ pipe_set_constant_buffer(struct pipe_context *pipe,
+    }
+ }
+ 
+-static inline void
++/**
++ * Bind a user buffer as constant buffer 0. Returns false, binding nothing,
++ * when the driver has no memory for the upload.
++ */
++static inline bool
+ pipe_upload_constant_buffer0(struct pipe_context *pipe, mesa_shader_stage stage,
+                              struct pipe_constant_buffer *cb,
+                              struct pipe_resource **releasebuf)
+@@ -723,6 +727,9 @@ pipe_upload_constant_buffer0(struct pipe_context *pipe, mesa_shader_stage stage,
+    if (pipe->screen->caps.prefer_real_buffer_in_constbuf0) {
+       u_upload_alloc(pipe->const_uploader, 0, cbuf.buffer_size,
+          alignment, &cbuf.buffer_offset, &cbuf.buffer, releasebuf, (void**)&ptr);
++      if (!ptr)
++         return false;
++
+       memcpy(ptr, cbuf.user_buffer, cbuf.buffer_size);
+       cbuf.user_buffer = NULL;
+ 
+@@ -731,6 +738,8 @@ pipe_upload_constant_buffer0(struct pipe_context *pipe, mesa_shader_stage stage,
+    } else {
+       pipe->set_constant_buffer(pipe, stage, 0, cb);
+    }
++
++   return true;
+ }
+ 
+ /**
+diff --git a/src/mesa/main/compute.c b/src/mesa/main/compute.c
+index 867768c641a1525e3988cf0960f40ce2315691a5..e4153225139600637f6403b64b878694ba0c93f9 100644
+--- a/src/mesa/main/compute.c
++++ b/src/mesa/main/compute.c
+@@ -284,7 +284,7 @@ valid_dispatch_indirect(struct gl_context *ctx,  GLintptr indirect)
+    return GL_TRUE;
+ }
+ 
+-static void
++static bool
+ prepare_compute(struct gl_context *ctx)
+ {
+    struct st_context *st = st_context(ctx);
+@@ -296,8 +296,11 @@ prepare_compute(struct gl_context *ctx)
+       _mesa_update_state(ctx);
+ 
+    ST_PIPELINE_COMPUTE_STATE_MASK(mask);
+-   st_validate_state(st, mask);
++   if (!st_validate_state(st, mask))
++      return false;
++
+    st_context_add_work(st);
++   return true;
+ }
+ 
+ static ALWAYS_INLINE void
+@@ -325,7 +328,9 @@ dispatch_compute(GLuint num_groups_x, GLuint num_groups_y,
+    info.block[1] = prog->info.workgroup_size[1];
+    info.block[2] = prog->info.workgroup_size[2];
+ 
+-   prepare_compute(ctx);
++   if (!prepare_compute(ctx))
++      return;
++
+    ctx->pipe->launch_grid(ctx->pipe, &info);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
+@@ -367,7 +372,9 @@ dispatch_compute_indirect(GLintptr indirect, bool no_error)
+    info.block[1] = prog->info.workgroup_size[1];
+    info.block[2] = prog->info.workgroup_size[2];
+ 
+-   prepare_compute(ctx);
++   if (!prepare_compute(ctx))
++      return;
++
+    ctx->pipe->launch_grid(ctx->pipe, &info);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
+@@ -411,7 +418,9 @@ dispatch_compute_group_size(GLuint num_groups_x, GLuint num_groups_y,
+    if (num_groups_x == 0u || num_groups_y == 0u || num_groups_z == 0u)
+        return;
+ 
+-   prepare_compute(ctx);
++   if (!prepare_compute(ctx))
++      return;
++
+    ctx->pipe->launch_grid(ctx->pipe, &info);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
+diff --git a/src/mesa/main/draw.c b/src/mesa/main/draw.c
+index 992fadd3b5b32f266ecafb4f8e83f54d06549e82..b01c3787ed4301c3c1a70b86ac6610fba785a5de 100644
+--- a/src/mesa/main/draw.c
++++ b/src/mesa/main/draw.c
+@@ -1173,7 +1173,8 @@ _mesa_draw_arrays(struct gl_context *ctx, GLenum mode, GLint start,
+    draw.count = count;
+ 
+    ST_PIPELINE_RENDER_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask))
++      return;
+ 
+    ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
+ 
+@@ -1479,7 +1480,8 @@ _mesa_MultiDrawArrays(GLenum mode, const GLint *first,
+    }
+ 
+    ST_PIPELINE_RENDER_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask))
++      return;
+ 
+    ctx->Driver.DrawGallium(ctx, &info, 0, NULL, draw, primcount);
+ 
+@@ -1612,7 +1614,8 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+    }
+ 
+    ST_PIPELINE_RENDER_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask))
++      return;
+ 
+    /* Fast path for a very common DrawElements case:
+     * - there are no user indices here (always true with glthread)
+@@ -2100,7 +2103,8 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+       }
+ 
+       ST_PIPELINE_RENDER_STATE_MASK(mask);
+-      st_prepare_draw(ctx, mask);
++      if (!st_prepare_draw(ctx, mask))
++         return;
+       if (!validate_index_bounds(ctx, &info, draw, primcount))
+          return;
+ 
+@@ -2111,7 +2115,8 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+       info.increment_draw_id = false;
+ 
+       ST_PIPELINE_RENDER_STATE_MASK(mask);
+-      st_prepare_draw(ctx, mask);
++      if (!st_prepare_draw(ctx, mask))
++         return;
+ 
+       for (int i = 0; i < primcount; i++) {
+          struct pipe_draw_start_count_bias draw;
+@@ -2275,7 +2280,8 @@ _mesa_DrawTransformFeedbackStreamInstanced(GLenum mode, GLuint name,
+       return;
+ 
+    ST_PIPELINE_RENDER_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask))
++      return;
+ 
+    struct pipe_draw_indirect_info indirect;
+    memset(&indirect, 0, sizeof(indirect));
+@@ -2442,7 +2448,8 @@ _mesa_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
+       /* Packed section end. */
+ 
+       ST_PIPELINE_RENDER_STATE_MASK(mask);
+-      st_prepare_draw(ctx, mask);
++      if (!st_prepare_draw(ctx, mask))
++         return;
+ 
+       const uint8_t *ptr = (const uint8_t *) indirect;
+       for (unsigned i = 0; i < primcount; i++) {
+@@ -2545,7 +2552,8 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
+          return;
+ 
+       ST_PIPELINE_RENDER_STATE_MASK(mask);
+-      st_prepare_draw(ctx, mask);
++      if (!st_prepare_draw(ctx, mask))
++         return;
+ 
+       const uint8_t *ptr = (const uint8_t *) indirect;
+       for (unsigned i = 0; i < primcount; i++) {
+diff --git a/src/mesa/main/mesh_shader.c b/src/mesa/main/mesh_shader.c
+index 3f5df597d8ad1ca52aa3c007746bd65c883c17c2..f8e7372bb526bdc24c0eb1ffccaaca3d28af5dcf 100644
+--- a/src/mesa/main/mesh_shader.c
++++ b/src/mesa/main/mesh_shader.c
+@@ -50,7 +50,8 @@ draw_mesh_tasks(struct gl_context *ctx, const struct pipe_grid_info *info)
+       _mesa_update_state(ctx);
+ 
+    ST_PIPELINE_MESH_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask))
++      return;
+ 
+    ctx->pipe->draw_mesh_tasks(ctx->pipe, info);
+ 
+diff --git a/src/mesa/state_tracker/st_atom_array.cpp b/src/mesa/state_tracker/st_atom_array.cpp
+index 76de4cceec0b6c56d2ff2e49aabf1bf953bac334..4d907cd7c8a1929a837ac118aa010b14fed8f44e 100644
+--- a/src/mesa/state_tracker/st_atom_array.cpp
++++ b/src/mesa/state_tracker/st_atom_array.cpp
+@@ -39,6 +39,7 @@
+ #include "st_atom.h"
+ #include "st_draw.h"
+ #include "st_program.h"
++#include "st_util.h"
+ 
+ #include "cso_cache/cso_context.h"
+ #include "util/u_cpu_detect.h"
+@@ -324,7 +325,19 @@ st_setup_current(struct st_context *st,
+       u_upload_alloc(uploader, 0, max_size, 16,
+                      &vbuffer[bufidx].buffer_offset,
+                      &vbuffer[bufidx].buffer.resource, &releasebuf, (void**)&ptr);
+-      uint8_t *cursor = ptr;
++
++      /* The driver may have no memory for the values. The vertex elements
++       * are still laid out, so the state is consistent, but nothing is
++       * copied and the slot has no buffer. The draw must not use it:
++       * st_validate_state() reports the failure and the next draw runs this
++       * update again.
++       */
++      if (unlikely(!ptr)) {
++         vbuffer[bufidx].buffer_offset = 0;
++         vbuffer[bufidx].buffer.resource = NULL;
++         st_note_upload_failure(st, ST_NEW_VERTEX_ARRAYS);
++      }
++      unsigned cursor = 0;
+ 
+       if (FILL_TC_SET_VB) {
+          struct pipe_context *pipe = ctx->pipe;
+@@ -346,10 +359,11 @@ st_setup_current(struct st_context *st,
+           * is always true.
+           */
+          assert(size % 4 == 0); /* assume a hw-friendly alignment */
+-         memcpy(cursor, attrib->Ptr, size);
++         if (ptr)
++            memcpy(ptr + cursor, attrib->Ptr, size);
+ 
+          if (UPDATE_VELEMS) {
+-            init_velement(velements->velems, &attrib->Format, cursor - ptr,
++            init_velement(velements->velems, &attrib->Format, cursor,
+                           0, 0, bufidx, dual_slot_inputs & BITFIELD_BIT(attr),
+                           util_bitcount_fast<POPCNT>(inputs_read &
+                                                      BITFIELD_MASK(attr)));
+diff --git a/src/mesa/state_tracker/st_atom_constbuf.c b/src/mesa/state_tracker/st_atom_constbuf.c
+index 4759c344a0008fa5eb181747eed7b1fe4c7850ce..485ee1e5d83acc37d50ea48c03062b7b7840194c 100644
+--- a/src/mesa/state_tracker/st_atom_constbuf.c
++++ b/src/mesa/state_tracker/st_atom_constbuf.c
+@@ -47,6 +47,7 @@
+ #include "st_atom.h"
+ #include "st_atom_constbuf.h"
+ #include "st_program.h"
++#include "st_util.h"
+ 
+ /* Unbinds the CB0 if it's not used by the current program to avoid leaving
+  * dangling pointers to old (potentially deleted) shaders in the driver.
+@@ -62,6 +63,33 @@ st_unbind_unused_cb0(struct st_context *st, mesa_shader_stage shader_type)
+    }
+ }
+ 
++/**
++ * The state atom that uploads a stage's constants.
++ */
++static unsigned
++st_constants_atom(mesa_shader_stage stage)
++{
++   switch (stage) {
++   case MESA_SHADER_VERTEX:
++      return ST_NEW_VS_CONSTANTS;
++   case MESA_SHADER_TESS_CTRL:
++      return ST_NEW_TCS_CONSTANTS;
++   case MESA_SHADER_TESS_EVAL:
++      return ST_NEW_TES_CONSTANTS;
++   case MESA_SHADER_GEOMETRY:
++      return ST_NEW_GS_CONSTANTS;
++   case MESA_SHADER_FRAGMENT:
++      return ST_NEW_FS_CONSTANTS;
++   case MESA_SHADER_COMPUTE:
++      return ST_NEW_CS_CONSTANTS;
++   case MESA_SHADER_TASK:
++      return ST_NEW_TS_CONSTANTS;
++   default:
++      assert(stage == MESA_SHADER_MESH);
++      return ST_NEW_MS_CONSTANTS;
++   }
++}
++
+ /**
+  * Pass the given program parameters to the graphics pipe as a
+  * constant buffer.
+@@ -136,6 +164,16 @@ st_upload_constants(struct st_context *st, struct gl_program *prog, mesa_shader_
+          u_upload_alloc(pipe->const_uploader, 0, paramBytes + 12,
+             alignment, &cb.buffer_offset, &cb.buffer, &releasebuf, (void**)&ptr);
+ 
++         if (unlikely(!ptr)) {
++            /* The driver has no memory for the constants. Leave the stage's
++             * constant buffer as it was and make the draw that asked for the
++             * validation skip itself: st_validate_state() reports the failure
++             * and the next draw runs this update again.
++             */
++            st_note_upload_failure(st, st_constants_atom(stage));
++            return;
++         }
++
+          int uniform_bytes = params->UniformBytes;
+          if (uniform_bytes)
+             memcpy(ptr, params->ParameterValues, uniform_bytes);
+diff --git a/src/mesa/state_tracker/st_cb_bitmap.c b/src/mesa/state_tracker/st_cb_bitmap.c
+index 1824d38f7303ae8ec22468fb20e087c11ae28254..88fd274958527ec7dd9e8c8a748ebc140b2e7dad 100644
+--- a/src/mesa/state_tracker/st_cb_bitmap.c
++++ b/src/mesa/state_tracker/st_cb_bitmap.c
+@@ -652,7 +652,8 @@ st_Bitmap(struct gl_context *ctx, GLint x, GLint y,
+    st_state_bitset constants = {0};
+    ST_SET_SHADER_STATES(constants, CONSTANTS);
+    BITSET_ANDNOT(mask, mask, constants);
+-   st_validate_state(st, mask);
++   if (!st_validate_state(st, mask))
++      return;
+ 
+    struct pipe_sampler_view *view = NULL;
+ 
+diff --git a/src/mesa/state_tracker/st_cb_clear.c b/src/mesa/state_tracker/st_cb_clear.c
+index 9d83ce47862587658babd5e55163bf8a3e9f204d..c648a0b880002b3a5e61524fee97c7ad4e41f289 100644
+--- a/src/mesa/state_tracker/st_cb_clear.c
++++ b/src/mesa/state_tracker/st_cb_clear.c
+@@ -104,9 +104,10 @@ st_destroy_clear(struct st_context *st)
+ 
+ 
+ /**
+- * Helper function to set the clear color fragment shader.
++ * Helper function to set the clear color fragment shader. Returns false when
++ * the driver had no memory for the clear color: the quad must not be drawn.
+  */
+-static void
++static bool
+ set_clearcolor_fs(struct st_context *st, union pipe_color_union *color,
+                   struct pipe_resource **releasebuf)
+ {
+@@ -114,13 +115,15 @@ set_clearcolor_fs(struct st_context *st, union pipe_color_union *color,
+       .user_buffer = color->f,
+       .buffer_size = 4 * sizeof(float),
+    };
+-   pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_FRAGMENT, &cb, releasebuf);
++   const bool uploaded =
++      pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_FRAGMENT, &cb, releasebuf);
+ 
+    if (!st->clear.fs) {
+       st->clear.fs = st_nir_make_clearcolor_shader(st);
+    }
+ 
+    cso_set_fragment_shader_handle(st->cso_context, st->clear.fs);
++   return uploaded;
+ }
+ 
+ static void *
+@@ -287,7 +290,8 @@ clear_with_quad(struct gl_context *ctx, unsigned clear_buffers)
+ 
+    /* Set constant buffer */
+    struct pipe_resource *releasebuf = NULL;
+-   set_clearcolor_fs(st, (union pipe_color_union*)&ctx->Color.ClearColor, &releasebuf);
++   const bool uploaded =
++      set_clearcolor_fs(st, (union pipe_color_union*)&ctx->Color.ClearColor, &releasebuf);
+    cso_set_tessctrl_shader_handle(cso, NULL);
+    cso_set_tesseval_shader_handle(cso, NULL);
+    cso_set_mesh_shader_handle(cso, NULL);
+@@ -305,7 +309,8 @@ clear_with_quad(struct gl_context *ctx, unsigned clear_buffers)
+     * We can't translate the clear color to the colorbuffer format,
+     * because different colorbuffers may have different formats.
+     */
+-   if (!st_draw_quad(st, x0, y0, x1, y1,
++   if (!uploaded ||
++       !st_draw_quad(st, x0, y0, x1, y1,
+                      ctx->Depth.Clear * 2.0f - 1.0f,
+                      0.0f, 0.0f, 0.0f, 0.0f,
+                      (const float *) &ctx->Color.ClearColor.f,
+diff --git a/src/mesa/state_tracker/st_cb_drawpixels.c b/src/mesa/state_tracker/st_cb_drawpixels.c
+index 8848db1d9058cf2c7c7f50298ee799fb60381021..91e89bbfad506718885321cc14fc2fe4ec162665 100644
+--- a/src/mesa/state_tracker/st_cb_drawpixels.c
++++ b/src/mesa/state_tracker/st_cb_drawpixels.c
+@@ -1261,7 +1261,8 @@ st_DrawPixels(struct gl_context *ctx, GLint x, GLint y,
+    st_invalidate_readpix_cache(st);
+ 
+    ST_PIPELINE_META_STATE_MASK(mask);
+-   st_validate_state(st, mask);
++   if (!st_validate_state(st, mask))
++      return;
+ 
+    clippedUnpack = *unpack;
+    unpack = &clippedUnpack;
+@@ -1675,7 +1676,8 @@ st_CopyPixels(struct gl_context *ctx, GLint srcx, GLint srcy,
+    st_invalidate_readpix_cache(st);
+ 
+    ST_PIPELINE_META_STATE_MASK(mask);
+-   st_validate_state(st, mask);
++   if (!st_validate_state(st, mask))
++      return;
+ 
+    if (blit_copy_pixels(ctx, srcx, srcy, width, height, dstx, dsty, type))
+       return;
+diff --git a/src/mesa/state_tracker/st_cb_drawtex.c b/src/mesa/state_tracker/st_cb_drawtex.c
+index 1398c344cc3cb20fa07db0cd689028e0df86c653..b8c191a68cf669008152028564e8a216e0bcc4df 100644
+--- a/src/mesa/state_tracker/st_cb_drawtex.c
++++ b/src/mesa/state_tracker/st_cb_drawtex.c
+@@ -136,7 +136,8 @@ st_DrawTex(struct gl_context *ctx, GLfloat x, GLfloat y, GLfloat z,
+    st_invalidate_readpix_cache(st);
+ 
+    ST_PIPELINE_META_STATE_MASK(mask);
+-   st_validate_state(st, mask);
++   if (!st_validate_state(st, mask))
++      return;
+ 
+    /* determine if we need vertex color */
+    if (ctx->FragmentProgram._Current->info.inputs_read & VARYING_BIT_COL0)
+diff --git a/src/mesa/state_tracker/st_cb_rasterpos.c b/src/mesa/state_tracker/st_cb_rasterpos.c
+index 98abebadc81831e0db9f4d94f8ad24bfe9d3f158..a005ce32cad2311ee621cdfe9250853290ab97e7 100644
+--- a/src/mesa/state_tracker/st_cb_rasterpos.c
++++ b/src/mesa/state_tracker/st_cb_rasterpos.c
+@@ -279,8 +279,8 @@ st_RasterPos(struct gl_context *ctx, const GLfloat v[4])
+                                ctx->Array._DrawVAO->_EnabledWithMapMode);
+ 
+    ST_PIPELINE_RENDER_STATE_MASK(pipeline_mask);
+-   st_prepare_draw(ctx, pipeline_mask);
+-   st_feedback_draw_vbo(ctx, &rs->info, 0, NULL, &rs->draw, 1);
++   if (st_prepare_draw(ctx, pipeline_mask))
++      st_feedback_draw_vbo(ctx, &rs->info, 0, NULL, &rs->draw, 1);
+ 
+    _mesa_restore_draw_vao(ctx, old_vao, old_vp_input_filter);
+ 
+diff --git a/src/mesa/state_tracker/st_context.h b/src/mesa/state_tracker/st_context.h
+index 5826952b3a721fbb95255ea5b7853e7329c7dbe9..7d8eb0650559adfe1b1d9a5ae4d0772783919b05 100644
+--- a/src/mesa/state_tracker/st_context.h
++++ b/src/mesa/state_tracker/st_context.h
+@@ -176,6 +176,12 @@ struct st_context
+    bool draw_needs_minmax_index;
+    bool is_threaded_context;
+ 
++   /* A state update could not get the upload memory it needs from the
++    * driver. Set by the update functions, read and cleared by
++    * st_validate_state().
++    */
++   bool upload_failed;
++
+    /* driver supports scissored clears */
+    bool can_scissor_clear;
+ 
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index c3005f52c39fa181c0c2aeb89f8a9f03a89cba7d..58b264fbb7445b1d47683e3be99cc24e0e5651bf 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -72,6 +72,20 @@ static_assert(GL_TRIANGLE_STRIP_ADJACENCY == MESA_PRIM_TRIANGLE_STRIP_ADJACENCY,
+ static_assert(GL_PATCHES == MESA_PRIM_PATCHES, "enum mismatch");
+ 
+ void
++st_report_upload_failure(struct st_context *st)
++{
++   /* The driver had no memory for the upload a state update needed. Nothing
++    * is lost but the draw: the state stays dirty for the next one to retry.
++    */
++   _mesa_error(st->ctx, GL_OUT_OF_MEMORY, "no memory for the draw's uploads");
++}
++
++/**
++ * Validate the state for a draw. Returns false when the draw must be skipped
++ * because the driver had no memory for an upload the state needs; the error
++ * has been raised.
++ */
++bool
+ st_prepare_draw(struct gl_context *ctx, const st_state_bitset state_mask)
+ {
+    struct st_context *st = ctx->st;
+@@ -85,8 +99,11 @@ st_prepare_draw(struct gl_context *ctx, const st_state_bitset state_mask)
+    st_invalidate_readpix_cache(st);
+ 
+    /* Validate state. */
+-   st_validate_state(st, state_mask);
++   if (!st_validate_state(st, state_mask))
++      return false;
++
+    st_context_add_work(st);
++   return true;
+ }
+ 
+ void
+@@ -161,7 +178,8 @@ st_indirect_draw_vbo(struct gl_context *ctx,
+ 
+    assert(stride);
+    ST_PIPELINE_RENDER_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask))
++      return;
+ 
+    memset(&indirect, 0, sizeof(indirect));
+    util_draw_init_info(&info);
+diff --git a/src/mesa/state_tracker/st_draw.h b/src/mesa/state_tracker/st_draw.h
+index 6cf3c0e55ea6bb3a67abf0890c495b1ad0e19ce8..f5d7ed11e65ffa585391d64151753a8978b18712 100644
+--- a/src/mesa/state_tracker/st_draw.h
++++ b/src/mesa/state_tracker/st_draw.h
+@@ -74,7 +74,7 @@ pointer_to_offset(const void *ptr)
+    return (unsigned) (((GLsizeiptr) ptr) & 0xffffffffUL);
+ }
+ 
+-void
++bool
+ st_prepare_draw(struct gl_context *ctx, const st_state_bitset state_mask);
+ 
+ void
+diff --git a/src/mesa/state_tracker/st_draw_hw_select.c b/src/mesa/state_tracker/st_draw_hw_select.c
+index 6b2bb993477067392d554053223700509666dc23..0483d7b78f7bea7f00e57f7eb8adaf153ab165e2 100644
+--- a/src/mesa/state_tracker/st_draw_hw_select.c
++++ b/src/mesa/state_tracker/st_draw_hw_select.c
+@@ -693,7 +693,8 @@ st_draw_hw_select_prepare_common(struct gl_context *ctx,
+    cb.buffer_size = sizeof(consts) - (MAX_CLIP_PLANES - num_planes) * 4 * sizeof(float);
+ 
+    struct pipe_context *pipe = st->pipe;
+-   pipe_upload_constant_buffer0(pipe, MESA_SHADER_GEOMETRY, &cb, releasebuf);
++   if (!pipe_upload_constant_buffer0(pipe, MESA_SHADER_GEOMETRY, &cb, releasebuf))
++      return false;
+ 
+    struct pipe_shader_buffer buffer;
+    memset(&buffer, 0, sizeof(buffer));
+diff --git a/src/mesa/state_tracker/st_pbo.c b/src/mesa/state_tracker/st_pbo.c
+index f4a7ba127d0ca4b9dc7f9ec88149f08fd7a58c73..97df41eff6d62b7e64f5c4a80994b622d7bf25c7 100644
+--- a/src/mesa/state_tracker/st_pbo.c
++++ b/src/mesa/state_tracker/st_pbo.c
+@@ -267,7 +267,10 @@ st_pbo_draw(struct st_context *st, const struct st_pbo_addresses *addr,
+       cb.buffer_offset = 0;
+       cb.buffer_size = sizeof(addr->constants);
+ 
+-      pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_FRAGMENT, &cb, &cb_releasebuf);
++      if (!pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_FRAGMENT, &cb, &cb_releasebuf)) {
++         pipe_resource_release(st->pipe, vb_releasebuf);
++         return false;
++      }
+    }
+ 
+    /* Rasterizer state */
+diff --git a/src/mesa/state_tracker/st_pbo_compute.c b/src/mesa/state_tracker/st_pbo_compute.c
+index 7c9ea0938b44940d331121a51fc222eb9f512ca6..45e53300b6f7d3283bd2c841f1b7540d352eb9fa 100644
+--- a/src/mesa/state_tracker/st_pbo_compute.c
++++ b/src/mesa/state_tracker/st_pbo_compute.c
+@@ -996,7 +996,8 @@ download_texture_compute(struct st_context *st,
+    struct cso_context *cso = st->cso_context;
+ 
+    struct pipe_resource *releasebuf = NULL;
+-   pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_COMPUTE, &cb, &releasebuf);
++   if (!pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_COMPUTE, &cb, &releasebuf))
++      return NULL;
+ 
+    cso_save_compute_state(cso, CSO_BIT_COMPUTE_SHADER | CSO_BIT_COMPUTE_SAMPLERS);
+    cso_set_compute_shader_handle(cso, cs);
+diff --git a/src/mesa/state_tracker/st_util.h b/src/mesa/state_tracker/st_util.h
+index 9958ea8eab4687189450a6963e059ac82e1c7f22..958103528bf25761d89ff23bb63f65fbbb74c2c3 100644
+--- a/src/mesa/state_tracker/st_util.h
++++ b/src/mesa/state_tracker/st_util.h
+@@ -115,7 +115,28 @@ st_point_size_per_vertex(struct gl_context *ctx)
+    return false;
+ }
+ 
++/**
++ * Called by a state update function that needed memory for an upload and the
++ * driver had none. The update could not finish, so the state is marked
++ * dirty again for the next draw to try once more, and the draw that asked
++ * for the validation must be skipped.
++ */
+ static inline void
++st_note_upload_failure(struct st_context *st, unsigned atom)
++{
++   st->upload_failed = true;
++   ST_SET_STATE(st->ctx->NewDriverState, atom);
++}
++
++void
++st_report_upload_failure(struct st_context *st);
++
++/**
++ * Validate the state. Returns false, after raising GL_OUT_OF_MEMORY, when a
++ * state update could not get the upload memory it needs: the caller must not
++ * draw, because the state the draw would use is incomplete.
++ */
++static inline bool
+ st_validate_state(struct st_context *st, const st_state_bitset pipeline_state_mask)
+ {
+    struct gl_context *ctx = st->ctx;
+@@ -133,9 +154,17 @@ st_validate_state(struct st_context *st, const st_state_bitset pipeline_state_ma
+        * the last draw.
+        */
+       unsigned i;
++      st->upload_failed = false;
+       BITSET_FOREACH_SET(i, dirty, ST_NUM_ATOMS)
+          st->update_functions[i](st);
++
++      if (unlikely(st->upload_failed)) {
++         st_report_upload_failure(st);
++         return false;
++      }
+    }
++
++   return true;
+ }
+ 
+ #ifdef __cplusplus
+diff --git a/src/mesa/vbo/vbo_exec_draw.c b/src/mesa/vbo/vbo_exec_draw.c
+index 34ef4b705127aa52f366e50ebee1b195c6b461ce..a26d60234fc0c41fcea05217288da059043ad004 100644
+--- a/src/mesa/vbo/vbo_exec_draw.c
++++ b/src/mesa/vbo/vbo_exec_draw.c
+@@ -342,12 +342,11 @@ vbo_exec_vtx_flush(struct vbo_exec_context *exec)
+                    exec->vtx.vert_count);
+ 
+          ST_PIPELINE_RENDER_STATE_MASK(mask);
+-         st_prepare_draw(ctx, mask);
+-
+-         ctx->Driver.DrawGalliumMultiMode(ctx, &exec->vtx.info,
+-                                          exec->vtx.draw,
+-                                          exec->vtx.mode,
+-                                          exec->vtx.prim_count);
++         if (st_prepare_draw(ctx, mask))
++            ctx->Driver.DrawGalliumMultiMode(ctx, &exec->vtx.info,
++                                             exec->vtx.draw,
++                                             exec->vtx.mode,
++                                             exec->vtx.prim_count);
+ 
+          /* Get new storage -- unless asked not to. */
+          if (!persistent_mapping)
+diff --git a/src/mesa/vbo/vbo_save_draw.c b/src/mesa/vbo/vbo_save_draw.c
+index dbcef2e7cae5c55168ccf627b506f8c2b4212c7a..a8c426fb3b5b7332091f0bd51eb73e3b6e17b6ce 100644
+--- a/src/mesa/vbo/vbo_save_draw.c
++++ b/src/mesa/vbo/vbo_save_draw.c
+@@ -282,7 +282,12 @@ vbo_save_playback_vertex_list_gallium(struct gl_context *ctx,
+    _mesa_update_edgeflag_state_explicit(ctx, enabled & VERT_BIT_EDGEFLAG);
+ 
+    ST_PIPELINE_RENDER_STATE_MASK_NO_VARRAYS(mask);
+-   st_prepare_draw(ctx, mask);
++   if (!st_prepare_draw(ctx, mask)) {
++      /* No draw takes the vertex state's reference: give it back. */
++      if (info.take_vertex_state_ownership)
++         (*(int16_t*)&node->private_refcount[mode])++;
++      goto skipped;
++   }
+ 
+    struct pipe_context *pipe = ctx->pipe;
+    uint32_t velem_mask = ctx->VertexProgram._Current->info.inputs_read;
+@@ -319,6 +324,7 @@ vbo_save_playback_vertex_list_gallium(struct gl_context *ctx,
+                               &node->start_count, 1);
+    }
+ 
++skipped:
+    /* Restore edge flag state and ctx->VertexProgram._VaryingInputs. */
+    _mesa_update_edgeflag_state_vao(ctx);
+ 
+@@ -379,9 +385,9 @@ vbo_save_playback_vertex_list(struct gl_context *ctx, void *data, bool copy_to_c
+    struct pipe_draw_info *info = (struct pipe_draw_info *) &node->cold->info;
+ 
+    ST_PIPELINE_RENDER_STATE_MASK(mask);
+-   st_prepare_draw(ctx, mask);
+-
+-   if (node->modes) {
++   if (!st_prepare_draw(ctx, mask)) {
++      /* Skip the draw. */
++   } else if (node->modes) {
+       ctx->Driver.DrawGalliumMultiMode(ctx, info,
+                                        node->start_counts,
+                                        node->modes,

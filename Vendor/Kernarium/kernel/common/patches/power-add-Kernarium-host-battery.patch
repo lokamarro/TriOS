@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 03:28:07 +0000
+Subject: [PATCH] power: add Kernarium host battery
+
+---
+ drivers/power/supply/Kconfig                  |   8 +
+ drivers/power/supply/Makefile                 |   1 +
+ .../power/supply/virtio_kernarium_battery.c   | 322 ++++++++++++++++++
+ 3 files changed, 331 insertions(+)
+ create mode 100644 drivers/power/supply/virtio_kernarium_battery.c
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index dca4be23ee709581ff8ef68addd8ca2513f7ac93..5e9b7094ed93df26e42d55cbf9af5406a79c649f 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -86,6 +86,14 @@ config TEST_POWER
+ 	help
+ 	  This driver is used for testing. It's safe to say M here.
+ 
++config KERNARIUM_VIRTIO_BATTERY
++	tristate "Kernarium host battery over Virtio"
++	depends on VIRTIO
++	help
++	  Say Y here to expose the Apple host's battery percentage and charging
++	  state through the Linux power-supply class. The Kernarium emulator
++	  provides the matching local experimental Virtio device.
++
+ config BATTERY_88PM860X
+ 	tristate "Marvell 88PM860x battery driver"
+ 	depends on MFD_88PM860X
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 99a820d38197cd00d40ab8a87dfd4f9c0d3f9e7b..376f5a0750c8bc9bb55bd609025e33502b620a83 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_WM831X_BACKUP)	+= wm831x_backup.o
+ obj-$(CONFIG_WM831X_POWER)	+= wm831x_power.o
+ obj-$(CONFIG_WM8350_POWER)	+= wm8350_power.o
+ obj-$(CONFIG_TEST_POWER)	+= test_power.o
++obj-$(CONFIG_KERNARIUM_VIRTIO_BATTERY) += virtio_kernarium_battery.o
+ 
+ obj-$(CONFIG_BATTERY_88PM860X)	+= 88pm860x_battery.o
+ obj-$(CONFIG_CHARGER_ADP5061)	+= adp5061.o
+diff --git a/drivers/power/supply/virtio_kernarium_battery.c b/drivers/power/supply/virtio_kernarium_battery.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ee7a069f4cf9f66832500a9fe96dd78d03aeda0
+--- /dev/null
++++ b/drivers/power/supply/virtio_kernarium_battery.c
+@@ -0,0 +1,322 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Kernarium host battery transport.
++ *
++ * This is a local experimental Virtio protocol. Device ID 65535 is the
++ * backwards-growing experimental ID reserved by the Virtio specification.
++ */
++
++#include <linux/types.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/power_supply.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/workqueue.h>
++
++#define VIRTIO_ID_KERNARIUM_BATTERY	65535
++#define KERNARIUM_BATTERY_VERSION	1
++#define KERNARIUM_BATTERY_POLL_MS	5000
++
++enum kernarium_battery_status {
++	KERNARIUM_BATTERY_STATUS_UNKNOWN,
++	KERNARIUM_BATTERY_STATUS_CHARGING,
++	KERNARIUM_BATTERY_STATUS_DISCHARGING,
++	KERNARIUM_BATTERY_STATUS_NOT_CHARGING,
++	KERNARIUM_BATTERY_STATUS_FULL,
++};
++
++struct kernarium_battery_request {
++	__le32 version;
++} __packed;
++
++struct kernarium_battery_state {
++	__le32 version;
++	u8 percentage;
++	u8 status;
++	u8 present;
++	u8 external_power;
++} __packed;
++
++struct kernarium_battery {
++	struct virtio_device *vdev;
++	struct virtqueue *vq;
++	struct delayed_work poll_work;
++	/* Serializes cached state and virtqueue access against its callback. */
++	spinlock_t lock;
++	bool request_pending;
++	struct kernarium_battery_request request;
++	struct kernarium_battery_state response;
++	u8 percentage;
++	u8 status;
++	bool present;
++	bool external_power;
++	struct power_supply *battery;
++	struct power_supply *mains;
++};
++
++static enum power_supply_property kernarium_battery_properties[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_CAPACITY,
++};
++
++static enum power_supply_property kernarium_mains_properties[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++};
++
++static int kernarium_power_supply_status(u8 status)
++{
++	switch (status) {
++	case KERNARIUM_BATTERY_STATUS_CHARGING:
++		return POWER_SUPPLY_STATUS_CHARGING;
++	case KERNARIUM_BATTERY_STATUS_DISCHARGING:
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	case KERNARIUM_BATTERY_STATUS_NOT_CHARGING:
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	case KERNARIUM_BATTERY_STATUS_FULL:
++		return POWER_SUPPLY_STATUS_FULL;
++	default:
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++	}
++}
++
++static int kernarium_battery_get_property(struct power_supply *psy,
++					  enum power_supply_property property,
++					  union power_supply_propval *value)
++{
++	struct kernarium_battery *battery = power_supply_get_drvdata(psy);
++	unsigned long flags;
++	u8 percentage;
++	u8 status;
++	bool present;
++
++	spin_lock_irqsave(&battery->lock, flags);
++	percentage = battery->percentage;
++	status = battery->status;
++	present = battery->present;
++	spin_unlock_irqrestore(&battery->lock, flags);
++
++	switch (property) {
++	case POWER_SUPPLY_PROP_STATUS:
++		value->intval = kernarium_power_supply_status(status);
++		return 0;
++	case POWER_SUPPLY_PROP_PRESENT:
++		value->intval = present;
++		return 0;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		value->intval = percentage;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int kernarium_mains_get_property(struct power_supply *psy,
++					enum power_supply_property property,
++					union power_supply_propval *value)
++{
++	struct kernarium_battery *battery = power_supply_get_drvdata(psy);
++	unsigned long flags;
++	bool external_power;
++
++	if (property != POWER_SUPPLY_PROP_ONLINE)
++		return -EINVAL;
++
++	spin_lock_irqsave(&battery->lock, flags);
++	external_power = battery->external_power;
++	spin_unlock_irqrestore(&battery->lock, flags);
++	value->intval = external_power;
++	return 0;
++}
++
++static const struct power_supply_desc kernarium_battery_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = kernarium_battery_properties,
++	.num_properties = ARRAY_SIZE(kernarium_battery_properties),
++	.get_property = kernarium_battery_get_property,
++};
++
++static const struct power_supply_desc kernarium_mains_desc = {
++	.name = "kernarium-mains",
++	.type = POWER_SUPPLY_TYPE_MAINS,
++	.properties = kernarium_mains_properties,
++	.num_properties = ARRAY_SIZE(kernarium_mains_properties),
++	.get_property = kernarium_mains_get_property,
++};
++
++static bool kernarium_battery_valid(const struct kernarium_battery_state *state)
++{
++	return le32_to_cpu(state->version) == KERNARIUM_BATTERY_VERSION &&
++		state->percentage <= 100 &&
++		state->status <= KERNARIUM_BATTERY_STATUS_FULL &&
++		state->present <= 1 && state->external_power <= 1;
++}
++
++static void kernarium_battery_done(struct virtqueue *vq)
++{
++	struct kernarium_battery *battery = vq->vdev->priv;
++	struct kernarium_battery *token;
++	unsigned long flags;
++	unsigned int length;
++	bool changed = false;
++
++	for (;;) {
++		spin_lock_irqsave(&battery->lock, flags);
++		token = virtqueue_get_buf(vq, &length);
++		if (!token) {
++			spin_unlock_irqrestore(&battery->lock, flags);
++			break;
++		}
++		if (token != battery) {
++			spin_unlock_irqrestore(&battery->lock, flags);
++			dev_warn(&battery->vdev->dev,
++				 "received an unknown battery response token\n");
++			continue;
++		}
++
++		battery->request_pending = false;
++		if (length == sizeof(battery->response) &&
++		    kernarium_battery_valid(&battery->response)) {
++			changed = battery->percentage != battery->response.percentage ||
++				battery->status != battery->response.status ||
++				battery->present != battery->response.present ||
++				battery->external_power !=
++					battery->response.external_power;
++			battery->percentage = battery->response.percentage;
++			battery->status = battery->response.status;
++			battery->present = battery->response.present;
++			battery->external_power = battery->response.external_power;
++		}
++		spin_unlock_irqrestore(&battery->lock, flags);
++	}
++
++	if (changed) {
++		power_supply_changed(battery->battery);
++		power_supply_changed(battery->mains);
++	}
++}
++
++static void kernarium_battery_poll(struct work_struct *work)
++{
++	struct kernarium_battery *battery;
++	struct scatterlist request_sg;
++	struct scatterlist response_sg;
++	struct scatterlist *sgs[] = { &request_sg, &response_sg };
++	unsigned long flags;
++	int error;
++
++	battery = container_of(to_delayed_work(work),
++			       struct kernarium_battery, poll_work);
++
++	spin_lock_irqsave(&battery->lock, flags);
++	if (battery->request_pending) {
++		spin_unlock_irqrestore(&battery->lock, flags);
++		goto reschedule;
++	}
++
++	battery->request.version = cpu_to_le32(KERNARIUM_BATTERY_VERSION);
++	memset(&battery->response, 0, sizeof(battery->response));
++	sg_init_one(&request_sg, &battery->request, sizeof(battery->request));
++	sg_init_one(&response_sg, &battery->response, sizeof(battery->response));
++	error = virtqueue_add_sgs(battery->vq, sgs, 1, 1, battery, GFP_ATOMIC);
++	if (!error)
++		battery->request_pending = true;
++	spin_unlock_irqrestore(&battery->lock, flags);
++
++	if (error) {
++		dev_warn_ratelimited(&battery->vdev->dev,
++				     "could not queue host battery request: %d\n",
++				     error);
++	} else if (!virtqueue_kick(battery->vq)) {
++		dev_warn_ratelimited(&battery->vdev->dev,
++				     "could not notify the host battery device\n");
++	}
++
++reschedule:
++	schedule_delayed_work(&battery->poll_work,
++			      msecs_to_jiffies(KERNARIUM_BATTERY_POLL_MS));
++}
++
++static int kernarium_battery_probe(struct virtio_device *vdev)
++{
++	struct power_supply_config supply_config = {};
++	struct kernarium_battery *battery;
++
++	battery = devm_kzalloc(&vdev->dev, sizeof(*battery), GFP_KERNEL);
++	if (!battery)
++		return -ENOMEM;
++
++	battery->vdev = vdev;
++	battery->percentage = 100;
++	battery->status = KERNARIUM_BATTERY_STATUS_FULL;
++	battery->present = true;
++	battery->external_power = true;
++	spin_lock_init(&battery->lock);
++	INIT_DELAYED_WORK(&battery->poll_work, kernarium_battery_poll);
++	vdev->priv = battery;
++
++	battery->vq = virtio_find_single_vq(vdev, kernarium_battery_done,
++					    "status");
++	if (IS_ERR(battery->vq))
++		return dev_err_probe(&vdev->dev, PTR_ERR(battery->vq),
++				     "could not create battery status queue\n");
++
++	supply_config.drv_data = battery;
++	battery->battery = devm_power_supply_register(&vdev->dev,
++						      &kernarium_battery_desc,
++						       &supply_config);
++	if (IS_ERR(battery->battery))
++		goto delete_queues;
++
++	battery->mains = devm_power_supply_register(&vdev->dev,
++						    &kernarium_mains_desc,
++						     &supply_config);
++	if (IS_ERR(battery->mains))
++		goto delete_queues;
++
++	schedule_delayed_work(&battery->poll_work, msecs_to_jiffies(100));
++	return 0;
++
++delete_queues:
++	vdev->config->del_vqs(vdev);
++	return dev_err_probe(&vdev->dev,
++		IS_ERR(battery->mains) ? PTR_ERR(battery->mains) :
++		PTR_ERR(battery->battery),
++		"could not register battery power supplies\n");
++}
++
++static void kernarium_battery_remove(struct virtio_device *vdev)
++{
++	struct kernarium_battery *battery = vdev->priv;
++
++	cancel_delayed_work_sync(&battery->poll_work);
++	virtio_reset_device(vdev);
++	vdev->config->del_vqs(vdev);
++}
++
++static const struct virtio_device_id kernarium_battery_id_table[] = {
++	{ VIRTIO_ID_KERNARIUM_BATTERY, VIRTIO_DEV_ANY_ID },
++	{ },
++};
++MODULE_DEVICE_TABLE(virtio, kernarium_battery_id_table);
++
++static struct virtio_driver kernarium_battery_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = kernarium_battery_id_table,
++	.probe = kernarium_battery_probe,
++	.remove = kernarium_battery_remove,
++};
++module_virtio_driver(kernarium_battery_driver);
++
++MODULE_DESCRIPTION("Kernarium host battery Virtio driver");
++MODULE_LICENSE("GPL");

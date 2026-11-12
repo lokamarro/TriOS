@@ -1,0 +1,1865 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 17:19:59 +0900
+Subject: [PATCH] kosmickrisp: blend with Metal's own state where Metal can
+ express it
+
+KosmicKrisp lowered every blend into the fragment shader, which made the
+shader's MSL a function of the colour-blend state.  That state belongs to the
+fragment-output interface library, not to the library holding the fragment
+shader, so the shader could not be compiled until the two were linked, and
+VK_EXT_graphics_pipeline_library's link had to carry Metal's whole MSL to AIR
+compile - about 95% of its cost, and the reason
+dEQP-VK.pipeline.pipeline_library.graphics_library.misc.other.compare_link_times
+warns.
+
+Metal has a fixed-function blend for every Vulkan blend factor and every
+Vulkan blend operation, including the constant-colour factors and the
+saturate, plus the write mask, and it applies them in the attachment's own
+format, so an sRGB target blends in linear space exactly as the specification
+asks.  Use it.  What Metal has no form of at all - a logic op, an advanced
+blend operation - keeps kk_lower_fs_blend, and so does a dual-source factor
+until the MSL backend can emit a second colour index, and so does a pipeline
+that makes blend enables, equations, write masks, the logic op or the
+attachment count dynamic, because Metal bakes all of those into the pipeline
+state.  kk_blend_is_metal_expressible is the single predicate, and it
+deliberately ignores MESA_VK_DYNAMIC_CB_BLEND_ADVANCED: the runtime sets that
+bit whenever advancedBlendCoherentOperations is disabled, which means the
+advanced state is ignored rather than deferred.
+
+Blend constants stay dynamic on both paths.  Metal takes them on the encoder,
+so a pipeline blending with Metal's state binds them there instead of writing
+them into the root descriptor table, and the bind repeats when the shader is
+rebound because the pipeline can change without the constants changing.
+
+The attachment's shape decides whether Metal can own the equation at all, in
+two ways the lowered path used to hide.  KosmicKrisp declared the fragment
+function's return with the attachment's component count, which was safe only
+because kk_lower_fs_blend narrowed every colour store to match; with the blend
+left to Metal, that return both names components the declared type lacks - the
+MSL failed to compile for every attachment narrower than four components - and
+would rob the blend unit of the source alpha it weights with, since Metal reads
+that alpha from the return value.  A shader left independent of the blend state
+therefore keeps returning four components, which Metal narrows to the
+attachment itself while still supplying the destination alpha of 1.0 that a
+format without one is defined to read.  And a format Metal has no native form
+of is reached through the view's MTLTextureSwizzleChannels, which sits between
+the shader and the texture but not between the texture and the blend unit, so
+the three four-bit packed formats blend their destination in the hardware's
+channel order; those stay on the lowered path, which reads the destination back
+through the same swizzle.
+
+A fragment shader may also declare an index 1 output that no blend factor
+names.  It feeds nothing but a dual-source factor, so it is dead - but
+nir_lower_blend is what consumed it, unconditionally, and Metal has neither a
+second colour source nor, in this backend, a second colour index to emit.
+Leaving it in place while Metal blends produced a shader the backend could not
+express; dropping it keeps the pipeline on the fixed-function path and leaves
+the same MSL whichever expressible blend state the link supplies.  A factor
+that does name SRC1 still falls back to kk_lower_fs_blend.
+
+The new kosmickrisp_metal_blend test renders a covered target through fourteen
+blend states - every operation, the dst, one-minus-dst, constant and saturate
+factors, three write masks - and compares every channel the format holds
+against the same equation evaluated on the host.  It runs them against an
+attachment of each shape: R8G8B8A8_UNORM and R8G8B8A8_SRGB, the three-, two-
+and one-component R5G6B5_UNORM_PACK16, R8G8_UNORM and R8_UNORM, and the
+swizzle-emulated B4G4R4A4_UNORM_PACK16, plus an R8G8B8A8_UNORM target drawn
+with a fragment shader carrying a dead index 1 output.  It passes on both
+paths, which is what MESA_KK_DEBUG=no_metal_blend is for:
+it forces the lowered path so the two can be compared, and so a suspected
+fixed-function blend defect can be bisected without a rebuild.
+A one-off benchmark timed four hundred covering draws over a 1024x1024
+attachment with a GPU timestamp around the pass; on an M1 Ultra with the host
+otherwise busy, the best of four alternating runs was 8.57 us per draw with
+Metal's blend and 9.54 us with the lowered one, so the fixed-function path is
+no slower and is the better default for a monolithic pipeline as well.
+---
+ src/kosmickrisp/bridge/mtl_compiler.h         |  14 +
+ src/kosmickrisp/bridge/mtl_compiler.m         |  35 +
+ src/kosmickrisp/bridge/mtl_encoder.h          |   6 +
+ src/kosmickrisp/bridge/mtl_encoder.m          |  10 +
+ src/kosmickrisp/bridge/mtl_types.h            |  41 +
+ src/kosmickrisp/bridge/stubs/mtl_compiler.c   |  17 +
+ src/kosmickrisp/bridge/stubs/mtl_encoder.c    |   6 +
+ src/kosmickrisp/bridge/vk_to_mtl_map.c        |  73 ++
+ src/kosmickrisp/bridge/vk_to_mtl_map.h        |  18 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  19 +-
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   5 +
+ src/kosmickrisp/vulkan/kk_gpl.h               |   1 +
+ src/kosmickrisp/vulkan/kk_shader.c            | 248 +++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |  14 +
+ src/kosmickrisp/vulkan/meson.build            |  14 +
+ .../tests/metal_blend_shaders/blend.frag      |   9 +
+ .../tests/metal_blend_shaders/blend.frag.h    |  26 +
+ .../tests/metal_blend_shaders/blend.vert      |   7 +
+ .../tests/metal_blend_shaders/blend.vert.h    |  54 ++
+ .../tests/metal_blend_shaders/blend_dual.frag |  13 +
+ .../metal_blend_shaders/blend_dual.frag.h     |  35 +
+ .../tests/metal_blend_shaders/generate.sh     |   7 +
+ .../vulkan/tests/test_metal_blend.cpp         | 797 ++++++++++++++++++
+ 24 files changed, 1454 insertions(+), 16 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/metal_blend_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_metal_blend.cpp
+
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.h b/src/kosmickrisp/bridge/mtl_compiler.h
+index b433ac9b048ab98215b4bbe2238cb978a6f4b536..6fa72ada40ab02a71647b8fa754657c4a550d318 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.h
++++ b/src/kosmickrisp/bridge/mtl_compiler.h
+@@ -50,6 +50,20 @@ void mtl_render_pipeline_descriptor_set_color_attachment_format(
+    mtl_render_pipeline_descriptor *descriptor, uint8_t index,
+    enum mtl_pixel_format format);
+ 
++/* Metal's fixed-function blend for one colour attachment.  A pipeline whose
++ * blend state Metal cannot express keeps kk_lower_fs_blend instead, so the
++ * factors and operations reaching here are always ones Metal has. */
++void mtl_render_pipeline_descriptor_set_blend(
++   mtl_render_pipeline_descriptor *descriptor, uint8_t index, bool enabled,
++   enum mtl_blend_factor source_rgb, enum mtl_blend_factor destination_rgb,
++   enum mtl_blend_operation rgb_operation, enum mtl_blend_factor source_alpha,
++   enum mtl_blend_factor destination_alpha,
++   enum mtl_blend_operation alpha_operation);
++
++void mtl_render_pipeline_descriptor_set_write_mask(
++   mtl_render_pipeline_descriptor *descriptor, uint8_t index,
++   enum mtl_color_write_mask mask);
++
+ void mtl_render_pipeline_descriptor_set_raster_sample_count(
+    mtl_render_pipeline_descriptor *descriptor, uint32_t sample_count);
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_compiler.m
+index 87e93c0a930beb883b7f3ddbd05d3b9c7812b9a1..6730f8af364c6ca79be47d39b9ddf9e29d6c0d48 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -158,6 +158,41 @@
+    }
+ }
+ 
++void
++mtl_render_pipeline_descriptor_set_blend(mtl_render_pipeline_descriptor *descriptor,
++                                         uint8_t index,
++                                         bool enabled,
++                                         enum mtl_blend_factor source_rgb,
++                                         enum mtl_blend_factor destination_rgb,
++                                         enum mtl_blend_operation rgb_operation,
++                                         enum mtl_blend_factor source_alpha,
++                                         enum mtl_blend_factor destination_alpha,
++                                         enum mtl_blend_operation alpha_operation)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
++      MTL4RenderPipelineColorAttachmentDescriptor *att = desc.colorAttachments[index];
++      att.blendingState = enabled ? MTL4BlendStateEnabled : MTL4BlendStateDisabled;
++      att.sourceRGBBlendFactor = (MTLBlendFactor)source_rgb;
++      att.destinationRGBBlendFactor = (MTLBlendFactor)destination_rgb;
++      att.rgbBlendOperation = (MTLBlendOperation)rgb_operation;
++      att.sourceAlphaBlendFactor = (MTLBlendFactor)source_alpha;
++      att.destinationAlphaBlendFactor = (MTLBlendFactor)destination_alpha;
++      att.alphaBlendOperation = (MTLBlendOperation)alpha_operation;
++   }
++}
++
++void
++mtl_render_pipeline_descriptor_set_write_mask(mtl_render_pipeline_descriptor *descriptor,
++                                              uint8_t index,
++                                              enum mtl_color_write_mask mask)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
++      desc.colorAttachments[index].writeMask = (MTLColorWriteMask)mask;
++   }
++}
++
+ void
+ mtl_render_pipeline_descriptor_set_raster_sample_count(mtl_render_pipeline_descriptor *descriptor,
+                                                        uint32_t sample_count)
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.h b/src/kosmickrisp/bridge/mtl_encoder.h
+index 1d6ea7188b6c46cef7310f9d7fb5cae64da035f3..eecbcde7e73fb6ddc299e63b9bfbf98f79342f4c 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.h
++++ b/src/kosmickrisp/bridge/mtl_encoder.h
+@@ -101,6 +101,12 @@ void mtl_set_visibility_result_mode(mtl_render_encoder *encoder,
+                                     enum mtl_visibility_result_mode mode,
+                                     size_t offset);
+ 
++/* Vulkan's blend constants.  Only a pipeline blending with Metal's own
++ * fixed-function state needs them; a shader-lowered blend reads them from the
++ * root descriptor table instead. */
++void mtl_set_blend_color(mtl_render_encoder *encoder, float red, float green,
++                         float blue, float alpha);
++
+ void mtl_set_depth_bias(mtl_render_encoder *encoder, float depth_bias,
+                         float slope_scale, float clamp);
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
+index 5e0c19fd3e24007b00c24c725a5c6c40ab125796..e1e6a46ddbea1740a5ecb7ae0fd355d538932419 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -357,6 +357,16 @@
+    }
+ }
+ 
++void
++mtl_set_blend_color(mtl_render_encoder *encoder, float red, float green,
++                    float blue, float alpha)
++{
++   @autoreleasepool {
++      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
++      [enc setBlendColorRed:red green:green blue:blue alpha:alpha];
++   }
++}
++
+ void
+ mtl_set_depth_bias(mtl_render_encoder *encoder, float depth_bias,
+                    float slope_scale, float clamp)
+diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
+index b6ed24d792ca6384a07b463967d9b158b2acee82..1a4d1bb622d2a789c5ab0b11abe42b11280190ad 100644
+--- a/src/kosmickrisp/bridge/mtl_types.h
++++ b/src/kosmickrisp/bridge/mtl_types.h
+@@ -229,6 +229,47 @@ enum mtl_visibility_result_mode {
+    MTL_VISIBILITY_RESULT_MODE_COUNTING = 2,
+ };
+ 
++/* MTLBlendFactor.  Metal has no equivalent of a Vulkan logic op or of an
++ * advanced blend operation, so a pipeline that asks for either keeps the
++ * shader-lowered blend path instead. */
++enum mtl_blend_factor {
++   MTL_BLEND_FACTOR_ZERO = 0,
++   MTL_BLEND_FACTOR_ONE = 1,
++   MTL_BLEND_FACTOR_SOURCE_COLOR = 2,
++   MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR = 3,
++   MTL_BLEND_FACTOR_SOURCE_ALPHA = 4,
++   MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA = 5,
++   MTL_BLEND_FACTOR_DESTINATION_COLOR = 6,
++   MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR = 7,
++   MTL_BLEND_FACTOR_DESTINATION_ALPHA = 8,
++   MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA = 9,
++   MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED = 10,
++   MTL_BLEND_FACTOR_BLEND_COLOR = 11,
++   MTL_BLEND_FACTOR_ONE_MINUS_BLEND_COLOR = 12,
++   MTL_BLEND_FACTOR_BLEND_ALPHA = 13,
++   MTL_BLEND_FACTOR_ONE_MINUS_BLEND_ALPHA = 14,
++};
++
++/* MTLBlendOperation */
++enum mtl_blend_operation {
++   MTL_BLEND_OPERATION_ADD = 0,
++   MTL_BLEND_OPERATION_SUBTRACT = 1,
++   MTL_BLEND_OPERATION_REVERSE_SUBTRACT = 2,
++   MTL_BLEND_OPERATION_MIN = 3,
++   MTL_BLEND_OPERATION_MAX = 4,
++};
++
++/* MTLColorWriteMask orders its channels the other way round from Vulkan's
++ * VkColorComponentFlagBits, so the two masks must be translated, not cast. */
++enum mtl_color_write_mask {
++   MTL_COLOR_WRITE_MASK_NONE = 0,
++   MTL_COLOR_WRITE_MASK_ALPHA = 1u << 0,
++   MTL_COLOR_WRITE_MASK_BLUE = 1u << 1,
++   MTL_COLOR_WRITE_MASK_GREEN = 1u << 2,
++   MTL_COLOR_WRITE_MASK_RED = 1u << 3,
++   MTL_COLOR_WRITE_MASK_ALL = 0xfu,
++};
++
+ enum mtl_depth_clip_mode {
+    MTL_DEPTH_CLIP_MODE_CLIP = 0,
+    MTL_DEPTH_CLIP_MODE_CLAMP = 1,
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_compiler.c b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+index c8b1a1be2c88d6bb2793868a1b89d18371e557d1..6dd3cbae16d50812a28eacc4d4fbb4ea2014aed0 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -79,6 +79,23 @@ mtl_render_pipeline_descriptor_set_raster_sample_count(
+ {
+ }
+ 
++void
++mtl_render_pipeline_descriptor_set_blend(
++   mtl_render_pipeline_descriptor *descriptor, uint8_t index, bool enabled,
++   enum mtl_blend_factor source_rgb, enum mtl_blend_factor destination_rgb,
++   enum mtl_blend_operation rgb_operation, enum mtl_blend_factor source_alpha,
++   enum mtl_blend_factor destination_alpha,
++   enum mtl_blend_operation alpha_operation)
++{
++}
++
++void
++mtl_render_pipeline_descriptor_set_write_mask(
++   mtl_render_pipeline_descriptor *descriptor, uint8_t index,
++   enum mtl_color_write_mask mask)
++{
++}
++
+ void
+ mtl_render_pipeline_descriptor_set_alpha_to_coverage(
+    mtl_render_pipeline_descriptor *descriptor, bool enabled)
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_encoder.c b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+index 108d2e6be4ab0f19d844048a581393be16f2891a..ad18d56a1c604a534e4f3c604c4424934579c56a 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -178,6 +178,12 @@ mtl_set_visibility_result_mode(mtl_render_encoder *encoder,
+ {
+ }
+ 
++void
++mtl_set_blend_color(mtl_render_encoder *encoder, float red, float green,
++                    float blue, float alpha)
++{
++}
++
+ void
+ mtl_set_depth_bias(mtl_render_encoder *encoder, float depth_bias,
+                    float slope_scale, float clamp)
+diff --git a/src/kosmickrisp/bridge/vk_to_mtl_map.c b/src/kosmickrisp/bridge/vk_to_mtl_map.c
+index 6968bef2c7509c8973e18da3b6cebb60f78e3cc0..328eefc67e7555dae3529bca0707d881ebbd7b47 100644
+--- a/src/kosmickrisp/bridge/vk_to_mtl_map.c
++++ b/src/kosmickrisp/bridge/vk_to_mtl_map.c
+@@ -184,6 +184,79 @@ vk_sampler_mipmap_mode_to_mtl_sampler_mip_filter(enum VkSamplerMipmapMode mode)
+    }
+ }
+ 
++enum mtl_blend_factor
++vk_blend_factor_to_mtl(enum VkBlendFactor factor)
++{
++   switch (factor) {
++   case VK_BLEND_FACTOR_ZERO:
++      return MTL_BLEND_FACTOR_ZERO;
++   case VK_BLEND_FACTOR_ONE:
++      return MTL_BLEND_FACTOR_ONE;
++   case VK_BLEND_FACTOR_SRC_COLOR:
++      return MTL_BLEND_FACTOR_SOURCE_COLOR;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:
++      return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR;
++   case VK_BLEND_FACTOR_DST_COLOR:
++      return MTL_BLEND_FACTOR_DESTINATION_COLOR;
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:
++      return MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR;
++   case VK_BLEND_FACTOR_SRC_ALPHA:
++      return MTL_BLEND_FACTOR_SOURCE_ALPHA;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:
++      return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA;
++   case VK_BLEND_FACTOR_DST_ALPHA:
++      return MTL_BLEND_FACTOR_DESTINATION_ALPHA;
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
++      return MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
++   case VK_BLEND_FACTOR_CONSTANT_COLOR:
++      return MTL_BLEND_FACTOR_BLEND_COLOR;
++   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
++      return MTL_BLEND_FACTOR_ONE_MINUS_BLEND_COLOR;
++   case VK_BLEND_FACTOR_CONSTANT_ALPHA:
++      return MTL_BLEND_FACTOR_BLEND_ALPHA;
++   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA:
++      return MTL_BLEND_FACTOR_ONE_MINUS_BLEND_ALPHA;
++   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:
++      return MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED;
++   default:
++      UNREACHABLE("Blend factor Metal cannot express");
++   }
++}
++
++enum mtl_color_write_mask
++vk_color_write_mask_to_mtl(uint32_t mask)
++{
++   uint32_t result = MTL_COLOR_WRITE_MASK_NONE;
++   if (mask & VK_COLOR_COMPONENT_R_BIT)
++      result |= MTL_COLOR_WRITE_MASK_RED;
++   if (mask & VK_COLOR_COMPONENT_G_BIT)
++      result |= MTL_COLOR_WRITE_MASK_GREEN;
++   if (mask & VK_COLOR_COMPONENT_B_BIT)
++      result |= MTL_COLOR_WRITE_MASK_BLUE;
++   if (mask & VK_COLOR_COMPONENT_A_BIT)
++      result |= MTL_COLOR_WRITE_MASK_ALPHA;
++   return (enum mtl_color_write_mask)result;
++}
++
++enum mtl_blend_operation
++vk_blend_op_to_mtl(enum VkBlendOp op)
++{
++   switch (op) {
++   case VK_BLEND_OP_ADD:
++      return MTL_BLEND_OPERATION_ADD;
++   case VK_BLEND_OP_SUBTRACT:
++      return MTL_BLEND_OPERATION_SUBTRACT;
++   case VK_BLEND_OP_REVERSE_SUBTRACT:
++      return MTL_BLEND_OPERATION_REVERSE_SUBTRACT;
++   case VK_BLEND_OP_MIN:
++      return MTL_BLEND_OPERATION_MIN;
++   case VK_BLEND_OP_MAX:
++      return MTL_BLEND_OPERATION_MAX;
++   default:
++      UNREACHABLE("Blend operation Metal cannot express");
++   }
++}
++
+ enum mtl_compare_function
+ vk_compare_op_to_mtl_compare_function(enum VkCompareOp op)
+ {
+diff --git a/src/kosmickrisp/bridge/vk_to_mtl_map.h b/src/kosmickrisp/bridge/vk_to_mtl_map.h
+index 48962190dc0cd4d9699e9aa303e482f1897ab424..3e2c59b6686259df2e4baba4bb74847456a2a70a 100644
+--- a/src/kosmickrisp/bridge/vk_to_mtl_map.h
++++ b/src/kosmickrisp/bridge/vk_to_mtl_map.h
+@@ -6,6 +6,8 @@
+ #ifndef KK_MTL_TO_VK_MAP_H
+ #define KK_MTL_TO_VK_MAP_H 1
+ 
++#include <stdint.h>
++
+ struct mtl_origin;
+ struct mtl_size;
+ enum mtl_primitive_type;
+@@ -19,6 +21,9 @@ enum mtl_sampler_mip_filter;
+ enum mtl_compare_function;
+ enum mtl_winding;
+ enum mtl_cull_mode;
++enum mtl_blend_factor;
++enum mtl_blend_operation;
++enum mtl_color_write_mask;
+ enum mtl_index_type;
+ enum mtl_command_queue_error;
+ 
+@@ -30,6 +35,8 @@ enum VkAttachmentLoadOp;
+ enum VkAttachmentStoreOp;
+ enum VkSamplerAddressMode;
+ enum VkBorderColor;
++enum VkBlendFactor;
++enum VkBlendOp;
+ enum VkFilter;
+ enum VkSamplerMipmapMode;
+ enum VkCompareOp;
+@@ -68,6 +75,17 @@ vk_filter_to_mtl_sampler_min_mag_filter(enum VkFilter filter);
+ enum mtl_sampler_mip_filter
+ vk_sampler_mipmap_mode_to_mtl_sampler_mip_filter(enum VkSamplerMipmapMode mode);
+ 
++/* Metal expresses every Vulkan blend factor and operation except the two
++ * dual-source families; kk_blend_is_metal_expressible rejects those before a
++ * pipeline reaches here, so an unmapped value is a driver bug. */
++enum mtl_blend_factor vk_blend_factor_to_mtl(enum VkBlendFactor factor);
++
++enum mtl_blend_operation vk_blend_op_to_mtl(enum VkBlendOp op);
++
++/* VkColorComponentFlagBits numbers red as the low bit and MTLColorWriteMask
++ * numbers alpha as the low bit, so the mask is translated, not cast. */
++enum mtl_color_write_mask vk_color_write_mask_to_mtl(uint32_t mask);
++
+ enum mtl_compare_function
+ vk_compare_op_to_mtl_compare_function(enum VkCompareOp op);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index c1609538fff091860a40ed36555750e9b65a1de4..8509deb688d8ea16d02a4ad7cd6454cf089bc08a 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1778,14 +1778,25 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+          enc, cmd->vk.dynamic_graphics_state.ds.stencil.front.reference,
+          cmd->vk.dynamic_graphics_state.ds.stencil.back.reference);
+ 
+-   if (IS_DIRTY(CB_BLEND_CONSTANTS)) {
++   if (IS_DIRTY(CB_BLEND_CONSTANTS) || IS_SHADER_DIRTY(VERTEX)) {
+       static_assert(sizeof(desc->root.draw.blend_constant) ==
+                        sizeof(dyn->cb.blend_constants),
+                     "common size");
+ 
+-      memcpy(desc->root.draw.blend_constant, dyn->cb.blend_constants,
+-             sizeof(dyn->cb.blend_constants));
+-      desc->root_dirty = true;
++      /* A pipeline blending with Metal's own state takes the constants on the
++       * encoder; one carrying a lowered blend reads them from the root table.
++       * The pipeline can change without the constants changing, so the bind
++       * has to be repeated when the shader is rebound. */
++      if (vertex && vertex->info.vs.metal_blend) {
++         mtl_set_blend_color(enc, dyn->cb.blend_constants[0],
++                             dyn->cb.blend_constants[1],
++                             dyn->cb.blend_constants[2],
++                             dyn->cb.blend_constants[3]);
++      } else {
++         memcpy(desc->root.draw.blend_constant, dyn->cb.blend_constants,
++                sizeof(dyn->cb.blend_constants));
++         desc->root_dirty = true;
++      }
+    }
+ 
+    if (IS_DIRTY(CB_LOGIC_OP)) {
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 375698e44092641f2445a939b5482146de09734c..9dd178a198295175aab10f8abc237e06c9fd1c89 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -12,6 +12,7 @@ const struct debug_named_value flags[] = {
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
+    {"submit_timing", KK_DEBUG_SUBMIT_TIMING},
++   {"no_metal_blend", KK_DEBUG_NO_METAL_BLEND},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index 178dcc89bd30cde7c58f89aa96945344a54ad5e8..e5664b76bb857eebe1b7d2bd0d39c02c2d4949bf 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -14,6 +14,11 @@ enum kk_debug {
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
+    /* Print raw GPU execution intervals for completed Metal submissions. */
+    KK_DEBUG_SUBMIT_TIMING = 1ull << 3,
++   /* Lower every blend into the fragment shader, even one Metal's own blend
++    * state could express.  Kept so the two paths can be compared and so a
++    * suspected fixed-function blend defect can be bisected without a
++    * rebuild. */
++   KK_DEBUG_NO_METAL_BLEND = 1ull << 4,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_gpl.h b/src/kosmickrisp/vulkan/kk_gpl.h
+index fe1de5ed5aea8a91980dd71163d546051de05580..9a3f458f98a38ced65e9838be6b35a78f53bfb1c 100644
+--- a/src/kosmickrisp/vulkan/kk_gpl.h
++++ b/src/kosmickrisp/vulkan/kk_gpl.h
+@@ -6,6 +6,7 @@
+ #ifndef KK_GPL_H
+ #define KK_GPL_H
+ 
++#include "kk_debug.h"
+ #include "kk_depth_clip.h"
+ #include "kk_logic_op.h"
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 6e00807230fe733939d329ffa3322843b835ace3..705b897306c5860c3e73b68b1bf25f7ccc1a0ead 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -596,6 +596,142 @@ kk_nir_remove_undeclared_fs_output(nir_builder *b,
+    return true;
+ }
+ 
++/* An index-1 fragment output feeds nothing but a dual-source blend factor, so
++ * when no factor names one it is dead.  Metal's blend unit has no second
++ * colour source and the MSL backend emits no second colour index, and today
++ * nir_lower_blend is what consumes the store - unconditionally, whether or not
++ * a factor reads it.  Dropping it here lets a shader that merely declares the
++ * output keep Metal's fixed-function blend, and leaves the same MSL whichever
++ * expressible blend state the link finally supplies. */
++static bool
++kk_nir_remove_dual_source_fs_output(nir_builder *b, nir_intrinsic_instr *intrin,
++                                    void *data)
++{
++   if (intrin->intrinsic != nir_intrinsic_store_output)
++      return false;
++
++   const nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
++   if (!io.dual_source_blend_index && io.location != FRAG_RESULT_DUAL_SRC_BLEND)
++      return false;
++
++   nir_instr_remove(&intrin->instr);
++   if (io.location == FRAG_RESULT_DUAL_SRC_BLEND)
++      b->shader->info.outputs_written &= ~BITFIELD64_BIT(io.location);
++
++   return true;
++}
++
++/* Can Metal's fixed-function blend express this pipeline's colour blend state?
++ * Metal has every Vulkan blend factor and operation, but no logic op and no
++ * advanced blend operation at all, and the MSL backend does not yet emit the
++ * second colour index a dual-source factor needs.  Anything it cannot express
++ * keeps kk_lower_fs_blend, which costs the fragment shader its independence
++ * from the colour-blend state and so its fast link, but stays correct.
++ *
++ * Blend constants may be dynamic - Metal takes them on the encoder - but the
++ * rest of the blend state is baked into MTLRenderPipelineState, so a pipeline
++ * that makes any of it dynamic keeps the lowered path too. */
++static bool
++kk_blend_factor_is_dual_source(VkBlendFactor factor)
++{
++   switch (factor) {
++   case VK_BLEND_FACTOR_SRC1_COLOR:
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:
++   case VK_BLEND_FACTOR_SRC1_ALPHA:
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA:
++      return true;
++   default:
++      return false;
++   }
++}
++
++/* A format Metal does not have natively is rendered to a compatible Metal
++ * format through the view's MTLTextureSwizzleChannels.  That swizzle sits
++ * between the shader and the texture, but Metal's blend unit reads the
++ * destination from the texture itself, so it would combine the attachment's
++ * channels in the hardware order while the shader supplies them in Vulkan
++ * order.  Only the shader-lowered path, which reads the destination back
++ * through the same swizzle, keeps such a format correct. */
++static bool
++kk_format_blends_in_metal_channel_order(VkFormat format)
++{
++   const enum pipe_format pipe = vk_format_to_pipe_format(format);
++   if (pipe == PIPE_FORMAT_NONE)
++      return true;
++
++   const struct kk_va_format *supported = kk_get_va_format(pipe);
++   if (supported == NULL)
++      return false;
++
++   return supported->unswizzle.red == PIPE_SWIZZLE_X &&
++          supported->unswizzle.green == PIPE_SWIZZLE_Y &&
++          supported->unswizzle.blue == PIPE_SWIZZLE_Z &&
++          supported->unswizzle.alpha == PIPE_SWIZZLE_W;
++}
++
++static bool
++kk_blend_is_metal_expressible(const struct vk_graphics_pipeline_state *state)
++{
++   if (state == NULL || state->cb == NULL || state->rp == NULL)
++      return false;
++
++   if (KK_DEBUG(NO_METAL_BLEND))
++      return false;
++
++   static const enum mesa_vk_dynamic_graphics_state baked[] = {
++      MESA_VK_DYNAMIC_CB_LOGIC_OP_ENABLE, MESA_VK_DYNAMIC_CB_LOGIC_OP,
++      MESA_VK_DYNAMIC_CB_ATTACHMENT_COUNT,
++      MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES,
++      MESA_VK_DYNAMIC_CB_BLEND_ENABLES, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS,
++      MESA_VK_DYNAMIC_CB_WRITE_MASKS,
++   };
++   /* MESA_VK_DYNAMIC_CB_BLEND_ADVANCED is deliberately absent: the runtime
++    * marks it dynamic whenever advancedBlendCoherentOperations is disabled,
++    * which means the advanced blend state is ignored rather than deferred.
++    * An advanced operation that does reach the attachments is rejected by the
++    * blend-operation test below. */
++   for (uint32_t i = 0; i < ARRAY_SIZE(baked); ++i) {
++      if (BITSET_TEST(state->dynamic, baked[i]))
++         return false;
++   }
++
++   if (state->cb->logic_op_enable)
++      return false;
++
++   /* VK_EXT_color_write_enable turns a whole attachment off; Metal expresses
++    * that as an empty write mask, but only the lowered path implements the
++    * dynamic form, which the loop above already rejected. */
++   const uint8_t used = (uint8_t)BITFIELD_MASK(state->cb->attachment_count);
++   if ((state->cb->color_write_enables & used) != used)
++      return false;
++
++   for (uint32_t i = 0; i < state->rp->color_attachment_count; ++i) {
++      if (!kk_format_blends_in_metal_channel_order(
++             state->rp->color_attachment_formats[i]))
++         return false;
++   }
++
++   for (uint32_t i = 0; i < state->cb->attachment_count; ++i) {
++      const struct vk_color_blend_attachment_state *att =
++         &state->cb->attachments[i];
++
++      if (!att->blend_enable)
++         continue;
++
++      if (att->color_blend_op >= VK_BLEND_OP_ZERO_EXT ||
++          att->alpha_blend_op >= VK_BLEND_OP_ZERO_EXT)
++         return false;
++
++      if (kk_blend_factor_is_dual_source(att->src_color_blend_factor) ||
++          kk_blend_factor_is_dual_source(att->dst_color_blend_factor) ||
++          kk_blend_factor_is_dual_source(att->src_alpha_blend_factor) ||
++          kk_blend_factor_is_dual_source(att->dst_alpha_blend_factor))
++         return false;
++   }
++
++   return true;
++}
++
+ static void
+ kk_lower_fs_blend(nir_shader *nir,
+                   const struct vk_graphics_pipeline_state *state)
+@@ -829,8 +965,18 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+             kk_nir_remove_undeclared_fs_output, nir_metadata_control_flow,
+             (void *)state);
+ 
+-   if (state->cb)
+-      kk_lower_fs_blend(nir, state);
++   /* Metal's own blend state keeps the fragment shader independent of the
++    * colour-blend state, which belongs to a different pipeline library, so
++    * only a blend Metal cannot express is lowered into the shader. */
++   if (state->cb) {
++      if (kk_blend_is_metal_expressible(state)) {
++         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
++                  kk_nir_remove_dual_source_fs_output, nir_metadata_control_flow,
++                  NULL);
++      } else {
++         kk_lower_fs_blend(nir, state);
++      }
++   }
+ 
+    enum pipe_format rts[MAX_DRAW_BUFFERS] = {PIPE_FORMAT_NONE};
+    const struct vk_render_pass_state *rp = state->rp;
+@@ -1347,16 +1493,28 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+           * to coverage with unused attachments. */
+          translate_options.rts_component_count[i] = 4;
+       }
+-      for (uint32_t i = 0u; i < state->rp->color_attachment_count; ++i) {
+-         uint8_t logical_index = kk_get_logical_color_att_index(state, i);
+-         if (logical_index == MESA_VK_ATTACHMENT_UNUSED) {
+-            continue;
+-         }
+-         enum pipe_format format =
+-            vk_format_to_pipe_format(state->rp->color_attachment_formats[i]);
+-         if (format != PIPE_FORMAT_NONE) {
+-            translate_options.rts_component_count[logical_index] =
+-               util_format_get_nr_components(format);
++      /* Narrowing the declared output to the attachment's components is only
++       * safe once kk_lower_fs_blend has consumed the alpha, because it also
++       * narrows every colour store to match.  Metal's own blend unit reads the
++       * source alpha from the fragment function's return value, so a shader
++       * left independent of the blend state must keep returning all four
++       * components: a narrowed return both names components the declared type
++       * lacks and leaves the blend unit without an alpha to weight with.
++       * Metal ignores the components the attachment does not hold, and
++       * supplies the destination alpha Vulkan requires for a format without
++       * one, so the wider return stays correct for every attachment. */
++      if (!kk_blend_is_metal_expressible(state)) {
++         for (uint32_t i = 0u; i < state->rp->color_attachment_count; ++i) {
++            uint8_t logical_index = kk_get_logical_color_att_index(state, i);
++            if (logical_index == MESA_VK_ATTACHMENT_UNUSED) {
++               continue;
++            }
++            enum pipe_format format =
++               vk_format_to_pipe_format(state->rp->color_attachment_formats[i]);
++            if (format != PIPE_FORMAT_NONE) {
++               translate_options.rts_component_count[logical_index] =
++                  util_format_get_nr_components(format);
++            }
+          }
+       }
+    }
+@@ -3681,6 +3839,26 @@ kk_compile_depth_stencil_state(struct kk_device *device,
+    return kk_compile_ds_state(device, &info);
+ }
+ 
++/* Metal stores R9G9B9E5 as three mantissas that share one exponent, so no
++ * colour channel of that format can be written without the other two.  Its
++ * render pipelines therefore accept only an all-or-nothing write mask there
++ * and fail descriptor validation - which aborts the process - on any other.
++ * The format stores no alpha, so the alpha bit of a Vulkan mask on it names
++ * nothing, and Vulkan requires the R, G and B bits to move together; dropping
++ * the alpha bit leaves a mask that is already all or nothing.
++ */
++static enum mtl_color_write_mask
++kk_metal_color_write_mask(enum mtl_pixel_format format, uint32_t mask)
++{
++   if (format != MTL_PIXEL_FORMAT_R9G9B9E5_FLOAT)
++      return vk_color_write_mask_to_mtl(mask);
++
++   const uint32_t colour = VK_COLOR_COMPONENT_R_BIT |
++                           VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
++   return (mask & colour) ? MTL_COLOR_WRITE_MASK_ALL
++                          : MTL_COLOR_WRITE_MASK_NONE;
++}
++
+ /* Copies all msl shader data to the vertex and gathers information for pipeline
+  * compilation. */
+ static void
+@@ -3713,6 +3891,40 @@ gather_graphics_pipeline_create_info(
+                ? MTL_PIXEL_FORMAT_INVALID
+                : vk_format_to_mtl_pixel_format(format);
+       }
++      info->vs.metal_blend = kk_blend_is_metal_expressible(state);
++      for (uint8_t i = 0u; i < MAX_DRAW_BUFFERS; ++i) {
++         info->vs.blend[i].write_mask = MTL_COLOR_WRITE_MASK_ALL;
++         info->vs.blend[i].enabled = false;
++      }
++      if (info->vs.metal_blend) {
++         for (uint8_t i = 0u; i < state->cb->attachment_count; ++i) {
++            uint8_t logical_index = kk_get_logical_color_att_index(state, i);
++            if (logical_index == MESA_VK_ATTACHMENT_UNUSED)
++               continue;
++
++            const struct vk_color_blend_attachment_state *att =
++               &state->cb->attachments[i];
++            info->vs.blend[logical_index].write_mask =
++               kk_metal_color_write_mask(info->vs.rt_formats[logical_index],
++                                         att->write_mask);
++            info->vs.blend[logical_index].enabled = att->blend_enable;
++            if (!att->blend_enable)
++               continue;
++
++            info->vs.blend[logical_index].source_rgb =
++               vk_blend_factor_to_mtl(att->src_color_blend_factor);
++            info->vs.blend[logical_index].destination_rgb =
++               vk_blend_factor_to_mtl(att->dst_color_blend_factor);
++            info->vs.blend[logical_index].rgb_operation =
++               vk_blend_op_to_mtl(att->color_blend_op);
++            info->vs.blend[logical_index].source_alpha =
++               vk_blend_factor_to_mtl(att->src_alpha_blend_factor);
++            info->vs.blend[logical_index].destination_alpha =
++               vk_blend_factor_to_mtl(att->dst_alpha_blend_factor);
++            info->vs.blend[logical_index].alpha_operation =
++               vk_blend_op_to_mtl(att->alpha_blend_op);
++         }
++      }
+       info->vs.d_format =
+          has_depth ? vk_format_to_mtl_pixel_format(rp->depth_attachment_format)
+                    : MTL_PIXEL_FORMAT_INVALID;
+@@ -3916,6 +4128,18 @@ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+       assert(vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID);
+       mtl_render_pipeline_descriptor_set_color_attachment_format(
+          pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
++
++      if (!vs->info.vs.metal_blend)
++         continue;
++
++      mtl_render_pipeline_descriptor_set_write_mask(
++         pipeline_descriptor, i, vs->info.vs.blend[i].write_mask);
++      mtl_render_pipeline_descriptor_set_blend(
++         pipeline_descriptor, i, vs->info.vs.blend[i].enabled,
++         vs->info.vs.blend[i].source_rgb, vs->info.vs.blend[i].destination_rgb,
++         vs->info.vs.blend[i].rgb_operation, vs->info.vs.blend[i].source_alpha,
++         vs->info.vs.blend[i].destination_alpha,
++         vs->info.vs.blend[i].alpha_operation);
+    }
+ 
+    if (vs->info.vs.view_mask) {
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 70ea704cd8c78b5a36cb9364225a45268d611cca..059399497ea496c802d9ee873b7ad9249bbd9e2a 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -122,6 +122,20 @@ struct kk_shader_info {
+             uint8_t write_mask;
+          } stencil_front, stencil_back;
+          uint8_t color_attachment_count;
++         /* Metal's own blend state, used when kk_blend_is_metal_expressible
++          * accepted the pipeline's colour blend state and the fragment shader
++          * therefore kept its stores instead of carrying a lowered blend. */
++         bool metal_blend;
++         struct {
++            uint8_t source_rgb;
++            uint8_t destination_rgb;
++            uint8_t rgb_operation;
++            uint8_t source_alpha;
++            uint8_t destination_alpha;
++            uint8_t alpha_operation;
++            uint8_t write_mask;
++            bool enabled;
++         } blend[MAX_DRAW_BUFFERS];
+          bool has_ms;
+          bool has_alpha_to_coverage_enabled;
+          bool has_alpha_to_one_enabled;
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 770cad75802e4005d7fd0df5c74dbc337590a7d3..6afef36d1bd67a9408ce2f188119edb543875db5 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -647,6 +647,20 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_metal_blend',
++      executable(
++        'test_kosmickrisp_metal_blend',
++        files('tests/test_metal_blend.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_early_sample_mask_count',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..9edcd8e9899d3c16dede79ec3d9dd0332df01a99
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag
+@@ -0,0 +1,9 @@
++#version 450
++layout(push_constant) uniform Source {
++   vec4 colour;
++} source;
++layout(location = 0) out vec4 out_colour;
++void main()
++{
++   out_colour = source.colour;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag.h b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..42b755bb7c2c1e80f98cc2acc51dfab32b386774
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.frag.h
+@@ -0,0 +1,26 @@
++{0x07230203,0x00010600,0x000d000b,0x00000012,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000c,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00030047,0x0000000a,
++0x00000002,0x00050048,0x0000000a,0x00000000,
++0x00000023,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x0003001e,0x0000000a,
++0x00000007,0x00040020,0x0000000b,0x00000009,
++0x0000000a,0x0004003b,0x0000000b,0x0000000c,
++0x00000009,0x00040015,0x0000000d,0x00000020,
++0x00000001,0x0004002b,0x0000000d,0x0000000e,
++0x00000000,0x00040020,0x0000000f,0x00000009,
++0x00000007,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x00050041,0x0000000f,0x00000010,0x0000000c,
++0x0000000e,0x0004003d,0x00000007,0x00000011,
++0x00000010,0x0003003e,0x00000009,0x00000011,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..d24859a24f0899c467d266a5130aea3bcdea2983
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert
+@@ -0,0 +1,7 @@
++#version 450
++/* A full-target triangle, so every pixel of the small attachment is covered. */
++void main()
++{
++   vec2 position = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++   gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert.h b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfd5e55ff490c127258a03a386d9fbca72511c06
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend.vert.h
+@@ -0,0 +1,54 @@
++{0x07230203,0x00010600,0x000d000b,0x0000002c,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000c,0x0000001d,0x00040047,
++0x0000000c,0x0000000b,0x0000002a,0x00030047,
++0x0000001b,0x00000002,0x00050048,0x0000001b,
++0x00000000,0x0000000b,0x00000000,0x00050048,
++0x0000001b,0x00000001,0x0000000b,0x00000001,
++0x00050048,0x0000001b,0x00000002,0x0000000b,
++0x00000003,0x00050048,0x0000001b,0x00000003,
++0x0000000b,0x00000004,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000002,0x00040015,0x0000000a,
++0x00000020,0x00000001,0x00040020,0x0000000b,
++0x00000001,0x0000000a,0x0004003b,0x0000000b,
++0x0000000c,0x00000001,0x0004002b,0x0000000a,
++0x0000000e,0x00000001,0x0004002b,0x0000000a,
++0x00000010,0x00000002,0x00040017,0x00000017,
++0x00000006,0x00000004,0x00040015,0x00000018,
++0x00000020,0x00000000,0x0004002b,0x00000018,
++0x00000019,0x00000001,0x0004001c,0x0000001a,
++0x00000006,0x00000019,0x0006001e,0x0000001b,
++0x00000017,0x00000006,0x0000001a,0x0000001a,
++0x00040020,0x0000001c,0x00000003,0x0000001b,
++0x0004003b,0x0000001c,0x0000001d,0x00000003,
++0x0004002b,0x0000000a,0x0000001e,0x00000000,
++0x0004002b,0x00000006,0x00000020,0x40000000,
++0x0004002b,0x00000006,0x00000022,0x3f800000,
++0x0004002b,0x00000006,0x00000025,0x00000000,
++0x00040020,0x00000029,0x00000003,0x00000017,
++0x0005002c,0x00000007,0x0000002b,0x00000022,
++0x00000022,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003d,0x0000000a,0x0000000d,0x0000000c,
++0x000500c4,0x0000000a,0x0000000f,0x0000000d,
++0x0000000e,0x000500c7,0x0000000a,0x00000011,
++0x0000000f,0x00000010,0x0004006f,0x00000006,
++0x00000012,0x00000011,0x000500c7,0x0000000a,
++0x00000014,0x0000000d,0x00000010,0x0004006f,
++0x00000006,0x00000015,0x00000014,0x00050050,
++0x00000007,0x00000016,0x00000012,0x00000015,
++0x0005008e,0x00000007,0x00000021,0x00000016,
++0x00000020,0x00050083,0x00000007,0x00000024,
++0x00000021,0x0000002b,0x00050051,0x00000006,
++0x00000026,0x00000024,0x00000000,0x00050051,
++0x00000006,0x00000027,0x00000024,0x00000001,
++0x00070050,0x00000017,0x00000028,0x00000026,
++0x00000027,0x00000025,0x00000022,0x00050041,
++0x00000029,0x0000002a,0x0000001d,0x0000001e,
++0x0003003e,0x0000002a,0x00000028,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f0cd8380051d892caafd807521d2372b9b3e791
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag
+@@ -0,0 +1,13 @@
++#version 450
++layout(push_constant) uniform Source {
++   vec4 colour;
++} source;
++/* An index 1 output exists but no blend factor in this test names it, so it is
++ * dead and must not cost the pipeline Metal's fixed-function blend. */
++layout(location = 0, index = 0) out vec4 out_colour;
++layout(location = 0, index = 1) out vec4 out_second;
++void main()
++{
++   out_colour = source.colour;
++   out_second = vec4(1.0) - source.colour;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag.h b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9308cf8a0c61b2d3235a40763d1bd5c2fa422a00
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/blend_dual.frag.h
+@@ -0,0 +1,35 @@
++{0x07230203,0x00010600,0x000d000b,0x00000018,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000c,0x00000012,
++0x00030010,0x00000004,0x00000007,0x00040047,
++0x00000009,0x0000001e,0x00000000,0x00040047,
++0x00000009,0x00000020,0x00000000,0x00030047,
++0x0000000a,0x00000002,0x00050048,0x0000000a,
++0x00000000,0x00000023,0x00000000,0x00040047,
++0x00000012,0x0000001e,0x00000000,0x00040047,
++0x00000012,0x00000020,0x00000001,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000004,0x00040020,
++0x00000008,0x00000003,0x00000007,0x0004003b,
++0x00000008,0x00000009,0x00000003,0x0003001e,
++0x0000000a,0x00000007,0x00040020,0x0000000b,
++0x00000009,0x0000000a,0x0004003b,0x0000000b,
++0x0000000c,0x00000009,0x00040015,0x0000000d,
++0x00000020,0x00000001,0x0004002b,0x0000000d,
++0x0000000e,0x00000000,0x00040020,0x0000000f,
++0x00000009,0x00000007,0x0004003b,0x00000008,
++0x00000012,0x00000003,0x0004002b,0x00000006,
++0x00000013,0x3f800000,0x0007002c,0x00000007,
++0x00000014,0x00000013,0x00000013,0x00000013,
++0x00000013,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x00050041,0x0000000f,0x00000010,0x0000000c,
++0x0000000e,0x0004003d,0x00000007,0x00000011,
++0x00000010,0x0003003e,0x00000009,0x00000011,
++0x00050083,0x00000007,0x00000017,0x00000014,
++0x00000011,0x0003003e,0x00000012,0x00000017,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_blend_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..c16500ee146ea60d9a09bbea900c9087907e5e56
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_blend_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in blend.vert blend.frag blend_dual.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/test_metal_blend.cpp b/src/kosmickrisp/vulkan/tests/test_metal_blend.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d14f00ef5e68d2e1d2d447b32a42b29dd74fc9f0
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_metal_blend.cpp
+@@ -0,0 +1,797 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* KosmicKrisp blends with Metal's own fixed-function state whenever
++ * kk_blend_is_metal_expressible accepts the pipeline, which keeps the fragment
++ * shader independent of the colour-blend state and so lets a pipeline library
++ * compile it before the link.  Metal owns the whole equation there - factors,
++ * operation, write mask, blend constants and the conversion to the
++ * attachment's format - so this renders one fully covered target for a matrix
++ * of blend states and compares every channel against the same equation
++ * evaluated on the host.
++ *
++ * The matrix runs against an attachment of every shape, because the shape is
++ * what decides whether Metal can own the equation: a format with fewer than
++ * four components still needs the fragment function to return the source alpha
++ * Metal weights with, and a format Metal reaches only through a channel
++ * swizzle has to stay on the shader-lowered path, since the blend unit reads
++ * the destination straight from the texture and never sees that swizzle.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "metal_blend_shaders/blend.vert.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "metal_blend_shaders/blend.frag.h"
++   ;
++static const uint32_t fragment_dual_spirv[] =
++#include "metal_blend_shaders/blend_dual.frag.h"
++;
++
++static const uint32_t kExtent = 4u;
++
++/* Vulkan blends an sRGB attachment in linear space and stores the encoded
++ * value, and Metal does the same in its own hardware, so the host model blends
++ * the linear clear value and encodes the result to compare like with like. */
++static float srgb_encode(float linear)
++{
++   return linear <= 0.0031308f
++             ? linear * 12.92f
++             : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
++}
++
++struct Rgba {
++   float v[4];
++};
++
++/* The host model of one Vulkan blend equation, evaluated in the order the
++ * specification gives: factor, operation, write mask, then the conversion the
++ * attachment's format performs. */
++static float factor_value(VkBlendFactor factor, const Rgba &src,
++                          const Rgba &dst, const Rgba &constant,
++                          uint32_t channel)
++{
++   const bool alpha = channel == 3u;
++   switch (factor) {
++   case VK_BLEND_FACTOR_ZERO:
++      return 0.0f;
++   case VK_BLEND_FACTOR_ONE:
++      return 1.0f;
++   case VK_BLEND_FACTOR_SRC_COLOR:
++      return src.v[channel];
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:
++      return 1.0f - src.v[channel];
++   case VK_BLEND_FACTOR_DST_COLOR:
++      return dst.v[channel];
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:
++      return 1.0f - dst.v[channel];
++   case VK_BLEND_FACTOR_SRC_ALPHA:
++      return src.v[3];
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:
++      return 1.0f - src.v[3];
++   case VK_BLEND_FACTOR_DST_ALPHA:
++      return dst.v[3];
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
++      return 1.0f - dst.v[3];
++   case VK_BLEND_FACTOR_CONSTANT_COLOR:
++      return constant.v[channel];
++   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
++      return 1.0f - constant.v[channel];
++   case VK_BLEND_FACTOR_CONSTANT_ALPHA:
++      return constant.v[3];
++   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA:
++      return 1.0f - constant.v[3];
++   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:
++      /* The alpha channel takes one, every colour channel the saturate. */
++      return alpha ? 1.0f
++                   : std::fmin(src.v[3], 1.0f - dst.v[3]);
++   default:
++      std::fprintf(stderr, "unmodelled blend factor %d\n", (int)factor);
++      std::exit(1);
++   }
++}
++
++static float apply_operation(VkBlendOp op, float source, float destination)
++{
++   switch (op) {
++   case VK_BLEND_OP_ADD:
++      return source + destination;
++   case VK_BLEND_OP_SUBTRACT:
++      return source - destination;
++   case VK_BLEND_OP_REVERSE_SUBTRACT:
++      return destination - source;
++   case VK_BLEND_OP_MIN:
++      return std::fmin(source, destination);
++   case VK_BLEND_OP_MAX:
++      return std::fmax(source, destination);
++   default:
++      std::fprintf(stderr, "unmodelled blend operation %d\n", (int)op);
++      std::exit(1);
++   }
++}
++
++/* The attachment format decides how many components the fragment shader has to
++ * hand Metal's blend unit and whether Metal can reach the attachment's channels
++ * in Vulkan's order at all, so every blend state is run against a format of
++ * each shape rather than against RGBA8 alone. */
++struct Format {
++   VkFormat format;
++   const char *name;
++   uint32_t channels;
++   uint32_t texel_bytes;
++   bool encoded;
++   float tolerance;
++   /* The largest value the format stores: a normalized format clamps a blend
++    * result to one, a floating-point one does not. */
++   float maximum;
++   /* One exponent shared by the three colour channels: none of them can be
++    * written on its own, so Vulkan requires their write-mask bits to move
++    * together and Metal accepts only an all-or-nothing mask. */
++   bool shared_exponent;
++   /* Render with a fragment shader that also declares an index 1 output, which
++    * no blend state here names.  Metal has no second colour source, so a
++    * pipeline that keeps its fixed-function blend has to drop the dead output
++    * rather than hand the MSL backend a colour index it cannot emit. */
++   bool dual_source_output;
++};
++
++static const Format kFormats[] = {
++   {VK_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM", 4u, 4u, false, 1.5f / 255.0f,
++    1.0f, false, false},
++   {VK_FORMAT_R8G8B8A8_SRGB, "R8G8B8A8_SRGB", 4u, 4u, true, 1.5f / 255.0f, 1.0f,
++    false, false},
++   /* Fewer than four components: Metal still weights with the source alpha the
++    * fragment function returns, so the return value may not be narrowed to the
++    * attachment. */
++   {VK_FORMAT_R5G6B5_UNORM_PACK16, "R5G6B5_UNORM_PACK16", 3u, 2u, false,
++    1.5f / 31.0f, 1.0f, false, false},
++   {VK_FORMAT_R8G8_UNORM, "R8G8_UNORM", 2u, 2u, false, 1.5f / 255.0f, 1.0f,
++    false, false},
++   {VK_FORMAT_R8_UNORM, "R8_UNORM", 1u, 1u, false, 1.5f / 255.0f, 1.0f, false,
++    false},
++   /* Metal has no B4G4R4A4, so the view reaches a compatible format through a
++    * channel swizzle that the blend unit does not apply. */
++   {VK_FORMAT_B4G4R4A4_UNORM_PACK16, "B4G4R4A4_UNORM_PACK16", 4u, 2u, false,
++    1.5f / 15.0f, 1.0f, false, false},
++   /* Three 9-bit mantissas over one shared 5-bit exponent.  It stores values
++    * above one, and at every value this test renders the quantum is at most
++    * 2^-8, which 1.5/255 covers. */
++   {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, "E5B9G9R9_UFLOAT_PACK32", 3u, 4u, false,
++    1.5f / 255.0f, 65408.0f, true, false},
++   {VK_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM (dead index 1 output)", 4u, 4u,
++    false, 1.5f / 255.0f, 1.0f, false, true},
++};
++
++static float decode_channel(const Format &format, const uint8_t *texel,
++                            uint32_t channel)
++{
++   switch (format.format) {
++   case VK_FORMAT_R5G6B5_UNORM_PACK16: {
++      /* PACK16 numbers the bits from the most significant end: R is 15..11,
++       * G is 10..5 and B is 4..0. */
++      const uint32_t v = (uint32_t)texel[0] | ((uint32_t)texel[1] << 8);
++      if (channel == 0u)
++         return ((v >> 11) & 0x1fu) / 31.0f;
++      if (channel == 1u)
++         return ((v >> 5) & 0x3fu) / 63.0f;
++      return (v & 0x1fu) / 31.0f;
++   }
++   case VK_FORMAT_B4G4R4A4_UNORM_PACK16: {
++      /* B is 15..12, G is 11..8, R is 7..4 and A is 3..0. */
++      static const uint32_t shift[4] = {4u, 8u, 12u, 0u};
++      const uint32_t v = (uint32_t)texel[0] | ((uint32_t)texel[1] << 8);
++      return ((v >> shift[channel]) & 0xfu) / 15.0f;
++   }
++   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: {
++      /* PACK32 names the fields from the most significant end - E5 B9 G9 R9 -
++       * so R occupies bits 8..0, G 17..9 and B 26..18, and every mantissa is
++       * scaled by the one exponent in 31..27. */
++      const uint32_t v = (uint32_t)texel[0] | ((uint32_t)texel[1] << 8) |
++                         ((uint32_t)texel[2] << 16) | ((uint32_t)texel[3] << 24);
++      const uint32_t mantissa = (v >> (channel * 9u)) & 0x1ffu;
++      const int exponent = (int)(v >> 27) - 24;
++      return (float)mantissa * std::ldexp(1.0f, exponent);
++   }
++   default:
++      return texel[channel] / 255.0f;
++   }
++}
++
++struct Case {
++   const char *name;
++   bool blend_enable;
++   VkBlendFactor src_colour;
++   VkBlendFactor dst_colour;
++   VkBlendOp colour_op;
++   VkBlendFactor src_alpha;
++   VkBlendFactor dst_alpha;
++   VkBlendOp alpha_op;
++   VkColorComponentFlags write_mask;
++};
++
++static const VkColorComponentFlags kAll =
++   VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++
++static const Case kCases[] = {
++   {"disabled", false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO,
++    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
++    kAll},
++   {"src_over", true, VK_BLEND_FACTOR_SRC_ALPHA,
++    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, kAll},
++   {"additive", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
++    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD, kAll},
++   {"subtract", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_OP_SUBTRACT, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_OP_SUBTRACT, kAll},
++   {"reverse_subtract", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_OP_REVERSE_SUBTRACT, kAll},
++   {"min", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MIN,
++    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MIN, kAll},
++   {"max", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MAX,
++    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MAX, kAll},
++   {"dst_colour", true, VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO,
++    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_DST_ALPHA, VK_BLEND_FACTOR_ZERO,
++    VK_BLEND_OP_ADD, kAll},
++   {"one_minus_dst", true, VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
++    VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, VK_BLEND_OP_ADD,
++    VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
++    VK_BLEND_OP_ADD, kAll},
++   {"constant_colour", true, VK_BLEND_FACTOR_CONSTANT_COLOR,
++    VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR, VK_BLEND_OP_ADD,
++    VK_BLEND_FACTOR_CONSTANT_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
++    VK_BLEND_OP_ADD, kAll},
++   {"alpha_saturate", true, VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,
++    VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,
++    VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD, kAll},
++   {"write_mask_rb", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
++    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_B_BIT},
++   {"write_mask_none", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO,
++    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
++    0},
++   {"write_mask_alpha_only_disabled", false, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_COLOR_COMPONENT_A_BIT},
++   /* Every colour channel and no alpha: the only partial mask a
++    * shared-exponent attachment accepts. */
++   {"write_mask_rgb", true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
++    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++       VK_COLOR_COMPONENT_B_BIT},
++};
++
++int main()
++{
++   VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   application.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &application;
++
++   VkInstance instance = VK_NULL_HANDLE;
++   {
++      LOAD_I(vkCreateInstance);
++      require(vkCreateInstance(&instance_info, nullptr, &instance) == VK_SUCCESS,
++              "vkCreateInstance");
++   }
++
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++
++   uint32_t device_count = 0;
++   require(vkEnumeratePhysicalDevices(instance, &device_count, nullptr) ==
++              VK_SUCCESS,
++           "vkEnumeratePhysicalDevices");
++   require(device_count > 0, "no physical device");
++   std::vector<VkPhysicalDevice> physical_devices(device_count);
++   require(vkEnumeratePhysicalDevices(instance, &device_count,
++                                      physical_devices.data()) == VK_SUCCESS,
++           "vkEnumeratePhysicalDevices");
++   VkPhysicalDevice physical_device = physical_devices[0];
++
++   VkPhysicalDeviceProperties properties{};
++   vkGetPhysicalDeviceProperties(physical_device, &properties);
++   std::printf("%s\n", properties.deviceName);
++
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count,
++                                            nullptr);
++   std::vector<VkQueueFamilyProperties> families(family_count);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count,
++                                            families.data());
++   uint32_t family = UINT32_MAX;
++   for (uint32_t i = 0; i < family_count; ++i) {
++      if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++         family = i;
++         break;
++      }
++   }
++   require(family != UINT32_MAX, "no graphics queue");
++
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info{
++      VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++   queue_info.queueFamilyIndex = family;
++   queue_info.queueCount = 1;
++   queue_info.pQueuePriorities = &priority;
++
++   VkPhysicalDeviceVulkan13Features vulkan13{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++   vulkan13.dynamicRendering = VK_TRUE;
++   VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++   device_info.pNext = &vulkan13;
++   device_info.queueCreateInfoCount = 1;
++   device_info.pQueueCreateInfos = &queue_info;
++
++   VkDevice device = VK_NULL_HANDLE;
++   require(vkCreateDevice(physical_device, &device_info, nullptr, &device) ==
++              VK_SUCCESS,
++           "vkCreateDevice");
++
++   int failures = 0;
++   {
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdSetBlendConstants);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
++      auto memory_type = [&](uint32_t bits, VkMemoryPropertyFlags want) {
++         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
++            if ((bits & (1u << i)) &&
++                (memory_properties.memoryTypes[i].propertyFlags & want) == want)
++               return i;
++         }
++         require(false, "no memory type");
++         return 0u;
++      };
++
++      /* The colour target and the buffer its contents are read back through. */
++      VkShaderModuleCreateInfo module_info{
++         VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++      module_info.codeSize = sizeof(vertex_spirv);
++      module_info.pCode = vertex_spirv;
++      VkShaderModule vertex_module = VK_NULL_HANDLE;
++      require(vkCreateShaderModule(device, &module_info, nullptr,
++                                   &vertex_module) == VK_SUCCESS,
++              "vkCreateShaderModule vertex");
++      module_info.codeSize = sizeof(fragment_dual_spirv);
++      module_info.pCode = fragment_dual_spirv;
++      VkShaderModule fragment_dual_module = VK_NULL_HANDLE;
++      require(vkCreateShaderModule(device, &module_info, nullptr,
++                                   &fragment_dual_module) == VK_SUCCESS,
++              "vkCreateShaderModule fragment dual");
++
++      module_info.codeSize = sizeof(fragment_spirv);
++      module_info.pCode = fragment_spirv;
++      VkShaderModule fragment_module = VK_NULL_HANDLE;
++      require(vkCreateShaderModule(device, &module_info, nullptr,
++                                   &fragment_module) == VK_SUCCESS,
++              "vkCreateShaderModule fragment");
++
++      VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Rgba)};
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      layout_info.pushConstantRangeCount = 1;
++      layout_info.pPushConstantRanges = &push;
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      require(vkCreatePipelineLayout(device, &layout_info, nullptr, &layout) ==
++                 VK_SUCCESS,
++              "vkCreatePipelineLayout");
++
++      VkCommandPoolCreateInfo pool_info{
++         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++      pool_info.queueFamilyIndex = family;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      require(vkCreateCommandPool(device, &pool_info, nullptr, &pool) ==
++                 VK_SUCCESS,
++              "vkCreateCommandPool");
++      VkCommandBufferAllocateInfo command_allocate{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      command_allocate.commandPool = pool;
++      command_allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      command_allocate.commandBufferCount = 1;
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      require(vkAllocateCommandBuffers(device, &command_allocate, &command) ==
++                 VK_SUCCESS,
++              "vkAllocateCommandBuffers");
++      VkQueue queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, family, 0, &queue);
++
++      for (const Format &target : kFormats) {
++      const VkFormat format = target.format;
++      const bool encoded = target.encoded;
++      std::printf("  %s\n", target.name);
++
++      VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      image_info.imageType = VK_IMAGE_TYPE_2D;
++      image_info.format = format;
++      image_info.extent = {kExtent, kExtent, 1u};
++      image_info.mipLevels = 1;
++      image_info.arrayLayers = 1;
++      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      VkImage image = VK_NULL_HANDLE;
++      require(vkCreateImage(device, &image_info, nullptr, &image) == VK_SUCCESS,
++              "vkCreateImage");
++      VkMemoryRequirements image_requirements{};
++      vkGetImageMemoryRequirements(device, image, &image_requirements);
++      VkMemoryAllocateInfo image_allocate{
++         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      image_allocate.allocationSize = image_requirements.size;
++      image_allocate.memoryTypeIndex = memory_type(
++         image_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      VkDeviceMemory image_memory = VK_NULL_HANDLE;
++      require(vkAllocateMemory(device, &image_allocate, nullptr,
++                               &image_memory) == VK_SUCCESS,
++              "vkAllocateMemory image");
++      require(vkBindImageMemory(device, image, image_memory, 0) == VK_SUCCESS,
++              "vkBindImageMemory");
++
++      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view_info.image = image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++      view_info.format = format;
++      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      VkImageView view = VK_NULL_HANDLE;
++      require(vkCreateImageView(device, &view_info, nullptr, &view) ==
++                 VK_SUCCESS,
++              "vkCreateImageView");
++
++      const VkDeviceSize readback_size =
++         kExtent * kExtent * target.texel_bytes;
++      VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      buffer_info.size = readback_size;
++      buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      VkBuffer readback = VK_NULL_HANDLE;
++      require(vkCreateBuffer(device, &buffer_info, nullptr, &readback) ==
++                 VK_SUCCESS,
++              "vkCreateBuffer");
++      VkMemoryRequirements buffer_requirements{};
++      vkGetBufferMemoryRequirements(device, readback, &buffer_requirements);
++      VkMemoryAllocateInfo buffer_allocate{
++         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      buffer_allocate.allocationSize = buffer_requirements.size;
++      buffer_allocate.memoryTypeIndex =
++         memory_type(buffer_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
++      require(vkAllocateMemory(device, &buffer_allocate, nullptr,
++                               &buffer_memory) == VK_SUCCESS,
++              "vkAllocateMemory buffer");
++      require(vkBindBufferMemory(device, readback, buffer_memory, 0) ==
++                 VK_SUCCESS,
++              "vkBindBufferMemory");
++      void *mapped = nullptr;
++      require(vkMapMemory(device, buffer_memory, 0, readback_size, 0,
++                          &mapped) == VK_SUCCESS,
++              "vkMapMemory");
++
++
++      const Rgba source{{0.6f, 0.4f, 0.8f, 0.5f}};
++      const Rgba destination{{0.2f, 0.8f, 0.4f, 0.75f}};
++      /* Vulkan reads the destination alpha of a format without one as 1.0, and
++       * so does Metal, so the reference has to do the same. */
++      Rgba reference_destination = destination;
++      if (target.channels < 4u)
++         reference_destination.v[3] = 1.0f;
++      const Rgba constant{{0.25f, 0.5f, 0.75f, 0.5f}};
++
++      for (const Case &test : kCases) {
++         const VkColorComponentFlags colour_bits =
++            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++            VK_COLOR_COMPONENT_B_BIT;
++         const VkColorComponentFlags colour_written =
++            test.write_mask & colour_bits;
++         if (target.shared_exponent && colour_written != 0u &&
++             colour_written != colour_bits) {
++            /* Masking one channel of a shared exponent is invalid usage. */
++            std::printf("  %-32s skipped\n", test.name);
++            continue;
++         }
++
++         VkPipelineShaderStageCreateInfo stages[2]{};
++         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++         stages[0].module = vertex_module;
++         stages[0].pName = "main";
++         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++         stages[1].module =
++            target.dual_source_output ? fragment_dual_module : fragment_module;
++         stages[1].pName = "main";
++
++         VkPipelineVertexInputStateCreateInfo vertex_input{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         VkPipelineInputAssemblyStateCreateInfo input_assembly{
++            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++         input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++         VkViewport viewport{0.0f, 0.0f, (float)kExtent, (float)kExtent,
++                             0.0f, 1.0f};
++         VkRect2D scissor{{0, 0}, {kExtent, kExtent}};
++         VkPipelineViewportStateCreateInfo viewport_state{
++            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++         viewport_state.viewportCount = 1;
++         viewport_state.pViewports = &viewport;
++         viewport_state.scissorCount = 1;
++         viewport_state.pScissors = &scissor;
++         VkPipelineRasterizationStateCreateInfo rasterization{
++            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++         rasterization.polygonMode = VK_POLYGON_MODE_FILL;
++         rasterization.cullMode = VK_CULL_MODE_NONE;
++         rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++         rasterization.lineWidth = 1.0f;
++         VkPipelineMultisampleStateCreateInfo multisample{
++            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++         VkPipelineColorBlendAttachmentState attachment{};
++         attachment.blendEnable = test.blend_enable ? VK_TRUE : VK_FALSE;
++         attachment.srcColorBlendFactor = test.src_colour;
++         attachment.dstColorBlendFactor = test.dst_colour;
++         attachment.colorBlendOp = test.colour_op;
++         attachment.srcAlphaBlendFactor = test.src_alpha;
++         attachment.dstAlphaBlendFactor = test.dst_alpha;
++         attachment.alphaBlendOp = test.alpha_op;
++         attachment.colorWriteMask = test.write_mask;
++         VkPipelineColorBlendStateCreateInfo colour_blend{
++            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++         colour_blend.attachmentCount = 1;
++         colour_blend.pAttachments = &attachment;
++
++         const VkDynamicState dynamic_states[] = {
++            VK_DYNAMIC_STATE_BLEND_CONSTANTS};
++         VkPipelineDynamicStateCreateInfo dynamic{
++            VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++         dynamic.dynamicStateCount = 1;
++         dynamic.pDynamicStates = dynamic_states;
++
++         const VkFormat colour_format = format;
++         VkPipelineRenderingCreateInfo rendering{
++            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++         rendering.colorAttachmentCount = 1;
++         rendering.pColorAttachmentFormats = &colour_format;
++
++         VkGraphicsPipelineCreateInfo pipeline_info{
++            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++         pipeline_info.pNext = &rendering;
++         pipeline_info.stageCount = 2;
++         pipeline_info.pStages = stages;
++         pipeline_info.pVertexInputState = &vertex_input;
++         pipeline_info.pInputAssemblyState = &input_assembly;
++         pipeline_info.pViewportState = &viewport_state;
++         pipeline_info.pRasterizationState = &rasterization;
++         pipeline_info.pMultisampleState = &multisample;
++         pipeline_info.pColorBlendState = &colour_blend;
++         pipeline_info.pDynamicState = &dynamic;
++         pipeline_info.layout = layout;
++
++         VkPipeline pipeline = VK_NULL_HANDLE;
++         require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                           &pipeline_info, nullptr,
++                                           &pipeline) == VK_SUCCESS,
++                 "vkCreateGraphicsPipelines");
++
++         VkCommandBufferBeginInfo begin{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++         require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                 "vkBeginCommandBuffer");
++
++         VkImageMemoryBarrier to_colour{
++            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++         to_colour.srcAccessMask = 0;
++         to_colour.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++         to_colour.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++         to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         to_colour.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_colour.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_colour.image = image;
++         to_colour.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                              0, nullptr, 0, nullptr, 1, &to_colour);
++
++         VkRenderingAttachmentInfo colour{
++            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++         colour.imageView = view;
++         colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         colour.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++         colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++         for (uint32_t i = 0; i < 4; ++i)
++            colour.clearValue.color.float32[i] = destination.v[i];
++         VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++         rendering_info.renderArea = scissor;
++         rendering_info.layerCount = 1;
++         rendering_info.colorAttachmentCount = 1;
++         rendering_info.pColorAttachments = &colour;
++
++         vkCmdBeginRendering(command, &rendering_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++         vkCmdSetBlendConstants(command, constant.v);
++         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
++                            sizeof(Rgba), &source);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         vkCmdEndRendering(command);
++
++         VkImageMemoryBarrier to_source{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++         to_source.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++         to_source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++         to_source.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         to_source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++         to_source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_source.image = image;
++         to_source.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++
++         VkBufferImageCopy copy{};
++         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++         copy.imageExtent = {kExtent, kExtent, 1u};
++         vkCmdCopyImageToBuffer(command, image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &copy);
++
++         require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                 "vkEndCommandBuffer");
++         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         submit.commandBufferCount = 1;
++         submit.pCommandBuffers = &command;
++         require(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS,
++                 "vkQueueSubmit");
++         require(vkQueueWaitIdle(queue) == VK_SUCCESS, "vkQueueWaitIdle");
++
++         Rgba expected{};
++         for (uint32_t c = 0; c < 4; ++c) {
++            float value;
++            if (!test.blend_enable) {
++               value = source.v[c];
++            } else {
++               const VkBlendFactor source_factor =
++                  c == 3 ? test.src_alpha : test.src_colour;
++               const VkBlendFactor destination_factor =
++                  c == 3 ? test.dst_alpha : test.dst_colour;
++               const VkBlendOp op = c == 3 ? test.alpha_op : test.colour_op;
++               const float sf = factor_value(source_factor, source,
++                                             reference_destination, constant, c);
++               const float df = factor_value(destination_factor, source,
++                                             reference_destination, constant, c);
++               /* Min and max ignore the factors entirely. */
++               if (op == VK_BLEND_OP_MIN || op == VK_BLEND_OP_MAX) {
++                  value = apply_operation(op, source.v[c],
++                                          reference_destination.v[c]);
++               } else {
++                  value = apply_operation(op, source.v[c] * sf,
++                                          reference_destination.v[c] * df);
++               }
++            }
++            const bool written = (test.write_mask & (1u << c)) != 0;
++            if (!written)
++               value = reference_destination.v[c];
++            value = std::fmin(std::fmax(value, 0.0f), target.maximum);
++            /* Only the three colour channels carry the transfer function. */
++            expected.v[c] = (encoded && c < 3u) ? srgb_encode(value) : value;
++         }
++
++         const uint8_t *pixels = static_cast<const uint8_t *>(mapped);
++         bool ok = true;
++         for (uint32_t p = 0; p < kExtent * kExtent && ok; ++p) {
++            for (uint32_t c = 0; c < target.channels; ++c) {
++               const float got = decode_channel(
++                  target, pixels + p * target.texel_bytes, c);
++               if (std::fabs(got - expected.v[c]) > target.tolerance) {
++                  std::fprintf(
++                     stderr,
++                     "%s: pixel %u channel %u is %.4f, expected %.4f\n",
++                     test.name, p, c, got, expected.v[c]);
++                  ok = false;
++                  break;
++               }
++            }
++         }
++         std::printf("  %-32s %s\n", test.name, ok ? "ok" : "WRONG");
++         if (!ok)
++            ++failures;
++
++         vkDestroyPipeline(device, pipeline, nullptr);
++      }
++
++      vkDestroyImageView(device, view, nullptr);
++      vkDestroyImage(device, image, nullptr);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, image_memory, nullptr);
++      vkFreeMemory(device, buffer_memory, nullptr);
++      }
++
++
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyShaderModule(device, fragment_module, nullptr);
++      vkDestroyShaderModule(device, fragment_dual_module, nullptr);
++      vkDestroyShaderModule(device, vertex_module, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++
++   vkDestroyInstance(instance, nullptr);
++   return failures == 0 ? 0 : 1;
++}

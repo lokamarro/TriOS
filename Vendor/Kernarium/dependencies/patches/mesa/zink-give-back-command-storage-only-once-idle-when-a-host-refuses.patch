@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 11:11:30 +0900
+Subject: [PATCH] zink: give back command storage only once idle when a host
+ refuses
+
+A host that bounds the GPU memory of its process asks the screen for
+the memory it caches before it refuses an allocation. That gave back the
+command storage of every free batch state. A context that is still
+drawing frees its batch states at every submission and takes them
+again for the next frame, so the command storage the refusal freed was
+allocated again at once, outside the host's bound: the room went to the
+allocation that had been refused, and an Android guest drawing WebGL
+at the full budget went past it by about 100 MiB.
+
+A batch state now records when a submission made it one of the
+screen's free states, and the host's request releases the storage of
+the states that have been free for a second; a context's destruction
+still releases them all. Cached buffers still go at any age: taking
+one again allocates through the host, which refuses past its bound.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_batch.c   | 16 +++++++++++++---
+ src/gallium/drivers/zink/zink_batch.h   |  3 ++-
+ src/gallium/drivers/zink/zink_context.c |  2 +-
+ src/gallium/drivers/zink/zink_screen.c  |  7 ++++++-
+ src/gallium/drivers/zink/zink_types.h   |  2 ++
+ src/gallium/include/pipe/p_screen.h     | 10 +++++++---
+ 6 files changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index 4285bae83e310511426833e8334af69899110d98..f10f60c8ff39e8dd361587afbd8a24463ea0f9d1 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -8,6 +8,7 @@
+ #include "zink_screen.h"
+ #include "zink_surface.h"
+ 
++#include "util/os_time.h"
+ #include "util/timespec.h"
+ 
+ #ifdef VK_USE_PLATFORM_METAL_EXT
+@@ -462,10 +463,12 @@ find_completed_batch_state(struct zink_context *ctx)
+ static void
+ reset_active_batch_states(struct zink_screen *screen)
+ {
++   const int64_t now_ns = os_time_get_nano();
+    simple_mtx_lock(&screen->active_batch_states_lock);
+    simple_mtx_lock(&screen->free_batch_states_lock);
+    for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
+       reset_batch_state_internal(screen, i);
++      i->free_since_ns = now_ns;
+       zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
+    }
+    screen->active_batch_states = NULL;
+@@ -479,14 +482,21 @@ reset_active_batch_states(struct zink_screen *screen)
+  * behind its command buffers at their largest size.  The screen keeps every
+  * state any context has needed and hands them to whichever context asks next,
+  * so the storage of contexts that are gone stays allocated for as long as the
+- * screen lives.  Give it back; the next batch to take a state allocates what
+- * it needs again.  Returns the number of states released. */
++ * screen lives.  Give it back from every state that has been free for at
++ * least min_idle_ns; a context that keeps submitting frees its states and
++ * takes them again within a frame or two, and keeps theirs.  The next batch
++ * to take a released state allocates what it needs again.  Returns the
++ * number of states released. */
+ unsigned
+-zink_screen_release_batch_storage(struct zink_screen *screen)
++zink_screen_release_batch_storage(struct zink_screen *screen,
++                                  uint64_t min_idle_ns)
+ {
+    unsigned released = 0;
++   const int64_t now_ns = os_time_get_nano();
+    simple_mtx_lock(&screen->free_batch_states_lock);
+    for (struct zink_batch_state *bs = screen->free_batch_states; bs; bs = bs->next) {
++      if (min_idle_ns && now_ns - bs->free_since_ns < (int64_t)min_idle_ns)
++         continue;
+       VKSCR(ResetCommandPool)(screen->dev, bs->cmdpool,
+                               VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
+       VKSCR(ResetCommandPool)(screen->dev, bs->unsynchronized_cmdpool,
+diff --git a/src/gallium/drivers/zink/zink_batch.h b/src/gallium/drivers/zink/zink_batch.h
+index 19a2f45353480f679439538101afcacc2b9acd52..a81c13396d5df1954d9f1d503560cd0bf1334007 100644
+--- a/src/gallium/drivers/zink/zink_batch.h
++++ b/src/gallium/drivers/zink/zink_batch.h
+@@ -52,7 +52,8 @@ void
+ zink_batch_trim(struct zink_context *ctx);
+ 
+ unsigned
+-zink_screen_release_batch_storage(struct zink_screen *screen);
++zink_screen_release_batch_storage(struct zink_screen *screen,
++                                  uint64_t min_idle_ns);
+ 
+ void
+ zink_batch_state_destroy(struct zink_screen *screen, struct zink_batch_state *bs);
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 512b3f82eb922b14fbe4587b1015d9403966d1df..a11491f942bef612ccf9e9591ec3f749fe1c7d71 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -262,7 +262,7 @@ zink_context_destroy(struct pipe_context *pctx)
+       screen->last_free_batch_state = screen->last_free_batch_state->next;
+    simple_mtx_unlock(&screen->free_batch_states_lock);
+    /* the contexts left need fewer states than were needed with this one */
+-   zink_screen_release_batch_storage(screen);
++   zink_screen_release_batch_storage(screen, 0);
+ 
+    for (unsigned i = 0; i < 2; i++) {
+       if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index a6689c4167691016a03f07e529cdf4e075dabf59..66207c5f30b79169e795c5a134b806c84e6413af 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1516,12 +1516,17 @@ zink_is_format_supported(struct pipe_screen *pscreen,
+    return true;
+ }
+ 
++/* A host asks for this before it refuses an allocation.  Only what has been
++ * idle for a second goes: a workload that is still drawing would allocate the
++ * rest again at once, past the refusal that was meant to hold it. */
++#define ZINK_RELEASE_CACHED_IDLE_NS (1000ull * 1000 * 1000)
++
+ static unsigned
+ zink_release_cached_memory(struct pipe_screen *pscreen)
+ {
+    struct zink_screen *screen = zink_screen(pscreen);
+    /* the driver reports what the command storage gave back itself */
+-   zink_screen_release_batch_storage(screen);
++   zink_screen_release_batch_storage(screen, ZINK_RELEASE_CACHED_IDLE_NS);
+    return zink_bo_release_cached(screen);
+ }
+ 
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index e432c0059a6ece36150814cb56e51ffac0d1e97c..30150fbf20e8214ebe6ff31fbdd76d1a2b8344e5 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -614,6 +614,8 @@ struct zink_batch_obj_list {
+ struct zink_batch_state {
+    struct zink_fence fence;
+    struct zink_batch_state *next;
++   /* when a submission last made it one of the screen's free states */
++   int64_t free_since_ns;
+ 
+    struct zink_batch_usage usage;
+    struct zink_context *ctx;
+diff --git a/src/gallium/include/pipe/p_screen.h b/src/gallium/include/pipe/p_screen.h
+index 3d9571d71484a11361dcf3b348ec6fbd7c23801a..0645f26e5b1168a7fb57199e5c0acb689b0eb580 100644
+--- a/src/gallium/include/pipe/p_screen.h
++++ b/src/gallium/include/pipe/p_screen.h
+@@ -647,9 +647,13 @@ struct pipe_screen {
+     * the next allocation is cheap, and holds on to it until a client frees
+     * enough or the cache expires. A host that bounds the memory it gives out
+     * calls this for a screen that is not the one asking, when another's
+-    * allocation was refused. Optional. May be called from any thread, with
+-    * no context current, while the screen allocates and frees; it never
+-    * waits for the device.
++    * allocation was refused. Memory the device allocates through the host
++    * (buffers) goes at any age, since taking it again asks the host once more;
++    * storage the host does not bound (command storage) goes only once it has
++    * been unused for a while, since a client that is still drawing takes it
++    * again at once. Optional. May be called from any thread, with no context
++    * current, while the screen allocates and frees; it never waits for the
++    * device.
+     *
+     * \return the number of cached allocations released.
+     */

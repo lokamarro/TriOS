@@ -1,0 +1,2522 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 04:52:53 +0900
+Subject: [PATCH] kosmickrisp: restart the render encoder for layered draws
+
+A Metal render command encoder that has already run one draw drops most of
+the primitives of a later draw that writes a different
+render_target_array_index. The layer the first draw wrote stays correct and
+the primitives are not misrouted, they simply never land: the newly selected
+layer keeps whatever the attachment held when the pass began.
+
+The loss is deterministic and large. A layered pass drawing 1048576 points
+per layer into a 1024x1024x2 R32G32B32A32_SFLOAT attachment loses the first
+908672 points of the second draw; triangles lose 933472 of 1048576 covered
+texels, and three- and four-layer passes lose the same amount on every layer
+after the first. This is what fails
+dEQP-VK.api.copy_and_blit.core.use_after_copy.*.transfer_dst_optimal.1024x1024x2*_color_att_flag_img2img:
+the copy itself is correct, and it is the layered pass that samples the copy
+result afterwards that loses its second layer.
+
+None of the documented requirements for layered rendering are unmet:
+inputPrimitiveTopology is set from the pipeline's topology class,
+renderTargetArrayLength is the attachment layer count, and the generated MSL
+declares and writes [[render_target_array_index]]. Neither an encoder-scope
+nor a queue-scope barrier between the draws helps, and neither does dropping
+the single-view setVertexAmplificationCount call or clearing
+allowGPUOptimizedContents. Only ending the encoder and starting a new one
+recovers the primitives.
+
+So restart the render encoder before every Metal draw that is not the first
+in the current encoder whenever the pass is layered and the stage that feeds
+the rasterizer writes the layer: the emulated geometry shader's raster draw,
+else the tessellation evaluation shader, else the vertex shader. The decision
+is made per Metal draw rather than per draw call, because each entry of a
+multi-draw is a Metal draw of its own. The restart runs through the existing
+render-pass flush path, which forces the attachment load, so nothing is lost;
+the cost is one attachment load and store per such draw, and a pass that is not
+layered or never writes the layer is untouched.
+
+A restart has to preserve everything the open encoder was carrying. Vertex
+amplification did not survive it: vkCmdClearAttachments turns amplification
+off for its meta draw, which routes its own layers, and cs_start_render
+re-derived the mapping from the view mask, so a restart while the meta draw
+was being flushed handed it the pass's multiview mapping instead. In a
+multiview pass that put the clear on the wrong layers, which is what
+dEQP-VK.multiview.dynamic_rendering.clear_attachments.no_queries.5_10_5_10
+caught: view mask 10's clear landed on layers 0 and 2. Record the
+amplification mapping in the graphics state and let every encoder start
+replay it, so a mid-pass restart keeps the mapping the pass, or the clear,
+installed.
+
+The workaround is deliberately not gated on a draw size. Splitting the same
+1048576 points into four draws of 262144 still loses 653984 of them, so there
+is no primitive count below which a later draw is safe; a threshold of 262144
+would have left most of the failure in place. A CLEAR load op on the same pass
+does render correctly, but that rests on a single configuration and three
+earlier narrowings of this failure were each refuted by the next measurement,
+so it is recorded in the workaround documentation rather than used as a gate.
+
+kosmickrisp_layered_draw_sequence reproduces the primitive loss without the
+workaround, kosmickrisp_layered_draw_multi_draw and
+kosmickrisp_layered_draw_geometry reproduce the same 908672-point loss through
+a two-entry multi-draw and through a layer a geometry shader writes, and
+kosmickrisp_multiview_clear_attachments reproduces the misrouted multiview
+clear without the recorded amplification mapping.
+---
+ docs/drivers/kosmickrisp/workarounds.rst      |  71 +++
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        |  39 +-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  14 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  40 ++
+ src/kosmickrisp/vulkan/kk_cmd_meta.c          |   8 +-
+ src/kosmickrisp/vulkan/kk_shader.c            |   4 +
+ src/kosmickrisp/vulkan/kk_shader.h            |   3 +
+ src/kosmickrisp/vulkan/meson.build            |  46 ++
+ .../tests/layered_draw_shaders/draw_id.vert   |  25 +
+ .../tests/layered_draw_shaders/draw_id.vert.h |  74 +++
+ .../tests/layered_draw_shaders/generate.sh    |   7 +
+ .../tests/layered_draw_shaders/layer.geom     |  23 +
+ .../tests/layered_draw_shaders/layer.geom.h   |  54 ++
+ .../layered_draw_shaders/passthrough.vert     |  19 +
+ .../layered_draw_shaders/passthrough.vert.h   |  57 ++
+ .../tests/layered_draw_shaders/points.frag    |   9 +
+ .../tests/layered_draw_shaders/points.frag.h  |  29 +
+ .../tests/layered_draw_shaders/points.vert    |  24 +
+ .../tests/layered_draw_shaders/points.vert.h  |  72 +++
+ .../tests/multiview_clear_shaders/generate.sh |   7 +
+ .../tests/multiview_clear_shaders/quad.frag   |   7 +
+ .../tests/multiview_clear_shaders/quad.frag.h |  20 +
+ .../tests/multiview_clear_shaders/quad.vert   |  16 +
+ .../tests/multiview_clear_shaders/quad.vert.h |  57 ++
+ .../vulkan/tests/test_layered_draw_routes.cpp | 512 ++++++++++++++++++
+ .../tests/test_layered_draw_sequence.cpp      | 448 +++++++++++++++
+ .../test_multiview_clear_attachments.cpp      | 450 +++++++++++++++
+ 27 files changed, 2126 insertions(+), 9 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/layered_draw_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/multiview_clear_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_layered_draw_routes.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_multiview_clear_attachments.cpp
+
+diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
+index 4e1a6c004110588e9b28418c0993361cf94c7121..8137ea4564d99f43f80fc29a3a63ecd33039ea88 100644
+--- a/docs/drivers/kosmickrisp/workarounds.rst
++++ b/docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,77 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_18
++----------------
++| macOS version: 27.0
++| Metal ticket: Not reported
++| Metal ticket status:
++| CTS test failure: ``dEQP-VK.api.copy_and_blit.core.use_after_copy.*.transfer_dst_optimal.1024x1024x2*_color_att_flag_img2img``
++| Comments:
++
++A render command encoder that already ran one draw drops most of the
++primitives of a later draw that writes a different ``render_target_array_index``.
++The layer the first draw wrote stays correct, the newly selected layer keeps
++whatever the attachment held before the pass, and the primitives are dropped
++rather than routed to the wrong layer: the previously written layer is never
++disturbed.
++
++The loss is deterministic, and only the trailing part of the second draw
++survives. A layered pass drawing 1048576 points per layer into a
++1024x1024x2 ``R32G32B32A32_SFLOAT`` attachment loses exactly the first 908672
++points of the second draw on the first such pass in a fresh process; later
++passes in the same process are correct. Triangles behave the same way, losing
++933472 of 1048576 covered texels. Three or four layers lose the same amount on
++every layer after the first.
++
++A ``VK_ATTACHMENT_LOAD_OP_CLEAR`` load op on the same pass renders correctly,
++while ``LOAD`` and ``DONT_CARE`` both lose the primitives, so only a pass that
++does not clear its attachments is affected. That is not used to narrow the
++workaround, because it rests on a single configuration and three earlier
++narrowings of this failure were each refuted by the next measurement.
++
++``inputPrimitiveTopology`` is already set from the pipeline's topology class,
++``renderTargetArrayLength`` is already the attachment layer count, and the MSL
++vertex output already declares ``[[render_target_array_index]]``, so none of
++the documented requirements for layered rendering are unmet. Neither an
++encoder-scope nor a queue-scope barrier between the draws helps, and neither
++does dropping the single-view ``setVertexAmplificationCount`` call or clearing
++``allowGPUOptimizedContents``. Only ending the render command encoder and
++starting a new one restores the dropped primitives.
++
++Splitting the draws into smaller ones does not avoid the loss either: 1048576
++points issued as four draws of 262144 still lose 653984 of them, so there is no
++primitive count below which a later draw is safe and the workaround cannot be
++gated on a draw size.
++
++The workaround therefore restarts the render command encoder before any Metal
++draw that is not the first in the current encoder, whenever the pass is layered
++and the stage that feeds the rasterizer writes the layer: the emulated geometry
++shader's raster draw, else the tessellation evaluation shader, else the vertex
++shader. Each entry of a multi-draw is a Metal draw of its own, so every entry
++after the first restarts the encoder as a separate draw call would. Restarting reuses the existing
++render-pass flush path, so the attachments are reloaded and nothing is lost.
++The cost is one attachment load and store per such draw; a pass that never
++writes the layer, or is not layered, is untouched. The
++``kosmickrisp_layered_draw_sequence`` test reproduces the loss without the
++workaround, and ``kosmickrisp_layered_draw_multi_draw`` and
++``kosmickrisp_layered_draw_geometry`` reproduce it through a multi-draw and
++through a geometry shader's layer: without the per-draw restart and the
++raster-stage check, each loses the same 908672 points.
++
++Restarting an encoder mid-pass has to preserve everything the open encoder
++was carrying. Vertex amplification was the one piece that did not survive:
++``vkCmdClearAttachments`` turns amplification off because the meta clear
++routes its own layers, and the restart used to hand the meta draw the pass's
++multiview mapping again, so in a multiview pass the clear landed on the wrong
++layers - ``dEQP-VK.multiview.dynamic_rendering.clear_attachments.no_queries``
++``.5_10_5_10`` put view mask 10's clear on layers 0 and 2. The amplification
++mapping is therefore recorded in the graphics state and replayed by every
++encoder start, and ``kosmickrisp_multiview_clear_attachments`` covers it.
++
++| Log:
++| 2026-09-12: Workaround implemented
++
+ KK_WORKAROUND_17
+ ----------------
+ | macOS version: 27.0
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index abbc91e87599113cc3452c09800663b2dbb26e11..ddd8da4fe0b709afab3950c38f12d55c4b3b8ff4 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -334,14 +334,20 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
+       cmd->gfx.cmd_buf, state->render_pass_descriptor);
+ 
+-   uint32_t layer_ids[KK_MAX_MULTIVIEW_VIEW_COUNT] = {};
+-   uint32_t count = 0u;
+-   u_foreach_bit(id, view_mask)
+-      layer_ids[count++] = id;
+-   if (view_mask == 0u) {
+-      layer_ids[count++] = 0;
++   cmd->state.gfx.draws_since_encoder_start = 0u;
++
++   if (state->vertex_amplification_count == 0u) {
++      uint32_t count = 0u;
++      u_foreach_bit(id, view_mask)
++         state->vertex_amplification_ids[count++] = id;
++      if (view_mask == 0u) {
++         state->vertex_amplification_ids[count++] = 0u;
++      }
++      state->vertex_amplification_count = count;
+    }
+-   mtl_set_vertex_amplification_count(cmd->gfx.encoder, layer_ids, count);
++   mtl_set_vertex_amplification_count(cmd->gfx.encoder,
++                                      state->vertex_amplification_ids,
++                                      state->vertex_amplification_count);
+ 
+    /* Argument table won't ever change */
+    mtl_render_set_argument_table(
+@@ -351,6 +357,25 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    kk_cmd_buffer_dirty_all_gfx(cmd);
+ }
+ 
++void
++kk_cmd_buffer_set_vertex_amplification(struct kk_cmd_buffer *cmd,
++                                       const uint32_t *layer_ids,
++                                       uint32_t count)
++{
++   struct kk_graphics_state *state = &cmd->state.gfx;
++
++   assert(count > 0u && count <= ARRAY_SIZE(state->vertex_amplification_ids));
++   memcpy(state->vertex_amplification_ids, layer_ids,
++          count * sizeof(state->vertex_amplification_ids[0]));
++   state->vertex_amplification_count = count;
++
++   /* A restarted encoder replays this in cs_start_render, so an encoder that
++    * is not open yet needs nothing more than the recorded state. */
++   if (cmd->gfx.encoder != NULL)
++      mtl_set_vertex_amplification_count(
++         cmd->gfx.encoder, state->vertex_amplification_ids, count);
++}
++
+ mtl_render_encoder *
+ cs_get_render(struct kk_cmd_buffer *cmd)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index a83e9a6d575aa57da52255b11d0307dc1bfd04d2..25d7aecc45c04ad280e222555cd1271b5edaf963 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -207,6 +207,17 @@ struct kk_graphics_state {
+    bool is_cull_front_and_back;
+    bool need_to_start_render_pass;
+ 
++   /* Draws issued into the render encoder that is currently open. Reset every
++    * time a render encoder starts. KK_WORKAROUND_18 uses it. */
++   uint32_t draws_since_encoder_start;
++
++   /* Vertex amplification the open render encoder must carry. Every encoder
++    * start applies it, so an encoder restarted mid-pass keeps the view
++    * mapping the pass, or kk_CmdClearAttachments, installed. A zero count
++    * means the next encoder start derives it from the view mask. */
++   uint32_t vertex_amplification_ids[KK_MAX_MULTIVIEW_VIEW_COUNT];
++   uint32_t vertex_amplification_count;
++
+    enum kk_dirty dirty;
+    uint32_t pipeline_sample_count;
+ 
+@@ -412,6 +423,9 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+ void kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd);
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
++void kk_cmd_buffer_set_vertex_amplification(struct kk_cmd_buffer *cmd,
++                                            const uint32_t *layer_ids,
++                                            uint32_t count);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 65ae10b92fb28c8464cf5362b5dcc33e4f8619e2..9a8a6529b6f5c30284d502394aebe1613d6df96c 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -354,6 +354,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    struct kk_rendering_state *render = &cmd->state.gfx.render;
+ 
+    memset(render, 0, sizeof(*render));
++   cmd->state.gfx.vertex_amplification_count = 0u;
+ 
+    render->flags = pRenderingInfo->flags;
+    render->area = pRenderingInfo->renderArea;
+@@ -643,6 +644,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+       need_resolve = false;
+ 
+    memset(render, 0, sizeof(*render));
++   cmd->state.gfx.vertex_amplification_count = 0u;
+ 
+    if (need_resolve) {
+       kk_meta_resolve_rendering(cmd, &vk_render);
+@@ -982,6 +984,35 @@ kk_force_attachment_load(struct kk_cmd_buffer *cmd)
+    }
+ }
+ 
++/* Whether the stage that feeds the rasterizer selects the layer: the
++ * emulated geometry shader's raster draw, else the tessellation evaluation
++ * shader, else the vertex shader. */
++static bool
++kk_raster_writes_layer(const struct kk_cmd_buffer *cmd)
++{
++   const struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   const struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
++
++   if (vs == NULL)
++      return false;
++   if (vs->info.vs.geometry_shader_emulation)
++      return vs->info.vs.geometry_writes_layer;
++   const uint64_t outputs =
++      tes ? tes->info.tess.outputs_written : vs->info.vs.outputs_written;
++   return (outputs & VARYING_BIT_LAYER) != 0u;
++}
++
++/* KK_WORKAROUND_18: a layer-selecting Metal draw must be the first in its
++ * render encoder. */
++static bool
++kk_layered_draw_needs_encoder_restart(const struct kk_cmd_buffer *cmd)
++{
++   const struct kk_graphics_state *gfx = &cmd->state.gfx;
++
++   return gfx->render.layer_count > 1u &&
++          gfx->draws_since_encoder_start > 0u && kk_raster_writes_layer(cmd);
++}
++
+ static void
+ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+ {
+@@ -989,6 +1020,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+    struct kk_rendering_state *render = &gfx->render;
+    bool needs_restart = kk_flush_sample_locations(cmd);
++   needs_restart |= kk_layered_draw_needs_encoder_restart(cmd);
+    bool color_map_changed = false;
+ 
+    if (IS_DIRTY(COLOR_ATTACHMENT_MAP)) {
+@@ -2289,6 +2321,8 @@ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
+ {
+    mtl_render_encoder *enc = cs_get_render(cmd);
+ 
++   cmd->state.gfx.draws_since_encoder_start++;
++
+    if (kk_grid_is_indirect(data.grid)) {
+       if (data.index.el_size_B) {
+          struct kk_addr_range index_range =
+@@ -3407,6 +3441,12 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    }
+ 
+    for (uint32_t i = 0; i < data->draw_count; i++) {
++      /* KK_WORKAROUND_18: every entry of a multi-draw is a Metal draw of its
++       * own, so one that follows a draw in the same encoder restarts it just
++       * as a separate draw call's flush would. */
++      if (i > 0u && kk_layered_draw_needs_encoder_restart(cmd))
++         kk_flush_gfx_state(cmd);
++
+       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
+ 
+       if (data->upload_mask &&
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_meta.c b/src/kosmickrisp/vulkan/kk_cmd_meta.c
+index 30c4e4a82998744ef4c1ec52e9cc08c044ab2ecc..11ceccbd098bd813f962e718e949db6f43a52114 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_meta.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_meta.c
+@@ -298,7 +298,11 @@ kk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+ 
+    uint32_t view_mask = cmd->state.gfx.render.view_mask;
+    uint32_t layer_ids[KK_MAX_MULTIVIEW_VIEW_COUNT] = {};
+-   mtl_set_vertex_amplification_count(cmd->gfx.encoder, layer_ids, 1u);
++   /* The meta clear routes its own layers, so it runs unamplified. Record it
++    * instead of touching the encoder directly: the encoder can be restarted
++    * while the meta draw is being flushed, and cs_start_render replays the
++    * recorded mapping. */
++   kk_cmd_buffer_set_vertex_amplification(cmd, layer_ids, 1u);
+ 
+    /* Preserve conditional rendering state for clearing attachments */
+    struct kk_conditional_rendering_state cond_render = cmd->state.cond_render;
+@@ -316,7 +320,7 @@ kk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+    if (view_mask == 0u) {
+       layer_ids[count++] = 0;
+    }
+-   mtl_set_vertex_amplification_count(cmd->gfx.encoder, layer_ids, count);
++   kk_cmd_buffer_set_vertex_amplification(cmd, layer_ids, count);
+ }
+ 
+ void
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 6a5e3ea4f75f3cc99baec3b0866ade5d4e7fea43..969e22bf1033d129b243745e7e9f86f8adaa638e 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -4352,6 +4352,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+    uint32_t geometry_pre_gs_shader = UINT32_MAX;
+    struct poly_gs_info transform_feedback_info = {0};
+    struct poly_gs_info geometry_info = {0};
++   bool geometry_writes_layer = false;
+    nir_shader *line_source = nir_shaders[0];
+    nir_shader *line_source_clone = NULL;
+    uint64_t line_raster_outputs = 0;
+@@ -4362,6 +4363,8 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+       const struct vk_shader_compile_info *gs_compile =
+          &infos[geometry_shader];
+       nir_shader *main = nir_shaders[geometry_shader];
++      geometry_writes_layer =
++         (main->info.outputs_written & VARYING_BIT_LAYER) != 0u;
+       nir_shader *count = NULL;
+       nir_shader *raster = NULL;
+       nir_shader *pre_gs = NULL;
+@@ -4672,6 +4675,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+       struct kk_shader *vs = shaders[0];
+       vs->info.vs.geometry_shader_emulation = true;
+       vs->info.vs.geometry = geometry_info;
++      vs->info.vs.geometry_writes_layer = geometry_writes_layer;
+ 
+       struct kk_shader *main = shaders[geometry_main_shader];
+       vs->geometry_main_msl = main->msl_data[MESA_SHADER_COMPUTE];
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index a57bbe651f864cc13836ab7f5849baf3c60f6e89..b8a5ad1cec6b3fddbd26c0cba8774775dbdd0762 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -99,6 +99,9 @@ struct kk_shader_info {
+          uint64_t line_raster_outputs;
+          bool transform_feedback_emulation;
+          bool geometry_shader_emulation;
++         /* The emulated geometry shader writes the layer, so its raster
++          * draw selects one. KK_WORKAROUND_18 needs to know. */
++         bool geometry_writes_layer;
+          struct poly_gs_info transform_feedback;
+          struct poly_gs_info geometry;
+          uint64_t flat_outputs;
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 6dc7d2003bb63f518a0f8a26e8bcf918108538c8..d189f090a3f999a531f039721c7e9f156fda535f 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -368,6 +368,52 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_layered_draw_sequence',
++      executable(
++        'test_kosmickrisp_layered_draw_sequence',
++        files('tests/test_layered_draw_sequence.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
++    test(
++      'kosmickrisp_multiview_clear_attachments',
++      executable(
++        'test_kosmickrisp_multiview_clear_attachments',
++        files('tests/test_multiview_clear_attachments.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
++    layered_draw_routes_test = executable(
++      'test_kosmickrisp_layered_draw_routes',
++      files('tests/test_layered_draw_routes.cpp'),
++      include_directories : kk_test_include_directories,
++      dependencies : [idep_vulkan_runtime_headers],
++      link_with : libvulkan_kosmickrisp,
++      override_options : ['cpp_std=c++20'],
++    )
++    foreach route : ['multi_draw', 'geometry']
++      test(
++        'kosmickrisp_layered_draw_' + route,
++        layered_draw_routes_test,
++        args : [route],
++        suite : ['kosmickrisp'],
++        env : ['MESA_SHADER_CACHE_DISABLE=true'],
++        timeout : 120,
++      )
++    endforeach
+     test(
+       'kosmickrisp_alpha_to_coverage_no_attachment',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..c95e0f1c3106576d712bfa390fc9433ebce5d105
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert
+@@ -0,0 +1,25 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++#extension GL_ARB_shader_viewport_layer_array : enable
++layout (push_constant, std430) uniform PushConstantBlock {
++    int layer;
++    int width;
++} pc;
++layout (location=0) out flat int outLayer;
++out gl_PerVertex
++{
++    vec4 gl_Position;
++    float gl_PointSize;
++};
++void main (void) {
++    /* One point per texel, in raster order, into the layer named by the
++     * multi-draw entry. */
++    const int x = gl_VertexIndex % pc.width;
++    const int y = gl_VertexIndex / pc.width;
++    gl_Position = vec4((float(x) + 0.5) / float(pc.width) * 2.0 - 1.0,
++                       (float(y) + 0.5) / float(pc.width) * 2.0 - 1.0,
++                       0.0, 1.0);
++    gl_PointSize = 1.0;
++    gl_Layer = gl_DrawID;
++    outLayer = gl_DrawID;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert.h b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d3dd072066e330b7f22b59eb234b86c14e61993
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/draw_id.vert.h
+@@ -0,0 +1,74 @@
++{0x07230203,0x00010600,0x000d000b,0x0000003f,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000045,0x00020011,0x0000114b,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000b000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000a,0x0000000e,0x0000001d,
++0x0000003b,0x0000003c,0x0000003e,0x00040047,
++0x0000000a,0x0000000b,0x0000002a,0x00030047,
++0x0000000c,0x00000002,0x00050048,0x0000000c,
++0x00000000,0x00000023,0x00000000,0x00050048,
++0x0000000c,0x00000001,0x00000023,0x00000004,
++0x00030047,0x0000001b,0x00000002,0x00050048,
++0x0000001b,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x0000001b,0x00000001,0x0000000b,
++0x00000001,0x00040047,0x0000003b,0x0000000b,
++0x00000009,0x00040047,0x0000003c,0x0000000b,
++0x0000114a,0x00030047,0x0000003e,0x0000000e,
++0x00040047,0x0000003e,0x0000001e,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x00040020,0x00000009,0x00000001,
++0x00000006,0x0004003b,0x00000009,0x0000000a,
++0x00000001,0x0004001e,0x0000000c,0x00000006,
++0x00000006,0x00040020,0x0000000d,0x00000009,
++0x0000000c,0x0004003b,0x0000000d,0x0000000e,
++0x00000009,0x0004002b,0x00000006,0x0000000f,
++0x00000001,0x00040020,0x00000010,0x00000009,
++0x00000006,0x00030016,0x00000019,0x00000020,
++0x00040017,0x0000001a,0x00000019,0x00000004,
++0x0004001e,0x0000001b,0x0000001a,0x00000019,
++0x00040020,0x0000001c,0x00000003,0x0000001b,
++0x0004003b,0x0000001c,0x0000001d,0x00000003,
++0x0004002b,0x00000006,0x0000001e,0x00000000,
++0x0004002b,0x00000019,0x00000021,0x3f000000,
++0x0004002b,0x00000019,0x00000027,0x40000000,
++0x0004002b,0x00000019,0x00000029,0x3f800000,
++0x0004002b,0x00000019,0x00000034,0x00000000,
++0x00040020,0x00000036,0x00000003,0x0000001a,
++0x00040020,0x00000038,0x00000003,0x00000019,
++0x00040020,0x0000003a,0x00000003,0x00000006,
++0x0004003b,0x0000003a,0x0000003b,0x00000003,
++0x0004003b,0x00000009,0x0000003c,0x00000001,
++0x0004003b,0x0000003a,0x0000003e,0x00000003,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x00000006,0x0000000b,0x0000000a,0x00050041,
++0x00000010,0x00000011,0x0000000e,0x0000000f,
++0x0004003d,0x00000006,0x00000012,0x00000011,
++0x0005008b,0x00000006,0x00000013,0x0000000b,
++0x00000012,0x00050087,0x00000006,0x00000018,
++0x0000000b,0x00000012,0x0004006f,0x00000019,
++0x00000020,0x00000013,0x00050081,0x00000019,
++0x00000022,0x00000020,0x00000021,0x0004006f,
++0x00000019,0x00000025,0x00000012,0x00050088,
++0x00000019,0x00000026,0x00000022,0x00000025,
++0x00050085,0x00000019,0x00000028,0x00000026,
++0x00000027,0x00050083,0x00000019,0x0000002a,
++0x00000028,0x00000029,0x0004006f,0x00000019,
++0x0000002c,0x00000018,0x00050081,0x00000019,
++0x0000002d,0x0000002c,0x00000021,0x00050088,
++0x00000019,0x00000031,0x0000002d,0x00000025,
++0x00050085,0x00000019,0x00000032,0x00000031,
++0x00000027,0x00050083,0x00000019,0x00000033,
++0x00000032,0x00000029,0x00070050,0x0000001a,
++0x00000035,0x0000002a,0x00000033,0x00000034,
++0x00000029,0x00050041,0x00000036,0x00000037,
++0x0000001d,0x0000001e,0x0003003e,0x00000037,
++0x00000035,0x00050041,0x00000038,0x00000039,
++0x0000001d,0x0000000f,0x0003003e,0x00000039,
++0x00000029,0x0004003d,0x00000006,0x0000003d,
++0x0000003c,0x0003003e,0x0000003b,0x0000003d,
++0x0003003e,0x0000003e,0x0000003d,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..cb7ce9e13541847aeed85d0be383291eaae5e5d9
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in points.vert points.frag draw_id.vert passthrough.vert layer.geom; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom
+new file mode 100644
+index 0000000000000000000000000000000000000000..a751099fa932baf8a6cf61d75665c75a0c83331e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom
+@@ -0,0 +1,23 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (points) in;
++layout (points, max_vertices = 1) out;
++layout (push_constant, std430) uniform PushConstantBlock {
++    int layer;
++    int width;
++} pc;
++layout (location=0) out flat int outLayer;
++in gl_PerVertex
++{
++    vec4 gl_Position;
++} gl_in[];
++out gl_PerVertex
++{
++    vec4 gl_Position;
++};
++void main (void) {
++    gl_Position = gl_in[0].gl_Position;
++    gl_Layer = pc.layer;
++    outLayer = pc.layer;
++    EmitVertex();
++}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom.h b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e20517272d294e77a1354159ef17a117b3c569a8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/layer.geom.h
+@@ -0,0 +1,54 @@
++{0x07230203,0x00010600,0x000d000b,0x00000021,
++0x00000000,0x00020011,0x00000002,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000a000f,0x00000003,0x00000004,0x6e69616d,
++0x00000000,0x0000000a,0x00000012,0x00000019,
++0x0000001c,0x00000020,0x00030010,0x00000004,
++0x00000013,0x00040010,0x00000004,0x00000000,
++0x00000001,0x00030010,0x00000004,0x0000001b,
++0x00040010,0x00000004,0x0000001a,0x00000001,
++0x00030047,0x00000008,0x00000002,0x00050048,
++0x00000008,0x00000000,0x0000000b,0x00000000,
++0x00030047,0x0000000d,0x00000002,0x00050048,
++0x0000000d,0x00000000,0x0000000b,0x00000000,
++0x00040047,0x00000019,0x0000000b,0x00000009,
++0x00030047,0x0000001a,0x00000002,0x00050048,
++0x0000001a,0x00000000,0x00000023,0x00000000,
++0x00050048,0x0000001a,0x00000001,0x00000023,
++0x00000004,0x00030047,0x00000020,0x0000000e,
++0x00040047,0x00000020,0x0000001e,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00030016,0x00000006,0x00000020,
++0x00040017,0x00000007,0x00000006,0x00000004,
++0x0003001e,0x00000008,0x00000007,0x00040020,
++0x00000009,0x00000003,0x00000008,0x0004003b,
++0x00000009,0x0000000a,0x00000003,0x00040015,
++0x0000000b,0x00000020,0x00000001,0x0004002b,
++0x0000000b,0x0000000c,0x00000000,0x0003001e,
++0x0000000d,0x00000007,0x00040015,0x0000000e,
++0x00000020,0x00000000,0x0004002b,0x0000000e,
++0x0000000f,0x00000001,0x0004001c,0x00000010,
++0x0000000d,0x0000000f,0x00040020,0x00000011,
++0x00000001,0x00000010,0x0004003b,0x00000011,
++0x00000012,0x00000001,0x00040020,0x00000013,
++0x00000001,0x00000007,0x00040020,0x00000016,
++0x00000003,0x00000007,0x00040020,0x00000018,
++0x00000003,0x0000000b,0x0004003b,0x00000018,
++0x00000019,0x00000003,0x0004001e,0x0000001a,
++0x0000000b,0x0000000b,0x00040020,0x0000001b,
++0x00000009,0x0000001a,0x0004003b,0x0000001b,
++0x0000001c,0x00000009,0x00040020,0x0000001d,
++0x00000009,0x0000000b,0x0004003b,0x00000018,
++0x00000020,0x00000003,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x00060041,0x00000013,0x00000014,
++0x00000012,0x0000000c,0x0000000c,0x0004003d,
++0x00000007,0x00000015,0x00000014,0x00050041,
++0x00000016,0x00000017,0x0000000a,0x0000000c,
++0x0003003e,0x00000017,0x00000015,0x00050041,
++0x0000001d,0x0000001e,0x0000001c,0x0000000c,
++0x0004003d,0x0000000b,0x0000001f,0x0000001e,
++0x0003003e,0x00000019,0x0000001f,0x0003003e,
++0x00000020,0x0000001f,0x000100da,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0050d3d10adfbc20a7fc92a5f8c38d1a45c12e4
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert
+@@ -0,0 +1,19 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (push_constant, std430) uniform PushConstantBlock {
++    int layer;
++    int width;
++} pc;
++out gl_PerVertex
++{
++    vec4 gl_Position;
++};
++void main (void) {
++    /* One point per texel, in raster order; the geometry shader picks the
++     * layer. */
++    const int x = gl_VertexIndex % pc.width;
++    const int y = gl_VertexIndex / pc.width;
++    gl_Position = vec4((float(x) + 0.5) / float(pc.width) * 2.0 - 1.0,
++                       (float(y) + 0.5) / float(pc.width) * 2.0 - 1.0,
++                       0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert.h b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9a498cd2df87bff844113c50c5f5b91567b6e1f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/passthrough.vert.h
+@@ -0,0 +1,57 @@
++{0x07230203,0x00010600,0x000d000b,0x00000038,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000a,0x0000000e,0x0000001d,
++0x00040047,0x0000000a,0x0000000b,0x0000002a,
++0x00030047,0x0000000c,0x00000002,0x00050048,
++0x0000000c,0x00000000,0x00000023,0x00000000,
++0x00050048,0x0000000c,0x00000001,0x00000023,
++0x00000004,0x00030047,0x0000001b,0x00000002,
++0x00050048,0x0000001b,0x00000000,0x0000000b,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040020,0x00000009,
++0x00000001,0x00000006,0x0004003b,0x00000009,
++0x0000000a,0x00000001,0x0004001e,0x0000000c,
++0x00000006,0x00000006,0x00040020,0x0000000d,
++0x00000009,0x0000000c,0x0004003b,0x0000000d,
++0x0000000e,0x00000009,0x0004002b,0x00000006,
++0x0000000f,0x00000001,0x00040020,0x00000010,
++0x00000009,0x00000006,0x00030016,0x00000019,
++0x00000020,0x00040017,0x0000001a,0x00000019,
++0x00000004,0x0003001e,0x0000001b,0x0000001a,
++0x00040020,0x0000001c,0x00000003,0x0000001b,
++0x0004003b,0x0000001c,0x0000001d,0x00000003,
++0x0004002b,0x00000006,0x0000001e,0x00000000,
++0x0004002b,0x00000019,0x00000021,0x3f000000,
++0x0004002b,0x00000019,0x00000027,0x40000000,
++0x0004002b,0x00000019,0x00000029,0x3f800000,
++0x0004002b,0x00000019,0x00000034,0x00000000,
++0x00040020,0x00000036,0x00000003,0x0000001a,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x00000006,0x0000000b,0x0000000a,0x00050041,
++0x00000010,0x00000011,0x0000000e,0x0000000f,
++0x0004003d,0x00000006,0x00000012,0x00000011,
++0x0005008b,0x00000006,0x00000013,0x0000000b,
++0x00000012,0x00050087,0x00000006,0x00000018,
++0x0000000b,0x00000012,0x0004006f,0x00000019,
++0x00000020,0x00000013,0x00050081,0x00000019,
++0x00000022,0x00000020,0x00000021,0x0004006f,
++0x00000019,0x00000025,0x00000012,0x00050088,
++0x00000019,0x00000026,0x00000022,0x00000025,
++0x00050085,0x00000019,0x00000028,0x00000026,
++0x00000027,0x00050083,0x00000019,0x0000002a,
++0x00000028,0x00000029,0x0004006f,0x00000019,
++0x0000002c,0x00000018,0x00050081,0x00000019,
++0x0000002d,0x0000002c,0x00000021,0x00050088,
++0x00000019,0x00000031,0x0000002d,0x00000025,
++0x00050085,0x00000019,0x00000032,0x00000031,
++0x00000027,0x00050083,0x00000019,0x00000033,
++0x00000032,0x00000029,0x00070050,0x0000001a,
++0x00000035,0x0000002a,0x00000033,0x00000034,
++0x00000029,0x00050041,0x00000036,0x00000037,
++0x0000001d,0x0000001e,0x0003003e,0x00000037,
++0x00000035,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..76fb4ad082f61e87e69fdd6f1872c313ccf72b07
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag
+@@ -0,0 +1,9 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (location=0) in flat int inLayer;
++layout (location=0) out vec4 outColor;
++void main (void) {
++    /* Encode the layer so a primitive routed to the wrong layer is caught
++     * as well as one that never lands. */
++    outColor = vec4(float(inLayer + 1), 0.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag.h b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d6cffae7fd02dd487b25dc3a0c4052e3c235263
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.frag.h
+@@ -0,0 +1,29 @@
++{0x07230203,0x00010600,0x000d000b,0x00000014,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000c,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00030047,0x0000000c,
++0x0000000e,0x00040047,0x0000000c,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00030016,0x00000006,
++0x00000020,0x00040017,0x00000007,0x00000006,
++0x00000004,0x00040020,0x00000008,0x00000003,
++0x00000007,0x0004003b,0x00000008,0x00000009,
++0x00000003,0x00040015,0x0000000a,0x00000020,
++0x00000001,0x00040020,0x0000000b,0x00000001,
++0x0000000a,0x0004003b,0x0000000b,0x0000000c,
++0x00000001,0x0004002b,0x0000000a,0x0000000e,
++0x00000001,0x0004002b,0x00000006,0x00000011,
++0x00000000,0x0004002b,0x00000006,0x00000012,
++0x3f800000,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003d,0x0000000a,0x0000000d,0x0000000c,
++0x00050080,0x0000000a,0x0000000f,0x0000000d,
++0x0000000e,0x0004006f,0x00000006,0x00000010,
++0x0000000f,0x00070050,0x00000007,0x00000013,
++0x00000010,0x00000011,0x00000011,0x00000012,
++0x0003003e,0x00000009,0x00000013,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..f20b80b128ea94dd9aa2efe6649514861b7b7305
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert
+@@ -0,0 +1,24 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++#extension GL_ARB_shader_viewport_layer_array : enable
++layout (push_constant, std430) uniform PushConstantBlock {
++    int layer;
++    int width;
++} pc;
++layout (location=0) out flat int outLayer;
++out gl_PerVertex
++{
++    vec4 gl_Position;
++    float gl_PointSize;
++};
++void main (void) {
++    /* One point per texel, in raster order. */
++    const int x = gl_VertexIndex % pc.width;
++    const int y = gl_VertexIndex / pc.width;
++    gl_Position = vec4((float(x) + 0.5) / float(pc.width) * 2.0 - 1.0,
++                       (float(y) + 0.5) / float(pc.width) * 2.0 - 1.0,
++                       0.0, 1.0);
++    gl_PointSize = 1.0;
++    gl_Layer = pc.layer;
++    outLayer = pc.layer;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert.h b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..afb9aab6c64bcc2c7a51b3f97bd0f0a12385cdcf
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/layered_draw_shaders/points.vert.h
+@@ -0,0 +1,72 @@
++{0x07230203,0x00010600,0x000d000b,0x0000003f,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000045,0x0006000b,0x00000001,0x4c534c47,
++0x6474732e,0x3035342e,0x00000000,0x0003000e,
++0x00000000,0x00000001,0x000a000f,0x00000000,
++0x00000004,0x6e69616d,0x00000000,0x0000000a,
++0x0000000e,0x0000001d,0x0000003b,0x0000003e,
++0x00040047,0x0000000a,0x0000000b,0x0000002a,
++0x00030047,0x0000000c,0x00000002,0x00050048,
++0x0000000c,0x00000000,0x00000023,0x00000000,
++0x00050048,0x0000000c,0x00000001,0x00000023,
++0x00000004,0x00030047,0x0000001b,0x00000002,
++0x00050048,0x0000001b,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x0000001b,0x00000001,
++0x0000000b,0x00000001,0x00040047,0x0000003b,
++0x0000000b,0x00000009,0x00030047,0x0000003e,
++0x0000000e,0x00040047,0x0000003e,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040020,0x00000009,
++0x00000001,0x00000006,0x0004003b,0x00000009,
++0x0000000a,0x00000001,0x0004001e,0x0000000c,
++0x00000006,0x00000006,0x00040020,0x0000000d,
++0x00000009,0x0000000c,0x0004003b,0x0000000d,
++0x0000000e,0x00000009,0x0004002b,0x00000006,
++0x0000000f,0x00000001,0x00040020,0x00000010,
++0x00000009,0x00000006,0x00030016,0x00000019,
++0x00000020,0x00040017,0x0000001a,0x00000019,
++0x00000004,0x0004001e,0x0000001b,0x0000001a,
++0x00000019,0x00040020,0x0000001c,0x00000003,
++0x0000001b,0x0004003b,0x0000001c,0x0000001d,
++0x00000003,0x0004002b,0x00000006,0x0000001e,
++0x00000000,0x0004002b,0x00000019,0x00000021,
++0x3f000000,0x0004002b,0x00000019,0x00000027,
++0x40000000,0x0004002b,0x00000019,0x00000029,
++0x3f800000,0x0004002b,0x00000019,0x00000034,
++0x00000000,0x00040020,0x00000036,0x00000003,
++0x0000001a,0x00040020,0x00000038,0x00000003,
++0x00000019,0x00040020,0x0000003a,0x00000003,
++0x00000006,0x0004003b,0x0000003a,0x0000003b,
++0x00000003,0x0004003b,0x0000003a,0x0000003e,
++0x00000003,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003d,0x00000006,0x0000000b,0x0000000a,
++0x00050041,0x00000010,0x00000011,0x0000000e,
++0x0000000f,0x0004003d,0x00000006,0x00000012,
++0x00000011,0x0005008b,0x00000006,0x00000013,
++0x0000000b,0x00000012,0x00050087,0x00000006,
++0x00000018,0x0000000b,0x00000012,0x0004006f,
++0x00000019,0x00000020,0x00000013,0x00050081,
++0x00000019,0x00000022,0x00000020,0x00000021,
++0x0004006f,0x00000019,0x00000025,0x00000012,
++0x00050088,0x00000019,0x00000026,0x00000022,
++0x00000025,0x00050085,0x00000019,0x00000028,
++0x00000026,0x00000027,0x00050083,0x00000019,
++0x0000002a,0x00000028,0x00000029,0x0004006f,
++0x00000019,0x0000002c,0x00000018,0x00050081,
++0x00000019,0x0000002d,0x0000002c,0x00000021,
++0x00050088,0x00000019,0x00000031,0x0000002d,
++0x00000025,0x00050085,0x00000019,0x00000032,
++0x00000031,0x00000027,0x00050083,0x00000019,
++0x00000033,0x00000032,0x00000029,0x00070050,
++0x0000001a,0x00000035,0x0000002a,0x00000033,
++0x00000034,0x00000029,0x00050041,0x00000036,
++0x00000037,0x0000001d,0x0000001e,0x0003003e,
++0x00000037,0x00000035,0x00050041,0x00000038,
++0x00000039,0x0000001d,0x0000000f,0x0003003e,
++0x00000039,0x00000029,0x00050041,0x00000010,
++0x0000003c,0x0000000e,0x0000001e,0x0004003d,
++0x00000006,0x0000003d,0x0000003c,0x0003003e,
++0x0000003b,0x0000003d,0x0003003e,0x0000003e,
++0x0000003d,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..6c7f9a12c4900ba1c9f627e80254caacb6a06bd1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in quad.vert quad.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c68ed2d7005595fb6fe2ba26e2946f5173e870e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag
+@@ -0,0 +1,7 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (location = 0) in vec4 inColor;
++layout (location = 0) out vec4 outColor;
++void main (void) {
++    outColor = inColor;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag.h b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..50544d69c37b4e3889a931f38533262b813a6160
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.frag.h
+@@ -0,0 +1,20 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000b,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00040047,0x0000000b,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000007,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x0000000c,
++0x0000000b,0x0003003e,0x00000009,0x0000000c,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..df60a8a03ef25e81a09e77e906c33bdccf3f30dd
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert
+@@ -0,0 +1,16 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (push_constant, std430) uniform PushConstantBlock {
++    vec4 color;
++} pc;
++layout (location = 0) out vec4 outColor;
++out gl_PerVertex
++{
++    vec4 gl_Position;
++};
++void main (void) {
++    /* One full-screen triangle. */
++    const vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++    outColor = pc.color;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert.h b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8270da2979ac5e8cd01f2cf4c88b317c2e6d653
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/multiview_clear_shaders/quad.vert.h
+@@ -0,0 +1,57 @@
++{0x07230203,0x00010600,0x000d000b,0x00000030,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000c,0x0000001a,0x00000028,
++0x0000002b,0x00040047,0x0000000c,0x0000000b,
++0x0000002a,0x00030047,0x00000018,0x00000002,
++0x00050048,0x00000018,0x00000000,0x0000000b,
++0x00000000,0x00040047,0x00000028,0x0000001e,
++0x00000000,0x00030047,0x00000029,0x00000002,
++0x00050048,0x00000029,0x00000000,0x00000023,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00030016,0x00000006,
++0x00000020,0x00040017,0x00000007,0x00000006,
++0x00000002,0x00040015,0x0000000a,0x00000020,
++0x00000001,0x00040020,0x0000000b,0x00000001,
++0x0000000a,0x0004003b,0x0000000b,0x0000000c,
++0x00000001,0x0004002b,0x0000000a,0x0000000e,
++0x00000001,0x0004002b,0x0000000a,0x00000010,
++0x00000002,0x00040017,0x00000017,0x00000006,
++0x00000004,0x0003001e,0x00000018,0x00000017,
++0x00040020,0x00000019,0x00000003,0x00000018,
++0x0004003b,0x00000019,0x0000001a,0x00000003,
++0x0004002b,0x0000000a,0x0000001b,0x00000000,
++0x0004002b,0x00000006,0x0000001d,0x40000000,
++0x0004002b,0x00000006,0x0000001f,0x3f800000,
++0x0004002b,0x00000006,0x00000022,0x00000000,
++0x00040020,0x00000026,0x00000003,0x00000017,
++0x0004003b,0x00000026,0x00000028,0x00000003,
++0x0003001e,0x00000029,0x00000017,0x00040020,
++0x0000002a,0x00000009,0x00000029,0x0004003b,
++0x0000002a,0x0000002b,0x00000009,0x00040020,
++0x0000002c,0x00000009,0x00000017,0x0005002c,
++0x00000007,0x0000002f,0x0000001f,0x0000001f,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x0000000a,0x0000000d,0x0000000c,0x000500c4,
++0x0000000a,0x0000000f,0x0000000d,0x0000000e,
++0x000500c7,0x0000000a,0x00000011,0x0000000f,
++0x00000010,0x0004006f,0x00000006,0x00000012,
++0x00000011,0x000500c7,0x0000000a,0x00000014,
++0x0000000d,0x00000010,0x0004006f,0x00000006,
++0x00000015,0x00000014,0x00050050,0x00000007,
++0x00000016,0x00000012,0x00000015,0x0005008e,
++0x00000007,0x0000001e,0x00000016,0x0000001d,
++0x00050083,0x00000007,0x00000021,0x0000001e,
++0x0000002f,0x00050051,0x00000006,0x00000023,
++0x00000021,0x00000000,0x00050051,0x00000006,
++0x00000024,0x00000021,0x00000001,0x00070050,
++0x00000017,0x00000025,0x00000023,0x00000024,
++0x00000022,0x0000001f,0x00050041,0x00000026,
++0x00000027,0x0000001a,0x0000001b,0x0003003e,
++0x00000027,0x00000025,0x00050041,0x0000002c,
++0x0000002d,0x0000002b,0x0000001b,0x0004003d,
++0x00000017,0x0000002e,0x0000002d,0x0003003e,
++0x00000028,0x0000002e,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_layered_draw_routes.cpp b/src/kosmickrisp/vulkan/tests/test_layered_draw_routes.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ff35085d14d6115368734d3c6d98fa9d806f60e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_layered_draw_routes.cpp
+@@ -0,0 +1,512 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* KK_WORKAROUND_18 has to see every Metal draw that selects a layer, however
++ * the application reaches it. kosmickrisp_layered_draw_sequence covers one
++ * draw call per layer with a vertex-shader layer; this test covers the other
++ * two routes, each in a fresh process because only the first affected pass of
++ * a process loses primitives:
++ *
++ *   multi_draw  one vkCmdDrawMultiEXT whose two entries select layers 0 and 1
++ *               through gl_DrawID, so the second is a later Metal draw of the
++ *               same call;
++ *   geometry    one draw call per layer, with the layer written by a geometry
++ *               shader rather than the vertex shader.
++ *
++ * Every texel of every layer must carry the value its own layer's draw
++ * writes.
++ */
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t draw_id_vertex_spirv[] =
++#include "layered_draw_shaders/draw_id.vert.h"
++;
++static const uint32_t passthrough_vertex_spirv[] =
++#include "layered_draw_shaders/passthrough.vert.h"
++;
++static const uint32_t geometry_spirv[] =
++#include "layered_draw_shaders/layer.geom.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "layered_draw_shaders/points.frag.h"
++;
++
++/* Large enough to lose primitives without the workaround. */
++static const uint32_t kExtent = 1024u;
++static const uint32_t kLayers = 2u;
++static const uint32_t kTexelBytes = 16u;
++
++struct PushConstants {
++   int32_t layer;
++   int32_t width;
++};
++
++int main(int argc, char **argv)
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   require(argc == 2 && (std::strcmp(argv[1], "multi_draw") == 0 ||
++                         std::strcmp(argv[1], "geometry") == 0),
++           "usage: test_kosmickrisp_layered_draw_routes multi_draw|geometry");
++   const bool multi_draw = std::strcmp(argv[1], "multi_draw") == 0;
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "layered-draw-routes";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceFeatures2);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceMultiDrawFeaturesEXT supported_multi_draw{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT};
++      VkPhysicalDeviceVulkan11Features supported11{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++      supported11.pNext = &supported_multi_draw;
++      VkPhysicalDeviceVulkan12Features supported12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      supported12.pNext = &supported11;
++      VkPhysicalDeviceFeatures2 supported{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++      supported.pNext = &supported12;
++      vkGetPhysicalDeviceFeatures2(physical, &supported);
++      require(multi_draw ? supported12.shaderOutputLayer &&
++                              supported11.shaderDrawParameters &&
++                              supported_multi_draw.multiDraw
++                         : supported.features.geometryShader,
++              "the route's features");
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count && !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceMultiDrawFeaturesEXT features_multi_draw{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT};
++      features_multi_draw.multiDraw = multi_draw;
++      VkPhysicalDeviceVulkan11Features features11{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++      features11.pNext = multi_draw ? &features_multi_draw : nullptr;
++      features11.shaderDrawParameters = multi_draw;
++      VkPhysicalDeviceVulkan12Features features12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      features12.pNext = &features11;
++      features12.shaderOutputLayer = multi_draw;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.pNext = &features12;
++      features13.dynamicRendering = VK_TRUE;
++      VkPhysicalDeviceFeatures2 features{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++      features.pNext = &features13;
++      features.features.geometryShader = !multi_draw;
++      const char *multi_draw_extension = VK_EXT_MULTI_DRAW_EXTENSION_NAME;
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      device_info.enabledExtensionCount = multi_draw ? 1u : 0u;
++      device_info.ppEnabledExtensionNames = &multi_draw_extension;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkUnmapMemory);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdDraw);
++      auto vkCmdDrawMultiEXT = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(
++         vkGetDeviceProcAddr(device, "vkCmdDrawMultiEXT"));
++      require(!multi_draw || vkCmdDrawMultiEXT != nullptr, "vkCmdDrawMultiEXT");
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++
++      VkQueue graphics_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &graphics_queue);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto find_memory = [&](uint32_t bits, VkMemoryPropertyFlags want) {
++         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i)
++            if ((bits & (1u << i)) &&
++                (memory_properties.memoryTypes[i].propertyFlags & want) == want)
++               return i;
++         require(false, "memory type");
++         return 0u;
++      };
++
++      const VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
++      VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      image_info.imageType = VK_IMAGE_TYPE_2D;
++      image_info.format = format;
++      image_info.extent = {kExtent, kExtent, 1u};
++      image_info.mipLevels = 1u;
++      image_info.arrayLayers = kLayers;
++      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      VkImage image = VK_NULL_HANDLE;
++      result = vkCreateImage(device, &image_info, nullptr, &image);
++      require(result == VK_SUCCESS, "create image", result);
++      VkMemoryRequirements image_requirements{};
++      vkGetImageMemoryRequirements(device, image, &image_requirements);
++      VkMemoryAllocateInfo image_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      image_allocate.allocationSize = image_requirements.size;
++      image_allocate.memoryTypeIndex = find_memory(
++         image_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      VkDeviceMemory image_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &image_allocate, nullptr, &image_memory);
++      require(result == VK_SUCCESS, "allocate image", result);
++      result = vkBindImageMemory(device, image, image_memory, 0);
++      require(result == VK_SUCCESS, "bind image", result);
++
++      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view_info.image = image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++      view_info.format = format;
++      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, kLayers};
++      VkImageView view = VK_NULL_HANDLE;
++      result = vkCreateImageView(device, &view_info, nullptr, &view);
++      require(result == VK_SUCCESS, "create view", result);
++
++      const VkDeviceSize layer_bytes =
++         VkDeviceSize(kExtent) * kExtent * kTexelBytes;
++      const VkDeviceSize readback_bytes = layer_bytes * kLayers;
++      VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      buffer_info.size = readback_bytes;
++      buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      VkBuffer readback = VK_NULL_HANDLE;
++      result = vkCreateBuffer(device, &buffer_info, nullptr, &readback);
++      require(result == VK_SUCCESS, "create buffer", result);
++      VkMemoryRequirements buffer_requirements{};
++      vkGetBufferMemoryRequirements(device, readback, &buffer_requirements);
++      VkMemoryAllocateInfo buffer_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      buffer_allocate.allocationSize = buffer_requirements.size;
++      buffer_allocate.memoryTypeIndex =
++         find_memory(buffer_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &buffer_allocate, nullptr, &readback_memory);
++      require(result == VK_SUCCESS, "allocate buffer", result);
++      result = vkBindBufferMemory(device, readback, readback_memory, 0);
++      require(result == VK_SUCCESS, "bind buffer", result);
++      void *mapped = nullptr;
++      result = vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped);
++      require(result == VK_SUCCESS, "map buffer", result);
++      std::memset(mapped, 0, size_t(readback_bytes));
++
++      VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++      module_info.codeSize = multi_draw ? sizeof(draw_id_vertex_spirv)
++                                        : sizeof(passthrough_vertex_spirv);
++      module_info.pCode =
++         multi_draw ? draw_id_vertex_spirv : passthrough_vertex_spirv;
++      VkShaderModule vertex_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &vertex_module);
++      require(result == VK_SUCCESS, "vertex module", result);
++      module_info.codeSize = sizeof(geometry_spirv);
++      module_info.pCode = geometry_spirv;
++      VkShaderModule geometry_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &geometry_module);
++      require(result == VK_SUCCESS, "geometry module", result);
++      module_info.codeSize = sizeof(fragment_spirv);
++      module_info.pCode = fragment_spirv;
++      VkShaderModule fragment_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &fragment_module);
++      require(result == VK_SUCCESS, "fragment module", result);
++
++      const VkShaderStageFlags push_stages =
++         VK_SHADER_STAGE_VERTEX_BIT |
++         (multi_draw ? 0u : VK_SHADER_STAGE_GEOMETRY_BIT);
++      VkPushConstantRange push_range{push_stages, 0u, sizeof(PushConstants)};
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      layout_info.pushConstantRangeCount = 1u;
++      layout_info.pPushConstantRanges = &push_range;
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "pipeline layout", result);
++
++      VkPipelineShaderStageCreateInfo stages[3]{};
++      stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++      stages[0].module = vertex_module;
++      stages[0].pName = "main";
++      stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++      stages[1].module = fragment_module;
++      stages[1].pName = "main";
++      stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
++      stages[2].module = geometry_module;
++      stages[2].pName = "main";
++      VkPipelineVertexInputStateCreateInfo vertex_input{
++         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      VkPipelineInputAssemblyStateCreateInfo assembly{
++         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++      VkViewport viewport{0.0f, 0.0f, float(kExtent), float(kExtent), 0.0f, 1.0f};
++      VkRect2D scissor{{0, 0}, {kExtent, kExtent}};
++      VkPipelineViewportStateCreateInfo viewport_state{
++         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++      viewport_state.viewportCount = 1u;
++      viewport_state.pViewports = &viewport;
++      viewport_state.scissorCount = 1u;
++      viewport_state.pScissors = &scissor;
++      VkPipelineRasterizationStateCreateInfo raster{
++         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      raster.polygonMode = VK_POLYGON_MODE_FILL;
++      raster.cullMode = VK_CULL_MODE_NONE;
++      raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++      raster.lineWidth = 1.0f;
++      VkPipelineMultisampleStateCreateInfo multisample{
++         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++      multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++      VkPipelineColorBlendAttachmentState blend_attachment{};
++      blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
++                                        VK_COLOR_COMPONENT_G_BIT |
++                                        VK_COLOR_COMPONENT_B_BIT |
++                                        VK_COLOR_COMPONENT_A_BIT;
++      VkPipelineColorBlendStateCreateInfo blend{
++         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++      blend.attachmentCount = 1u;
++      blend.pAttachments = &blend_attachment;
++      VkPipelineRenderingCreateInfo rendering_info{
++         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      rendering_info.colorAttachmentCount = 1u;
++      rendering_info.pColorAttachmentFormats = &format;
++      VkGraphicsPipelineCreateInfo pipeline_info{
++         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      pipeline_info.pNext = &rendering_info;
++      pipeline_info.stageCount = multi_draw ? 2u : 3u;
++      pipeline_info.pStages = stages;
++      pipeline_info.pVertexInputState = &vertex_input;
++      pipeline_info.pInputAssemblyState = &assembly;
++      pipeline_info.pViewportState = &viewport_state;
++      pipeline_info.pRasterizationState = &raster;
++      pipeline_info.pMultisampleState = &multisample;
++      pipeline_info.pColorBlendState = &blend;
++      pipeline_info.layout = layout;
++      VkPipeline pipeline = VK_NULL_HANDLE;
++      result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &pipeline_info,
++                                         nullptr, &pipeline);
++      require(result == VK_SUCCESS, "create pipeline", result);
++
++      VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "command pool", result);
++      VkCommandBufferAllocateInfo command_info{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      command_info.commandPool = pool;
++      command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      command_info.commandBufferCount = 1u;
++      VkCommandBuffer commands = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &command_info, &commands);
++      require(result == VK_SUCCESS, "command buffer", result);
++
++      VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      result = vkBeginCommandBuffer(commands, &begin);
++      require(result == VK_SUCCESS, "begin commands", result);
++
++      VkRenderingAttachmentInfo color_attachment{
++         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++      color_attachment.imageView = view;
++      color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      /* A CLEAR load op hides the defect, so keep DONT_CARE as the CTS
++       * cases that found it use. */
++      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
++      rendering.renderArea = scissor;
++      rendering.layerCount = kLayers;
++      rendering.colorAttachmentCount = 1u;
++      rendering.pColorAttachments = &color_attachment;
++      vkCmdBeginRendering(commands, &rendering);
++      vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++      if (multi_draw) {
++         PushConstants push{0, int32_t(kExtent)};
++         vkCmdPushConstants(commands, layout, push_stages, 0u, sizeof(push),
++                            &push);
++         VkMultiDrawInfoEXT draws[kLayers];
++         for (uint32_t layer = 0u; layer < kLayers; ++layer)
++            draws[layer] = {0u, kExtent * kExtent};
++         vkCmdDrawMultiEXT(commands, kLayers, draws, 1u, 0u,
++                           sizeof(VkMultiDrawInfoEXT));
++      } else {
++         for (uint32_t layer = 0u; layer < kLayers; ++layer) {
++            PushConstants push{int32_t(layer), int32_t(kExtent)};
++            vkCmdPushConstants(commands, layout, push_stages, 0u, sizeof(push),
++                               &push);
++            vkCmdDraw(commands, kExtent * kExtent, 1u, 0u, 0u);
++         }
++      }
++      vkCmdEndRendering(commands);
++
++      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++      barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.image = image;
++      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, kLayers};
++      vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u,
++                           nullptr, 1u, &barrier);
++      VkBufferImageCopy copy{};
++      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, kLayers};
++      copy.imageExtent = {kExtent, kExtent, 1u};
++      vkCmdCopyImageToBuffer(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                             readback, 1u, &copy);
++      result = vkEndCommandBuffer(commands);
++      require(result == VK_SUCCESS, "end commands", result);
++
++      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++      submit.commandBufferCount = 1u;
++      submit.pCommandBuffers = &commands;
++      result = vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE);
++      require(result == VK_SUCCESS, "submit", result);
++      result = vkQueueWaitIdle(graphics_queue);
++      require(result == VK_SUCCESS, "wait idle", result);
++
++      const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
++      for (uint32_t layer = 0u; layer < kLayers; ++layer) {
++         const float expected = float(layer + 1u);
++         uint64_t wrong = 0u;
++         int64_t first_wrong = -1;
++         for (uint64_t texel = 0u; texel < uint64_t(kExtent) * kExtent; ++texel) {
++            float value[4];
++            std::memcpy(value, bytes + layer * layer_bytes + texel * kTexelBytes,
++                        sizeof(value));
++            if (value[0] == expected && value[1] == 0.0f && value[2] == 0.0f &&
++                value[3] == 1.0f)
++               continue;
++            ++wrong;
++            if (first_wrong < 0)
++               first_wrong = int64_t(texel);
++         }
++         if (wrong) {
++            float value[4];
++            std::memcpy(value,
++                        bytes + layer * layer_bytes +
++                           uint64_t(first_wrong) * kTexelBytes,
++                        sizeof(value));
++            std::fprintf(stderr,
++                         "layer %u: %llu of %llu texels were not drawn by their "
++                         "own layer's draw, first at %lld (got %f %f %f %f)\n",
++                         layer, static_cast<unsigned long long>(wrong),
++                         static_cast<unsigned long long>(uint64_t(kExtent) * kExtent),
++                         static_cast<long long>(first_wrong), double(value[0]),
++                         double(value[1]), double(value[2]), double(value[3]));
++            std::exit(1);
++         }
++      }
++
++      vkDestroyPipeline(device, pipeline, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyShaderModule(device, fragment_module, nullptr);
++      vkDestroyShaderModule(device, geometry_module, nullptr);
++      vkDestroyShaderModule(device, vertex_module, nullptr);
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkUnmapMemory(device, readback_memory);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      vkDestroyImageView(device, view, nullptr);
++      vkDestroyImage(device, image, nullptr);
++      vkFreeMemory(device, image_memory, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++
++   vkDestroyInstance(instance, nullptr);
++   std::printf("layered draw route %s ok\n", argv[1]);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp b/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..49abc983536d7bff19b40e827768e37e649d7445
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_layered_draw_sequence.cpp
+@@ -0,0 +1,448 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* KK_WORKAROUND_18: a render command encoder that already ran one draw drops
++ * most of the primitives of a later draw that selects a different
++ * render_target_array_index. Draw one point per texel into each layer of a
++ * two-layer attachment with one draw per layer, then require every texel of
++ * every layer to carry the value its own layer's draw writes.
++ *
++ * The attachment size, the layered point draws and the DONT_CARE load op all
++ * matter: without the workaround the second draw loses its first 908672
++ * points, but a CLEAR load op on the same pass renders correctly.
++ */
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "layered_draw_shaders/points.vert.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "layered_draw_shaders/points.frag.h"
++;
++
++/* Large enough to lose primitives without the workaround: a 1024x1024 layer
++ * loses 908672 of its 1048576 points on the first affected pass. */
++static const uint32_t kExtent = 1024u;
++static const uint32_t kLayers = 2u;
++static const uint32_t kTexelBytes = 16u;
++
++struct PushConstants {
++   int32_t layer;
++   int32_t width;
++};
++
++int main()
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "layered-draw-sequence";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceFeatures2);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceVulkan12Features supported12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      VkPhysicalDeviceFeatures2 supported{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++      supported.pNext = &supported12;
++      vkGetPhysicalDeviceFeatures2(physical, &supported);
++      if (!supported12.shaderOutputLayer) {
++         std::printf("shaderOutputLayer unsupported, skipping\n");
++         continue;
++      }
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count && !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceVulkan12Features features12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      features12.shaderOutputLayer = VK_TRUE;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.pNext = &features12;
++      features13.dynamicRendering = VK_TRUE;
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkUnmapMemory);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++
++      VkQueue graphics_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &graphics_queue);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto find_memory = [&](uint32_t bits, VkMemoryPropertyFlags want) {
++         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i)
++            if ((bits & (1u << i)) &&
++                (memory_properties.memoryTypes[i].propertyFlags & want) == want)
++               return i;
++         require(false, "memory type");
++         return 0u;
++      };
++
++      const VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
++      VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      image_info.imageType = VK_IMAGE_TYPE_2D;
++      image_info.format = format;
++      image_info.extent = {kExtent, kExtent, 1u};
++      image_info.mipLevels = 1u;
++      image_info.arrayLayers = kLayers;
++      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      VkImage image = VK_NULL_HANDLE;
++      result = vkCreateImage(device, &image_info, nullptr, &image);
++      require(result == VK_SUCCESS, "create image", result);
++      VkMemoryRequirements image_requirements{};
++      vkGetImageMemoryRequirements(device, image, &image_requirements);
++      VkMemoryAllocateInfo image_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      image_allocate.allocationSize = image_requirements.size;
++      image_allocate.memoryTypeIndex = find_memory(
++         image_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      VkDeviceMemory image_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &image_allocate, nullptr, &image_memory);
++      require(result == VK_SUCCESS, "allocate image", result);
++      result = vkBindImageMemory(device, image, image_memory, 0);
++      require(result == VK_SUCCESS, "bind image", result);
++
++      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view_info.image = image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++      view_info.format = format;
++      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, kLayers};
++      VkImageView view = VK_NULL_HANDLE;
++      result = vkCreateImageView(device, &view_info, nullptr, &view);
++      require(result == VK_SUCCESS, "create view", result);
++
++      const VkDeviceSize layer_bytes =
++         VkDeviceSize(kExtent) * kExtent * kTexelBytes;
++      const VkDeviceSize readback_bytes = layer_bytes * kLayers;
++      VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      buffer_info.size = readback_bytes;
++      buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      VkBuffer readback = VK_NULL_HANDLE;
++      result = vkCreateBuffer(device, &buffer_info, nullptr, &readback);
++      require(result == VK_SUCCESS, "create buffer", result);
++      VkMemoryRequirements buffer_requirements{};
++      vkGetBufferMemoryRequirements(device, readback, &buffer_requirements);
++      VkMemoryAllocateInfo buffer_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      buffer_allocate.allocationSize = buffer_requirements.size;
++      buffer_allocate.memoryTypeIndex =
++         find_memory(buffer_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &buffer_allocate, nullptr, &readback_memory);
++      require(result == VK_SUCCESS, "allocate buffer", result);
++      result = vkBindBufferMemory(device, readback, readback_memory, 0);
++      require(result == VK_SUCCESS, "bind buffer", result);
++      void *mapped = nullptr;
++      result = vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped);
++      require(result == VK_SUCCESS, "map buffer", result);
++      std::memset(mapped, 0, size_t(readback_bytes));
++
++      VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++      module_info.codeSize = sizeof(vertex_spirv);
++      module_info.pCode = vertex_spirv;
++      VkShaderModule vertex_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &vertex_module);
++      require(result == VK_SUCCESS, "vertex module", result);
++      module_info.codeSize = sizeof(fragment_spirv);
++      module_info.pCode = fragment_spirv;
++      VkShaderModule fragment_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &fragment_module);
++      require(result == VK_SUCCESS, "fragment module", result);
++
++      VkPushConstantRange push_range{VK_SHADER_STAGE_VERTEX_BIT, 0u,
++                                     sizeof(PushConstants)};
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      layout_info.pushConstantRangeCount = 1u;
++      layout_info.pPushConstantRanges = &push_range;
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "pipeline layout", result);
++
++      VkPipelineShaderStageCreateInfo stages[2]{};
++      stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++      stages[0].module = vertex_module;
++      stages[0].pName = "main";
++      stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++      stages[1].module = fragment_module;
++      stages[1].pName = "main";
++      VkPipelineVertexInputStateCreateInfo vertex_input{
++         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      VkPipelineInputAssemblyStateCreateInfo assembly{
++         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++      VkViewport viewport{0.0f, 0.0f, float(kExtent), float(kExtent), 0.0f, 1.0f};
++      VkRect2D scissor{{0, 0}, {kExtent, kExtent}};
++      VkPipelineViewportStateCreateInfo viewport_state{
++         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++      viewport_state.viewportCount = 1u;
++      viewport_state.pViewports = &viewport;
++      viewport_state.scissorCount = 1u;
++      viewport_state.pScissors = &scissor;
++      VkPipelineRasterizationStateCreateInfo raster{
++         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      raster.polygonMode = VK_POLYGON_MODE_FILL;
++      raster.cullMode = VK_CULL_MODE_NONE;
++      raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++      raster.lineWidth = 1.0f;
++      VkPipelineMultisampleStateCreateInfo multisample{
++         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++      multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++      VkPipelineColorBlendAttachmentState blend_attachment{};
++      blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
++                                        VK_COLOR_COMPONENT_G_BIT |
++                                        VK_COLOR_COMPONENT_B_BIT |
++                                        VK_COLOR_COMPONENT_A_BIT;
++      VkPipelineColorBlendStateCreateInfo blend{
++         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++      blend.attachmentCount = 1u;
++      blend.pAttachments = &blend_attachment;
++      VkPipelineRenderingCreateInfo rendering_info{
++         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      rendering_info.colorAttachmentCount = 1u;
++      rendering_info.pColorAttachmentFormats = &format;
++      VkGraphicsPipelineCreateInfo pipeline_info{
++         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      pipeline_info.pNext = &rendering_info;
++      pipeline_info.stageCount = 2u;
++      pipeline_info.pStages = stages;
++      pipeline_info.pVertexInputState = &vertex_input;
++      pipeline_info.pInputAssemblyState = &assembly;
++      pipeline_info.pViewportState = &viewport_state;
++      pipeline_info.pRasterizationState = &raster;
++      pipeline_info.pMultisampleState = &multisample;
++      pipeline_info.pColorBlendState = &blend;
++      pipeline_info.layout = layout;
++      VkPipeline pipeline = VK_NULL_HANDLE;
++      result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &pipeline_info,
++                                         nullptr, &pipeline);
++      require(result == VK_SUCCESS, "create pipeline", result);
++
++      VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "command pool", result);
++      VkCommandBufferAllocateInfo command_info{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      command_info.commandPool = pool;
++      command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      command_info.commandBufferCount = 1u;
++      VkCommandBuffer commands = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &command_info, &commands);
++      require(result == VK_SUCCESS, "command buffer", result);
++
++      VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      result = vkBeginCommandBuffer(commands, &begin);
++      require(result == VK_SUCCESS, "begin commands", result);
++
++      VkRenderingAttachmentInfo color_attachment{
++         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++      color_attachment.imageView = view;
++      color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      /* A CLEAR load op hides the defect, so keep DONT_CARE as the CTS
++       * cases that found it use. */
++      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
++      rendering.renderArea = scissor;
++      rendering.layerCount = kLayers;
++      rendering.colorAttachmentCount = 1u;
++      rendering.pColorAttachments = &color_attachment;
++      vkCmdBeginRendering(commands, &rendering);
++      vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++      for (uint32_t layer = 0u; layer < kLayers; ++layer) {
++         PushConstants push{int32_t(layer), int32_t(kExtent)};
++         vkCmdPushConstants(commands, layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
++                            sizeof(push), &push);
++         vkCmdDraw(commands, kExtent * kExtent, 1u, 0u, 0u);
++      }
++      vkCmdEndRendering(commands);
++
++      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++      barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.image = image;
++      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, kLayers};
++      vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u,
++                           nullptr, 1u, &barrier);
++      VkBufferImageCopy copy{};
++      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, kLayers};
++      copy.imageExtent = {kExtent, kExtent, 1u};
++      vkCmdCopyImageToBuffer(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                             readback, 1u, &copy);
++      result = vkEndCommandBuffer(commands);
++      require(result == VK_SUCCESS, "end commands", result);
++
++      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++      submit.commandBufferCount = 1u;
++      submit.pCommandBuffers = &commands;
++      result = vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE);
++      require(result == VK_SUCCESS, "submit", result);
++      result = vkQueueWaitIdle(graphics_queue);
++      require(result == VK_SUCCESS, "wait idle", result);
++
++      const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
++      for (uint32_t layer = 0u; layer < kLayers; ++layer) {
++         const float expected = float(layer + 1u);
++         uint64_t wrong = 0u;
++         int64_t first_wrong = -1;
++         for (uint64_t texel = 0u; texel < uint64_t(kExtent) * kExtent; ++texel) {
++            float value[4];
++            std::memcpy(value, bytes + layer * layer_bytes + texel * kTexelBytes,
++                        sizeof(value));
++            if (value[0] == expected && value[1] == 0.0f && value[2] == 0.0f &&
++                value[3] == 1.0f)
++               continue;
++            ++wrong;
++            if (first_wrong < 0)
++               first_wrong = int64_t(texel);
++         }
++         if (wrong) {
++            float value[4];
++            std::memcpy(value,
++                        bytes + layer * layer_bytes +
++                           uint64_t(first_wrong) * kTexelBytes,
++                        sizeof(value));
++            std::fprintf(stderr,
++                         "layer %u: %llu of %llu texels were not drawn by their "
++                         "own layer's draw, first at %lld (got %f %f %f %f)\n",
++                         layer, static_cast<unsigned long long>(wrong),
++                         static_cast<unsigned long long>(uint64_t(kExtent) * kExtent),
++                         static_cast<long long>(first_wrong), double(value[0]),
++                         double(value[1]), double(value[2]), double(value[3]));
++            std::exit(1);
++         }
++      }
++
++      vkDestroyPipeline(device, pipeline, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyShaderModule(device, fragment_module, nullptr);
++      vkDestroyShaderModule(device, vertex_module, nullptr);
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkUnmapMemory(device, readback_memory);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      vkDestroyImageView(device, view, nullptr);
++      vkDestroyImage(device, image, nullptr);
++      vkFreeMemory(device, image_memory, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++
++   vkDestroyInstance(instance, nullptr);
++   std::printf("layered draw sequence ok\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_multiview_clear_attachments.cpp b/src/kosmickrisp/vulkan/tests/test_multiview_clear_attachments.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c81b169aa4e9373728ac62754bb6c5a0fd0efbb
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_multiview_clear_attachments.cpp
+@@ -0,0 +1,450 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* KK_WORKAROUND_18 restarts the render encoder mid-pass, and every encoder
++ * start has to replay the vertex amplification the pass is carrying.
++ * vkCmdClearAttachments turns amplification off because the meta clear routes
++ * its own layers, so a restart that reinstates the multiview mapping sends the
++ * clear to the wrong layers.
++ *
++ * Draw over a two-view (view mask 10) pass on a four-layer image and clear the
++ * left half. Layers 1 and 3 must carry the draw colour on the right and the
++ * clear colour on the left; layers 0 and 2 must not change.
++ */
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "multiview_clear_shaders/quad.vert.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "multiview_clear_shaders/quad.frag.h"
++;
++
++static const uint32_t kExtent = 64u;
++static const uint32_t kLayers = 4u;
++static const uint32_t kViewMask = 10u; /* layers 1 and 3 */
++static const uint8_t kDrawRed = 40u;
++static const uint8_t kClearRed = 200u;
++
++int main()
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "multiview-clear-attachments";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceFeatures2);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceVulkan11Features supported11{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++      VkPhysicalDeviceFeatures2 supported{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++      supported.pNext = &supported11;
++      vkGetPhysicalDeviceFeatures2(physical, &supported);
++      if (!supported11.multiview) {
++         std::printf("multiview unsupported, skipping\n");
++         continue;
++      }
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count && !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceVulkan11Features features11{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++      features11.multiview = VK_TRUE;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.pNext = &features11;
++      features13.dynamicRendering = VK_TRUE;
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkUnmapMemory);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkCmdClearAttachments);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++
++      VkQueue graphics_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &graphics_queue);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto find_memory = [&](uint32_t bits, VkMemoryPropertyFlags want) {
++         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i)
++            if ((bits & (1u << i)) &&
++                (memory_properties.memoryTypes[i].propertyFlags & want) == want)
++               return i;
++         require(false, "memory type");
++         return 0u;
++      };
++
++      const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++      VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      image_info.imageType = VK_IMAGE_TYPE_2D;
++      image_info.format = format;
++      image_info.extent = {kExtent, kExtent, 1u};
++      image_info.mipLevels = 1u;
++      image_info.arrayLayers = kLayers;
++      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      VkImage image = VK_NULL_HANDLE;
++      result = vkCreateImage(device, &image_info, nullptr, &image);
++      require(result == VK_SUCCESS, "create image", result);
++      VkMemoryRequirements image_requirements{};
++      vkGetImageMemoryRequirements(device, image, &image_requirements);
++      VkMemoryAllocateInfo image_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      image_allocate.allocationSize = image_requirements.size;
++      image_allocate.memoryTypeIndex = find_memory(
++         image_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      VkDeviceMemory image_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &image_allocate, nullptr, &image_memory);
++      require(result == VK_SUCCESS, "allocate image", result);
++      result = vkBindImageMemory(device, image, image_memory, 0);
++      require(result == VK_SUCCESS, "bind image", result);
++
++      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view_info.image = image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++      view_info.format = format;
++      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, kLayers};
++      VkImageView view = VK_NULL_HANDLE;
++      result = vkCreateImageView(device, &view_info, nullptr, &view);
++      require(result == VK_SUCCESS, "create view", result);
++
++      const VkDeviceSize layer_bytes = VkDeviceSize(kExtent) * kExtent * 4u;
++      const VkDeviceSize readback_bytes = layer_bytes * kLayers;
++      VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      buffer_info.size = readback_bytes;
++      buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      VkBuffer readback = VK_NULL_HANDLE;
++      result = vkCreateBuffer(device, &buffer_info, nullptr, &readback);
++      require(result == VK_SUCCESS, "create buffer", result);
++      VkMemoryRequirements buffer_requirements{};
++      vkGetBufferMemoryRequirements(device, readback, &buffer_requirements);
++      VkMemoryAllocateInfo buffer_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      buffer_allocate.allocationSize = buffer_requirements.size;
++      buffer_allocate.memoryTypeIndex =
++         find_memory(buffer_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &buffer_allocate, nullptr, &readback_memory);
++      require(result == VK_SUCCESS, "allocate buffer", result);
++      result = vkBindBufferMemory(device, readback, readback_memory, 0);
++      require(result == VK_SUCCESS, "bind buffer", result);
++      void *mapped = nullptr;
++      result = vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped);
++      require(result == VK_SUCCESS, "map buffer", result);
++      std::memset(mapped, 0, size_t(readback_bytes));
++
++      VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++      module_info.codeSize = sizeof(vertex_spirv);
++      module_info.pCode = vertex_spirv;
++      VkShaderModule vertex_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &vertex_module);
++      require(result == VK_SUCCESS, "vertex module", result);
++      module_info.codeSize = sizeof(fragment_spirv);
++      module_info.pCode = fragment_spirv;
++      VkShaderModule fragment_module = VK_NULL_HANDLE;
++      result = vkCreateShaderModule(device, &module_info, nullptr, &fragment_module);
++      require(result == VK_SUCCESS, "fragment module", result);
++
++      VkPushConstantRange push_range{VK_SHADER_STAGE_VERTEX_BIT, 0u,
++                                     sizeof(float) * 4u};
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      layout_info.pushConstantRangeCount = 1u;
++      layout_info.pPushConstantRanges = &push_range;
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "pipeline layout", result);
++
++      VkPipelineShaderStageCreateInfo stages[2]{};
++      stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++      stages[0].module = vertex_module;
++      stages[0].pName = "main";
++      stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++      stages[1].module = fragment_module;
++      stages[1].pName = "main";
++      VkPipelineVertexInputStateCreateInfo vertex_input{
++         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      VkPipelineInputAssemblyStateCreateInfo assembly{
++         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++      VkViewport viewport{0.0f, 0.0f, float(kExtent), float(kExtent), 0.0f, 1.0f};
++      VkRect2D scissor{{0, 0}, {kExtent, kExtent}};
++      VkPipelineViewportStateCreateInfo viewport_state{
++         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++      viewport_state.viewportCount = 1u;
++      viewport_state.pViewports = &viewport;
++      viewport_state.scissorCount = 1u;
++      viewport_state.pScissors = &scissor;
++      VkPipelineRasterizationStateCreateInfo raster{
++         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      raster.polygonMode = VK_POLYGON_MODE_FILL;
++      raster.cullMode = VK_CULL_MODE_NONE;
++      raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++      raster.lineWidth = 1.0f;
++      VkPipelineMultisampleStateCreateInfo multisample{
++         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++      multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++      VkPipelineColorBlendAttachmentState blend_attachment{};
++      blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
++                                        VK_COLOR_COMPONENT_G_BIT |
++                                        VK_COLOR_COMPONENT_B_BIT |
++                                        VK_COLOR_COMPONENT_A_BIT;
++      VkPipelineColorBlendStateCreateInfo blend{
++         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++      blend.attachmentCount = 1u;
++      blend.pAttachments = &blend_attachment;
++      VkPipelineRenderingCreateInfo rendering_info{
++         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      rendering_info.viewMask = kViewMask;
++      rendering_info.colorAttachmentCount = 1u;
++      rendering_info.pColorAttachmentFormats = &format;
++      VkGraphicsPipelineCreateInfo pipeline_info{
++         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      pipeline_info.pNext = &rendering_info;
++      pipeline_info.stageCount = 2u;
++      pipeline_info.pStages = stages;
++      pipeline_info.pVertexInputState = &vertex_input;
++      pipeline_info.pInputAssemblyState = &assembly;
++      pipeline_info.pViewportState = &viewport_state;
++      pipeline_info.pRasterizationState = &raster;
++      pipeline_info.pMultisampleState = &multisample;
++      pipeline_info.pColorBlendState = &blend;
++      pipeline_info.layout = layout;
++      VkPipeline pipeline = VK_NULL_HANDLE;
++      result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &pipeline_info,
++                                         nullptr, &pipeline);
++      require(result == VK_SUCCESS, "create pipeline", result);
++
++      VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "command pool", result);
++      VkCommandBufferAllocateInfo command_info{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      command_info.commandPool = pool;
++      command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      command_info.commandBufferCount = 1u;
++      VkCommandBuffer commands = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &command_info, &commands);
++      require(result == VK_SUCCESS, "command buffer", result);
++
++      VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      result = vkBeginCommandBuffer(commands, &begin);
++      require(result == VK_SUCCESS, "begin commands", result);
++
++      VkRenderingAttachmentInfo color_attachment{
++         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++      color_attachment.imageView = view;
++      color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++      color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      color_attachment.clearValue.color.float32[3] = 1.0f;
++
++      /* Put every layer into a known state outside multiview. */
++      VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
++      rendering.renderArea = scissor;
++      rendering.layerCount = kLayers;
++      rendering.colorAttachmentCount = 1u;
++      rendering.pColorAttachments = &color_attachment;
++      vkCmdBeginRendering(commands, &rendering);
++      vkCmdEndRendering(commands);
++
++      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++      rendering.viewMask = kViewMask;
++      vkCmdBeginRendering(commands, &rendering);
++      vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++      const float draw_color[4] = {kDrawRed / 255.0f, 0.0f, 0.0f, 1.0f};
++      vkCmdPushConstants(commands, layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
++                         sizeof(draw_color), draw_color);
++      vkCmdDraw(commands, 3u, 1u, 0u, 0u);
++      VkClearAttachment clear_attachment{};
++      clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++      clear_attachment.colorAttachment = 0u;
++      clear_attachment.clearValue.color.float32[0] = kClearRed / 255.0f;
++      clear_attachment.clearValue.color.float32[3] = 1.0f;
++      VkClearRect clear_rect{};
++      clear_rect.rect = {{0, 0}, {kExtent / 2u, kExtent}};
++      clear_rect.baseArrayLayer = 0u;
++      clear_rect.layerCount = 1u;
++      vkCmdClearAttachments(commands, 1u, &clear_attachment, 1u, &clear_rect);
++      vkCmdEndRendering(commands);
++
++      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++      barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.image = image;
++      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, kLayers};
++      vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u,
++                           nullptr, 1u, &barrier);
++      VkBufferImageCopy copy{};
++      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, kLayers};
++      copy.imageExtent = {kExtent, kExtent, 1u};
++      vkCmdCopyImageToBuffer(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                             readback, 1u, &copy);
++      result = vkEndCommandBuffer(commands);
++      require(result == VK_SUCCESS, "end commands", result);
++
++      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++      submit.commandBufferCount = 1u;
++      submit.pCommandBuffers = &commands;
++      result = vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE);
++      require(result == VK_SUCCESS, "submit", result);
++      result = vkQueueWaitIdle(graphics_queue);
++      require(result == VK_SUCCESS, "wait idle", result);
++
++      const uint8_t *texels = static_cast<const uint8_t *>(mapped);
++      for (uint32_t layer = 0u; layer < kLayers; ++layer) {
++         const bool in_view = (kViewMask & (1u << layer)) != 0u;
++         for (uint32_t y = 0u; y < kExtent; ++y) {
++            for (uint32_t x = 0u; x < kExtent; ++x) {
++               const uint8_t *value =
++                  texels + layer * layer_bytes + (y * kExtent + x) * 4u;
++               uint8_t expected_red = 0u;
++               if (in_view)
++                  expected_red = x < kExtent / 2u ? kClearRed : kDrawRed;
++               if (value[0] == expected_red && value[1] == 0u && value[2] == 0u &&
++                   value[3] == 0xffu)
++                  continue;
++               std::fprintf(stderr,
++                            "layer %u (%s view mask 0x%x) texel %u,%u is "
++                            "%u,%u,%u,%u, expected red %u\n",
++                            layer, in_view ? "in" : "outside", kViewMask, x, y,
++                            unsigned(value[0]), unsigned(value[1]),
++                            unsigned(value[2]), unsigned(value[3]),
++                            unsigned(expected_red));
++               std::exit(1);
++            }
++         }
++      }
++
++      vkDestroyPipeline(device, pipeline, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyShaderModule(device, fragment_module, nullptr);
++      vkDestroyShaderModule(device, vertex_module, nullptr);
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkUnmapMemory(device, readback_memory);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      vkDestroyImageView(device, view, nullptr);
++      vkDestroyImage(device, image, nullptr);
++      vkFreeMemory(device, image_memory, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++
++   vkDestroyInstance(instance, nullptr);
++   std::printf("multiview clear attachments ok\n");
++   return 0;
++}

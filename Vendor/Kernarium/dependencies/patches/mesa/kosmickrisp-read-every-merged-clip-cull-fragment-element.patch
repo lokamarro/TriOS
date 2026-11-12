@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 22:58:59 +0900
+Subject: [PATCH] kosmickrisp: read every merged clip/cull fragment element
+
+A fragment shader reads gl_ClipDistance and gl_CullDistance through the one
+compact array that nir_merge_clip_cull_distance_vars leaves in CLIP_DIST0/1,
+and varying optimization vectorizes those element reads into one vector load
+per slot. nir_separate_merged_clip_cull_io requires scalar accesses, and the
+Metal backend names one varying per element, so a surviving vector load
+silently broadcast the slot's first distance into every component.
+
+Scalarize fragment clip/cull inputs alongside the final vertex stage's stores.
+Add a regression covering the separated scalar reads and the per-element Metal
+varying names for every split of the eight combined distances.
+---
+ .../compiler/msl_nir_lower_common.c           |  23 +-
+ src/kosmickrisp/vulkan/meson.build            |  14 ++
+ .../vulkan/tests/test_clip_cull_distance_io.c | 211 ++++++++++++++++++
+ 3 files changed, 245 insertions(+), 3 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_clip_cull_distance_io.c
+
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_common.c b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+index 8699eadad62942d034287e60713e850a2768f92f..2c837a01f80e43657c37bbd3fb2535bc8d9a674a 100644
+--- a/src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -552,13 +552,19 @@ msl_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances)
+    return nir_progress(true, b->impl, nir_metadata_control_flow);
+ }
+ 
+-/* Scalarize stores to CLIP_DIST* varyings */
++/* Scalarize accesses to the merged CLIP_DIST* varyings */
+ static bool
+ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
+                                     UNUSED const void *_data)
+ {
+-   if (intrin->intrinsic != nir_intrinsic_store_output)
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_store_output:
++   case nir_intrinsic_load_input:
++   case nir_intrinsic_load_interpolated_input:
++      break;
++   default:
+       return false;
++   }
+    nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
+    return semantics.location == VARYING_SLOT_CLIP_DIST0 ||
+           semantics.location == VARYING_SLOT_CLIP_DIST1 ||
+@@ -569,7 +575,18 @@ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
+ void
+ msl_nir_lower_clip_cull_distance(nir_shader *nir, unsigned num_cull_distances)
+ {
+-   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out,
++   /* A fragment shader reads gl_ClipDistance and gl_CullDistance through the
++    * same merged compact array, and an indexed or vectorized read produces a
++    * multi-component load.  Splitting that array and naming one Metal varying
++    * per element both require scalar element accesses, so scalarize the
++    * fragment inputs as well as the final vertex stage's stores.  Vertex
++    * inputs use attribute locations rather than varying slots and are never
++    * part of this interface. */
++   nir_variable_mode modes = nir_var_shader_out;
++   if (nir->info.stage == MESA_SHADER_FRAGMENT)
++      modes |= nir_var_shader_in;
++
++   NIR_PASS(_, nir, nir_lower_io_to_scalar, modes,
+             scalarize_clip_cull_distance_filter, NULL);
+    NIR_PASS(_, nir, nir_separate_merged_clip_cull_io);
+    if (nir->info.stage == MESA_SHADER_FRAGMENT)
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 0ac4f683eaace636ecef990b838babf78e712123..a39741180b3484826372257852a9d56026408e08 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -698,6 +698,20 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_clip_cull_distance_io',
++    executable(
++      'test_kosmickrisp_clip_cull_distance_io',
++      files('tests/test_clip_cull_distance_io.c'),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_msl_to_nir,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_pipeline_statistics',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_clip_cull_distance_io.c b/src/kosmickrisp/vulkan/tests/test_clip_cull_distance_io.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2444c3ce471c2ccd646602deb9e4bad7189bd5f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_clip_cull_distance_io.c
+@@ -0,0 +1,211 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++/* A fragment shader reads gl_ClipDistance and gl_CullDistance through the one
++ * merged compact array that nir_merge_clip_cull_distance_vars leaves in
++ * VARYING_SLOT_CLIP_DIST0/1, and varying optimization vectorizes the per
++ * element loads into one vector load per slot.  Rebuild that shape directly so
++ * the lowering sees what the linker really hands it.
++ */
++static nir_shader *
++build_merged_clip_cull_fs(unsigned clip_size, unsigned cull_size)
++{
++   const unsigned total = clip_size + cull_size;
++   assert(total > 0 && total <= 8);
++
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "merged clip/cull fragment read");
++   nir_shader *nir = b.shader;
++
++   nir->info.clip_distance_array_size = clip_size;
++   nir->info.cull_distance_array_size = cull_size;
++   nir->info.io_lowered = true;
++
++   nir_def *sum = nir_imm_float(&b, 0.0f);
++   for (unsigned slot = 0; slot * 4 < total; ++slot) {
++      const unsigned components = MIN2(4, total - slot * 4);
++      nir_def *baryc = nir_load_barycentric_pixel(
++         &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
++      nir_def *value = nir_load_interpolated_input(
++         &b, components, 32, baryc, nir_imm_int(&b, 0), .base = slot,
++         .component = 0, .dest_type = nir_type_float32,
++         .io_semantics.location = VARYING_SLOT_CLIP_DIST0 + slot,
++         .io_semantics.num_slots = 1);
++
++      for (unsigned c = 0; c < components; ++c) {
++         /* Weight every element differently so no two reads can be shared. */
++         nir_def *weighted =
++            nir_fmul_imm(&b, nir_fabs(&b, nir_channel(&b, value, c)),
++                         (double)(slot * 4 + c + 1));
++         sum = nir_fadd(&b, sum, weighted);
++      }
++
++      nir->info.inputs_read |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0 + slot);
++   }
++
++   nir_store_output(&b, sum, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_float32,
++                    .io_semantics.location = FRAG_RESULT_DATA0,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
++
++   nir_validate_shader(nir, "merged clip/cull fragment read");
++   return nir;
++}
++
++struct distance_reads {
++   /* Component masks of the clip/cull distance elements still read, indexed by
++    * slot.  A slot pair covers the eight combined distances. */
++   uint32_t clip[2];
++   uint32_t cull[2];
++   /* Loads of a clip/cull distance varying that return more than one
++    * component.  nir_separate_merged_clip_cull_io cannot relocate those, and
++    * the Metal backend names one varying per element, so any survivor silently
++    * broadcasts the slot's first element. */
++   unsigned vector_loads;
++};
++
++static void
++collect_distance_reads(nir_shader *nir, struct distance_reads *reads)
++{
++   memset(reads, 0, sizeof(*reads));
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_input &&
++                intr->intrinsic != nir_intrinsic_load_interpolated_input)
++               continue;
++
++            const unsigned location =
++               nir_intrinsic_io_semantics(intr).location;
++            uint32_t *slots;
++            if (location == VARYING_SLOT_CLIP_DIST0 ||
++                location == VARYING_SLOT_CLIP_DIST1)
++               slots = &reads->clip[location - VARYING_SLOT_CLIP_DIST0];
++            else if (location == VARYING_SLOT_CULL_DIST0 ||
++                     location == VARYING_SLOT_CULL_DIST1)
++               slots = &reads->cull[location - VARYING_SLOT_CULL_DIST0];
++            else
++               continue;
++
++            if (intr->def.num_components != 1) {
++               reads->vector_loads++;
++               continue;
++            }
++
++            *slots |= BITFIELD_BIT(nir_intrinsic_component(intr));
++         }
++      }
++   }
++}
++
++/* Component mask of the elements [first, first + count) of a compact
++ * distance array that land in slot @slot. */
++static uint32_t
++slot_mask(unsigned first, unsigned count, unsigned slot)
++{
++   uint32_t mask = 0;
++   for (unsigned i = first; i < first + count; ++i) {
++      if (i / 4 == slot)
++         mask |= BITFIELD_BIT(i % 4);
++   }
++   return mask;
++}
++
++static void
++check_reads_are_separated(unsigned clip_size, unsigned cull_size)
++{
++   nir_shader *nir = build_merged_clip_cull_fs(clip_size, cull_size);
++
++   msl_nir_lower_clip_cull_distance(nir, cull_size);
++   nir_validate_shader(nir, "after clip/cull distance lowering");
++
++   struct distance_reads reads;
++   collect_distance_reads(nir, &reads);
++
++   /* Every element keeps its own scalar read. */
++   assert(reads.vector_loads == 0);
++
++   /* Clip distances stay in CLIP_DIST*, cull distances move to CULL_DIST*,
++    * both packed from element zero of their own array. */
++   for (unsigned slot = 0; slot < 2; ++slot) {
++      assert(reads.clip[slot] == slot_mask(0, clip_size, slot));
++      assert(reads.cull[slot] == slot_mask(0, cull_size, slot));
++   }
++
++   ralloc_free(nir);
++}
++
++static bool
++msl_reads(const char *msl, const char *prefix, unsigned index, char component)
++{
++   char name[32];
++   snprintf(name, sizeof(name), "in.%s_%u_%c", prefix, index, component);
++   return strstr(msl, name) != NULL;
++}
++
++static void
++check_msl_reads_every_element(unsigned clip_size, unsigned cull_size)
++{
++   nir_shader *nir = build_merged_clip_cull_fs(clip_size, cull_size);
++
++   msl_nir_lower_clip_cull_distance(nir, cull_size);
++   msl_optimize_nir(nir);
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   /* Barycentric system values are part of the Metal varying declaration
++    * rather than a shader argument, exactly as the driver records before
++    * translating a fragment shader. */
++   BITSET_CLEAR(nir->info.system_values_read,
++                SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL);
++   BITSET_CLEAR(nir->info.system_values_read,
++                SYSTEM_VALUE_BARYCENTRIC_LINEAR_PIXEL);
++
++   struct nir_to_msl_options options = {0};
++   char *msl = nir_to_msl(nir, &options);
++
++   /* Metal declares one varying per clip/cull element, so the translation must
++    * read exactly the elements the shader declared and no others. */
++   for (unsigned i = 0; i < 8; ++i) {
++      const char component = "xyzw"[i % 4];
++      assert(msl_reads(msl, "clip", i / 4, component) == (i < clip_size));
++      assert(msl_reads(msl, "cull", i / 4, component) == (i < cull_size));
++   }
++
++   ralloc_free(msl);
++   ralloc_free(nir);
++}
++
++int
++main(void)
++{
++   /* Slot-aligned split, and splits where one vector load spans both the clip
++    * and the cull half of the merged array. */
++   static const struct {
++      unsigned clip;
++      unsigned cull;
++   } sizes[] = {
++      {4, 4}, {2, 6}, {1, 7}, {6, 2}, {0, 8}, {0, 4}, {4, 0},
++   };
++
++   for (unsigned i = 0; i < ARRAY_SIZE(sizes); ++i) {
++      check_reads_are_separated(sizes[i].clip, sizes[i].cull);
++      check_msl_reads_every_element(sizes[i].clip, sizes[i].cull);
++   }
++
++   return 0;
++}

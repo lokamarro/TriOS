@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 00:00:25 +0900
+Subject: [PATCH] venus: export a memory again once its resource is gone
+
+A device memory could be exported to a blob resource only once in its
+lifetime, so that two resources never share its storage. The flag that
+enforced this outlived the resource it guarded. A guest kernel sends the
+blob creation before it places the mapping, and when its blob aperture is
+full it destroys the new resource at once. The memory then refused every
+later export, and the guest could never map it again, even after the
+aperture had room.
+
+Record which resource holds a memory's export and clear the flag when that
+resource is destroyed, or when an export fails to become a resource, so a
+memory still backs at most one resource of its own context at a time. A
+resource that another context imported from the export holds its own
+reference to the storage and is unaffected.
+---
+ src/venus/vkr_context.c       | 53 +++++++++++++++++++++++++++--------
+ src/venus/vkr_context.h       |  3 ++
+ src/venus/vkr_device_memory.c |  4 +--
+ src/venus/vkr_device_memory.h |  4 +++
+ 4 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea2f0a3cd1 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -266,6 +266,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
+    res->native_handle_type = native_handle_type;
+    res->native_handle = native_handle;
+    res->shm_mapping = NULL;
++   res->exported_memory_id = 0;
+ 
+    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
+    assert(fd < 0 || !mmap_ptr);
+@@ -401,13 +402,10 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+       if (!vkr_context_import_resource_from_shm(ctx, res_id, blob_size,
+                                                 blob.u.fd, native_resource_id,
+                                                 native_handle_type,
+-                                                native_handle)) {
+-         close(blob.u.fd);
+-         return false;
+-      }
++                                                native_handle))
++         goto fail;
+ 
+-      *out_blob = blob;
+-      return true;
++      goto exported;
+    }
+ 
+    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+@@ -417,10 +415,8 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    int res_fd = -1;
+    if (mem->might_export) {
+       res_fd = os_dupfd_cloexec(blob.u.fd);
+-      if (res_fd < 0) {
+-         close(blob.u.fd);
+-         return false;
+-      }
++      if (res_fd < 0)
++         goto fail;
+    }
+ 
+    if (!vkr_context_import_resource_internal(
+@@ -428,13 +424,21 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+           VIRGL_RESOURCE_NATIVE_HANDLE_NONE, NULL)) {
+       if (res_fd >= 0)
+          close(res_fd);
+-      close(blob.u.fd);
+-      return false;
++      goto fail;
+    }
+ 
++exported:
++   vkr_context_get_resource(ctx, res_id)->exported_memory_id = blob_id;
++   mem->export_res_id = res_id;
+    *out_blob = blob;
+ 
+    return true;
++
++fail:
++   /* An export that yields no resource leaves the memory exportable. */
++   close(blob.u.fd);
++   mem->exported = false;
++   return false;
+ }
+ 
+ bool
+@@ -485,6 +489,28 @@ vkr_context_import_resource(struct vkr_context *ctx,
+       VIRGL_RESOURCE_NATIVE_HANDLE_NONE, NULL);
+ }
+ 
++/* A memory backs one resource at a time, not one resource ever. Once the
++ * resource holding its export is gone, the guest may export it again, as it
++ * does to map a memory whose earlier blob it had to destroy. The object lock
++ * keeps a concurrent vkFreeMemory from freeing the memory meanwhile.
++ */
++static void
++vkr_context_release_memory_export(struct vkr_context *ctx,
++                                  vkr_object_id memory_id,
++                                  uint32_t res_id)
++{
++   mtx_lock(&ctx->object_mutex);
++   const struct hash_entry *entry =
++      _mesa_hash_table_search(ctx->object_table, &memory_id);
++   struct vkr_object *obj = entry ? entry->data : NULL;
++   if (obj && obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY) {
++      struct vkr_device_memory *mem = (struct vkr_device_memory *)obj;
++      if (mem->exported && mem->export_res_id == res_id)
++         mem->exported = false;
++   }
++   mtx_unlock(&ctx->object_mutex);
++}
++
+ void
+ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
+ {
+@@ -511,6 +537,9 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
+    }
+    mtx_unlock(&ctx->ring_mutex);
+ 
++   if (res->exported_memory_id)
++      vkr_context_release_memory_export(ctx, res->exported_memory_id, res_id);
++
+    vkr_context_remove_resource(ctx, res_id);
+ }
+ 
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 74482ee0a0461c273e1d1badd1ad08c31909e5b5..e38f98895fdb531df18fb0752d035697129d2d08 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -58,6 +58,9 @@ struct vkr_resource {
+ 
+    /* The reference that keeps u.data mapped, valid when fd_type is shm. */
+    struct vkr_shm_mapping *shm_mapping;
++
++   /* The VkDeviceMemory this resource was exported from, or 0. */
++   uint64_t exported_memory_id;
+ };
+ 
+ enum vkr_context_validate_level {
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 4b6f407f9aee49907648c125b0c354d0a174a6dd..65b58fca5172571b4fceb86606aa104e9a15ea8e 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -788,8 +788,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+ {
+    TRACE_FUNC();
+ 
+-   /* a memory can only be exported once; we don't want two resources to point
+-    * to the same storage.
++   /* a memory backs at most one resource at a time; we don't want two
++    * resources to point to the same storage.
+     */
+    if (mem->exported) {
+       vkr_log("mem has been exported");
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index 76d61e4620ee2d046a197e207fa3cdd6bff114a0..d20ee6d0e190671b005d5f321e1a1c0cfa1980af 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -42,7 +42,11 @@ struct vkr_device_memory {
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+ 
++   /* A memory backs at most one resource at a time: the one named here while
++    * exported is set.
++    */
+    bool exported;
++   uint32_t export_res_id;
+ };
+ VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
+ 

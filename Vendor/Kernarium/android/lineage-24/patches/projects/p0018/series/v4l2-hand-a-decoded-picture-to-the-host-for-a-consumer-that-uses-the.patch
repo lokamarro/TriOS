@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:28:17 +0900
+Subject: [PATCH] v4l2: hand a decoded picture to the host for a consumer that
+ uses the GPU
+
+The device writes a decoded picture into the guest pages of its buffer.
+A buffer that the GPU reads is a classic resource, whose host copy only
+a transfer after a write mapping updates, so a surface consumer saw
+whatever the host copy held. The frame pool also allocated a surface's
+blocks with no CPU usage, so the write mapping that causes the transfer
+was refused for every picture.
+
+Output blocks are now allocated for CPU writing (and for reading in byte
+buffer mode, as before), and a picture bound for a surface is mapped for
+writing and unmapped when the device is done with it, which transfers it
+to the host. Byte buffer output is read by the CPU from the guest pages
+and needs no transfer.
+---
+ components/DecodeComponent.cpp                        |  6 ++++++
+ components/VideoFrame.cpp                             |  5 +++++
+ components/VideoFramePool.cpp                         | 11 ++++++++---
+ .../include/v4l2_codec2/components/DecodeComponent.h  |  3 +++
+ .../include/v4l2_codec2/components/VideoFrame.h       |  5 +++++
+ 5 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index b21af2d52311e85ca4ede929440abf6260525ce7..91b51543ee69641efe888ce42f4e8eedbd072033 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -216,6 +216,11 @@ std::unique_ptr<VideoFramePool> DecodeComponent::getVideoFramePool(const ui::Siz
+         return nullptr;
+     }
+ 
++    // Byte buffers are read by the CPU, which maps the buffer and sees the guest pages the device
++    // wrote. Every other consumer is a surface, and composes the pictures with the GPU.
++    mFlushOutputToHost =
++            !mIsSecure && blockPool->getAllocatorId() != C2PlatformAllocatorStore::GRALLOC;
++
+     return VideoFramePool::Create(std::move(blockPool), numBuffers, size, pixelFormat, mIsSecure,
+                                   mDecoderTaskRunner);
+ }
+@@ -534,6 +539,7 @@ void DecodeComponent::onOutputFrameReady(std::unique_ptr<VideoFrame> frame) {
+     }
+     C2Work* work = it->second.get();
+ 
++    if (mFlushOutputToHost) frame->flushToHost();
+     C2ConstGraphicBlock constBlock = std::move(frame)->getGraphicBlock();
+     std::shared_ptr<C2Buffer> buffer = C2Buffer::CreateGraphicBuffer(std::move(constBlock));
+     if (mPendingColorAspectsChange &&
+diff --git a/components/VideoFrame.cpp b/components/VideoFrame.cpp
+index b7481ad2bf04cd5b0ccc555bb51b40dab4c91e6f..54d4f5a50906f6ec28f6965d8c3c8b9e544d36f3 100644
+--- a/components/VideoFrame.cpp
++++ b/components/VideoFrame.cpp
+@@ -50,6 +50,11 @@ int32_t VideoFrame::getBitstreamId() const {
+     return mBitstreamId;
+ }
+ 
++void VideoFrame::flushToHost() {
++    C2GraphicView view = mGraphicBlock->map().get();
++    if (view.error() != C2_OK) ALOGW("Failed to map the frame to flush it to the host: %d", view.error());
++}
++
+ C2ConstGraphicBlock VideoFrame::getGraphicBlock() {
+     return mGraphicBlock->share(C2Rect(mVisibleRect.width(), mVisibleRect.height()), C2Fence());
+ }
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+index 6f61dd560cd95f6e824b0aa99b13c0e4d7bdc937..805ff65e6d6b9656d3630bd8f9a19aa0089e07ae 100644
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -115,9 +115,14 @@ std::unique_ptr<VideoFramePool> VideoFramePool::Create(
+     uint64_t usage = static_cast<uint64_t>(BufferUsage::VIDEO_DECODER);
+     if (isSecure) {
+         usage |= C2MemoryUsage::READ_PROTECTED;
+-    } else if (blockPool->getAllocatorId() == C2PlatformAllocatorStore::GRALLOC) {
+-        // CPU access to buffers is only required in byte buffer mode.
+-        usage |= C2MemoryUsage::CPU_READ;
++    } else {
++        // The component maps a picture for writing to hand it to the host (see
++        // VideoFrame::flushToHost()), which a block allocated without CPU usage refuses.
++        usage |= C2MemoryUsage::CPU_WRITE;
++        // Reading by the CPU is only required in byte buffer mode.
++        if (blockPool->getAllocatorId() == C2PlatformAllocatorStore::GRALLOC) {
++            usage |= C2MemoryUsage::CPU_READ;
++        }
+     }
+     const C2MemoryUsage memoryUsage(usage);
+ 
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index 27905c7c9ee76ff017c35f77d9258ce6a1bf0ca5..4d7ee46d6936fff761c86cc0fd44814014788bf9 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -114,6 +114,9 @@ protected:
+ 
+     // Set to true when decoding the protected playback.
+     bool mIsSecure = false;
++    // Whether the decoded pictures go to a consumer that reads them with the GPU, which needs
++    // each one handed to the host first. Set with the frame pool, used on the decoder thread.
++    bool mFlushOutputToHost = false;
+     // The component state.
+     std::atomic<ComponentState> mComponentState{ComponentState::STOPPED};
+     // Whether we are currently draining the component. This is set when the component is processing
+diff --git a/components/include/v4l2_codec2/components/VideoFrame.h b/components/include/v4l2_codec2/components/VideoFrame.h
+index b5d7b99ae8f4b3fb271c246e35d888efa0459a3b..2077d73f72c27204b93422f3af2bdf154f2023b8 100644
+--- a/components/include/v4l2_codec2/components/VideoFrame.h
++++ b/components/include/v4l2_codec2/components/VideoFrame.h
+@@ -35,6 +35,11 @@ public:
+     // Get the read-only C2GraphicBlock, should be called after calling setVisibleRect().
+     C2ConstGraphicBlock getGraphicBlock();
+ 
++    // Maps the block for writing and unmaps it again. A buffer whose GPU resource is a copy of the
++    // guest pages the device wrote reaches the host only when it is unmapped after a write, so
++    // this is what makes the picture visible to a consumer that reads it with the GPU.
++    void flushToHost();
++
+ private:
+     VideoFrame(std::shared_ptr<C2GraphicBlock> block, std::vector<int> fds);
+ 

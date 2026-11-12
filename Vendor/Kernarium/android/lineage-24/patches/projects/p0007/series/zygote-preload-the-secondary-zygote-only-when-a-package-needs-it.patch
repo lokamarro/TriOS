@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:24:01 +0000
+Subject: [PATCH] zygote: preload the secondary zygote only when a package
+ needs it
+
+The secondary zygote hosts the processes of packages whose primary ABI is 32-bit.
+SystemServer preloads it at every boot, which keeps about 13 MiB of anonymous
+memory resident on a device that has no such package. Preload it when an
+installed package has a 32-bit primary ABI, and otherwise when the first one is
+installed.
+
+The WebView RELRO process is still forked from the secondary zygote at boot; an
+unpreloaded zygote forks it as before. A 32-bit application launched before the
+preload ends waits for it, as it does after a boot.
+
+The task never throws: system_server waits for it in startOtherServices and
+restarts if it failed, as it would for any initialization failure, so a failure
+of the package lookup, at boot or when a package is added or changed, falls back
+to the preload that stock Android does. The lookup of an added or changed package
+reads that one package's state.
+---
+ .../java/com/android/server/SystemServer.java | 123 ++++++++++++++++--
+ 1 file changed, 112 insertions(+), 11 deletions(-)
+
+diff --git a/services/java/com/android/server/SystemServer.java b/services/java/com/android/server/SystemServer.java
+index 4bb406fc598d41dee71cc551812a0897af2c3044..4d6f1c05ed07a43fe854fbe6b0c7e63aa2ad34e4 100644
+--- a/services/java/com/android/server/SystemServer.java
++++ b/services/java/com/android/server/SystemServer.java
+@@ -239,6 +239,7 @@ import com.android.server.pm.UserManagerService;
+ import com.android.server.pm.dex.OdsignStatsLogger;
+ import com.android.server.pm.permission.PermissionMigrationHelper;
+ import com.android.server.pm.permission.PermissionMigrationHelperImpl;
++import com.android.server.pm.pkg.PackageStateInternal;
+ import com.android.server.pm.verify.domain.DomainVerificationService;
+ import com.android.server.policy.AppOpsPolicy;
+ import com.android.server.policy.PermissionPolicyService;
+@@ -346,6 +347,7 @@ import java.util.Timer;
+ import java.util.TreeSet;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Future;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ /**
+  * Entry point to {@code system_server}.
+@@ -1592,18 +1594,13 @@ public final class SystemServer implements Dumpable {
+             // ensure that it completes before the 32 bit relro process is forked
+             // from the zygote. In the event that it takes too long, the webview
+             // RELRO process will block, but it will do so without holding any locks.
++            // The preload happens only while a package whose primary ABI is 32-bit is installed,
++            // and when the first one is installed later: an unpreloaded secondary zygote still
++            // forks the RELRO process.
+             mZygotePreload = SystemServerInitThreadPool.submit(() -> {
+-                try {
+-                    Slog.i(TAG, SECONDARY_ZYGOTE_PRELOAD);
+-                    TimingsTraceAndSlog traceLog = TimingsTraceAndSlog.newAsyncLog();
+-                    traceLog.traceBegin(SECONDARY_ZYGOTE_PRELOAD);
+-                    String[] abis32 = Build.SUPPORTED_32_BIT_ABIS;
+-                    if (abis32.length > 0 && !Process.ZYGOTE_PROCESS.preloadDefault(abis32[0])) {
+-                        Slog.e(TAG, "Unable to preload default resources for secondary");
+-                    }
+-                    traceLog.traceEnd();
+-                } catch (Exception ex) {
+-                    Slog.e(TAG, "Exception preloading default resources", ex);
++                String[] abis32 = Build.SUPPORTED_32_BIT_ABIS;
++                if (abis32.length > 0) {
++                    new SecondaryZygotePreloader(abis32[0]).run();
+                 }
+             }, SECONDARY_ZYGOTE_PRELOAD);
+ 
+@@ -3882,4 +3879,108 @@ public final class SystemServer implements Dumpable {
+         return false;
+     }
+ 
++    /**
++     * Preloads the secondary zygote, which hosts the processes of packages whose primary ABI is
++     * 32-bit, once a package needs it. A device with no such package would otherwise keep the
++     * preloaded classes and resources of a zygote nothing forks from. The first 32-bit package
++     * installed later starts the preload, which an application launch waits for as it does after
++     * a boot.
++     */
++    private static final class SecondaryZygotePreloader
++            implements PackageManagerInternal.PackageListObserver {
++        private static final String NAME = "SecondaryZygotePreload";
++
++        private final String mAbi;
++        private final PackageManagerInternal mPackageManager =
++                LocalServices.getService(PackageManagerInternal.class);
++        private final AtomicBoolean mDone = new AtomicBoolean();
++
++        SecondaryZygotePreloader(String abi) {
++            mAbi = abi;
++        }
++
++        /**
++         * Preloads now if an installed package needs the zygote, else when one is added. This
++         * never throws: system_server waits for the task and restarts if it fails, so a failure
++         * to find out falls back to what stock Android does, the preload.
++         */
++        void run() {
++            try {
++                // Observe first, so that a package installed meanwhile is not missed.
++                mPackageManager.getPackageList(this);
++                for (PackageStateInternal state : mPackageManager.getPackageStates().values()) {
++                    if (hasPrimary32BitAbi(state)) {
++                        preload();
++                        return;
++                    }
++                }
++                Slog.i(TAG, "No package has a 32-bit primary ABI: "
++                        + "the secondary zygote preloads when one is installed");
++            } catch (Exception ex) {
++                Slog.e(TAG, "Unable to tell whether a package needs the secondary zygote;"
++                        + " preloading it", ex);
++                preload();
++            }
++        }
++
++        @Override
++        public void onPackageAdded(String packageName, int uid) {
++            check(packageName);
++        }
++
++        @Override
++        public void onPackageChanged(String packageName, int uid) {
++            check(packageName);
++        }
++
++        /**
++         * Looks at the one package that was added or changed, on the package manager's thread, and
++         * never throws into it: a failure falls back to the preload.
++         */
++        private void check(String packageName) {
++            if (mDone.get()) {
++                return;
++            }
++            boolean needed;
++            try {
++                PackageStateInternal state = mPackageManager.getPackageStateInternal(packageName);
++                needed = state != null && hasPrimary32BitAbi(state);
++            } catch (Exception ex) {
++                Slog.e(TAG, "Unable to tell whether " + packageName
++                        + " needs the secondary zygote; preloading it", ex);
++                needed = true;
++            }
++            if (needed) {
++                // Leave the preload to a thread of its own.
++                new Thread(this::preload, NAME).start();
++            }
++        }
++
++        private static boolean hasPrimary32BitAbi(PackageStateInternal state) {
++            String abi = state.getPrimaryCpuAbi();
++            return abi != null && !VMRuntime.is64BitAbi(abi);
++        }
++
++        private void preload() {
++            if (!mDone.compareAndSet(false, true)) {
++                return;
++            }
++            try {
++                mPackageManager.removePackageListObserver(this);
++            } catch (Exception ex) {
++                Slog.w(TAG, "Unable to stop watching packages for the secondary zygote", ex);
++            }
++            try {
++                Slog.i(TAG, NAME);
++                TimingsTraceAndSlog traceLog = TimingsTraceAndSlog.newAsyncLog();
++                traceLog.traceBegin(NAME);
++                if (!Process.ZYGOTE_PROCESS.preloadDefault(mAbi)) {
++                    Slog.e(TAG, "Unable to preload default resources for secondary");
++                }
++                traceLog.traceEnd();
++            } catch (Exception ex) {
++                Slog.e(TAG, "Exception preloading default resources", ex);
++            }
++        }
++    }
+ }

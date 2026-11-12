@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 05:47:10 +0900
+Subject: [PATCH] ALSA: virtio: pad the last period of a drain with silence
+
+The driver queues only whole periods on the device, so the period in
+which a stream ends is never queued when the end falls inside it. A
+drain then waits for a position that cannot come: it ends on the core's
+drain timeout with -EIO, the end of the stream is never played, and the
+substream is stopped. Silence the core writes into the buffer past the
+application pointer does not help, because the indirect transfer hands
+only the application's data to messages; a drain through alsa-lib 1.2.14
+fails the same way. A stream shorter than a period does not play at all.
+
+Ask the core for a drain trigger on playback substreams. When the
+substream drains and the application's data has all reached the
+messages, at the trigger or at a later ack, fill the rest of its last
+period with silence and queue it, as DMA hardware plays on to its period
+boundary. The position then passes the end of the stream and the drain
+completes after at most one period of silence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sound/virtio/virtio_pcm_ops.c | 62 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index f162933da2a06c6228a2e22b31e3006dbd19fac4..5f9ea78fe9601ea7de3d42540dd7a03c454388eb 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -112,6 +112,9 @@ static int virtsnd_pcm_open(struct snd_pcm_substream *substream)
+ 	struct virtio_pcm_substream *vss = vs->substreams[substream->number];
+ 
+ 	substream->runtime->hw = vss->hw;
++	/* See virtsnd_pcm_pad_drain(). */
++	if (vss->direction == SNDRV_PCM_STREAM_PLAYBACK)
++		substream->runtime->hw.info |= SNDRV_PCM_INFO_DRAIN_TRIGGER;
+ 	substream->private_data = vss;
+ 
+ 	snd_pcm_hw_constraint_integer(substream->runtime,
+@@ -318,6 +321,46 @@ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ 	return virtsnd_ctl_msg_send_sync(vss->snd, msg);
+ }
+ 
++/**
++ * virtsnd_pcm_pad_drain() - Complete the last period of a draining playback
++ *                           substream with silence.
++ * @vss: VirtIO PCM substream.
++ *
++ * Only whole periods are queued on the device, so a stream whose end falls
++ * inside a period would leave that period unqueued: the drain then never sees
++ * the position reach the end and stops on its timeout with -EIO, and the end
++ * of the stream is never played. Once the application's data has all been
++ * handed to I/O messages, fill the rest of the period it ends in with silence
++ * and queue it, as DMA hardware plays on to its period boundary. The position
++ * then passes the end of the stream and the drain completes.
++ *
++ * Context: Any context. Expects the tx queue and the VirtIO substream
++ *          spinlocks to be held by caller.
++ */
++static void virtsnd_pcm_pad_drain(struct virtio_pcm_substream *vss)
++{
++	struct snd_pcm_runtime *runtime = vss->substream->runtime;
++	struct snd_pcm_indirect *rec = &vss->pcm_indirect;
++	unsigned int period_bytes = snd_pcm_lib_period_bytes(vss->substream);
++	unsigned int fill = rec->hw_data % period_bytes;
++	unsigned int pad;
++
++	if (rec->sw_ready > 0 || !fill)
++		return;
++
++	pad = period_bytes - fill;
++	snd_pcm_format_set_silence(runtime->format,
++				   runtime->dma_area + rec->hw_data,
++				   bytes_to_samples(runtime, pad));
++	if (virtsnd_pcm_msg_send(vss, rec->hw_data, pad))
++		return;
++
++	rec->hw_data += pad;
++	if (rec->hw_data == rec->hw_buffer_size)
++		rec->hw_data = 0;
++	rec->hw_ready += pad;
++}
++
+ /**
+  * virtsnd_pcm_trigger() - Process command for the PCM substream.
+  * @substream: Kernel ALSA substream.
+@@ -376,6 +419,15 @@ static int virtsnd_pcm_trigger(struct snd_pcm_substream *substream, int command)
+ 			return -ENOMEM;
+ 
+ 		return virtsnd_ctl_msg_send_sync(snd, msg);
++	case SNDRV_PCM_TRIGGER_DRAIN:
++		queue = virtsnd_pcm_queue(vss);
++
++		scoped_guard(spinlock_irqsave, &queue->lock) {
++			guard(spinlock)(&vss->lock);
++			virtsnd_pcm_pad_drain(vss);
++		}
++
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -562,12 +614,18 @@ static int virtsnd_pcm_pb_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+ 	struct virtio_snd_queue *queue = virtsnd_pcm_queue(vss);
++	int rc;
+ 
+ 	guard(spinlock_irqsave)(&queue->lock);
+ 	guard(spinlock)(&vss->lock);
+ 
+-	return snd_pcm_indirect_playback_transfer(substream, &vss->pcm_indirect,
+-						  virtsnd_pcm_trans_copy);
++	rc = snd_pcm_indirect_playback_transfer(substream, &vss->pcm_indirect,
++						virtsnd_pcm_trans_copy);
++	/* The rest of a draining stream reaches the messages here. */
++	if (!rc && substream->runtime->state == SNDRV_PCM_STATE_DRAINING)
++		virtsnd_pcm_pad_drain(vss);
++
++	return rc;
+ }
+ 
+ static int virtsnd_pcm_cp_ack(struct snd_pcm_substream *substream)

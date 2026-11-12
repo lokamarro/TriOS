@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 16:14:29 +0900
+Subject: [PATCH] uml: retire dead Darwin bridge entries and name a rejected
+ batch
+
+Bridge ABI 13 removes what no host path uses and names two contracts the
+kernel and the host shared only by accident.
+
+The host implemented darwin_uml_vm_flush_active() and
+darwin_uml_vm_sync_to_backing() as no-ops, and
+darwin_uml_begin_write_single_step() only failed with ENOTSUP; no host
+retry path returns 2, the value that selected it. Drop the 4 KiB
+pre-clone flush with syscall_snapshots_address_space(), the 4 KiB uaccess
+sync, both retry == 2 arms of the user fault path, and the unused
+DARWIN_UML_GUEST_REGISTER_COUNT. The bridge declares what
+darwin_uml_vm_retry_fault() returns.
+
+darwin_uml_vm_batch_end() reported a rejected batch as the host's -EAGAIN,
+which is Darwin's 35, so the replay's per-batch retry compared it with
+Linux's 11 and never ran: a rejected batch went back to the guest
+unpublished and cost it a refault. The host now returns
+DARWIN_UML_VM_BATCH_REJECTED, from the TLB-sync header kernel code already
+includes, and the replay walks the batch again.
+
+The Ethernet frame size the kernel's receive buffer and the SLiRP provider
+share is DARWIN_UML_NET_FRAME_SIZE; the driver, which cannot include the
+bridge headers, names the constant it mirrors.
+
+The generated identity header defines the bridge version and fingerprint,
+so the literal checks of both in process.c and in the bridge header go.
+---
+ arch/um/drivers/darwin_net_kern.c           |  1 +
+ arch/um/include/asm/tlb_sync_ranges.h       |  9 ++-
+ arch/um/include/shared/os.h                 |  1 -
+ arch/um/kernel/skas/uaccess.c               |  2 -
+ arch/um/kernel/tlb.c                        |  6 +-
+ arch/um/os-Darwin/skas/process.c            | 71 +--------------------
+ arch/um/os-Darwin/uml_darwin_abi.h          |  3 -
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |  4 +-
+ arch/um/os-Darwin/uml_darwin_memory.h       | 10 +--
+ arch/um/os-Darwin/uml_darwin_network.h      |  5 ++
+ 10 files changed, 28 insertions(+), 84 deletions(-)
+
+diff --git a/arch/um/drivers/darwin_net_kern.c b/arch/um/drivers/darwin_net_kern.c
+index 32b45034da9b82267bd9ffb4a0fd2a960744fd45..62b5c169bddbb46e83c9e16f5f648a6a3446fca8 100644
+--- a/arch/um/drivers/darwin_net_kern.c
++++ b/arch/um/drivers/darwin_net_kern.c
+@@ -8,6 +8,7 @@
+ #include <darwin_net.h>
+ #include <irq_kern.h>
+ 
++/* The bridge's DARWIN_UML_NET_FRAME_SIZE, which kernel code cannot include. */
+ #define DARWIN_NET_FRAME_SIZE 2048
+ 
+ struct darwin_net_private {
+diff --git a/arch/um/include/asm/tlb_sync_ranges.h b/arch/um/include/asm/tlb_sync_ranges.h
+index b8cb01088c5fa5cb9f05f17fbc68f8e8de27f186..5d52597843faacbcd6f5a4ef1140a1375ea723dd 100644
+--- a/arch/um/include/asm/tlb_sync_ranges.h
++++ b/arch/um/include/asm/tlb_sync_ranges.h
+@@ -1,10 +1,17 @@
+ /* SPDX-License-Identifier: GPL-2.0-or-later */
+-/* Canonical bounded TLB invalidation range helper shared with UML. */
++/* Canonical TLB synchronization contracts shared with UML: the bounded
++ * invalidation range helper, and the host's verdict on a replay batch. */
+ #ifndef UML_TLB_SYNC_RANGES_H
+ #define UML_TLB_SYNC_RANGES_H
+ 
+ #define UML_TLB_SYNC_MAX_RANGES 16
+ 
++/* darwin_uml_vm_batch_end() returns this when an invalidation rejected the
++ * batch.  It is a bridge value rather than an errno because the host's errno
++ * values are not Linux's.  Kernel code reaches this header, and not the other
++ * bridge headers. */
++#define DARWIN_UML_VM_BATCH_REJECTED 1
++
+ struct uml_tlb_sync_range {
+ 	unsigned long from;
+ 	unsigned long to;
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 6c022aa9698cec9b1ef5fe4f60e6a7a04c700274..2b1a007cd64b3197b25b8d994240e0bc28379237 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -293,7 +293,6 @@ extern int darwin_uml_vm_map_generation(unsigned long generation,
+ 					unsigned long length,
+ 					int protection, int guest_code,
+ 					int guest_writable);
+-extern int darwin_uml_vm_sync_to_backing(unsigned long address);
+ extern int darwin_uml_vm_sync_from_backing(unsigned long address);
+ extern int darwin_uml_vm_sync_from_buffer(unsigned long address,
+ 					  const void *buffer,
+diff --git a/arch/um/kernel/skas/uaccess.c b/arch/um/kernel/skas/uaccess.c
+index 1c2a4d1fe496894487f6f0a34874a823d006bf9d..f52741ef46b8a45b2367f44e536fafbb036a8909 100644
+--- a/arch/um/kernel/skas/uaccess.c
++++ b/arch/um/kernel/skas/uaccess.c
+@@ -289,8 +289,6 @@ static struct page *maybe_map(unsigned long virt, int is_write)
+ 			if (darwin_uml_vm_rebind(virt, fd, offset) < 0)
+ 				goto fail;
+ 		}
+-		if (darwin_uml_vm_sync_to_backing(virt) < 0)
+-			goto fail;
+ 	}
+ #endif
+ 
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 82ee607e57a315ddf5ad94f75be8acd0c9eaf39d..c1c5e43b6ad05f4aba9a8136a0184843f6f59f3b 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -552,9 +552,13 @@ static int darwin_replay_user_ranges(struct mm_struct *mm, struct vm_ops *ops,
+ 			}
+ 			/* Commit the collected mappings while no PTE lock is held.
+ 			 * A concurrent synchronous invalidation changes the host
+-			 * epoch; batch_end() then asks for this batch again.
++			 * epoch; batch_end() then asks for this batch again, in the
++			 * bridge's own value because the host's errno values are not
++			 * the kernel's.
+ 			 */
+ 			batch_ret = darwin_uml_vm_batch_end();
++			if (batch_ret == DARWIN_UML_VM_BATCH_REJECTED)
++				batch_ret = -EAGAIN;
+ 			full = ret == UML_TLB_SYNC_BATCH_FULL;
+ 			if (full)
+ 				ret = 0;
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index a08cb179663fe2011be0990430f526e98886d380..96cde66a5811c2b7e86a868e9b0c2b63e8bb7a63 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -7,7 +7,6 @@
+ #include <stdint.h>
+ #include <time.h>
+ #include <as-layout.h>
+-#include <asm/unistd.h>
+ #include <kern_util.h>
+ #include <longjmp.h>
+ #include <os.h>
+@@ -23,9 +22,6 @@
+  * These checks make an ABI drift fail at the kernel compiler rather than at a
+  * guest boundary after register state has been reinterpreted. */
+ _Static_assert(sizeof(unsigned long) == 8, "Darwin UML ABI requires LP64");
+-_Static_assert(DARWIN_UML_ABI_VERSION == 12U, "unexpected ABI version");
+-_Static_assert(DARWIN_UML_ABI_FINGERPRINT == 0xefee2a66cbe8be89ULL,
+-	       "unexpected ABI fingerprint");
+ _Static_assert(offsetof(struct uml_pt_regs, orig_x0) ==
+ 	      DARWIN_UML_ABI_GUEST_REGISTERS_ORIGINAL_X0_OFFSET,
+ 	       "orig_x0 ABI offset drift");
+@@ -53,7 +49,6 @@ _Static_assert(UML_ARM64_FAULT_EXECUTE == DARWIN_UML_FAULT_EXECUTE,
+ _Static_assert(UML_ARM64_FAULT_PAGE == DARWIN_UML_FAULT_PAGE,
+ 	       "fault page trap drift");
+ 
+-#define DARWIN_CLONE_VM 0x00000100UL
+ /* relay_signal consumes Linux signal numbers, not Darwin SIGBUS (10). */
+ #define DARWIN_GUEST_SIGBUS 7
+ /* Linux asm-generic/siginfo.h ABI value.  This host-side file includes
+@@ -282,37 +277,6 @@ static int reconcile_implicit_stack_quarter(struct uml_pt_regs *registers)
+ 	return darwin_uml_vm_finish_stack(stack_pointer);
+ }
+ 
+-static int syscall_snapshots_address_space(struct uml_pt_regs *registers)
+-{
+-	/* handle_syscall() copies architectural x8 into uml_pt_regs.syscall,
+-	 * but this decision must happen before handle_syscall() builds the
+-	 * child's COW page tables.  Read the current trap's x8 directly rather
+-	 * than the previous syscall retained in the bookkeeping field.
+-	 */
+-	switch (UPT_X(registers, 8)) {
+-	case __NR_clone:
+-		/* CLONE_VM (including the usual CLONE_VFORK exec path) shares
+-		 * the current mm and does not construct COW page tables.  Flushing
+-		 * and write-protecting every shadow slot in that case only forces the
+-		 * shared parent/child address space to refault clean pages.
+-		 */
+-		return !(UPT_X(registers, 0) & DARWIN_CLONE_VM);
+-#ifdef __NR_clone3
+-	case __NR_clone3:
+-#endif
+-		/* Linux builds a forked child's COW page tables from the physical
+-		 * backing pages while the parent's latest userspace writes still
+-		 * live in Darwin's private 4 KiB shadows.  Snapshot the active mm
+-		 * before copy_mm() can observe stale heap or stack contents.  This
+-		 * is harmless for CLONE_VM and keeps clone3 handling independent of
+-		 * reading its userspace argument structure here.
+-		 */
+-		return 1;
+-	default:
+-		return 0;
+-	}
+-}
+-
+ void halt_skas(void)
+ {
+ 	shutdown_kernel(0);
+@@ -367,7 +331,6 @@ void userspace(struct uml_pt_regs *registers)
+ 		unsigned int guest_ipi_snapshot;
+ 		int event;
+ 		int stepping;
+-		int snapshots_mm;
+ 
+ 		/*
+ 		 * This loop is Darwin's user-mode return path.  Cooperative timer or
+@@ -455,9 +418,6 @@ void userspace(struct uml_pt_regs *registers)
+ 		switch (event) {
+ 		case DARWIN_UML_EVENT_SYSCALL:
+ 			registers->orig_x0 = UPT_X(registers, 0);
+-			snapshots_mm = syscall_snapshots_address_space(registers);
+-			if (snapshots_mm && darwin_uml_vm_flush_active() < 0)
+-				fatal_userspace(registers, "pre-clone VM snapshot", -1);
+ 			handle_syscall(registers);
+ 			/* copy_mm() records the parent's COW protection changes in
+ 			 * UML's normal TLB synchronization state.  The next userspace
+@@ -488,29 +448,6 @@ void userspace(struct uml_pt_regs *registers)
+ 					FAULT_WRITE(registers->faultinfo));
+ 				if (retry < 0)
+ 					fatal_userspace(registers, "fault retry", retry);
+-				/* A 16 KiB host slot can combine writable and Linux-COW
+-				 * 4 KiB siblings.  Resolve COW eagerly for every writable
+-				 * sibling before falling back to a breakpoint-guarded store.
+-				 * Otherwise a large userspace write takes two host exceptions
+-				 * per instruction even though copying at most three adjacent
+-				 * Linux pages makes the complete slot safely writable.
+-				 */
+-				if (retry == 2) {
+-					if (current_mm_prefault_host_slot(fault, 1) < 0)
+-						fatal_userspace(registers,
+-							"mixed-slot COW prefault", -1);
+-					retry = darwin_uml_vm_retry_fault(fault, 0, 1);
+-					if (retry < 0)
+-						fatal_userspace(registers,
+-							"mixed-slot write retry", retry);
+-				}
+-				if (retry == 2) {
+-					if (darwin_uml_begin_write_single_step(
+-						fault, UPT_IP(registers)) <= 0)
+-						fatal_userspace(registers,
+-							"post-store breakpoint", -1);
+-					break;
+-				}
+ 				if (retry > 0)
+ 					break;
+ 			}
+@@ -525,19 +462,13 @@ void userspace(struct uml_pt_regs *registers)
+ 				/* A store which Linux just resolved should not take a
+ 				 * second protection fault merely to mark its clean Darwin
+ 				 * shadow dirty.  Grant the now-writable slot before retrying
+-				 * the instruction.  Mixed permission slots retain the
+-				 * hardware post-store breakpoint path.
++				 * the instruction.
+ 				 */
+ 				if (write) {
+ 					retry = darwin_uml_vm_retry_fault(fault, 0, 1);
+ 					if (retry < 0)
+ 						fatal_userspace(registers,
+ 							"resolved write retry", retry);
+-					if (retry == 2 &&
+-					    darwin_uml_begin_write_single_step(
+-						fault, UPT_IP(registers)) <= 0)
+-						fatal_userspace(registers,
+-							"post-store breakpoint", -1);
+ 				}
+ 			}
+ 			break;
+diff --git a/arch/um/os-Darwin/uml_darwin_abi.h b/arch/um/os-Darwin/uml_darwin_abi.h
+index bf40d80441b776417e83504ac732fcd5d7bb163b..ab48ecac887eca776291a8f864ef6c1ff9c823db 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi.h
++++ b/arch/um/os-Darwin/uml_darwin_abi.h
+@@ -31,7 +31,6 @@ typedef unsigned long long darwin_uml_abi_u64;
+ #endif
+ 
+ enum {
+-	DARWIN_UML_GUEST_REGISTER_COUNT = 31,
+ 	DARWIN_UML_VECTOR_REGISTER_COUNT = 32,
+ 	DARWIN_UML_POINTER_AUTH_KEY_COUNT = 5,
+ };
+@@ -121,8 +120,6 @@ struct darwin_uml_guest_fp_registers {
+ 
+ #if defined(__cplusplus)
+ #include <stddef.h>
+-static_assert(DARWIN_UML_ABI_VERSION == 12U);
+-static_assert(DARWIN_UML_ABI_FINGERPRINT == 0xefee2a66cbe8be89ULL);
+ static_assert(DARWIN_UML_EVENT_FLOATING_POINT_TRAP == 7);
+ static_assert(DARWIN_UML_EVENT_PC_ALIGNMENT == 8);
+ static_assert(DARWIN_UML_EVENT_STOP == 9);
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index e183d98c2733cedd9f471b7cb832f1f94c4f229d..7623c5473a06d2deca72a79040f513f9a46b54b4 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 12U
+-#define DARWIN_UML_ABI_FINGERPRINT 0xefee2a66cbe8be89ULL
++#define DARWIN_UML_ABI_VERSION 13U
++#define DARWIN_UML_ABI_FINGERPRINT 0x4936b61fe3c10ef8ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_memory.h b/arch/um/os-Darwin/uml_darwin_memory.h
+index e00d77ecfd814c31015132da7bac3082f06547a8..8a4edd1e63c89da9726cdd75c14104038ea97f04 100644
+--- a/arch/um/os-Darwin/uml_darwin_memory.h
++++ b/arch/um/os-Darwin/uml_darwin_memory.h
+@@ -21,15 +21,17 @@ int darwin_uml_vm_unmap_generation(unsigned long generation, void *address,
+ int darwin_uml_vm_drop(void *address, unsigned long length);
+ int darwin_uml_vm_activate(unsigned long generation);
+ int darwin_uml_vm_batch_begin(unsigned long generation);
++/* Returns 0 once the batch is published, DARWIN_UML_VM_BATCH_REJECTED
++ * (uml_tlb_sync_ranges.h) when an invalidation of the generation arrived
++ * before it ended and the walker must walk it again, or a negative value on
++ * failure. */
+ int darwin_uml_vm_batch_end(void);
+ int darwin_uml_vm_walker_lock(unsigned long generation);
+ int darwin_uml_vm_walker_unlock(unsigned long generation);
+ int darwin_uml_vm_destroy(unsigned long generation);
+-int darwin_uml_vm_flush_active(void);
+ int darwin_uml_vm_flush_generation(unsigned long generation);
+ int darwin_uml_vm_invalidate_code(unsigned long generation,
+ 				  unsigned long address, unsigned long length);
+-int darwin_uml_vm_sync_to_backing(unsigned long address);
+ int darwin_uml_vm_sync_from_backing(unsigned long address);
+ int darwin_uml_vm_sync_from_buffer(unsigned long address,
+ 				   const void *buffer, unsigned long length);
+@@ -39,9 +41,9 @@ int darwin_uml_vm_rebind(unsigned long address, int fd,
+ 			 unsigned long long offset);
+ int darwin_uml_vm_stage_stack(unsigned long address);
+ int darwin_uml_vm_finish_stack(unsigned long address);
++/* Returns 1 when the access can be retried, 0 when Linux must resolve the
++ * fault, or a negative value on failure. */
+ int darwin_uml_vm_retry_fault(unsigned long address, int execute, int write);
+-int darwin_uml_begin_write_single_step(unsigned long address,
+-				       unsigned long guest_pc);
+ 
+ /* Guest RAM commitment. Ranges are byte offsets into the anonymous physical-
+  * memory backing, aligned to the host page. Release hands a range the guest
+diff --git a/arch/um/os-Darwin/uml_darwin_network.h b/arch/um/os-Darwin/uml_darwin_network.h
+index e14c9c92ccdb43774b3fcd0525cda220c226d78b..3ff578789960e826d80f543113adf9b013d590ec 100644
+--- a/arch/um/os-Darwin/uml_darwin_network.h
++++ b/arch/um/os-Darwin/uml_darwin_network.h
+@@ -2,6 +2,11 @@
+ #ifndef UML_DARWIN_NETWORK_ABI_H
+ #define UML_DARWIN_NETWORK_ABI_H
+ 
++/* The largest Ethernet frame the bridge carries.  It sizes the kernel's
++ * receive buffer and each slot of the SLiRP provider's receive and transmit
++ * rings, so the provider never holds a frame the kernel cannot take. */
++#define DARWIN_UML_NET_FRAME_SIZE 2048
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif

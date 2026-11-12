@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:56:26 +0900
+Subject: [PATCH] kosmickrisp: let the host wait for freed memory to count
+
+A host that releases memory for a refused request needs two answers
+the driver alone has. Did the release free any device memory, and has
+the pool seen the room yet. Metal's allocation counter drops the
+moment a heap is released, but the graphics ledger the pool also counts
+follows a short while later, and the pool takes the larger of the two.
+A request that fits once everything is released can therefore be
+refused again a few milliseconds after the release.
+
+kk_freed_memory_bytes(), exported by the driver library, is the sum of
+the heaps the process's devices have made and destroyed; imports are
+not counted. It is raised after the heap is released.
+
+kk_wait_for_pool_headroom(timeout_ms), also exported, polls the
+process pool's headroom until it holds the request the calling thread
+was last refused, or the timeout passes. The refusal is remembered per
+thread and forgotten by the wait, and a thread that was refused nothing
+waits for nothing.
+
+test_device_memory_pool checks that the wait runs out against a full
+pool, ends when the pool reports the room, forgets the refusal and
+leaves a thread with none alone, and that a freed heap is counted.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_bo.c                |  4 +-
+ src/kosmickrisp/vulkan/kk_device.h            |  2 +
+ .../vulkan/kk_device_memory_pool.c            | 72 ++++++++++++++---
+ .../vulkan/kk_device_memory_pool.h            | 17 ++++
+ .../vulkan/tests/test_device_memory_pool.c    | 78 +++++++++++++++++++
+ 5 files changed, 162 insertions(+), 11 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
+index b02c2cbbb4b1a1518c986f752dafe64d77a15a05..5cb334fbd59bc3d22fe00f809e0af53897d015b8 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.c
++++ b/src/kosmickrisp/vulkan/kk_bo.c
+@@ -113,8 +113,10 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+ 
+    mtl_release(bo->map);
+ 
+-   if (bo->mtl_handle)
++   if (bo->mtl_handle) {
+       mtl_release(bo->mtl_handle);
++      kk_freed_memory_add(bo->size_B);
++   }
+ 
+    FREE(bo);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 2c08ef87c40a6c4d5c6204a058ebe861bd3c58fe..4995b6b8eb30ba8e4aeec6025e378be073930c26 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -250,6 +250,8 @@ VkDeviceSize kk_device_pool_headroom(const struct kk_device *dev);
+  * the count does not. */
+ void kk_imported_host_memory_add(uint64_t bytes);
+ void kk_imported_host_memory_sub(uint64_t bytes);
++/* Counts a heap the device made and destroyed. */
++void kk_freed_memory_add(uint64_t bytes);
+ 
+ static inline struct kk_physical_device *
+ kk_device_physical(const struct kk_device *dev)
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.c b/src/kosmickrisp/vulkan/kk_device_memory_pool.c
+index 3d0a9095d622cdc67ef400923e15ad256984bcb7..cbaf99b46a8b2b65852dc8c9c2d837a0b3121849 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.c
+@@ -8,6 +8,7 @@
+ #include "kk_device.h"
+ 
+ #include "util/macros.h"
++#include "util/os_time.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_atomic.h"
+ 
+@@ -53,19 +54,28 @@ kk_device_pooled(const struct kk_device *dev)
+           p_atomic_read(&kk_process_pool_set) != 0;
+ }
+ 
++/* The size of the request the pool last refused this thread, until a
++ * kk_wait_for_pool_headroom() consumes it. A request admitted since says
++ * nothing of the refusal: the thread's later, smaller allocations may fit. */
++static _Thread_local uint64_t kk_thread_refused_B;
++
+ bool
+ kk_device_pool_reserve(const struct kk_device *dev, VkDeviceSize size)
+ {
+-   if (dev->memory_pool.pfnReserve != NULL)
+-      return dev->memory_pool.pfnReserve(dev->memory_pool.pUserData, size);
+-
+-   simple_mtx_lock(&kk_process_pool_mutex);
+-   /* A pool cleared since the device was last charged leaves it with none,
+-    * and an unpooled device has no bound to refuse by. */
+-   const bool admitted =
+-      kk_process_pool.pfnReserve == NULL ||
+-      kk_process_pool.pfnReserve(kk_process_pool.pUserData, size);
+-   simple_mtx_unlock(&kk_process_pool_mutex);
++   bool admitted;
++   if (dev->memory_pool.pfnReserve != NULL) {
++      admitted =
++         dev->memory_pool.pfnReserve(dev->memory_pool.pUserData, size);
++   } else {
++      simple_mtx_lock(&kk_process_pool_mutex);
++      /* A pool cleared since the device was last charged leaves it with none,
++       * and an unpooled device has no bound to refuse by. */
++      admitted = kk_process_pool.pfnReserve == NULL ||
++                 kk_process_pool.pfnReserve(kk_process_pool.pUserData, size);
++      simple_mtx_unlock(&kk_process_pool_mutex);
++   }
++   if (!admitted)
++      kk_thread_refused_B = size;
+    return admitted;
+ }
+ 
+@@ -122,3 +132,45 @@ kk_imported_host_memory_bytes(void)
+ {
+    return p_atomic_read(&kk_imported_host_memory_B);
+ }
++
++/* Device memory the process's devices have freed. Counted after the heap is
++ * released, so a reader that sees the bytes can rely on Metal having dropped
++ * them. */
++static uint64_t kk_freed_memory_B;
++
++void
++kk_freed_memory_add(uint64_t bytes)
++{
++   p_atomic_add(&kk_freed_memory_B, bytes);
++}
++
++PUBLIC uint64_t
++kk_freed_memory_bytes(void)
++{
++   return p_atomic_read(&kk_freed_memory_B);
++}
++
++PUBLIC bool
++kk_wait_for_pool_headroom(uint32_t timeout_ms)
++{
++   const uint64_t needed_B = kk_thread_refused_B;
++   kk_thread_refused_B = 0;
++   if (needed_B == 0)
++      return true;
++
++   const int64_t deadline_ns =
++      os_time_get_nano() + (int64_t)timeout_ms * 1000 * 1000;
++   for (;;) {
++      simple_mtx_lock(&kk_process_pool_mutex);
++      const VkDeviceSize headroom =
++         kk_process_pool.pfnHeadroom != NULL
++            ? kk_process_pool.pfnHeadroom(kk_process_pool.pUserData)
++            : UINT64_MAX;
++      simple_mtx_unlock(&kk_process_pool_mutex);
++      if (headroom >= needed_B)
++         return true;
++      if (os_time_get_nano() >= deadline_ns)
++         return false;
++      os_time_sleep(5 * 1000);
++   }
++}
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+index d2f90139e898f7e8645462889f6c760ed91ab6be..5536479de76e63079f455f294f330af95783d07e 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -43,6 +43,7 @@
+ 
+ #pragma once
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ #include <vulkan/vulkan_core.h>
+@@ -97,6 +98,22 @@ uint64_t kk_release_cached_memory(void);
+  * library. */
+ uint64_t kk_imported_host_memory_bytes(void);
+ 
++/* The bytes of device memory the process's devices have freed since they
++ * started: the heaps they made and destroyed, never an import. A host that
++ * releases memory on a refused thread's behalf reads it before and after, to
++ * learn whether the release freed anything. Exported by the driver library. */
++uint64_t kk_freed_memory_bytes(void);
++
++/* Waits until the pool has the room for the request it last refused the
++ * calling thread, or for timeout_ms; the refusal is forgotten either way. Memory a device frees counts in Metal's
++ * allocation at once but in the graphics ledger a short while later, and the
++ * pool counts the larger of the two, so a request that fits once everything
++ * is released can still be refused for a few milliseconds. Returns true when
++ * the room is there, or when this thread has been refused nothing. Exported
++ * by the driver library; the calling thread may hold no lock of a device or
++ * of the pool. */
++bool kk_wait_for_pool_headroom(uint32_t timeout_ms);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+index e3e9b1349d4309cb1a106bfcb34d580335f7cb6c..2eb8fe7ac47d99507a639525c22a1e1139d0d49e 100644
+--- a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
++++ b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+@@ -18,8 +18,11 @@
+ #define VK_NO_PROTOTYPES
+ #include <vulkan/vulkan_core.h>
+ 
++#include <pthread.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <time.h>
+ 
+ #include "kosmickrisp/vulkan/kk_device_memory_pool.h"
+ #include "kk_test.h"
+@@ -32,6 +35,9 @@ struct pool {
+     * way. */
+    VkDeviceSize live_B, reserved_B;
+    unsigned reserves, refusals, releases;
++   /* When not UINT64_MAX, the headroom the pool reports, whatever it holds:
++    * the ledger a pool counts by can lag behind what was freed. */
++   _Atomic VkDeviceSize headroom_override_B;
+ };
+ 
+ static VkDeviceSize
+@@ -67,6 +73,9 @@ static VkDeviceSize VKAPI_PTR
+ pool_headroom(void *data)
+ {
+    const struct pool *pool = data;
++   const VkDeviceSize override_B = atomic_load(&pool->headroom_override_B);
++   if (override_B != UINT64_MAX)
++      return override_B;
+    const VkDeviceSize used_B = pool->live_B + pool->reserved_B;
+    return used_B < pool->limit_B ? pool->limit_B - used_B : 0u;
+ }
+@@ -112,12 +121,46 @@ release(const struct kk_test_device *t, VkDeviceSize size, VkDeviceMemory memory
+       pool->live_B -= charge_B(size);
+ }
+ 
++static double
++now_ms(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
++/* Reports the room a pool refused for after `delay_ms`, as a ledger that
++ * catches up with what was freed. */
++struct relief {
++   struct pool *pool;
++   unsigned delay_ms;
++   VkDeviceSize headroom_B;
++};
++
++static void *
++relieve(void *arg)
++{
++   const struct relief *relief = arg;
++   struct timespec delay = {.tv_nsec = (long)relief->delay_ms * 1000000L};
++   nanosleep(&delay, NULL);
++   atomic_store(&relief->pool->headroom_override_B, relief->headroom_B);
++   return NULL;
++}
++
++static void *
++wait_without_refusal(void *arg)
++{
++   *(bool *)arg = kk_wait_for_pool_headroom(2000);
++   return NULL;
++}
++
+ int
+ main(void)
+ {
+    /* The pool is stated before any device exists, as a host states it before
+     * it creates the renderer. */
+    struct pool process = {.limit_B = MIB(96)};
++   atomic_init(&process.headroom_override_B, UINT64_MAX);
+    VkDeviceMemoryPoolCreateInfoKK info = pool_info(&process);
+    kk_set_device_memory_pool(&info);
+ 
+@@ -152,9 +195,43 @@ main(void)
+    CHECK(allocate(&t, host_type, 16384u, &extra, &process) ==
+          VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
++   /* The thread the pool refused can wait for the room: the last request it
++    * was refused is 16 KiB, which the full pool does not have, so the wait
++    * runs out. The wait forgets the refusal, so a second one has nothing to
++    * wait for. */
++   double start = now_ms();
++   CHECK(!kk_wait_for_pool_headroom(60));
++   CHECK(now_ms() - start >= 50.0);
++   CHECK(kk_wait_for_pool_headroom(60));
++
++   /* A refusal of 32 MiB waits until the pool reports that room, which is
++    * when a lagging ledger catches up with what was freed, and not longer. */
++   CHECK(allocate(&t, device_type, MIB(32), &extra, &process) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   struct relief relief = {&process, 80, MIB(32)};
++   pthread_t relieved;
++   CHECK(pthread_create(&relieved, NULL, relieve, &relief) == 0);
++   start = now_ms();
++   CHECK(kk_wait_for_pool_headroom(5000));
++   const double waited = now_ms() - start;
++   CHECK(pthread_join(relieved, NULL) == 0);
++   CHECK(waited >= 60.0 && waited < 2500.0);
++   atomic_store(&process.headroom_override_B, UINT64_MAX);
++
++   /* A thread the pool has refused nothing waits for nothing. */
++   bool unrefused = false;
++   pthread_t other;
++   CHECK(pthread_create(&other, NULL, wait_without_refusal, &unrefused) == 0);
++   CHECK(pthread_join(other, NULL) == 0);
++   CHECK(unrefused);
++
++   /* A heap the device frees is counted, once it has gone. */
++   const uint64_t freed = kk_freed_memory_bytes();
++
+    /* A refusal leaves the device as it was: what is freed can be allocated
+     * again, in pieces as well. */
+    release(&t, MIB(32), memory[0], &process);
++   CHECK(kk_freed_memory_bytes() - freed >= MIB(32));
+    CHECK(allocate(&t, device_type, MIB(16), &memory[0], &process) ==
+          VK_SUCCESS);
+    VkDeviceMemory visible = VK_NULL_HANDLE;
+@@ -196,6 +273,7 @@ main(void)
+    /* A device that names a pool itself charges that one, and the process's
+     * is left alone. */
+    struct pool own = {.limit_B = MIB(64)};
++   atomic_init(&own.headroom_override_B, UINT64_MAX);
+    VkDeviceMemoryPoolCreateInfoKK own_info = pool_info(&own);
+    process.limit_B = 0u;
+    const unsigned process_reserves = process.reserves;

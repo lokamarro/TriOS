@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:33:09 +0900
+Subject: [PATCH] Embedding: masked stores check their pages before they store
+
+VMASKMOVPS, VMASKMOVPD, VPMASKMOVD and VPMASKMOVQ stores check the first
+byte of the lowest enabled element and then the last byte of the highest
+before they store any element, so a fault names the first of them to
+miss and stores nothing; an operand with no enabled element accesses
+nothing. MASKMOVQ and MASKMOVDQU fault on any page their operand
+touches, whatever the mask selects, MASKMOVDQU checking its high
+quadword before its low one. The embedded translations of the elements
+stored the lowest ones before a later element faulted and named the
+page for a quadword over its edge.
+
+A new EmbedderProbeMaskedStore op probes a masked store's two ends for
+writing, which EmbedderProbe can now do for a range with its Write
+operand, and MASKMOVQ and MASKMOVDQU probe their quadwords the same
+way.
+---
+ .../Interface/Core/JIT/EmbedderMemory.cpp     | 51 ++++++++++++++++++-
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  2 +
+ .../Core/OpcodeDispatcher/AVX_128.cpp         |  6 +++
+ .../Core/OpcodeDispatcher/Vector.cpp          | 14 +++++
+ FEXCore/Source/Interface/IR/IR.json           | 20 ++++++--
+ 5 files changed, 87 insertions(+), 6 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+index e35ee124dc8ee4e55c6003c69a944372b93da5ed..c6e0d7bde3ae5626e669931a377b93550beeb491 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+@@ -122,10 +122,57 @@ DEF_OP(EmbedderProbe) {
+   // The first byte, then the start of the page the last byte is on, which
+   // is the first byte's page when the operand does not cross one: a fault
+   // names the first byte of the operand that is not readable.
+-  (void)EmbedderTranslate(Addr, 1, 0);
++  const uint64_t Access = Op->Write ? Core::EMBEDDER_ACCESS_WRITE : 0;
++  (void)EmbedderTranslate(Addr, 1, Access);
+   add(ARMEmitter::Size::i64Bit, TMP4, Addr, Op->Size - 1);
+   and_(ARMEmitter::Size::i64Bit, TMP4, TMP4, ~uint64_t {0xFFF});
+-  (void)EmbedderTranslate(TMP4, 1, 0);
++  (void)EmbedderTranslate(TMP4, 1, Access);
++}
++
++DEF_OP(EmbedderProbeMaskedStore) {
++  const auto Op = IROp->C<IR::IROp_EmbedderProbeMaskedStore>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderProbeMaskedStore outside embedding");
++  const auto ElementSize = Op->ElementSize;
++  LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i32Bit || ElementSize == IR::OpSize::i64Bit, "Unexpected masked store element size {}", ElementSize);
++  const auto ElementBytes = IR::OpSizeToSize(ElementSize);
++  const unsigned ElementShift = ElementSize == IR::OpSize::i32Bit ? 2 : 3;
++  const unsigned PerHalf = 16 / ElementBytes;
++  const auto Base = GetReg(Op->Addr);
++
++  // TMP1 gets bit I set when element I is enabled. The translations below
++  // use TMP1 to TMP3, so it is gathered again for each.
++  const auto Gather = [&]() {
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, 0);
++    for (unsigned Half = 0; Half < (Op->MaskHigh.IsInvalid() ? 1U : 2U); ++Half) {
++      const auto Mask = GetVReg(Half ? Op->MaskHigh : Op->MaskLow);
++      for (unsigned i = 0; i < PerHalf; ++i) {
++        if (ElementSize == IR::OpSize::i32Bit) {
++          umov<ARMEmitter::SubRegSize::i32Bit>(TMP2, Mask, i);
++        } else {
++          umov<ARMEmitter::SubRegSize::i64Bit>(TMP2, Mask, i);
++        }
++        lsr(ARMEmitter::Size::i64Bit, TMP2, TMP2, IR::OpSizeAsBits(ElementSize) - 1);
++        bfi(ARMEmitter::Size::i64Bit, TMP1, TMP2, Half * PerHalf + i, 1);
++      }
++    }
++  };
++
++  ARMEmitter::ForwardLabel Done {};
++  Gather();
++  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Done);
++  // The first byte of the lowest enabled element.
++  rbit(ARMEmitter::Size::i64Bit, TMP2, TMP1);
++  clz(ARMEmitter::Size::i64Bit, TMP2, TMP2);
++  add(ARMEmitter::Size::i64Bit, TMP4, Base, TMP2, ARMEmitter::ShiftType::LSL, ElementShift);
++  (void)EmbedderTranslate(TMP4, 1, Core::EMBEDDER_ACCESS_WRITE);
++  // The last byte of the highest.
++  Gather();
++  clz(ARMEmitter::Size::i64Bit, TMP2, TMP1);
++  eor(ARMEmitter::Size::i64Bit, TMP2, TMP2, 63);
++  add(ARMEmitter::Size::i64Bit, TMP4, Base, TMP2, ARMEmitter::ShiftType::LSL, ElementShift);
++  add(ARMEmitter::Size::i64Bit, TMP4, TMP4, ElementBytes - 1);
++  (void)EmbedderTranslate(TMP4, 1, Core::EMBEDDER_ACCESS_WRITE);
++  (void)Bind(&Done);
+ }
+ 
+ DEF_OP(EmbedderRaiseGP) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 9f9fcd0a08feb17fac368a9783461ec7770835dd..ee8275ffd7036f3ad9f6fd8fcb2823b020e7f1f4 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1551,6 +1551,8 @@ private:
+   void EmbedderCheckMXCSR(Ref MXCSR, Ref Selected = nullptr);
+   // Embedded: faults as a read of the byte at Addr, as CLFLUSH, CLFLUSHOPT and CLWB do.
+   void EmbedderCacheLineProbe(Ref Addr);
++  // Embedded: MASKMOVQ and MASKMOVDQU write checks, in x86's order.
++  void EmbedderProbeMaskedBytes(Ref Addr, IR::OpSize Size);
+   // The operands of the last element of an embedded repeated compare, which
+   // wait in the frame until the loop sets the flags.
+   static constexpr auto EmbedderStringOperands = offsetof(FEXCore::Core::CpuStateFrame, Embedder.StringOperands);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+index 91e85899dff863dff27fe7c03a9b93f5853d3570..d20a25bdeed16724cc2c3272493c6339851b9bba 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+@@ -1687,6 +1687,11 @@ void OpDispatchBuilder::AVX128_VMASKMOVImpl(OpcodeArgs, IR::OpSize ElementSize,
+     auto Address = MakeAddress(Op->Dest);
+ 
+     auto Data = AVX128_LoadSource_WithOpSize(Op, DataOp, Op->Flags, !Is128Bit);
++    if (CTX->Embedded) {
++      // x86 checks the pages of the lowest and highest enabled elements
++      // before it stores any element.
++      _EmbedderProbeMaskedStore(ElementSize, Mask.Low, Is128Bit ? Invalid() : Mask.High, Address);
++    }
+     _VStoreVectorMasked(OpSize::i128Bit, ElementSize, Mask.Low, Data.Low, Address, Invalid(), MemOffsetType::SXTX, 1);
+     if (!Is128Bit) {
+       _VStoreVectorMasked(OpSize::i128Bit, ElementSize, Mask.High, Data.High, Address, _InlineConstant(16), MemOffsetType::SXTX, 1);
+@@ -1729,6 +1734,7 @@ void OpDispatchBuilder::AVX128_MASKMOV(OpcodeArgs) {
+ 
+   // RDI source (DS prefix by default)
+   auto MemDest = MakeSegmentAddress(X86State::REG_RDI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
++  EmbedderProbeMaskedBytes(MemDest, Size);
+ 
+   Ref XMMReg = _LoadMemFPR(Size, MemDest, OpSize::i8Bit);
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index b6e974e3f48dab068174b40cf27c0425957545d8..d03f1c829524c824f179909a0bf85f425b042e45 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -3041,6 +3041,19 @@ void OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int(OpcodeArgs, IR::OpSiz
+   StoreResultFPR_WithOpSize(Op, Op->Dest, Result, DstSize);
+ }
+ 
++// MASKMOVQ and MASKMOVDQU fault on any page their operand touches, whatever
++// the mask selects. MASKMOVDQU checks its high quadword before its low one,
++// and each quadword's first byte before its last.
++void OpDispatchBuilder::EmbedderProbeMaskedBytes(Ref Addr, IR::OpSize Size) {
++  if (!CTX->Embedded) {
++    return;
++  }
++  if (Size == OpSize::i128Bit) {
++    _EmbedderProbe(Add(OpSize::i64Bit, Addr, 8), 8, true);
++  }
++  _EmbedderProbe(Addr, 8, true);
++}
++
+ void OpDispatchBuilder::MASKMOVOp(OpcodeArgs) {
+   const auto Size = OpSizeFromSrc(Op);
+ 
+@@ -3053,6 +3066,7 @@ void OpDispatchBuilder::MASKMOVOp(OpcodeArgs) {
+ 
+   // RDI source (DS prefix by default)
+   auto MemDest = MakeSegmentAddress(X86State::REG_RDI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
++  EmbedderProbeMaskedBytes(MemDest, Size);
+ 
+   Ref XMMReg = _LoadMemFPR(Size, MemDest, OpSize::i8Bit);
+ 
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 1b61f8c36c760cfc90c79a999b6372b0480835cc..7e8d3de42eafe63a42c7d8d1663cfef7221e7cb4 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -779,10 +779,22 @@
+         "HasSideEffects": true
+       },
+ 
+-      "EmbedderProbe GPR:$Addr, u32:$Size": {
+-        "Desc": ["Embedded only: faults as a load of the Size bytes at Addr would, without loading.",
+-                 "An instruction that loads its operand in parts, such as FXRSTOR, probes the whole",
+-                 "operand before it changes any state, so a fault in a later part changes nothing."
++      "EmbedderProbe GPR:$Addr, u32:$Size, i1:$Write{false}": {
++        "Desc": ["Embedded only: faults as a load of the Size bytes at Addr would, without loading,",
++                 "or as a store of them when Write. An instruction that loads its operand in parts,",
++                 "such as FXRSTOR, probes the whole operand before it changes any state, so a fault",
++                 "in a later part changes nothing."
++                ],
++        "HasSideEffects": true
++      },
++
++      "EmbedderProbeMaskedStore OpSize:$ElementSize, FPR:$MaskLow, FPR:$MaskHigh, GPR:$Addr": {
++        "Desc": ["Embedded only: faults as the first byte of the lowest enabled element of a masked",
++                 "store at Addr would, and then as the last byte of the highest, without storing. An",
++                 "element is enabled by its mask element's top bit; MaskLow holds the first 16 bytes",
++                 "of elements and MaskHigh, when it is not invalid, the next 16. A store with no",
++                 "enabled element accesses nothing. VMASKMOV and VPMASKMOV probe their operand",
++                 "before they store any element, so a fault in a later one stores nothing."
+                 ],
+         "HasSideEffects": true
+       },

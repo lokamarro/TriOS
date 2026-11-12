@@ -1,0 +1,922 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:38:24 +0900
+Subject: [PATCH] kosmickrisp: register image textures for Metal validation
+
+Apple's residency sets make a heap they hold resident together with
+every resource placed in it, so the device set, which holds the heaps,
+already keeps every image texture resident. Metal's API and shader
+validation check each texture a command buffer reaches against the
+sets by itself, though. API validation reports every attachment as "not
+added to any residency set", and shader validation silently drops the
+image loads and stores it does not find there: under
+MTL_SHADER_VALIDATION=1, a vertex shader copying a cube map array image
+read and wrote nothing, as KHR-GLES31.core.texture_cube_map_array
+image_op_vertex_sh did through Zink.
+
+While a validation layer wraps the Metal device, which the device's
+class shows once at creation, the driver now registers the textures of
+images when they are bound and the textures views make themselves, and
+removes them on destruction. Registering costs about 1.4 us per image
+view lifetime on an M1 Ultra, a third of creating and destroying one,
+so a device without validation registers nothing. The texel buffer
+textures, registered always until now for the same reason, follow the
+same rule.
+
+kosmickrisp_validated_image_access runs the cube map array copy under
+MTL_SHADER_VALIDATION=1 and checks every texel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/bridge/mtl_device.h           |   2 +
+ src/kosmickrisp/bridge/mtl_device.m           |  12 +
+ src/kosmickrisp/bridge/stubs/mtl_device.c     |   6 +
+ src/kosmickrisp/vulkan/kk_buffer_view.c       |   8 +-
+ src/kosmickrisp/vulkan/kk_buffer_view.h       |   2 +
+ src/kosmickrisp/vulkan/kk_device.c            |  22 +-
+ src/kosmickrisp/vulkan/kk_device.h            |  14 +-
+ src/kosmickrisp/vulkan/kk_image.c             |  10 +
+ src/kosmickrisp/vulkan/kk_image.h             |   3 +
+ src/kosmickrisp/vulkan/kk_image_view.c        |  47 +++
+ src/kosmickrisp/vulkan/kk_image_view.h        |   5 +
+ src/kosmickrisp/vulkan/meson.build            |  16 +
+ .../tests/test_validated_image_access.cpp     | 351 ++++++++++++++++++
+ .../tests/validated_image_shaders/color.frag  |   9 +
+ .../validated_image_shaders/color.frag.h      |  18 +
+ .../tests/validated_image_shaders/copy.vert   |  23 ++
+ .../tests/validated_image_shaders/copy.vert.h | 109 ++++++
+ 17 files changed, 646 insertions(+), 11 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_validated_image_access.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert.h
+
+diff --git a/src/kosmickrisp/bridge/mtl_device.h b/src/kosmickrisp/bridge/mtl_device.h
+index 1f0205ff6561c91238dc385b7687ad18462cd118..665c8c967fadb76704d933b5b8dd687d98239641 100644
+--- a/src/kosmickrisp/bridge/mtl_device.h
++++ b/src/kosmickrisp/bridge/mtl_device.h
+@@ -30,6 +30,8 @@ void mtl_device_get_architecture_name(mtl_device *dev, char buffer[256]);
+ uint32_t mtl_device_get_gpu_apple_family(mtl_device *dev);
+ uint64_t mtl_device_get_registry_id(mtl_device *dev);
+ bool mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count);
++/* Whether Metal's API or shader validation layer wraps the device. */
++bool mtl_device_is_validated(mtl_device *dev);
+ /* Whether the device can sample BC/S3TC, RGTC and BPTC compressed
+  * textures. Apple GPUs on iOS do not. */
+ bool mtl_device_supports_bc_texture_compression(mtl_device *dev);
+diff --git a/src/kosmickrisp/bridge/mtl_device.m b/src/kosmickrisp/bridge/mtl_device.m
+index 52a8e8ca5473abf30bc63e7d5a91db4bcdf8a67c..ca5033d1a948fce03ccaae07503a3d00a6e8d8fe 100644
+--- a/src/kosmickrisp/bridge/mtl_device.m
++++ b/src/kosmickrisp/bridge/mtl_device.m
+@@ -71,6 +71,18 @@
+    }
+ }
+ 
++/* The validation layers hand out a wrapper of the GPU's own device:
++ * MTLDebugDevice for API validation, with or without shader validation
++ * beneath it, and MTLGPUDebugDevice for shader validation alone. */
++bool
++mtl_device_is_validated(mtl_device *dev)
++{
++   @autoreleasepool {
++      NSString *name = NSStringFromClass([(id)dev class]);
++      return [name hasPrefix:@"MTLDebug"] || [name hasPrefix:@"MTLGPUDebug"];
++   }
++}
++
+ /* Device feature query */
+ void
+ mtl_device_get_name(mtl_device *dev, char buffer[256])
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_device.c b/src/kosmickrisp/bridge/stubs/mtl_device.c
+index 73f3f17481e87b813b98fbc7efe28b19684e7543..e8db7cb1607fb994706e26c7969c5252db08726d 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_device.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_device.c
+@@ -24,6 +24,12 @@ mtl_stop_gpu_capture(void)
+ {
+ }
+ 
++bool
++mtl_device_is_validated(mtl_device *dev)
++{
++   return false;
++}
++
+ /* Device feature query */
+ void
+ mtl_device_get_name(mtl_device *dev, char buffer[256])
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 3998a631bb2b367447dd21397cbef9583133375f..321fb74d69358e672ea38a699adaf7fda8728f7e 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -198,7 +198,8 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+    /* Heap residency covers the storage, but Metal shader validation also needs
+     * the native texture view identity registered for its lifetime.
+     */
+-   kk_device_add_texture_to_residency_set(dev, view->mtl_texel_buffer_handle);
++   view->validation_registered =
++      kk_device_add_texture_for_validation(dev, view->mtl_texel_buffer_handle);
+ 
+    *pBufferView = kk_buffer_view_to_handle(view);
+ 
+@@ -216,8 +217,9 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
+       return;
+ 
+    if (view->mtl_texel_buffer_handle) {
+-      kk_device_remove_texture_from_residency_set(
+-         dev, view->mtl_texel_buffer_handle);
++      if (view->validation_registered)
++         kk_device_remove_texture_for_validation(
++            dev, view->mtl_texel_buffer_handle);
+       mtl_release(view->mtl_texel_buffer_handle);
+    }
+    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.h b/src/kosmickrisp/vulkan/kk_buffer_view.h
+index 07cae2c9116e40d40f643b4f6f53705c511964f7..d3c5e86de39bd959cec3b490a41771c509d8235d 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.h
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.h
+@@ -22,6 +22,8 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev, VkFormat format);
+ struct kk_buffer_view {
+    struct vk_buffer_view vk;
+    mtl_texture *mtl_texel_buffer_handle;
++   /* Registered with the residency set for Metal validation. */
++   bool validation_registered;
+    uint64_t texel_buffer_gpu_id;
+    /* First texel of a view whose format Metal cannot express, and zero
+     * otherwise. */
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 8e6416d1168b1776aa2fdc99bf21520911900cfe..f28456a4350ed568d9899372a38ed8bc6ba27af0 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -418,6 +418,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    /* We need to initialize the device residency set before any bo is created. */
+    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
+    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
++   dev->residency_set.validated = mtl_device_is_validated(dev->mtl_handle);
+    if (dev->residency_set.handle == NULL) {
+       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+       goto fail_linked_pipeline_cache;
+@@ -610,17 +611,30 @@ kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+    kk_device_remove_from_residency_set(dev, buffer);
+ }
+ 
+-void
+-kk_device_add_texture_to_residency_set(struct kk_device *dev, mtl_texture *texture)
++/* Apple's residency sets make a heap they hold resident together with every
++ * resource placed in it, so the textures of images and views need no entry
++ * of their own. Metal's API and shader validation check each texture a
++ * command buffer reaches against the sets by itself, though, and shader
++ * validation drops the accesses to one it does not find there. Registering
++ * the textures of an image view costs about 1.4 us over its lifetime on an M1
++ * Ultra, a third of creating and destroying the view, so only a validated
++ * device pays it. */
++bool
++kk_device_add_texture_for_validation(struct kk_device *dev, mtl_texture *texture)
+ {
++   if (!dev->residency_set.validated || texture == NULL)
++      return false;
++
+    simple_mtx_lock(&dev->residency_set.mutex);
+    mtl_residency_set_add_allocation(dev->residency_set.handle, texture);
+    simple_mtx_unlock(&dev->residency_set.mutex);
++   return true;
+ }
+ 
++/* Only for a texture kk_device_add_texture_for_validation registered. */
+ void
+-kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+-                                            mtl_texture *texture)
++kk_device_remove_texture_for_validation(struct kk_device *dev,
++                                        mtl_texture *texture)
+ {
+    kk_device_remove_from_residency_set(dev, texture);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 73f8c1b6be7830faf761534d2c6277593900bc65..947d9c4358629c7e462b009d4369b46da4024663 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -33,6 +33,9 @@ struct vk_pipeline_cache;
+ struct kk_residency_set {
+    simple_mtx_t mutex;
+    mtl_residency_set *handle;
++   /* Metal validation wraps the device, and wants every texture a command
++    * buffer reaches in the set itself, not only the heap it is placed in. */
++   bool validated;
+ };
+ 
+ struct kk_address_space {
+@@ -256,10 +259,13 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
+                                            mtl_buffer *buffer);
+ void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+                                                 mtl_buffer *buffer);
+-void kk_device_add_texture_to_residency_set(struct kk_device *dev,
+-                                           mtl_texture *texture);
+-void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+-                                                mtl_texture *texture);
++/* Textures placed in a heap the set holds are resident already. Under Metal
++ * validation alone these register one for its lifetime, and otherwise do
++ * nothing; each returns whether it registered the texture. */
++bool kk_device_add_texture_for_validation(struct kk_device *dev,
++                                          mtl_texture *texture);
++void kk_device_remove_texture_for_validation(struct kk_device *dev,
++                                             mtl_texture *texture);
+ void kk_device_make_resources_resident(struct kk_device *dev);
+ /* Commits to a queue the device set is attached to, never while the set is
+  * being written. */
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 185793185b46f52f3eb921e6b3fd67f645d035c0..817129a045ecb0a16e64765133f6ec182f8d6b62 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -855,6 +855,11 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
+                       VkImageCreateFlags create_flags,
+                       const VkAllocationCallbacks *pAllocator)
+ {
++   if (plane->validation_registered) {
++      kk_device_remove_texture_for_validation(dev, plane->mtl_handle);
++      if (plane->mtl_handle_array != NULL)
++         kk_device_remove_texture_for_validation(dev, plane->mtl_handle_array);
++   }
+    if (plane->mtl_handle != NULL)
+       mtl_release(plane->mtl_handle);
+    if (plane->mtl_handle_array != NULL)
+@@ -1170,6 +1175,11 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+       }
+    }
+ 
++   plane->validation_registered =
++      kk_device_add_texture_for_validation(dev, plane->mtl_handle);
++   if (plane->validation_registered)
++      kk_device_add_texture_for_validation(dev, plane->mtl_handle_array);
++
+    kk_image_plane_report_address_binding(dev, image, plane,
+                                          VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+    return VK_SUCCESS;
+diff --git a/src/kosmickrisp/vulkan/kk_image.h b/src/kosmickrisp/vulkan/kk_image.h
+index f5a849c8120e591bcfda885f31a8e24b2f82954b..18d2b818f332b5d16a883d508c97313be0d18717 100644
+--- a/src/kosmickrisp/vulkan/kk_image.h
++++ b/src/kosmickrisp/vulkan/kk_image.h
+@@ -44,6 +44,9 @@ struct kk_image_plane {
+    mtl_texture *mtl_handle;
+    /* Metal handle with 2D array type for 3D images */
+    mtl_texture *mtl_handle_array;
++   /* Both handles are registered with the residency set for Metal
++    * validation; a plane that aliases a swapchain image's never is. */
++   bool validation_registered;
+    uint64_t addr;
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index 5e1fa330a9212010b3c33dd6e0a4b76ade8e8fc8..2dc3068c87bf41e09c4f33a8c340c96c683fd394 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -65,6 +65,47 @@ kk_image_view_metal_type(const struct kk_image *image,
+    return type;
+ }
+ 
++/* The handles of a view plane, in the order of its validation_registered
++ * bits. */
++static void
++kk_image_view_plane_handles(struct kk_image_view *view, uint8_t plane,
++                            mtl_texture **handles[6])
++{
++   handles[0] = &view->planes[plane].mtl_handle_sampled;
++   handles[1] = &view->planes[plane].mtl_handle_cube_array;
++   handles[2] = &view->planes[plane].mtl_handle_storage;
++   handles[3] = &view->planes[plane].mtl_handle_input;
++   handles[4] = &view->planes[plane].mtl_handle_render;
++   handles[5] = &view->planes[plane].mtl_handle_subres;
++}
++
++/* Registers the textures the view made itself, not those of its image, which
++ * the image registers, nor one it holds twice. */
++static void
++kk_image_view_register_for_validation(struct kk_device *dev,
++                                      const struct kk_image *image,
++                                      struct kk_image_view *view)
++{
++   if (!dev->residency_set.validated)
++      return;
++
++   for (uint8_t plane = 0; plane < view->plane_count; plane++) {
++      mtl_texture **handles[6];
++      kk_image_view_plane_handles(view, plane, handles);
++      for (unsigned i = 0; i < ARRAY_SIZE(handles); i++) {
++         mtl_texture *texture = *handles[i];
++         bool owned = texture != NULL;
++         for (uint8_t p = 0; owned && p < image->plane_count; p++)
++            owned = texture != image->planes[p].mtl_handle &&
++                    texture != image->planes[p].mtl_handle_array;
++         for (unsigned j = 0; owned && j < i; j++)
++            owned = texture != *handles[j];
++         if (owned && kk_device_add_texture_for_validation(dev, texture))
++            view->planes[plane].validation_registered |= BITFIELD_BIT(i);
++      }
++   }
++}
++
+ VkResult
+ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                    const VkImageViewCreateInfo *pCreateInfo)
+@@ -330,6 +371,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+       }
+    }
+ 
++   kk_image_view_register_for_validation(dev, image, view);
+    return VK_SUCCESS;
+ 
+ fail_no_texture:
+@@ -348,6 +390,11 @@ void
+ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
+ {
+    for (uint8_t plane = 0; plane < view->plane_count; plane++) {
++      mtl_texture **handles[6];
++      kk_image_view_plane_handles(view, plane, handles);
++      u_foreach_bit(i, view->planes[plane].validation_registered)
++         kk_device_remove_texture_for_validation(dev, *handles[i]);
++
+       if (view->planes[plane].mtl_handle_sampled)
+          mtl_release(view->planes[plane].mtl_handle_sampled);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.h b/src/kosmickrisp/vulkan/kk_image_view.h
+index 3c4447d2d953a23a81ed43a7d101793763e376b3..18dd05d2d9ddb10bdc3efb218f08120d38a78cae 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.h
++++ b/src/kosmickrisp/vulkan/kk_image_view.h
+@@ -47,6 +47,11 @@ struct kk_image_view {
+       /* Used if view has to create its own alias of a specific subresource */
+       mtl_texture *mtl_handle_subres;
+ 
++      /* The handles above that the view made itself and registered with the
++       * residency set for Metal validation, one bit each in the order
++       * sampled, cube array, storage, input, render, subresource. */
++      uint8_t validation_registered;
++
+       uint64_t sampled_gpu_resource_id;
+       uint64_t cube_array_gpu_resource_id;
+       uint64_t storage_gpu_resource_id;
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 90bdafc435572cdd6530b2a3e555f0b6276e3da0..e3cbdac7f260dde62ae07ad45d8044cabe467e6e 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -331,6 +331,22 @@ if with_tests
+         )
+       endforeach
+     endforeach
++    # Image access under Metal's shader validation, which drops the accesses
++    # to a texture it does not find in a residency set.
++    test(
++      'kosmickrisp_validated_image_access',
++      executable(
++        'test_kosmickrisp_validated_image_access',
++        files('tests/test_validated_image_access.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : kk_test_env + ['MTL_SHADER_VALIDATION=1'],
++      timeout : 120,
++    )
+     # Queue commits against residency set writes on another thread, under
+     # the shader validation that walks the set's heaps in each commit.
+     test(
+diff --git a/src/kosmickrisp/vulkan/tests/test_validated_image_access.cpp b/src/kosmickrisp/vulkan/tests/test_validated_image_access.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..aef49fc64408fdedaedf8a3fce641a557daa7e40
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_validated_image_access.cpp
+@@ -0,0 +1,351 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Metal's shader validation checks every texture a command buffer reaches
++ * against the residency sets by itself, not by the heap it is placed in, and
++ * drops the accesses to one it does not find there. The driver registers the
++ * textures of images and views while validation wraps its device. One vertex
++ * invocation here copies a cube map array image texel by texel, as
++ * KHR-GLES31.core.texture_cube_map_array.image_op_vertex_sh does, and every
++ * texel must arrive. The test runs with MTL_SHADER_VALIDATION=1.
++ *
++ * usage: test_kosmickrisp_validated_image_access [--width N] [--cubes N] */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "kk_test.h"
++
++static const uint32_t copy_vert[] =
++#include "validated_image_shaders/copy.vert.h"
++;
++static const uint32_t color_frag[] =
++#include "validated_image_shaders/color.frag.h"
++;
++
++int main(int argc, char **argv)
++{
++   uint32_t width = 8u, cubes = 2u;
++   for (int i = 1; i < argc; ++i) {
++      if (!strcmp(argv[i], "--width") && i + 1 < argc)
++         width = uint32_t(strtoul(argv[++i], nullptr, 0));
++      else if (!strcmp(argv[i], "--cubes") && i + 1 < argc)
++         cubes = uint32_t(strtoul(argv[++i], nullptr, 0));
++      else
++         require(false, "unknown argument");
++   }
++   const uint32_t layers = 6u * cubes;
++   if (!getenv("MTL_SHADER_VALIDATION"))
++      std::printf("note: MTL_SHADER_VALIDATION is not set, so this run "
++                  "checks nothing the driver registers\n");
++
++   kk_test_device t;
++   kk_test_create_instance(&t, "validated-image-access");
++   VkPhysicalDeviceVulkan13Features features13{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++   features13.dynamicRendering = VK_TRUE;
++   VkPhysicalDeviceFeatures features{};
++   features.vertexPipelineStoresAndAtomics = VK_TRUE;
++   features.imageCubeArray = VK_TRUE;
++   kk_test_create_device(&t, &features13, &features, 0, nullptr);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkCreateDescriptorSetLayout);
++   LOAD_D(vkDestroyDescriptorSetLayout);
++   LOAD_D(vkCreateDescriptorPool);
++   LOAD_D(vkDestroyDescriptorPool);
++   LOAD_D(vkAllocateDescriptorSets);
++   LOAD_D(vkUpdateDescriptorSets);
++   LOAD_D(vkCmdBindDescriptorSets);
++   LOAD_D(vkCmdCopyBufferToImage);
++
++   const VkDeviceSize bytes = VkDeviceSize(width) * width * layers * 16u;
++   VkBuffer upload, readback;
++   VkDeviceMemory upload_memory, readback_memory;
++   float *source = nullptr, *result = nullptr;
++   kk_test_buffer(&t, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++                  KK_TEST_HOST_MEMORY, &upload, &upload_memory,
++                  reinterpret_cast<void **>(&source));
++   kk_test_buffer(&t, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                  KK_TEST_HOST_MEMORY, &readback, &readback_memory,
++                  reinterpret_cast<void **>(&result));
++   for (size_t i = 0; i < bytes / sizeof(float); ++i)
++      source[i] = float(i % 65521u) + 0.5f;
++   memset(result, 0, bytes);
++
++   VkImage images[2];
++   VkDeviceMemory image_memory[2];
++   VkImageView views[2];
++   for (int i = 0; i < 2; ++i) {
++      VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
++      info.imageType = VK_IMAGE_TYPE_2D;
++      info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
++      info.extent = {width, width, 1};
++      info.mipLevels = 1;
++      info.arrayLayers = layers;
++      info.samples = VK_SAMPLE_COUNT_1_BIT;
++      info.usage = VK_IMAGE_USAGE_STORAGE_BIT |
++                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      VkResult r = vkCreateImage(device, &info, nullptr, &images[i]);
++      require(r == VK_SUCCESS, "create image", r);
++      image_memory[i] = kk_test_image_memory(
++         &t, images[i], VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      views[i] = kk_test_image_view(&t, images[i],
++                                    VK_IMAGE_VIEW_TYPE_CUBE_ARRAY,
++                                    VK_FORMAT_R32G32B32A32_SFLOAT,
++                                    VK_IMAGE_ASPECT_COLOR_BIT, 0, layers);
++   }
++
++   const VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
++   VkImageCreateInfo target_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++   target_info.imageType = VK_IMAGE_TYPE_2D;
++   target_info.format = color_format;
++   target_info.extent = {4, 4, 1};
++   target_info.mipLevels = 1;
++   target_info.arrayLayers = 1;
++   target_info.samples = VK_SAMPLE_COUNT_1_BIT;
++   target_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++   VkImage target;
++   VkResult r = vkCreateImage(device, &target_info, nullptr, &target);
++   require(r == VK_SUCCESS, "create target", r);
++   VkDeviceMemory target_memory =
++      kk_test_image_memory(&t, target, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++   VkImageView target_view =
++      kk_test_image_view(&t, target, VK_IMAGE_VIEW_TYPE_2D, color_format,
++                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
++
++   VkDescriptorSetLayoutBinding bindings[2]{};
++   for (uint32_t i = 0; i < 2; ++i) {
++      bindings[i].binding = i;
++      bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++      bindings[i].descriptorCount = 1;
++      bindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++   }
++   VkDescriptorSetLayoutCreateInfo set_layout_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++   set_layout_info.bindingCount = 2;
++   set_layout_info.pBindings = bindings;
++   VkDescriptorSetLayout set_layout;
++   r = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
++                                   &set_layout);
++   require(r == VK_SUCCESS, "create set layout", r);
++   VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2};
++   VkDescriptorPoolCreateInfo pool_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++   pool_info.maxSets = 1;
++   pool_info.poolSizeCount = 1;
++   pool_info.pPoolSizes = &pool_size;
++   VkDescriptorPool descriptor_pool;
++   r = vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool);
++   require(r == VK_SUCCESS, "create descriptor pool", r);
++   VkDescriptorSetAllocateInfo set_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++   set_info.descriptorPool = descriptor_pool;
++   set_info.descriptorSetCount = 1;
++   set_info.pSetLayouts = &set_layout;
++   VkDescriptorSet set;
++   r = vkAllocateDescriptorSets(device, &set_info, &set);
++   require(r == VK_SUCCESS, "allocate descriptor set", r);
++   VkDescriptorImageInfo image_infos[2] = {
++      {VK_NULL_HANDLE, views[0], VK_IMAGE_LAYOUT_GENERAL},
++      {VK_NULL_HANDLE, views[1], VK_IMAGE_LAYOUT_GENERAL}};
++   VkWriteDescriptorSet writes[2]{};
++   for (uint32_t i = 0; i < 2; ++i) {
++      writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++      writes[i].dstSet = set;
++      writes[i].dstBinding = i;
++      writes[i].descriptorCount = 1;
++      writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++      writes[i].pImageInfo = &image_infos[i];
++   }
++   vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
++
++   const VkPushConstantRange push_range{VK_SHADER_STAGE_VERTEX_BIT, 0, 16};
++   VkPipelineLayoutCreateInfo layout_info{
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   layout_info.setLayoutCount = 1;
++   layout_info.pSetLayouts = &set_layout;
++   layout_info.pushConstantRangeCount = 1;
++   layout_info.pPushConstantRanges = &push_range;
++   VkPipelineLayout layout;
++   r = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++   require(r == VK_SUCCESS, "create layout", r);
++
++   VkShaderModule vs = kk_test_shader_module(&t, copy_vert, sizeof(copy_vert));
++   VkShaderModule fs =
++      kk_test_shader_module(&t, color_frag, sizeof(color_frag));
++   VkPipelineShaderStageCreateInfo stages[2]{
++      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
++      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
++   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++   stages[0].module = vs;
++   stages[0].pName = "main";
++   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++   stages[1].module = fs;
++   stages[1].pName = "main";
++   VkPipelineVertexInputStateCreateInfo vi{
++      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++   VkPipelineInputAssemblyStateCreateInfo ia{
++      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++   ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++   VkViewport viewport{0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f};
++   VkRect2D scissor{{0, 0}, {4, 4}};
++   VkPipelineViewportStateCreateInfo vp{
++      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++   vp.viewportCount = 1;
++   vp.pViewports = &viewport;
++   vp.scissorCount = 1;
++   vp.pScissors = &scissor;
++   VkPipelineRasterizationStateCreateInfo rs{
++      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++   rs.lineWidth = 1.0f;
++   VkPipelineMultisampleStateCreateInfo ms{
++      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++   ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++   VkPipelineColorBlendAttachmentState blend_attachment{};
++   blend_attachment.colorWriteMask = 0xf;
++   VkPipelineColorBlendStateCreateInfo blend{
++      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++   blend.attachmentCount = 1;
++   blend.pAttachments = &blend_attachment;
++   VkPipelineRenderingCreateInfo rendering{
++      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++   rendering.colorAttachmentCount = 1;
++   rendering.pColorAttachmentFormats = &color_format;
++   VkGraphicsPipelineCreateInfo pipeline_info{
++      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++   pipeline_info.pNext = &rendering;
++   pipeline_info.stageCount = 2;
++   pipeline_info.pStages = stages;
++   pipeline_info.pVertexInputState = &vi;
++   pipeline_info.pInputAssemblyState = &ia;
++   pipeline_info.pViewportState = &vp;
++   pipeline_info.pRasterizationState = &rs;
++   pipeline_info.pMultisampleState = &ms;
++   pipeline_info.pColorBlendState = &blend;
++   pipeline_info.layout = layout;
++   VkPipeline pipeline;
++   r = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                 nullptr, &pipeline);
++   require(r == VK_SUCCESS, "create pipeline", r);
++
++   VkCommandPool pool;
++   VkCommandBuffer command;
++   kk_test_command_buffer(&t, 0, &pool, &command);
++   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++   r = vkBeginCommandBuffer(command, &begin);
++   require(r == VK_SUCCESS, "begin command", r);
++   VkImageMemoryBarrier barriers[3]{};
++   for (int i = 0; i < 3; ++i) {
++      barriers[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                                      VK_REMAINING_ARRAY_LAYERS};
++   }
++   barriers[0].image = images[0];
++   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++   barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++   barriers[1].image = images[1];
++   barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
++   barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++   barriers[2].image = target;
++   barriers[2].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   barriers[2].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
++                        nullptr, 3, barriers);
++   VkBufferImageCopy copy{};
++   copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
++   copy.imageExtent = {width, width, 1};
++   vkCmdCopyBufferToImage(command, upload, images[0],
++                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
++   VkImageMemoryBarrier to_shader = barriers[0];
++   to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++   to_shader.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++   to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++   to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 0, nullptr, 0,
++                        nullptr, 1, &to_shader);
++   VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++   color.imageView = target_view;
++   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++   VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
++   render.renderArea.extent = {4, 4};
++   render.layerCount = 1;
++   render.colorAttachmentCount = 1;
++   render.pColorAttachments = &color;
++   vkCmdBeginRendering(command, &render);
++   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++   vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
++                           1, &set, 0, nullptr);
++   const int32_t dim[4] = {int32_t(width), int32_t(width), int32_t(layers),
++                           0};
++   vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
++                      sizeof(dim), dim);
++   vkCmdDraw(command, 1, 1, 0, 0);
++   vkCmdEndRendering(command);
++   VkImageMemoryBarrier to_copy = barriers[1];
++   to_copy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++   to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   to_copy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++   to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                        nullptr, 1, &to_copy);
++   vkCmdCopyImageToBuffer(command, images[1],
++                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
++                          &copy);
++   VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++   to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++   to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, nullptr,
++                        0, nullptr);
++   r = vkEndCommandBuffer(command);
++   require(r == VK_SUCCESS, "end command", r);
++
++   r = kk_test_submit_and_wait(&t, command, 20ull * 1000 * 1000 * 1000);
++   require(r == VK_SUCCESS, "submit", r);
++   size_t wrong = 0;
++   for (size_t i = 0; i < bytes / sizeof(float); ++i)
++      wrong += result[i] != source[i];
++   std::printf("validated image access: %ux%ux%u, %zu of %zu floats wrong\n",
++               width, width, layers, wrong, size_t(bytes / sizeof(float)));
++   require(wrong == 0, "every texel of the copy arrived");
++
++   vkDestroyCommandPool(device, pool, nullptr);
++   vkDestroyPipeline(device, pipeline, nullptr);
++   vkDestroyShaderModule(device, vs, nullptr);
++   vkDestroyShaderModule(device, fs, nullptr);
++   vkDestroyPipelineLayout(device, layout, nullptr);
++   vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
++   vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
++   vkDestroyImageView(device, target_view, nullptr);
++   vkDestroyImage(device, target, nullptr);
++   vkFreeMemory(device, target_memory, nullptr);
++   for (int i = 0; i < 2; ++i) {
++      vkDestroyImageView(device, views[i], nullptr);
++      vkDestroyImage(device, images[i], nullptr);
++      vkFreeMemory(device, image_memory[i], nullptr);
++   }
++   vkUnmapMemory(device, readback_memory);
++   vkDestroyBuffer(device, readback, nullptr);
++   vkFreeMemory(device, readback_memory, nullptr);
++   vkUnmapMemory(device, upload_memory);
++   vkDestroyBuffer(device, upload, nullptr);
++   vkFreeMemory(device, upload_memory, nullptr);
++   kk_test_destroy(&t);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag b/src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cb82aac95a07d85aacb206beb3b51953b6bb956
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag
+@@ -0,0 +1,9 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++
++layout(location = 0) out vec4 color;
++
++void main(void)
++{
++   color = vec4(1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag.h b/src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ffecbd4162f83eea23189a908e3ee1c24b6d077
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/validated_image_shaders/color.frag.h
+@@ -0,0 +1,18 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000c,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00030010,0x00000004,
++0x00000007,0x00040047,0x00000009,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00030016,0x00000006,
++0x00000020,0x00040017,0x00000007,0x00000006,
++0x00000004,0x00040020,0x00000008,0x00000003,
++0x00000007,0x0004003b,0x00000008,0x00000009,
++0x00000003,0x0004002b,0x00000006,0x0000000a,
++0x3f800000,0x0007002c,0x00000007,0x0000000b,
++0x0000000a,0x0000000a,0x0000000a,0x0000000a,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0003003e,
++0x00000009,0x0000000b,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert b/src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b613f5a147ba4dcc587199f35fae122400324b3
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert
+@@ -0,0 +1,23 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++
++/* One vertex invocation copies a whole cube map array image texel by texel,
++ * the shape of KHR-GLES31.core.texture_cube_map_array.image_op_vertex_sh. */
++layout(set = 0, binding = 0, rgba32f) uniform readonly imageCubeArray src;
++layout(set = 0, binding = 1, rgba32f) uniform writeonly imageCubeArray dst;
++
++layout(push_constant) uniform Params {
++   ivec4 dim;
++} pc;
++
++void main(void)
++{
++   if (gl_VertexIndex == 0) {
++      for (int x = 0; x < pc.dim.x; ++x)
++         for (int y = 0; y < pc.dim.y; ++y)
++            for (int z = 0; z < pc.dim.z; ++z)
++               imageStore(dst, ivec3(x, y, z), imageLoad(src, ivec3(x, y, z)));
++   }
++   gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
++   gl_PointSize = 1.0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert.h b/src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9b5e4e74c776b2dcd8ba668d753aa66e4e4577d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/validated_image_shaders/copy.vert.h
+@@ -0,0 +1,109 @@
++{0x07230203,0x00010600,0x000d000b,0x0000005f,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000022,0x0006000b,0x00000001,0x4c534c47,
++0x6474732e,0x3035342e,0x00000000,0x0003000e,
++0x00000000,0x00000001,0x000a000f,0x00000000,
++0x00000004,0x6e69616d,0x00000000,0x00000008,
++0x0000001a,0x0000003a,0x00000041,0x00000053,
++0x00040047,0x00000008,0x0000000b,0x0000002a,
++0x00030047,0x00000018,0x00000002,0x00050048,
++0x00000018,0x00000000,0x00000023,0x00000000,
++0x00030047,0x0000003a,0x00000019,0x00040047,
++0x0000003a,0x00000021,0x00000001,0x00040047,
++0x0000003a,0x00000022,0x00000000,0x00030047,
++0x00000041,0x00000018,0x00040047,0x00000041,
++0x00000021,0x00000000,0x00040047,0x00000041,
++0x00000022,0x00000000,0x00030047,0x00000051,
++0x00000002,0x00050048,0x00000051,0x00000000,
++0x0000000b,0x00000000,0x00050048,0x00000051,
++0x00000001,0x0000000b,0x00000001,0x00050048,
++0x00000051,0x00000002,0x0000000b,0x00000003,
++0x00050048,0x00000051,0x00000003,0x0000000b,
++0x00000004,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040020,0x00000007,
++0x00000001,0x00000006,0x0004003b,0x00000007,
++0x00000008,0x00000001,0x0004002b,0x00000006,
++0x0000000a,0x00000000,0x00020014,0x0000000b,
++0x00040017,0x00000017,0x00000006,0x00000004,
++0x0003001e,0x00000018,0x00000017,0x00040020,
++0x00000019,0x00000009,0x00000018,0x0004003b,
++0x00000019,0x0000001a,0x00000009,0x00040015,
++0x0000001b,0x00000020,0x00000000,0x0004002b,
++0x0000001b,0x0000001c,0x00000000,0x00040020,
++0x0000001d,0x00000009,0x00000006,0x0004002b,
++0x0000001b,0x00000028,0x00000001,0x0004002b,
++0x0000001b,0x00000033,0x00000002,0x00030016,
++0x00000037,0x00000020,0x00090019,0x00000038,
++0x00000037,0x00000003,0x00000000,0x00000001,
++0x00000000,0x00000002,0x00000001,0x00040020,
++0x00000039,0x00000000,0x00000038,0x0004003b,
++0x00000039,0x0000003a,0x00000000,0x00040017,
++0x0000003f,0x00000006,0x00000003,0x0004003b,
++0x00000039,0x00000041,0x00000000,0x00040017,
++0x00000047,0x00000037,0x00000004,0x0004002b,
++0x00000006,0x0000004a,0x00000001,0x0004001c,
++0x00000050,0x00000037,0x00000028,0x0006001e,
++0x00000051,0x00000047,0x00000037,0x00000050,
++0x00000050,0x00040020,0x00000052,0x00000003,
++0x00000051,0x0004003b,0x00000052,0x00000053,
++0x00000003,0x0004002b,0x00000037,0x00000054,
++0x00000000,0x0004002b,0x00000037,0x00000055,
++0x3f800000,0x0007002c,0x00000047,0x00000056,
++0x00000054,0x00000054,0x00000054,0x00000055,
++0x00040020,0x00000057,0x00000003,0x00000047,
++0x00040020,0x00000059,0x00000003,0x00000037,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x00000006,0x00000009,0x00000008,0x000500aa,
++0x0000000b,0x0000000c,0x00000009,0x0000000a,
++0x000300f7,0x0000000e,0x00000000,0x000400fa,
++0x0000000c,0x0000000d,0x0000000e,0x000200f8,
++0x0000000d,0x000200f9,0x00000011,0x000200f8,
++0x00000011,0x000700f5,0x00000006,0x0000005b,
++0x0000000a,0x0000000d,0x0000004f,0x00000014,
++0x00060041,0x0000001d,0x0000001e,0x0000001a,
++0x0000000a,0x0000001c,0x0004003d,0x00000006,
++0x0000001f,0x0000001e,0x000500b1,0x0000000b,
++0x00000020,0x0000005b,0x0000001f,0x000400f6,
++0x00000013,0x00000014,0x00000000,0x000400fa,
++0x00000020,0x00000012,0x00000013,0x000200f8,
++0x00000012,0x000200f9,0x00000022,0x000200f8,
++0x00000022,0x000700f5,0x00000006,0x0000005c,
++0x0000000a,0x00000012,0x0000004d,0x00000025,
++0x00060041,0x0000001d,0x00000029,0x0000001a,
++0x0000000a,0x00000028,0x0004003d,0x00000006,
++0x0000002a,0x00000029,0x000500b1,0x0000000b,
++0x0000002b,0x0000005c,0x0000002a,0x000400f6,
++0x00000024,0x00000025,0x00000000,0x000400fa,
++0x0000002b,0x00000023,0x00000024,0x000200f8,
++0x00000023,0x000200f9,0x0000002d,0x000200f8,
++0x0000002d,0x000700f5,0x00000006,0x0000005e,
++0x0000000a,0x00000023,0x0000004b,0x0000002e,
++0x00060041,0x0000001d,0x00000034,0x0000001a,
++0x0000000a,0x00000033,0x0004003d,0x00000006,
++0x00000035,0x00000034,0x000500b1,0x0000000b,
++0x00000036,0x0000005e,0x00000035,0x000400f6,
++0x0000002f,0x0000002e,0x00000000,0x000400fa,
++0x00000036,0x0000002e,0x0000002f,0x000200f8,
++0x0000002e,0x0004003d,0x00000038,0x0000003b,
++0x0000003a,0x00060050,0x0000003f,0x00000040,
++0x0000005b,0x0000005c,0x0000005e,0x0004003d,
++0x00000038,0x00000042,0x00000041,0x00050062,
++0x00000047,0x00000048,0x00000042,0x00000040,
++0x00040063,0x0000003b,0x00000040,0x00000048,
++0x00050080,0x00000006,0x0000004b,0x0000005e,
++0x0000004a,0x000200f9,0x0000002d,0x000200f8,
++0x0000002f,0x000200f9,0x00000025,0x000200f8,
++0x00000025,0x00050080,0x00000006,0x0000004d,
++0x0000005c,0x0000004a,0x000200f9,0x00000022,
++0x000200f8,0x00000024,0x000200f9,0x00000014,
++0x000200f8,0x00000014,0x00050080,0x00000006,
++0x0000004f,0x0000005b,0x0000004a,0x000200f9,
++0x00000011,0x000200f8,0x00000013,0x000200f9,
++0x0000000e,0x000200f8,0x0000000e,0x00050041,
++0x00000057,0x00000058,0x00000053,0x0000000a,
++0x0003003e,0x00000058,0x00000056,0x00050041,
++0x00000059,0x0000005a,0x00000053,0x0000004a,
++0x0003003e,0x0000005a,0x00000055,0x000100fd,
++0x00010038}

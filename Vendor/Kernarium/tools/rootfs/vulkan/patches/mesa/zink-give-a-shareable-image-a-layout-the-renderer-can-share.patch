@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 09:07:05 +0900
+Subject: [PATCH] zink: give a shareable image a layout the renderer can share
+
+A GBM buffer, a DRI3 pixmap and every other image gallium marks
+PIPE_BIND_SHARED must end up as a dma-buf. Zink only ever exports a
+non-optimal image, so such an image is laid out linearly; on a renderer whose
+linear layout is a texture over a buffer, two of the usages zink asks for are
+then impossible and the allocation has no configuration at all.
+
+An input attachment is a render-pass local read. An image laid out for sharing
+never performs one, and a driver that lays such an image out over a buffer may
+not be able to describe one: it needs a two-dimensional array texture, which
+Metal refuses to make from a buffer. Zink already withheld the usage from an
+image bound both PIPE_BIND_LINEAR and PIPE_BIND_SHARED, which covers a caller
+that asked for a linear layout by name but not the far more common one that
+only asked to share. Withhold it from every image whose tiling is not the
+driver's own instead, which is exactly the set that cannot use it. That also
+covers the old rule, because zink never lays out an image bound
+PIPE_BIND_LINEAR optimally.
+
+The colour attachment is the other. A renderer without real tiling has only
+one layout to describe, and may offer it as DRM_FORMAT_MOD_LINEAR rather than
+as VK_IMAGE_TILING_LINEAR, because a modifier is the form a producer and an
+importer can agree on and the form a swapchain image needs. Zink reached the
+modifier only when a caller named one, so a plain gbm_bo_create() produced an
+optimal image with no modifier, and its first export reallocated it as a
+linear image the renderer could not make. Negotiate a shareable image through
+DRM_FORMAT_MOD_LINEAR when the caller named no modifier, so it is created once
+with the capabilities it was asked for and reports a modifier its importer can
+agree on. A staging image is never shared and keeps plain linear tiling.
+
+The modifier negotiation applies only where the driver is Venus with DRM
+format modifiers and external memory fds, so no other driver changes the
+layout it chooses. The input-attachment rule applies to every driver: no
+image outside the driver's own tiling asks for the usage any more.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_resource.c | 39 +++++++++++++++++++-----
+ src/gallium/drivers/zink/zink_screen.h   | 14 +++++++++
+ 2 files changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 08e71cf6034ce6fe806e4aebe2bbd25f94e3fe57..fc273bf1fb3773fd2b38ce2dbb1a7281a7665492 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -410,7 +410,7 @@ check_ici(struct zink_screen *screen, VkImageCreateInfo *ici, uint64_t modifier)
+ }
+ 
+ static VkImageUsageFlags
+-get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feats, const struct pipe_resource *templ, unsigned bind, bool *need_extended)
++get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feats, const struct pipe_resource *templ, unsigned bind, VkImageTiling tiling, bool *need_extended)
+ {
+    VkImageUsageFlags usage = 0;
+    bool is_planar = util_format_get_num_planes(templ->format) > 1;
+@@ -435,7 +435,12 @@ get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feat
+    if (bind & PIPE_BIND_RENDER_TARGET) {
+       if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+          usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+-         if ((bind & (PIPE_BIND_LINEAR | PIPE_BIND_SHARED)) != (PIPE_BIND_LINEAR | PIPE_BIND_SHARED))
++         /* An input attachment is a render-pass local read that an image laid
++          * out for sharing never performs, and a driver that lays such an
++          * image out over a buffer may not be able to describe one at all.
++          * Ask for it only where the image keeps the driver's own layout.
++          */
++         if (tiling == VK_IMAGE_TILING_OPTIMAL)
+             usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+          if (screen->info.have_EXT_attachment_feedback_loop_layout)
+             usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+@@ -580,11 +585,11 @@ build_usage_candidates(struct zink_screen *screen, const struct pipe_resource *t
+       feats = UINT32_MAX;
+ 
+    bool need_extended = false;
+-   VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
++   VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, tiling, &need_extended);
+    if (need_extended) {
+       flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+       feats = UINT32_MAX;
+-      usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
++      usage = get_image_usage_for_feats(screen, feats, templ, bind, tiling, &need_extended);
+    }
+ 
+    /* full usage, mutable required */
+@@ -661,7 +666,9 @@ find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct p
+          try_flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+       ici->flags = try_flags;
+ 
+-      VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
++      VkImageUsageFlags usage = get_image_usage_for_feats(
++         screen, feats, templ, bind, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++         &need_extended);
+       assert(!need_extended);
+       if (try_usage_mutable(screen, ici, usage, modifiers[i])) {
+          found = true;
+@@ -732,7 +739,9 @@ negotiate_image_config(struct zink_screen *screen, VkImageCreateInfo *ici, const
+          VkImageCreateFlags saved_flags = ici->flags;
+          if (feats & VK_FORMAT_FEATURE_DISJOINT_BIT && util_format_get_num_planes(templ->format) > 1)
+             ici->flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+-         VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
++         VkImageUsageFlags usage = get_image_usage_for_feats(
++            screen, feats, templ, bind,
++            VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, &need_extended);
+          assert(!need_extended);
+          if (try_usage_mutable(screen, ici, usage, DRM_FORMAT_MOD_LINEAR)) {
+             mod = DRM_FORMAT_MOD_LINEAR;
+@@ -1652,6 +1661,20 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+                           alloc_info->whandle->modifier != DRM_FORMAT_MOD_INVALID;
+    uint64_t *ici_modifiers = winsys_modifier ? &alloc_info->whandle->modifier : modifiers;
+    unsigned ici_modifier_count = winsys_modifier ? 1 : modifiers_count;
++   /* A renderer that shares a layout only under DRM_FORMAT_MOD_LINEAR has no
++    * image configuration at all for a shareable VK_IMAGE_TILING_LINEAR image,
++    * and reports no layout for one either. Negotiate such an image through
++    * that modifier even when the caller named none, so that it keeps the
++    * capabilities it was asked for and carries a modifier its importer can
++    * agree on. A staging image is never shared and keeps plain linear tiling.
++    */
++   uint64_t implicit_linear_modifier = DRM_FORMAT_MOD_LINEAR;
++   if (!ici_modifier_count && templ->usage != PIPE_USAGE_STAGING &&
++       zink_bind_shares_dmabuf(templ->bind) &&
++       zink_use_venus_linear_modifier(screen)) {
++      ici_modifiers = &implicit_linear_modifier;
++      ici_modifier_count = 1;
++   }
+    unsigned num_planes = util_format_get_num_planes(templ->format);
+    VkImageCreateInfo ici;
+    VkFormat formats[4] = {VK_FORMAT_UNDEFINED};
+@@ -1668,7 +1691,7 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+       mod = negotiate_image_config(screen, &ici, templ, templ->bind, ici_modifier_count, ici_modifiers, fmtlist, &success);
+    }
+    /* images with modifiers MUST have a format list if they are mutable */
+-   if (modifiers_count && ici.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
++   if (ici_modifier_count && ici.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+       assert(ici.pNext != NULL);
+       if (!ici.pNext)
+          return roc_fail_and_free_object;
+@@ -1684,7 +1707,7 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+    }
+    struct image_pnext_state pnext_state;
+    setup_image_pnext(screen, templ, obj, alloc_info, &ici, mod, winsys_modifier,
+-                     modifiers, modifiers_count, &pnext_state);
++                     ici_modifiers, ici_modifier_count, &pnext_state);
+ 
+    if (linear)
+       *linear = ici.tiling == VK_IMAGE_TILING_LINEAR;
+diff --git a/src/gallium/drivers/zink/zink_screen.h b/src/gallium/drivers/zink/zink_screen.h
+index 83662746a7cf5b50e2eefb339a7baa388461d292..9173930bbfce5100b45b68147ca278355aa84094 100644
+--- a/src/gallium/drivers/zink/zink_screen.h
++++ b/src/gallium/drivers/zink/zink_screen.h
+@@ -165,6 +165,20 @@ zink_use_venus_implicit_dmabuf(const struct zink_screen *screen)
+           !screen->info.have_EXT_image_drm_format_modifier;
+ }
+ 
++/* A Venus renderer that shares a linear layout only as DRM_FORMAT_MOD_LINEAR
++ * cannot serve a shareable image created with VK_IMAGE_TILING_LINEAR: its
++ * plain linear tiling is not a colour attachment, while the same bytes named
++ * by the modifier are. The modifier is also the only form that reports a
++ * layout an importer can agree on, so a shareable image takes it even when
++ * the caller named no modifier at all.
++ */
++static inline bool
++zink_use_venus_linear_modifier(const struct zink_screen *screen)
++{
++   return zink_venus_shares_dmabuf(screen) &&
++          screen->info.have_EXT_image_drm_format_modifier;
++}
++
+ static inline uint32_t
+ zink_dmabuf_queue_family(const struct zink_screen *screen)
+ {

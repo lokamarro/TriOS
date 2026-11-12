@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 17:38:02 +0900
+Subject: [PATCH] arm64: single-step x86-64 tasks with RFLAGS.TF
+
+An x86-64 task is stepped with the trap flag, as on native x86: while
+PTRACE_SINGLESTEP is in effect the kernel sets TF for the entry, the
+engine retires one instruction and raises #DB, and the kernel delivers
+SIGTRAP with TRAP_TRACE at the next instruction. A TF the task set
+itself also raises #DB, and only a flag the kernel forced is cleared on
+return, so ptrace and signal frames observe the task's own value. As in
+x86's is_setting_trap_flag(), a stepped POPF or IRET writes TF itself,
+so the kernel leaves the value that instruction produced.
+
+The host reports a step's #DB with DR6.BS in its error code. ICEBP
+raises #DB with BS clear, and the kernel delivers it, as x86 Linux
+does, as SIGTRAP with TRAP_BRKPT at the next instruction.  As in x86's
+exc_debug_user(), each #DB restarts the DR6 a tracer reads from that
+BS bit.
+---
+ arch/arm64/um/ptrace.c           | 49 ++++++++++++++++++++++++++
+ arch/um/os-Darwin/skas/process.c | 60 ++++++++++++++++++++++++++++----
+ 2 files changed, 103 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm64/um/ptrace.c b/arch/arm64/um/ptrace.c
+index f355df97e151ed1cc8dd53909aad7f4c0fee4696..b5928e08d6271161496d9163b97032d115abc5d9 100644
+--- a/arch/arm64/um/ptrace.c
++++ b/arch/arm64/um/ptrace.c
+@@ -167,6 +167,55 @@ static void set_user_regs32(struct uml_pt_regs *guest,
+ 	upt_x86_64_set_segment_selector(guest, 2, regs->ss);
+ }
+ 
++/*
++ * Like x86's is_setting_trap_flag(): whether the instruction a step is about
++ * to run is a POPF or IRET, which writes TF itself, so the flag the kernel
++ * set for the step must not be cleared afterwards. Runs in the stepping
++ * task before it enters the engine; an unreadable byte means no.
++ */
++int uml_x86_64_step_sets_trap_flag(const struct uml_pt_regs *regs)
++{
++	const bool compat = upt_x86_32_task_mode(regs);
++	unsigned long address = UPT_IP(regs);
++	unsigned char opcode;
++	int i;
++
++	for (i = 0; i < 15; i++, address++) {
++		if (compat)
++			address &= 0xffffffffUL;
++		if (copy_from_user_nofault(&opcode,
++					   (const void __user *)address, 1))
++			return 0;
++		switch (opcode) {
++		case 0x9d: /* popf */
++		case 0xcf: /* iret */
++			return 1;
++		case 0x26: case 0x2e: case 0x36: case 0x3e:
++		case 0x64: case 0x65: case 0x66: case 0x67:
++		case 0xf0: case 0xf2: case 0xf3:
++			continue;
++		case 0x40 ... 0x4f:
++			/* REX in long mode; INC or DEC in compat mode. */
++			if (compat)
++				return 0;
++			continue;
++		default:
++			return 0;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Like x86's exc_debug_user(): each #DB restarts the DR6 a tracer reads
++ * from the single-step bit of the status the host reports, so a step
++ * leaves BS set and ICEBP leaves it clear.
++ */
++void uml_x86_64_note_debug_status(unsigned long debug_status)
++{
++	current->thread.arch.debugregs.dr6 = debug_status & UML_X86_64_DR6_STEP;
++}
++
+ unsigned long getreg(struct task_struct *child, int regno)
+ {
+ 	struct user_regs_struct regs;
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index f91352f44970b439b330d3b538274b3445a41392..9eb94479273d2bc898a29169a51c6b7ac7e60dd1 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -115,6 +115,35 @@ _Static_assert(UML_ARM64_SME_P_OFFSET(64, 3) ==
+  * valid_user_regs() does, so saved, traced and signal-frame registers never
+  * carry it.  Returns whether the bit was set for this entry.
+  */
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++/*
++ * An x86 task steps with RFLAGS.TF, which raises #DB after one instruction.
++ * A task may set TF itself; only a flag the kernel forced is cleared again,
++ * so ptrace and signal frames observe the task's own value.
++ */
++#define DARWIN_GUEST_RFLAGS_TF (1UL << 8)
++/* DR6.BS: the #DB is a single step rather than ICEBP. */
++#define DARWIN_GUEST_DR6_BS (1UL << 14)
++
++extern int uml_x86_64_step_sets_trap_flag(const struct uml_pt_regs *regs);
++extern void uml_x86_64_note_debug_status(unsigned long debug_status);
++
++static int begin_guest_step(struct uml_pt_regs *regs)
++{
++	if (!singlestepping() ||
++	    (UPT_X86_64_RFLAGS(regs) & DARWIN_GUEST_RFLAGS_TF))
++		return 0;
++	UPT_X86_64_RFLAGS(regs) |= DARWIN_GUEST_RFLAGS_TF;
++	/* A stepped POPF or IRET writes TF itself: leave its result. */
++	return !uml_x86_64_step_sets_trap_flag(regs);
++}
++
++static void end_guest_step(struct uml_pt_regs *regs, int stepping)
++{
++	if (stepping)
++		UPT_X86_64_RFLAGS(regs) &= ~DARWIN_GUEST_RFLAGS_TF;
++}
++#else
+ static int begin_guest_step(struct uml_pt_regs *regs)
+ {
+ 	if (!singlestepping())
+@@ -128,6 +157,7 @@ static void end_guest_step(struct uml_pt_regs *regs, int stepping)
+ 	if (stepping)
+ 		UPT_PSTATE(regs) &= ~DARWIN_GUEST_PSTATE_SS;
+ }
++#endif
+ 
+ /*
+  * The dispatch flags of the guest registers hold facts about the task for
+@@ -720,19 +750,37 @@ void userspace(struct uml_pt_regs *registers)
+ 		case DARWIN_UML_EVENT_BREAKPOINT:
+ 		{
+ 			siginfo_t signal_info = { 0 };
+-
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++			/* The host reports a #DB's DR6 as its error code. */
++			unsigned long debug_status =
++				(unsigned long)registers->faultinfo.error_code;
++#else
+ 			/* A completed single step is the software-step exception,
+ 			 * which native arm64 reports as TRAP_TRACE at the next PC. */
+ 			int stepped = registers->faultinfo.trap_no ==
+ 				DARWIN_GUEST_SOFTWARE_STEP;
++#endif
+ 
+ 			registers->faultinfo.cr2 = UPT_IP(registers);
+ #ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
+-			if (registers->faultinfo.trap_no == 4 ||
+-			    registers->faultinfo.trap_no == 5 ||
+-			    registers->faultinfo.trap_no ==
+-			    DARWIN_GUEST_X86_TRAP_SS ||
+-			    registers->faultinfo.trap_no == 13) {
++			if (registers->faultinfo.trap_no == 1) {
++				/* #DB after an instruction.  As on native Linux, DR6.BS
++				 * marks a TF single step, reported as TRAP_TRACE, and
++				 * ICEBP leaves DR6 clear and gets TRAP_BRKPT; both name
++				 * the next instruction. */
++				registers->faultinfo.error_code = 0;
++				uml_x86_64_note_debug_status(debug_status);
++				signal_info.si_signo = SIGTRAP;
++				signal_info.si_errno = 0;
++				signal_info.si_code =
++					debug_status & DARWIN_GUEST_DR6_BS ?
++					TRAP_TRACE : TRAP_BRKPT;
++				signal_info.si_addr = (void *)UPT_IP(registers);
++			} else if (registers->faultinfo.trap_no == 4 ||
++				   registers->faultinfo.trap_no == 5 ||
++				   registers->faultinfo.trap_no ==
++				   DARWIN_GUEST_X86_TRAP_SS ||
++				   registers->faultinfo.trap_no == 13) {
+ 				/* #OF from INTO or INT 4, #BR from BOUND, #SS from a
+ 				 * non-canonical stack address, and a #GP such as RDTSC
+ 				 * under PR_TSC_SIGSEGV reach native userspace with

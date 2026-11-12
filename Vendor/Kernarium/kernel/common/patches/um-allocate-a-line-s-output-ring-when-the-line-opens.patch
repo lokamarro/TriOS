@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:01:56 +0900
+Subject: [PATCH] um: allocate a line's output ring when the line opens
+
+line_write() holds the line's spinlock with interrupts off, and the
+first time a host channel takes less than a write offers it allocated
+the line's 4 KiB output ring with GFP_ATOMIC. When that failed it
+printed an error, buffered nothing and returned what the host took,
+while write_room() went on reporting the room of a ring it did not
+have.
+
+The line discipline relies on that report. Output processing writes a
+character it has room for through do_output_char() and ignores what
+write() returns, so with OPOST set every character that reached a full
+host channel while the allocation failed was counted as written and
+lost, and the writer never waited.
+
+Allocate the ring when the line first opens, which may sleep, and keep
+it as before. A write then never allocates, and a full ring holds the
+writer back through write_room() instead of losing its output. Opening
+a line takes 4 KiB at once that the first full host channel took
+before; a line nobody opens takes nothing.
+---
+ arch/um/drivers/line.c | 41 ++++++++++++++++++++++++++++++-----------
+ arch/um/drivers/line.h |  4 ++--
+ 2 files changed, 32 insertions(+), 13 deletions(-)
+
+diff --git a/arch/um/drivers/line.c b/arch/um/drivers/line.c
+index 7936f500e0b29c99724b47f759d9d745abc5f3c9..ffa37c3e25dc8b88d270a5471dbf8fc7734611be 100644
+--- a/arch/um/drivers/line.c
++++ b/arch/um/drivers/line.c
+@@ -87,17 +87,6 @@ static int buffer_data(struct line *line, const u8 *buf, size_t len)
+ {
+ 	int end, room;
+ 
+-	if (line->buffer == NULL) {
+-		line->buffer = kmalloc(LINE_BUFSIZE, GFP_ATOMIC);
+-		if (line->buffer == NULL) {
+-			printk(KERN_ERR "buffer_data - atomic allocation "
+-			       "failed\n");
+-			return 0;
+-		}
+-		line->head = line->buffer;
+-		line->tail = line->buffer;
+-	}
+-
+ 	room = write_room(line);
+ 	len = (len > room) ? room : len;
+ 
+@@ -288,11 +277,41 @@ int line_setup_irq(int fd, int input, int output, struct line *line, void *data)
+ 	return 0;
+ }
+ 
++/*
++ * A line's ring is allocated when the line first opens and kept, so a write,
++ * which runs with the line's lock held, never allocates. write_room() then
++ * reports only room the ring has, which the line discipline relies on: it
++ * writes a character it has room for without checking what write() returns.
++ */
++static int line_alloc_buffer(struct line *line)
++{
++	unsigned long flags;
++	u8 *buffer;
++
++	if (line->buffer)
++		return 0;
++
++	buffer = kmalloc(LINE_BUFSIZE, GFP_KERNEL);
++	if (!buffer)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&line->lock, flags);
++	line->buffer = buffer;
++	line->head = buffer;
++	line->tail = buffer;
++	spin_unlock_irqrestore(&line->lock, flags);
++	return 0;
++}
++
+ static int line_activate(struct tty_port *port, struct tty_struct *tty)
+ {
+ 	int ret;
+ 	struct line *line = tty->driver_data;
+ 
++	ret = line_alloc_buffer(line);
++	if (ret)
++		return ret;
++
+ 	ret = enable_chan(line);
+ 	if (ret)
+ 		return ret;
+diff --git a/arch/um/drivers/line.h b/arch/um/drivers/line.h
+index 899b54b5d48cc917677ffc34d970dc89d9701d88..fe5425e9656b05dd7ce96be5976860650904c59d 100644
+--- a/arch/um/drivers/line.h
++++ b/arch/um/drivers/line.h
+@@ -47,8 +47,8 @@ struct line {
+ 	/* Yes, this is a real circular buffer.
+ 	 * XXX: And this should become a struct kfifo!
+ 	 *
+-	 * buffer points to a buffer allocated on demand, of length
+-	 * LINE_BUFSIZE, head to the start of the ring, tail to the end.*/
++	 * buffer points to a buffer allocated when the line first opens, of
++	 * length LINE_BUFSIZE, head to the start of the ring, tail to the end.*/
+ 	u8 *buffer;
+ 	u8 *head;
+ 	u8 *tail;

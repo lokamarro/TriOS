@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 21:05:08 +0900
+Subject: [PATCH] vulkan/wsi/x11: bound the swapchain event wait
+
+---
+ src/vulkan/wsi/wsi_common_x11.c | 65 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index bb03c04a581900990683ff1980c5b6fced8f5f3e..22e394140ddbba7aefd5e1695f08adfc23e96d79 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -40,6 +40,7 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <poll.h>
+ #include <string.h>
+ #include <fcntl.h>
+ #include "drm-uapi/drm_fourcc.h"
+@@ -2266,6 +2267,62 @@ static unsigned x11_driver_owned_images(const struct x11_swapchain *chain)
+    return chain->base.image_count - chain->sent_image_count;
+ }
+ 
++/* Longest the event thread sleeps before it re-reads the swapchain state.
++ *
++ * The loop blocks whenever it believes the server owes it a Present event,
++ * and the loop below treats the server owning two or more presented images as
++ * that guarantee.  It is not one.  A compositor keeps the buffer it is
++ * currently showing for as long as the window stays mapped, so the matching
++ * PresentIdleNotify may never be sent; and an application that destroys its
++ * window before the swapchain that presented to it leaves the server with no
++ * present state for the window at all, so nothing further is sent either.
++ * xcb_wait_for_special_event() cannot be interrupted, so a swapchain torn
++ * down in either state deadlocks on the thrd_join() in x11_swapchain_destroy().
++ * Bounding the wait costs one poll wakeup per interval while the server still
++ * owes an event, and lets teardown proceed within the same interval.
++ */
++#define X11_EVENT_WAIT_MS 100
++
++/* Wait for the next Present event of this swapchain, or for the bound above.
++ * Returns NULL both when the wait expired and when the connection failed;
++ * *surface_lost separates the two.
++ */
++static xcb_generic_event_t *
++x11_await_special_event(struct x11_swapchain *chain, bool *surface_lost)
++{
++   *surface_lost = false;
++
++   /* Poll first: another thread on this connection may already have read the
++    * event into our queue, in which case the descriptor is no longer ready.
++    */
++   xcb_generic_event_t *event =
++      xcb_poll_for_special_event(chain->conn, chain->special_event);
++   if (event != NULL)
++      return event;
++   if (xcb_connection_has_error(chain->conn)) {
++      *surface_lost = true;
++      return NULL;
++   }
++
++   struct pollfd descriptor = {
++      .fd = xcb_get_file_descriptor(chain->conn),
++      .events = POLLIN,
++   };
++   int ready;
++   do {
++      ready = poll(&descriptor, 1, X11_EVENT_WAIT_MS);
++   } while (ready < 0 && errno == EINTR);
++
++   /* xcb_poll_for_special_event() drains the connection and routes whatever
++    * it reads, so a descriptor that was ready for another queue does not spin
++    * this loop.
++    */
++   event = xcb_poll_for_special_event(chain->conn, chain->special_event);
++   if (event == NULL && xcb_connection_has_error(chain->conn))
++      *surface_lost = true;
++   return event;
++}
++
+ /* This thread is responsible for pumping PRESENT replies.
+  * This is done in a separate thread from the X11 presentation thread
+  * to be able to support non-blocking modes like IMMEDIATE and MAILBOX.
+@@ -2317,10 +2374,16 @@ x11_manage_event_queue(void *state)
+       if (assume_forward_progress) {
+          /* Only yield lock when blocking on X11 event. */
+          mtx_unlock(&chain->thread_state_lock);
++         bool surface_lost = false;
+          xcb_generic_event_t *event =
+-               xcb_wait_for_special_event(chain->conn, chain->special_event);
++               x11_await_special_event(chain, &surface_lost);
+          mtx_lock(&chain->thread_state_lock);
+ 
++         /* The wait expired with nothing to report: re-read the swapchain
++          * status and what the server still owes, then wait again. */
++         if (event == NULL && !surface_lost)
++            continue;
++
+          /* Re-check status since we dropped the lock while waiting for X. */
+          VkResult result = chain->status;
+ 

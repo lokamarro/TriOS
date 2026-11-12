@@ -1,0 +1,527 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 27 Aug 2026 08:24:25 +0900
+Subject: [PATCH] uml: use one scalable Darwin native address profile
+
+Use one sparse Apple guest address contract, size the native hole from configured RAM, give auxiliary mappings a RAM-sized allowance within the supported bounds, and let vmalloc consume that whole window.
+---
+ arch/arm64/Makefile.um                        | 46 ++++--------
+ arch/arm64/um/asm/mman.h                      | 23 ++++++
+ arch/arm64/um/signal.c                        |  3 +-
+ arch/um/include/asm/processor-generic.h       |  2 +-
+ arch/um/include/asm/tlbflush.h                |  7 +-
+ arch/um/include/asm/uaccess.h                 | 10 +++
+ arch/um/include/shared/darwin-address-space.h | 38 ++++++++++
+ arch/um/kernel/tlb.c                          | 37 ++++++++++
+ arch/um/kernel/trap.c                         |  7 +-
+ arch/um/kernel/um_arch.c                      | 70 ++++++++++++++++---
+ arch/um/os-Darwin/skas/process.c              |  9 +--
+ arch/um/os-Darwin/uml_darwin_abi.h            |  6 +-
+ arch/um/os-Darwin/uml_darwin_abi_identity.h   |  4 +-
+ 13 files changed, 208 insertions(+), 54 deletions(-)
+ create mode 100644 arch/um/include/shared/darwin-address-space.h
+
+diff --git a/arch/arm64/Makefile.um b/arch/arm64/Makefile.um
+index ecf8bbeb93d1b784561f0d9457af06be4699f5d9..77705ea9267c8a5fa09a0b01a069c43fafa3a738 100644
+--- a/arch/arm64/Makefile.um
++++ b/arch/arm64/Makefile.um
+@@ -1,49 +1,33 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ # Keep native kernel mappings disjoint from the software guest task range.
+-# iOS processes with Extended Virtual Addressing have a much smaller host VM
+-# ceiling than macOS. Their shared device/Simulator embedded kernel is linked
+-# at the bottom of a relocatable signed envelope below 62 GiB.
+-UML_DARWIN_ADDRESS_SPACE ?= standard
+-ifeq ($(UML_DARWIN_ADDRESS_SPACE),standard)
+-START := 0x600000000000
+-UML_DARWIN_TASK_SIZE := 0x400000000000UL
+-UML_DARWIN_GUEST_ADDRESS_LIMIT := 0x600000000000UL
+-UML_DARWIN_HOST_TASK_SIZE := 0x700000000000UL
+-UML_DARWIN_TASK_UNMAPPED_BASE := 0x100000000000UL
+-UML_DARWIN_NATIVE_ADDRESS_START := 0x600000000000UL
+-UML_DARWIN_NATIVE_ADDRESS_END := 0x600000000000UL
+-UML_DARWIN_NATIVE_AUXILIARY_SIZE := 0x0UL
+-UML_DARWIN_DYNAMIC_NATIVE_LAYOUT := 0
+-UML_DARWIN_SIGRETURN_TRAMPOLINE := 0x3fffffffff00ULL
+-UML_DARWIN_ALIGN_TASK_SIZE_TO_PGDIR := 1
+-else ifeq ($(UML_DARWIN_ADDRESS_SPACE),ios-device)
++# The auxiliary half of the hole is address space, not memory: vmalloc's pages
++# come from the guest page allocator and are already bounded by mem=. It tracks
++# RAM one-for-one between a 1 GiB floor and a 4 GiB ceiling so vmalloc is never
++# the binding constraint; the ceiling keeps RAM plus auxiliary inside the
++# 14 GiB iOS envelope for every guest up to 10 GiB.
++# All Apple products use one relocatable image, RAM-scaled native hole, and
++# sparse guest range. The kernel is linked at the bottom of the iOS envelope;
++# the host loader keeps it below 62 GiB on iOS and moves the same bytes into
++# macOS's high native window. The kernel derives its host top from the actual
++# relocated image base rather than a platform-specific compile-time ceiling.
+ START := 0xc00000000
+ UML_DARWIN_TASK_SIZE := 0x800000000000UL
+ UML_DARWIN_GUEST_ADDRESS_LIMIT := 0x800000000000UL
+-UML_DARWIN_HOST_TASK_SIZE := 0xf80000000UL
+ UML_DARWIN_TASK_UNMAPPED_BASE := 0x1000000000UL
+-UML_DARWIN_NATIVE_ADDRESS_START := 0xc00000000UL
+ UML_DARWIN_NATIVE_ADDRESS_END := 0xf80000000UL
+-UML_DARWIN_NATIVE_AUXILIARY_SIZE := 0x100000000UL
+-UML_DARWIN_DYNAMIC_NATIVE_LAYOUT := 1
++UML_DARWIN_NATIVE_AUXILIARY_MINIMUM := 0x40000000UL
++UML_DARWIN_NATIVE_AUXILIARY_MAXIMUM := 0x100000000UL
+ UML_DARWIN_SIGRETURN_TRAMPOLINE := 0x7fffffffff00ULL
+-UML_DARWIN_ALIGN_TASK_SIZE_TO_PGDIR := 1
+-else
+-$(error unsupported UML_DARWIN_ADDRESS_SPACE=$(UML_DARWIN_ADDRESS_SPACE))
+-endif
+ 
+ KBUILD_CFLAGS += \
+ 	-DUML_DARWIN_TASK_SIZE=$(UML_DARWIN_TASK_SIZE) \
+ 	-DUML_DARWIN_GUEST_ADDRESS_LIMIT=$(UML_DARWIN_GUEST_ADDRESS_LIMIT) \
+-	-DUML_DARWIN_HOST_TASK_SIZE=$(UML_DARWIN_HOST_TASK_SIZE) \
+ 	-DUML_DARWIN_TASK_UNMAPPED_BASE=$(UML_DARWIN_TASK_UNMAPPED_BASE) \
+-	-DUML_DARWIN_NATIVE_ADDRESS_START=$(UML_DARWIN_NATIVE_ADDRESS_START) \
+ 	-DUML_DARWIN_NATIVE_ADDRESS_END=$(UML_DARWIN_NATIVE_ADDRESS_END) \
+-	-DUML_DARWIN_NATIVE_AUXILIARY_SIZE=$(UML_DARWIN_NATIVE_AUXILIARY_SIZE) \
+-	-DUML_DARWIN_DYNAMIC_NATIVE_LAYOUT=$(UML_DARWIN_DYNAMIC_NATIVE_LAYOUT) \
+-	-DDARWIN_UML_SIGRETURN_TRAMPOLINE=$(UML_DARWIN_SIGRETURN_TRAMPOLINE) \
+-	-DUML_DARWIN_ALIGN_TASK_SIZE_TO_PGDIR=$(UML_DARWIN_ALIGN_TASK_SIZE_TO_PGDIR)
++	-DUML_DARWIN_NATIVE_AUXILIARY_MINIMUM=$(UML_DARWIN_NATIVE_AUXILIARY_MINIMUM) \
++	-DUML_DARWIN_NATIVE_AUXILIARY_MAXIMUM=$(UML_DARWIN_NATIVE_AUXILIARY_MAXIMUM) \
++	-DDARWIN_UML_SIGRETURN_TRAMPOLINE=$(UML_DARWIN_SIGRETURN_TRAMPOLINE)
+ 
+ # The embedded ELF must be relocatable so its Darwin imports can be fixed up
+ # by the Mach-O launcher.  The image itself is much smaller than the small
+diff --git a/arch/arm64/um/asm/mman.h b/arch/arm64/um/asm/mman.h
+index 56ab3b4245323f6a57b73cef75b801c55aa5fd76..2a075458f6d6e6a70a6c3429ab0aa809048ef4ae 100644
+--- a/arch/arm64/um/asm/mman.h
++++ b/arch/arm64/um/asm/mman.h
+@@ -4,4 +4,27 @@
+ 
+ #include <asm-generic/mman.h>
+ 
++#ifdef UML_HOST_DARWIN
++#include <linux/errno.h>
++#include <darwin-address-space.h>
++
++static inline int uml_darwin_mmap_check(unsigned long address,
++					unsigned long length,
++					unsigned long flags)
++{
++	/* A zero non-fixed address asks the generic allocator to choose a range.
++	 * Darwin's TASK_UNMAPPED_BASE and top-down base both live above the native
++	 * kernel window.  A nonzero address is either a fixed placement or a hint;
++	 * reject native-window hints rather than allowing the generic fast path to
++	 * return them unchanged.
++	 */
++	if (address == 0 && !(flags & MAP_FIXED))
++		return 0;
++	return uml_darwin_guest_range(address, length) ? 0 : -EINVAL;
++}
++
++#define arch_mmap_check(address, length, flags) \
++	uml_darwin_mmap_check(address, length, flags)
++#endif
++
+ #endif
+diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
+index 3eae2bc63d71328fdc0a1ba1c5de0832641b1102..1b8d3a726ec4b17e88bbecb795b980a3bdb446d9 100644
+--- a/arch/arm64/um/signal.c
++++ b/arch/arm64/um/signal.c
+@@ -33,7 +33,8 @@ struct uml_arm64_frame_record {
+  * STACK_TOP, and the Darwin host runs the rt_sigreturn syscall itself when a
+  * task reaches this address, so no executable guest stack is needed.
+  */
+-#define UML_DARWIN_SIGRETURN_TRAMPOLINE 0x3fffffffff00UL
++#define UML_DARWIN_SIGRETURN_TRAMPOLINE \
++	(UML_DARWIN_TASK_SIZE - 0x100UL)
+ 
+ /*
+  * Unwinders (libgcc, which glibc's backtrace() and thread cancellation use,
+diff --git a/arch/um/include/asm/processor-generic.h b/arch/um/include/asm/processor-generic.h
+index dfcbfa025d624d2498f4f3e4421811f82daea62e..9e9f2c7f127f78532c554ee958d458884077d630 100644
+--- a/arch/um/include/asm/processor-generic.h
++++ b/arch/um/include/asm/processor-generic.h
+@@ -71,7 +71,7 @@ extern unsigned long stacksizelim;
+  * above that host reservation.  Linux still owns the guest virtual address
+  * space; the Darwin shadow-MMU maps these addresses into this process.
+  */
+-#define TASK_UNMAPPED_BASE	(0x100000000000UL)
++#define TASK_UNMAPPED_BASE	(UML_DARWIN_TASK_UNMAPPED_BASE)
+ #else
+ #define TASK_UNMAPPED_BASE	(0x40000000)
+ #endif
+diff --git a/arch/um/include/asm/tlbflush.h b/arch/um/include/asm/tlbflush.h
+index 1e7594036606ee51401df5750cb83863ebec9871..d048fa81f9085ec54c5150abca3c53ef49b73efd 100644
+--- a/arch/um/include/asm/tlbflush.h
++++ b/arch/um/include/asm/tlbflush.h
+@@ -38,6 +38,8 @@ extern int um_tlb_sync_locked(struct mm_struct *mm);
+ extern void darwin_tlb_invalidate_range(struct mm_struct *mm,
+ 					unsigned long start,
+ 					unsigned long end);
++extern void darwin_tlb_flush_range(struct mm_struct *mm, unsigned long start,
++				   unsigned long end);
+ #endif
+ 
+ extern void flush_tlb_all(void);
+@@ -56,9 +58,10 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
+ static inline void flush_tlb_range(struct vm_area_struct *vma,
+ 				   unsigned long start, unsigned long end)
+ {
+-	um_tlb_mark_sync(vma->vm_mm, start, end);
+ #ifdef UML_HOST_DARWIN
+-	darwin_tlb_invalidate_range(vma->vm_mm, start, end);
++	darwin_tlb_flush_range(vma->vm_mm, start, end);
++#else
++	um_tlb_mark_sync(vma->vm_mm, start, end);
+ #endif
+ }
+ 
+diff --git a/arch/um/include/asm/uaccess.h b/arch/um/include/asm/uaccess.h
+index 1c6e0ae41b0c5a7251e5ae81bfc57b21f739cec3..b435f1b5c30e8d4aec59db9c353649836bf3173b 100644
+--- a/arch/um/include/asm/uaccess.h
++++ b/arch/um/include/asm/uaccess.h
+@@ -10,10 +10,20 @@
+ #include <asm/elf.h>
+ #include <linux/unaligned.h>
+ #include <sysdep/faultinfo.h>
++#ifdef UML_HOST_DARWIN
++#include <darwin-address-space.h>
++#endif
+ 
++#ifdef UML_HOST_DARWIN
++#define __under_task_size(addr, size) \
++	(((unsigned long) (addr) < TASK_SIZE) && \
++	 (((unsigned long) (addr) + (size)) < TASK_SIZE) && \
++	 uml_darwin_guest_range((unsigned long)(addr), (unsigned long)(size)))
++#else
+ #define __under_task_size(addr, size) \
+ 	(((unsigned long) (addr) < TASK_SIZE) && \
+ 	 (((unsigned long) (addr) + (size)) < TASK_SIZE))
++#endif
+ 
+ #define __access_ok_vsyscall(addr, size) \
+ 	  (((unsigned long) (addr) >= FIXADDR_USER_START) && \
+diff --git a/arch/um/include/shared/darwin-address-space.h b/arch/um/include/shared/darwin-address-space.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fd6bd965bb5ada99d3f51edc4776a2238b300bb
+--- /dev/null
++++ b/arch/um/include/shared/darwin-address-space.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_DARWIN_ADDRESS_SPACE_H
++#define __UM_DARWIN_ADDRESS_SPACE_H
++
++extern unsigned long uml_physmem;
++extern unsigned long uml_darwin_native_end;
++
++static inline unsigned long uml_darwin_native_address_start(void)
++{
++	return uml_physmem;
++}
++
++static inline unsigned long uml_darwin_native_address_end(void)
++{
++	return uml_darwin_native_end;
++}
++
++static inline int uml_darwin_guest_range(unsigned long address,
++					 unsigned long length)
++{
++	unsigned long native_start = uml_darwin_native_address_start();
++	unsigned long native_end = uml_darwin_native_address_end();
++	unsigned long end;
++
++	if (address >= UML_DARWIN_GUEST_ADDRESS_LIMIT ||
++	    (address >= native_start &&
++	     address < native_end))
++		return 0;
++	if (length == 0)
++		return 1;
++	if (length > UML_DARWIN_GUEST_ADDRESS_LIMIT - address)
++		return 0;
++	end = address + length;
++	return end <= native_start ||
++		address >= native_end;
++}
++
++#endif
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 2585bfa7e23fde21bc6c9984389124388ca818d5..1db28abe9d40c61beccfd70c3920d82b9eeecbc2 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -15,6 +15,9 @@
+ #include <os.h>
+ #include <skas.h>
+ #include <kern_util.h>
++#ifdef UML_HOST_DARWIN
++#include <darwin-address-space.h>
++#endif
+ 
+ struct vm_ops {
+ 	struct mm_id *mm_idp;
+@@ -639,6 +642,40 @@ void darwin_tlb_invalidate_range(struct mm_struct *mm, unsigned long start,
+ 		panic("Darwin: unable to invalidate guest mm %lu range %#lx-%#lx",
+ 		      mm->context.id.darwin_generation, start, end);
+ }
++
++static void darwin_tlb_flush_guest_range(struct mm_struct *mm,
++					 unsigned long start,
++					 unsigned long end)
++{
++	if (end <= start)
++		return;
++	um_tlb_mark_sync(mm, start, end);
++	darwin_tlb_invalidate_range(mm, start, end);
++}
++
++/*
++ * No user mapping lies in the native window, yet a user flush can cover it.
++ * Freeing a page table widens the flush to the table's whole span, which
++ * starts inside the window when the table also maps the first pages above
++ * it, and one munmap() can free tables on both sides.  The host takes a
++ * range inside the window for the kernel's own mappings there, whether the
++ * flush drops it or a later replay unmaps it, so a user mm flushes only the
++ * guest ranges beside the window.
++ */
++void darwin_tlb_flush_range(struct mm_struct *mm, unsigned long start,
++			    unsigned long end)
++{
++	unsigned long native_start = uml_darwin_native_address_start();
++	unsigned long native_end = uml_darwin_native_address_end();
++
++	if (mm == &init_mm) {
++		um_tlb_mark_sync(mm, start, end);
++		return;
++	}
++	end = min_t(unsigned long, end, UML_DARWIN_GUEST_ADDRESS_LIMIT);
++	darwin_tlb_flush_guest_range(mm, start, min(end, native_start));
++	darwin_tlb_flush_guest_range(mm, max(start, native_end), end);
++}
+ #endif
+ 
+ void flush_tlb_mm(struct mm_struct *mm)
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index 41d0c399dbb0fca2d0a42c0eb3ab1bcc0b216f89..82adf37a8519edcc21e7cf41db9fd0641caef52f 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -18,6 +18,7 @@
+ #include <skas.h>
+ 
+ #ifdef UML_HOST_DARWIN
++#include <darwin-address-space.h>
+ extern int darwin_uml_vm_retry_fault(unsigned long address, int execute,
+ 				     int write);
+ #endif
+@@ -389,7 +390,11 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
+ 		show_regs(container_of(regs, struct pt_regs, regs));
+ 		panic("Segfault with no mm");
+ 	}
+-	else if (!is_user && address > PAGE_SIZE && address < TASK_SIZE) {
++	else if (!is_user && address > PAGE_SIZE && address < TASK_SIZE
++#ifdef UML_HOST_DARWIN
++		 && uml_darwin_guest_range(address, 1)
++#endif
++		 ) {
+ 		show_regs(container_of(regs, struct pt_regs, regs));
+ 		panic("Kernel tried to access user memory at addr 0x%lx, ip 0x%lx",
+ 		       address, ip);
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+index 30450cd585995344a780e0f58076f2bfd39de7e1..9fd3d449bb7ec0bb34f63527add349bb0041d3e3 100644
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -125,6 +125,9 @@ const struct seq_operations cpuinfo_op = {
+ /* Set in linux_main */
+ unsigned long uml_physmem;
+ EXPORT_SYMBOL(uml_physmem);
++#ifdef UML_HOST_DARWIN
++unsigned long uml_darwin_native_end = UML_DARWIN_NATIVE_ADDRESS_END;
++#endif
+ 
+ unsigned long uml_reserved; /* Also modified in mem_init */
+ unsigned long start_vm;
+@@ -298,16 +301,48 @@ static void __init parse_cache_line(char *line)
+ 	}
+ }
+ 
++#ifdef UML_HOST_DARWIN
++static unsigned long __init darwin_native_auxiliary_size(
++	unsigned long long memory)
++{
++	unsigned long size = PAGE_ALIGN(memory);
++
++	if (size < UML_DARWIN_NATIVE_AUXILIARY_MINIMUM)
++		size = UML_DARWIN_NATIVE_AUXILIARY_MINIMUM;
++	/*
++	 * Capped so RAM plus auxiliary stays inside the signed iOS envelope.
++	 * What vmalloc consumes is bounded by the guest page allocator, not by
++	 * the size of this reservation.
++	 */
++	if (size > UML_DARWIN_NATIVE_AUXILIARY_MAXIMUM)
++		size = UML_DARWIN_NATIVE_AUXILIARY_MAXIMUM;
++	return size;
++}
++#endif
++
+ static unsigned long __init get_top_address(char **envp)
+ {
+ #ifdef UML_HOST_DARWIN
++	unsigned long memory = (physmem_size + PAGE_SIZE - 1) & PAGE_MASK;
++	unsigned long auxiliary = darwin_native_auxiliary_size(memory);
++	unsigned long native_start =
++		(unsigned long)__binary_start & PAGE_MASK;
++
+ 	/*
+-	 * Darwin places the initial pthread stack near 6 GiB, below the linked
+-	 * UML kernel.  Use an explicit free high window for kernel vmalloc; guest
+-	 * mappings are capped below the kernel separately.
++	 * The host relocates one ET_DYN image into either iOS's low signed window
++	 * or macOS's high native window. Derive the kernel top from that runtime
++	 * base and the same RAM-scaled auxiliary rule instead of baking either
++	 * platform's host ceiling into the shared image.
+ 	 */
+ 	(void)envp;
+-	return 0x700000000000UL;
++	if (native_start >= UML_DARWIN_GUEST_ADDRESS_LIMIT ||
++	    memory > UML_DARWIN_GUEST_ADDRESS_LIMIT - native_start ||
++	    auxiliary > UML_DARWIN_GUEST_ADDRESS_LIMIT - native_start - memory) {
++		os_warn("Darwin native window exceeds guest address limit\n");
++		exit(1);
++	}
++	uml_darwin_native_end = native_start + memory + auxiliary;
++	return uml_darwin_native_end;
+ #else
+ 	unsigned long top_addr = (unsigned long) &top_addr;
+ 	int i;
+@@ -329,6 +364,9 @@ int __init linux_main(int argc, char **argv, char **envp)
+ {
+ 	unsigned long avail, diff;
+ 	unsigned long virtmem_size, max_physmem;
++#ifdef UML_HOST_DARWIN
++	unsigned long auxiliary_size;
++#endif
+ 	unsigned long stack;
+ 	unsigned int i;
+ 	int add;
+@@ -355,15 +393,16 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 	/* Limit TASK_SIZE to what is addressable by the page table */
+ 	task_size = host_task_size;
+ #ifdef UML_HOST_DARWIN
+-	/* Keep every same-process guest mapping below the kernel ELF window. */
+-	task_size = 0x400000000000UL;
++	/* The Darwin software MMU can place guest mappings on both sides of the
++	 * compact native kernel window shared by every Apple product. */
++	task_size = UML_DARWIN_TASK_SIZE;
+ #endif
+ 	if (task_size > (unsigned long long) PTRS_PER_PGD * PGDIR_SIZE)
+ 		task_size = PTRS_PER_PGD * PGDIR_SIZE;
+ 
+-	/*
+-	 * TASK_SIZE needs to be PGDIR_SIZE aligned or else exit_mmap craps
+-	 * out
++	/* Keep the task boundary on a whole PGD.  The compact Darwin native
++	 * window is a hole inside the first guest PGD span, not the end of the
++	 * sparse software-MMU address space.
+ 	 */
+ 	task_size = task_size & PGDIR_MASK;
+ 
+@@ -422,9 +461,20 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 	avail = stack - start_vm;
+ #ifdef UML_HOST_DARWIN
+ 	avail = host_task_size - start_vm;
+-#endif
++	auxiliary_size = darwin_native_auxiliary_size(physmem_size);
++	if (avail > auxiliary_size)
++		avail = auxiliary_size;
++	/*
++	 * vmalloc owns the whole auxiliary window rather than only as much of
++	 * it as there is RAM. Clamping to physmem_size would leave the tail of
++	 * the window past end_vm, where the kernel fault handler no longer
++	 * recognises a vmalloc address.
++	 */
++	virtmem_size = avail;
++#else
+ 	if (physmem_size > avail)
+ 		virtmem_size = avail;
++#endif
+ 	end_vm = start_vm + virtmem_size;
+ 
+ 	if (virtmem_size < physmem_size)
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 2ea6a61ce805cf312d28fa380522bf3ac98ce724..a860e1afc2be28ae194842b54d6f6747be03e590 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -11,6 +11,7 @@
+ #include <kern_util.h>
+ #include <longjmp.h>
+ #include <os.h>
++#include <darwin-address-space.h>
+ #include <skas.h>
+ #include <smp.h>
+ #include <sys/mman.h>
+@@ -22,8 +23,8 @@
+  * These checks make an ABI drift fail at the kernel compiler rather than at a
+  * guest boundary after register state has been reinterpreted. */
+ _Static_assert(sizeof(unsigned long) == 8, "Darwin UML ABI requires LP64");
+-_Static_assert(DARWIN_UML_ABI_VERSION == 6U, "unexpected ABI version");
+-_Static_assert(DARWIN_UML_ABI_FINGERPRINT == 0x7bfd9a6505527c44ULL,
++_Static_assert(DARWIN_UML_ABI_VERSION == 8U, "unexpected ABI version");
++_Static_assert(DARWIN_UML_ABI_FINGERPRINT == 0x3871ad612337ea76ULL,
+ 	       "unexpected ABI fingerprint");
+ _Static_assert(offsetof(struct uml_pt_regs, orig_x0) ==
+ 	      DARWIN_UML_ABI_GUEST_REGISTERS_ORIGINAL_X0_OFFSET,
+@@ -446,7 +447,7 @@ void userspace(struct uml_pt_regs *registers)
+ 			 * into the shadow MMU before asking Linux to resolve a real
+ 			 * guest page fault.
+ 			 */
+-			if (fault >= 4096 && fault < 0x600000000000UL) {
++			if (fault >= 4096 && uml_darwin_guest_range(fault, 1)) {
+ 				current_mm_force_sync(fault);
+ 				retry = darwin_uml_vm_retry_fault(fault,
+ 					FAULT_EXECUTE(registers->faultinfo),
+@@ -481,7 +482,7 @@ void userspace(struct uml_pt_regs *registers)
+ 			}
+ 			segv(registers->faultinfo, UPT_IP(registers), 1,
+ 			     registers, NULL);
+-			if (fault >= 4096 && fault < 0x600000000000UL) {
++			if (fault >= 4096 && uml_darwin_guest_range(fault, 1)) {
+ 				int write = FAULT_WRITE(registers->faultinfo);
+ 
+ 				if (current_mm_prefault_host_slot(fault, write) < 0)
+diff --git a/arch/um/os-Darwin/uml_darwin_abi.h b/arch/um/os-Darwin/uml_darwin_abi.h
+index a3df85afed6284a5bfd3cdb817605b953b30ffce..4a3c5fdf3aee3e15cd60e29d4f847f95460ca82e 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi.h
++++ b/arch/um/os-Darwin/uml_darwin_abi.h
+@@ -69,7 +69,9 @@ enum {
+ 	(DARWIN_UML_FLOATING_POINT_EC | DARWIN_UML_FLOATING_POINT_IL | \
+ 	 DARWIN_UML_FLOATING_POINT_TFV)
+ 
++#ifndef DARWIN_UML_SIGRETURN_TRAMPOLINE
+ #define DARWIN_UML_SIGRETURN_TRAMPOLINE 0x3fffffffff00ULL
++#endif
+ #define DARWIN_UML_NR_RT_SIGRETURN 139ULL
+ 
+ struct darwin_uml_faultinfo {
+@@ -118,8 +120,8 @@ struct darwin_uml_guest_fp_registers {
+ 
+ #if defined(__cplusplus)
+ #include <stddef.h>
+-static_assert(DARWIN_UML_ABI_VERSION == 6U);
+-static_assert(DARWIN_UML_ABI_FINGERPRINT == 0x7bfd9a6505527c44ULL);
++static_assert(DARWIN_UML_ABI_VERSION == 8U);
++static_assert(DARWIN_UML_ABI_FINGERPRINT == 0x3871ad612337ea76ULL);
+ static_assert(DARWIN_UML_EVENT_FLOATING_POINT_TRAP == 7);
+ static_assert(DARWIN_UML_EVENT_PC_ALIGNMENT == 8);
+ static_assert(DARWIN_UML_EVENT_STOP == 9);
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index b9a71eca27ab9e6670d9bcff938daf540db54a32..3dd57da3e4fe970b1d8385230a5828d7e7cc3109 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 6U
+-#define DARWIN_UML_ABI_FINGERPRINT 0x7bfd9a6505527c44ULL
++#define DARWIN_UML_ABI_VERSION 8U
++#define DARWIN_UML_ABI_FINGERPRINT 0x3871ad612337ea76ULL
+ 
+ #endif

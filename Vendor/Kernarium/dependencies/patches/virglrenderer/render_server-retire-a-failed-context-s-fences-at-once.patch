@@ -1,0 +1,412 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:31:18 +0900
+Subject: [PATCH] render_server: retire a failed context's fences at once
+
+A Venus context whose ring failed rejects every command from then on,
+and the fences it had accepted are never retired by the work they
+follow: the sync thread waits on queue submissions that were never made.
+The client waits on one of them until the host gives up on it, 30 s in
+this project, and only then reads the failed ring and ends. The render
+worker also stopped reading the context's socket at its first rejected
+command, so a fence request queued behind it was never read either.
+
+Tell the worker when a ring fails, through a new optional renderer
+callback, and retire at that moment the newest fence it accepted on each
+timeline. A fence it accepts later retires on arrival. When a command
+is rejected the worker destroys the context as before, and then keeps
+serving the socket until the client closes it, retiring fences,
+refusing resource creations and reading past commands, instead of
+leaving requests unread.
+
+A timeline never moves back: a sync thread that retires an older fence
+after a failure no longer takes it from the newer one.
+
+The client is released at once instead of after the host's overdue-fence
+escape, and its next ring access sees the failure and ends the process.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ server/render_context.c  | 159 ++++++++++++++++++++++++++++++++++++---
+ server/render_context.h  |  17 +++++
+ server/render_state.c    |   9 +++
+ src/venus/vkr_context.c  |   5 ++
+ src/venus/vkr_context.h  |   2 +
+ src/venus/vkr_renderer.c |   1 +
+ src/venus/vkr_renderer.h |   8 ++
+ 7 files changed, 192 insertions(+), 9 deletions(-)
+
+diff --git a/server/render_context.c b/server/render_context.c
+index b44b5b583888d5c400bfa90485b82385415e5be5..165cffc4e493eb7a7dfa6089a6685e8aa03e1a57 100644
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -17,12 +17,40 @@ render_context_update_timeline(struct render_context *ctx,
+                                uint32_t ring_idx,
+                                uint32_t seqno)
+ {
+-   /* this can be called by the context's main thread and sync threads */
+-   atomic_store(&ctx->shmem_timelines[ring_idx], seqno);
++   /* this can be called by the context's main thread and sync threads, and
++    * by a ring's thread after a failure, so a late retirement of an older
++    * fence must not take the timeline back from a newer one */
++   atomic_uint *timeline = &ctx->shmem_timelines[ring_idx];
++   uint32_t cur = atomic_load(timeline);
++   while ((int32_t)(seqno - cur) > 0 &&
++          !atomic_compare_exchange_weak(timeline, &cur, seqno))
++      ;
+    if (ctx->fence_eventfd >= 0)
+       write_eventfd(ctx->fence_eventfd, 1);
+ }
+ 
++/* Publishes the newest fence of every timeline as retired. The caller holds
++ * the fence mutex. */
++static void
++render_context_retire_accepted_locked(struct render_context *ctx)
++{
++   if (!ctx->last_fences)
++      return;
++   for (int i = 0; i < ctx->timeline_count; i++) {
++      if (ctx->last_fences[i].valid)
++         render_context_update_timeline(ctx, i, ctx->last_fences[i].seqno);
++   }
++}
++
++void
++render_context_on_fatal(struct render_context *ctx)
++{
++   mtx_lock(&ctx->fence_mutex);
++   ctx->failed = true;
++   render_context_retire_accepted_locked(ctx);
++   mtx_unlock(&ctx->fence_mutex);
++}
++
+ static bool
+ render_context_dispatch_submit_fence(struct render_context *ctx,
+                                      const union render_context_op_request *request,
+@@ -34,8 +62,18 @@ render_context_dispatch_submit_fence(struct render_context *ctx,
+    /* always merge fences */
+    assert(!(req->flags & ~VIRGL_RENDERER_FENCE_FLAG_MERGEABLE));
+    assert(req->ring_index < (uint32_t)ctx->timeline_count);
+-   return render_state_submit_fence(ctx->ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+-                                    req->ring_index, req->seqno);
++   if (!render_state_submit_fence(ctx->ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
++                                  req->ring_index, req->seqno))
++      return false;
++
++   /* fences retire in order on a timeline, so the newest implies the rest */
++   mtx_lock(&ctx->fence_mutex);
++   ctx->last_fences[req->ring_index].seqno = req->seqno;
++   ctx->last_fences[req->ring_index].valid = true;
++   if (ctx->failed)
++      render_context_update_timeline(ctx, req->ring_index, req->seqno);
++   mtx_unlock(&ctx->fence_mutex);
++   return true;
+ }
+ 
+ static bool
+@@ -140,11 +178,22 @@ render_context_dispatch_init(struct render_context *ctx,
+    if (shmem_ptr == MAP_FAILED)
+       return false;
+ 
++   struct render_context_fence *last_fences = calloc(timeline_count, sizeof(*last_fences));
++   if (!last_fences) {
++      munmap(shmem_ptr, req->shmem_size);
++      return false;
++   }
++
+    if (!render_state_create_context(ctx, req->flags, ctx->name_len, ctx->name)) {
++      free(last_fences);
+       munmap(shmem_ptr, req->shmem_size);
+       return false;
+    }
+ 
++   mtx_lock(&ctx->fence_mutex);
++   ctx->last_fences = last_fences;
++   mtx_unlock(&ctx->fence_mutex);
++
+    ctx->shmem_fd = shmem_fd;
+    ctx->shmem_size = req->shmem_size;
+    ctx->shmem_ptr = shmem_ptr;
+@@ -195,7 +244,16 @@ static const struct render_context_dispatch_entry
+ #undef RENDER_CONTEXT_DISPATCH
+    };
+ 
+-static bool
++enum render_context_dispatch_result {
++   /* the request was served */
++   RENDER_CONTEXT_DISPATCH_OK,
++   /* the client is gone, or sent a request that cannot be read */
++   RENDER_CONTEXT_DISPATCH_CLOSED,
++   /* the request failed, which ends the context */
++   RENDER_CONTEXT_DISPATCH_FAILED,
++};
++
++static enum render_context_dispatch_result
+ render_context_dispatch(struct render_context *ctx)
+ {
+    union render_context_op_request req;
+@@ -205,7 +263,7 @@ render_context_dispatch(struct render_context *ctx)
+    if (!render_socket_receive_request_with_fds(&ctx->socket, &req, sizeof(req), &req_size,
+                                                req_fds, ARRAY_SIZE(req_fds),
+                                                &req_fd_count))
+-      return false;
++      return RENDER_CONTEXT_DISPATCH_CLOSED;
+ 
+    assert((unsigned int)req_fd_count <= ARRAY_SIZE(req_fds));
+ 
+@@ -228,20 +286,98 @@ render_context_dispatch(struct render_context *ctx)
+       goto fail;
+    }
+ 
+-   return true;
++   return RENDER_CONTEXT_DISPATCH_OK;
+ 
+ fail:
+    for (int i = 0; i < req_fd_count; i++)
+       close(req_fds[i]);
+-   return false;
++   return RENDER_CONTEXT_DISPATCH_FAILED;
++}
++
++/* Serves what a failed context is still sent, until its client goes away: a
++ * fence retires at once, because the work it follows will never complete, and
++ * the client learns that from the failed ring and the failed submissions,
++ * not from a fence that stays busy. Every other request is answered as the
++ * failed context answers it, or dropped. */
++static bool
++render_context_serve_failed(struct render_context *ctx)
++{
++   union render_context_op_request req;
++   size_t req_size;
++   int req_fds[8];
++   int req_fd_count;
++   if (!render_socket_receive_request_with_fds(&ctx->socket, &req, sizeof(req), &req_size,
++                                               req_fds, ARRAY_SIZE(req_fds),
++                                               &req_fd_count))
++      return false;
++
++   bool ok = true;
++   if (req.header.op < RENDER_CONTEXT_OP_COUNT &&
++       render_context_dispatch_table[req.header.op].expect_size == req_size) {
++      switch (req.header.op) {
++      case RENDER_CONTEXT_OP_SUBMIT_FENCE:
++         if (req.submit_fence.ring_index < (uint32_t)ctx->timeline_count) {
++            render_context_update_timeline(ctx, req.submit_fence.ring_index,
++                                           req.submit_fence.seqno);
++         }
++         break;
++      case RENDER_CONTEXT_OP_SUBMIT_CMD:
++         /* the command's tail follows as a message of its own: read it past */
++         if (req.submit_cmd.size > sizeof(req.submit_cmd.cmd)) {
++            const size_t remain = req.submit_cmd.size - sizeof(req.submit_cmd.cmd);
++            void *tail = malloc(remain);
++            ok = tail && render_socket_receive_data(&ctx->socket, tail, remain);
++            free(tail);
++         }
++         break;
++      case RENDER_CONTEXT_OP_CREATE_RESOURCE: {
++         const struct render_context_op_create_resource_reply reply = {
++            .fd_type = VIRGL_RESOURCE_FD_INVALID,
++         };
++         ok = render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++         break;
++      }
++      default:
++         break;
++      }
++   }
++
++   for (int i = 0; i < req_fd_count; i++)
++      close(req_fds[i]);
++   return ok;
++}
++
++static void
++render_context_fail(struct render_context *ctx)
++{
++   /* Destroying the context joins its sync threads and ring threads, so
++    * nothing writes a timeline once it returns and what the context did
++    * not finish is not going to be finished. */
++   render_state_destroy_context(ctx->ctx_id);
++
++   /* Retire every fence it accepted: a waiter on one is waiting for work that
++    * is gone, and would otherwise wait for the host to give up on it. */
++   render_context_on_fatal(ctx);
++
++   while (render_context_serve_failed(ctx))
++      ;
+ }
+ 
+ static bool
+ render_context_run(struct render_context *ctx)
+ {
+    while (true) {
+-      if (!render_context_dispatch(ctx))
++      switch (render_context_dispatch(ctx)) {
++      case RENDER_CONTEXT_DISPATCH_OK:
++         break;
++      case RENDER_CONTEXT_DISPATCH_FAILED:
++         /* a context that never started accepted nothing to retire */
++         if (ctx->last_fences)
++            render_context_fail(ctx);
+          return false;
++      case RENDER_CONTEXT_DISPATCH_CLOSED:
++         return false;
++      }
+    }
+ 
+    return true;
+@@ -264,6 +400,9 @@ render_context_fini(struct render_context *ctx)
+    if (ctx->name)
+       free(ctx->name);
+ 
++   free(ctx->last_fences);
++   mtx_destroy(&ctx->fence_mutex);
++
+    render_socket_fini(&ctx->socket);
+ }
+ 
+@@ -343,6 +482,7 @@ render_context_init(struct render_context *ctx, const struct render_context_args
+    render_socket_init(&ctx->socket, args->ctx_fd);
+    ctx->shmem_fd = -1;
+    ctx->fence_eventfd = -1;
++   mtx_init(&ctx->fence_mutex, mtx_plain);
+ 
+    if (!render_context_init_name(ctx, args->ctx_id, args->ctx_name))
+       return false;
+@@ -363,6 +503,7 @@ render_context_main(const struct render_context_args *args)
+    }
+ 
+    if (!render_context_init(&ctx, args)) {
++      mtx_destroy(&ctx.fence_mutex);
+       render_state_fini();
+       close(args->ctx_fd);
+       return false;
+diff --git a/server/render_context.h b/server/render_context.h
+index 24435ab0b1dd776f278c5bb3c03ea10a3ca4da40..88b482b13bbedf01693e75cce9e316684d907106 100644
+--- a/server/render_context.h
++++ b/server/render_context.h
+@@ -10,6 +10,8 @@
+ 
+ #include <stdatomic.h>
+ 
++#include "c11/threads.h"
++
+ struct render_context {
+    uint32_t ctx_id;
+    struct render_socket socket;
+@@ -25,6 +27,16 @@ struct render_context {
+ 
+    int timeline_count;
+ 
++   /* Shared with the thread of a ring that fails: the newest fence this
++    * context accepted on each timeline (timeline_count entries), and whether
++    * the context has failed, after which every fence retires on arrival. */
++   mtx_t fence_mutex;
++   struct render_context_fence {
++      uint32_t seqno;
++      bool valid;
++   } *last_fences;
++   bool failed;
++
+    /* optional */
+    int fence_eventfd;
+ };
+@@ -49,4 +61,9 @@ render_context_update_timeline(struct render_context *ctx,
+                                uint32_t ring_idx,
+                                uint32_t val);
+ 
++/* A ring of the context failed: retire the fences it accepted, and every one
++ * it accepts from now on, because the work they follow will not complete. */
++void
++render_context_on_fatal(struct render_context *ctx);
++
+ #endif /* RENDER_CONTEXT_H */
+diff --git a/server/render_state.c b/server/render_state.c
+index bc7f8e16debdcdd603eb4596f48bc83cbbd12903..0e95dd4f287842ba70e5e99189ba5a677a16c6f3 100644
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -113,11 +113,20 @@ render_state_cb_retire_fence(uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_
+    render_context_update_timeline(ctx, ring_idx, seqno);
+ }
+ 
++static void
++render_state_cb_context_fatal(uint32_t ctx_id)
++{
++   struct render_context *ctx = render_state_lookup_context(ctx_id);
++   if (ctx)
++      render_context_on_fatal(ctx);
++}
++
+ static const struct vkr_renderer_callbacks render_state_cbs = {
+ #ifndef ENABLE_SAME_PROCESS_RENDER_SERVER
+    .debug_logger = render_state_cb_debug_logger,
+ #endif
+    .retire_fence = render_state_cb_retire_fence,
++   .context_fatal = render_state_cb_context_fatal,
+ };
+ 
+ static void
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 5fc6b43d9fc0dff013a1e6ab2f8f82ea2f0a3cd1..623486be6fe5b6ce9408afa532781cb0a9a07203 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -577,6 +577,11 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
+    mtx_lock(&ctx->wait_ring.mutex);
+    cnd_signal(&ctx->wait_ring.cond);
+    mtx_unlock(&ctx->wait_ring.mutex);
++
++   /* Nothing reads the context's other rings or its fence requests until the
++    * client sends another command, so tell the owner now. */
++   if (ctx->context_fatal)
++      ctx->context_fatal(ctx->ctx_id);
+ }
+ 
+ bool
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index e38f98895fdb531df18fb0752d035697129d2d08..c19ca2daf9bf7fa7b0373141683a8a8e39fcf6a3 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -75,6 +75,8 @@ enum vkr_context_validate_level {
+ struct vkr_context {
+    uint32_t ctx_id;
+    vkr_renderer_retire_fence_callback_type retire_fence;
++   /* optional */
++   vkr_renderer_context_fatal_callback_type context_fatal;
+ 
+    char *debug_name;
+    enum vkr_context_validate_level validate_level;
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 1b39488843090e9ea3be81d131390fe6003ae559..99dd8e298fbfa954910fd50229b634f76c04e2f9 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -238,6 +238,7 @@ vkr_renderer_create_context(uint32_t ctx_id,
+    ctx = vkr_context_create(ctx_id, vkr_state.cbs->retire_fence, nlen, name);
+    if (!ctx)
+       return false;
++   ctx->context_fatal = vkr_state.cbs->context_fatal;
+ 
+    list_addtail(&ctx->head, &vkr_state.contexts);
+ 
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index 807757c3e7c81cb307a8bd0a3c030259ce4ec253..f5867d07dc0233e71e33758b360de6bb4b4e8981 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -32,9 +32,17 @@ struct vkr_renderer_device_memory_pool {
+    void (*release)(void *data, uint64_t size);
+ };
+ 
++/* A context's ring has failed, from the ring's thread, with no lock of the
++ * context held. The context rejects every command from then on, and its
++ * fences are not going to be retired by the work they follow.
++ */
++typedef void (*vkr_renderer_context_fatal_callback_type)(uint32_t ctx_id);
++
+ struct vkr_renderer_callbacks {
+    virgl_log_callback_type debug_logger;
+    vkr_renderer_retire_fence_callback_type retire_fence;
++   /* optional */
++   vkr_renderer_context_fatal_callback_type context_fatal;
+ };
+ 
+ size_t

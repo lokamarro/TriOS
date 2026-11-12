@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:04:32 +0900
+Subject: [PATCH] um: tell the Darwin host how the guest ended
+
+A guest that restarts, powers off or halts ends its run the same way
+for the host, which could tell them apart only by the exit status: 2
+after a restart and /proc/exitcode otherwise, where the guest's root
+can set any exitcode, 2 included. The command of a restart, such as
+`reboot recovery`, was dropped on the way. A host that boots the same
+machine again after a restart needs both.
+
+Bridge ABI 26 adds darwin_uml_guest_shutdown(kind, command).
+machine_restart(), machine_power_off() and machine_halt() call it with
+DARWIN_UML_SHUTDOWN_RESTART, _POWER_OFF or _HALT before uml_cleanup()
+runs the exitcalls, so the host has the intent even if an exitcall
+never returns. A restart passes its command, NULL when the guest gave
+none, and the host copies what it keeps. machine_halt() no longer goes
+through machine_power_off(), so a halt reports as a halt.
+
+kernel_restart_prepare() and kernel_shutdown_prepare() run
+device_shutdown() before machine_*(), so a driver whose .shutdown never
+returns would keep the intent from the host, and only a host stop could
+end the run. A reboot notifier of the highest priority reports it as
+well, from SYS_RESTART with the command, SYS_HALT and SYS_POWER_OFF,
+before any driver is shut down. The report machine_*() makes later
+replaces it. Both reports are compiled out of a kernel that is not
+built for the Darwin host.
+
+A panic still aborts the process and reports nothing, and main() keeps
+its return values. Every kernel imports the function, the x86_64 slice
+included.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/include/shared/os.h                 | 10 ++++
+ arch/um/kernel/reboot.c                     | 55 ++++++++++++++++++++-
+ arch/um/os-Darwin/skas/process.c            |  8 +++
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |  4 +-
+ arch/um/os-Darwin/uml_darwin_host.h         | 15 ++++++
+ 5 files changed, 88 insertions(+), 4 deletions(-)
+
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index bb6fb24d7d7721ccee69c209073b498b2a1e85aa..baa005982001744d04629b405948124d2e100a95 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -354,6 +354,16 @@ extern void initial_thread_cb_skas(void (*proc)(void *),
+ 				 void *arg);
+ extern void halt_skas(void);
+ extern void reboot_skas(void);
++/*
++ * How the guest ends, as the bridge's DARWIN_UML_SHUTDOWN_* kinds, which
++ * kernel code cannot include; os-Darwin/skas/process.c checks the values.
++ */
++#define UML_SHUTDOWN_POWER_OFF	1
++#define UML_SHUTDOWN_HALT	2
++#define UML_SHUTDOWN_RESTART	3
++#ifdef UML_HOST_DARWIN
++extern void darwin_uml_guest_shutdown(int kind, const char *command);
++#endif
+ 
+ /* irq.c */
+ extern int os_waiting_for_events_epoll(void);
+diff --git a/arch/um/kernel/reboot.c b/arch/um/kernel/reboot.c
+index 680bce4bd8fa7a8117a57700cb840d3fe43a9f3a..80b4be00ac0bffe51e569a6682b2cf035e5abf25 100644
+--- a/arch/um/kernel/reboot.c
++++ b/arch/um/kernel/reboot.c
+@@ -9,6 +9,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/slab.h>
+ #include <linux/oom.h>
++#include <linux/notifier.h>
+ #include <linux/reboot.h>
+ #include <kern_util.h>
+ #include <os.h>
+@@ -43,22 +44,72 @@ void uml_cleanup(void)
+ 	kill_off_processes();
+ }
+ 
+-void machine_restart(char * __unused)
++static void uml_report_shutdown(int kind, const char *command)
+ {
++#ifdef UML_HOST_DARWIN
++	darwin_uml_guest_shutdown(kind, command);
++#endif
++}
++
++/*
++ * The host is told how the guest ends before the exitcalls run, so that the
++ * intent stays on record if one of them never returns.
++ */
++void machine_restart(char *command)
++{
++	uml_report_shutdown(UML_SHUTDOWN_RESTART, command);
+ 	uml_cleanup();
+ 	reboot_skas();
+ }
+ 
+ void machine_power_off(void)
+ {
++	uml_report_shutdown(UML_SHUTDOWN_POWER_OFF, NULL);
+ 	uml_cleanup();
+ 	halt_skas();
+ }
+ 
+ void machine_halt(void)
+ {
+-	machine_power_off();
++	uml_report_shutdown(UML_SHUTDOWN_HALT, NULL);
++	uml_cleanup();
++	halt_skas();
++}
++
++/*
++ * kernel_restart_prepare() and kernel_shutdown_prepare() run device_shutdown()
++ * before machine_restart(), machine_halt() and machine_power_off(), and a
++ * driver whose .shutdown never returns would keep the intent from the host.
++ * The reboot notifiers run first, so the intent is reported from one as well;
++ * the report machine_*() makes later replaces it.
++ */
++static int uml_shutdown_notify(struct notifier_block *nb, unsigned long action,
++			       void *data)
++{
++	switch (action) {
++	case SYS_RESTART:
++		uml_report_shutdown(UML_SHUTDOWN_RESTART, data);
++		break;
++	case SYS_HALT:
++		uml_report_shutdown(UML_SHUTDOWN_HALT, NULL);
++		break;
++	case SYS_POWER_OFF:
++		uml_report_shutdown(UML_SHUTDOWN_POWER_OFF, NULL);
++		break;
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block uml_shutdown_nb = {
++	.notifier_call = uml_shutdown_notify,
++	.priority = INT_MAX,
++};
++
++static int register_shutdown_report(void)
++{
++	return register_reboot_notifier(&uml_shutdown_nb);
+ }
++core_initcall(register_shutdown_report);
+ 
+ static int sys_power_off_handler(struct sys_off_data *data)
+ {
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 3c1e95c811b6f5a0d237723edd5148fd42d1f2e1..07c0695ddf9a836c63f53646bf2a2417fe96a240 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -52,6 +52,14 @@ _Static_assert(UML_ARM64_FAULT_EXECUTE == DARWIN_UML_FAULT_EXECUTE,
+ 	       "fault execute bit drift");
+ _Static_assert(UML_ARM64_FAULT_PAGE == DARWIN_UML_FAULT_PAGE,
+ 	       "fault page trap drift");
++/* The kernel tells the host how the guest ends with its own spelling of the
++ * bridge's shutdown kinds. */
++_Static_assert(UML_SHUTDOWN_POWER_OFF == DARWIN_UML_SHUTDOWN_POWER_OFF,
++	       "power-off shutdown kind drift");
++_Static_assert(UML_SHUTDOWN_HALT == DARWIN_UML_SHUTDOWN_HALT,
++	       "halt shutdown kind drift");
++_Static_assert(UML_SHUTDOWN_RESTART == DARWIN_UML_SHUTDOWN_RESTART,
++	       "restart shutdown kind drift");
+ /* The kernel side reads an arm64 task's SME registers through its mirror. */
+ _Static_assert(UML_ARM64_FP_REGISTERS_SIZE ==
+ 	       DARWIN_UML_ABI_GUEST_SME_REGISTERS_OFFSET,
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index 397d5e7467868f6911a82afc578d452ab43a68c6..f9e50b7ee00cb39e57bae199a6980c02b45c8ad6 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 25U
+-#define DARWIN_UML_ABI_FINGERPRINT 0x52dddc0658948841ULL
++#define DARWIN_UML_ABI_VERSION 26U
++#define DARWIN_UML_ABI_FINGERPRINT 0x1d7ce579d497fc37ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_host.h b/arch/um/os-Darwin/uml_darwin_host.h
+index d4e0f91623ebf7f683e389780cda5686e605f80b..23c18901190f393ba43dce6db2413bf793f3fae0 100644
+--- a/arch/um/os-Darwin/uml_darwin_host.h
++++ b/arch/um/os-Darwin/uml_darwin_host.h
+@@ -15,6 +15,21 @@ int darwin_uml_stop_requested(void);
+ void darwin_uml_abort(void) __attribute__((noreturn));
+ void darwin_uml_exit(int status, void *caller) __attribute__((noreturn));
+ 
++/* How the guest ended: the first argument of darwin_uml_guest_shutdown(). */
++enum darwin_uml_shutdown_kind {
++	DARWIN_UML_SHUTDOWN_POWER_OFF = 1,
++	DARWIN_UML_SHUTDOWN_HALT = 2,
++	DARWIN_UML_SHUTDOWN_RESTART = 3,
++};
++
++/*
++ * The kernel says how the guest is ending, before it runs its exitcalls, so
++ * the intent stays on record if an exitcall never returns. command is the
++ * restart command the guest passed, or NULL; the host copies what it keeps.
++ * A panic does not call this: it aborts the process.
++ */
++void darwin_uml_guest_shutdown(int kind, const char *command);
++
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,672 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 16:51:38 +0900
+Subject: [PATCH] protocol: serialize device-address commands and maintenance
+ features
+
+Append device-address command IDs after the ones upstream assigns, without
+changing any existing ID or alias. Transport the maintenance8 capability
+structures and their chained inputs through the paired driver and renderer
+codecs, and keep VkMemoryBarrierAccessFlags3KHR reachable from VkMemoryBarrier2
+even though vk.xml cannot list a context-dependent child in structextends.
+
+Upstream now carries maintenance 8 to 11 and VkCmdEndRendering2, so what
+remains here is VK_KHR_device_address_commands, whose twenty-one command IDs
+follow upstream's last assignment.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ README                                |   8 ++
+ tests/driver.c                        |  38 ++++++
+ tests/main.c                          | 161 +++++++++++++++++++++++++-
+ tests/meson.build                     |   3 +
+ tests/renderer.c                      |  21 ++++
+ tests/test_stream.h                   |  84 ++++++++++++++
+ tests/test_vn_protocol.py             |  54 +++++++++
+ tests/vkr_cs.h                        |  26 ++++-
+ tests/vn_cs.h                         |  19 ++-
+ vn_protocol.py                        |  11 ++
+ xmls/VK_EXT_command_serialization.xml |  23 ++++
+ 11 files changed, 437 insertions(+), 11 deletions(-)
+ create mode 100644 tests/test_stream.h
+ create mode 100644 tests/test_vn_protocol.py
+
+diff --git a/README b/README
+index cc84bda25ae0a1fb580e508602360356628fda77..2c7c3018311402de663144bfdbabea81371d2f68 100644
+--- a/README
++++ b/README
+@@ -10,3 +10,11 @@ Add an extension
+  - add an extension string to VK_XML_EXTENSION_LIST
+  - update VK_EXT_command_serialization.xml with the help of
+    print_vk_command_types.py
++
++Test generated codecs
++
++ - meson test -C build --print-errorlogs
++
++The C roundtrip uses bounded test-only stream and decoder storage to check
++maintenance8 memory-barrier child chains, root-chain filtering, and truncated
++input rejection.  Python tests check registry aliases, wire IDs, and pNext scope.
+diff --git a/tests/driver.c b/tests/driver.c
+index 92b9d958c49a74bbc25f3fec01d47dfe73d61263..ce7375c77531d36e83d351ed249ef873c7aefb67 100644
+--- a/tests/driver.c
++++ b/tests/driver.c
+@@ -4,3 +4,41 @@
+  */
+ 
+ #include "vn_protocol_driver.h"
++
++bool
++vn_test_encode_dependency(const VkDependencyInfo *info, struct vn_test_stream *stream)
++{
++    *stream = (struct vn_test_stream){ 0 };
++    struct vn_cs_encoder enc = { .stream = stream };
++    const size_t size = vn_sizeof_VkDependencyInfo(info);
++    if (!vn_cs_encoder_reserve(&enc, size))
++        return false;
++    vn_encode_VkDependencyInfo(&enc, info);
++    return !stream->fatal && stream->size == size;
++}
++
++void
++vn_test_encode_invalid_dependency_chain(struct vn_test_stream *stream,
++                                        bool after_range_info)
++{
++    const VkMemoryRangeBarriersInfoKHR range_info = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_RANGE_BARRIERS_INFO_KHR,
++    };
++    const VkMemoryBarrierAccessFlags3KHR flags3 = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR,
++    };
++    *stream = (struct vn_test_stream){ 0 };
++    struct vn_cs_encoder enc = { .stream = stream };
++
++    /* Deliberately inject an invalid wire sibling, bypassing root filtering. */
++    if (after_range_info) {
++        vn_encode_simple_pointer(&enc, &range_info);
++        vn_encode_VkStructureType(&enc, &range_info.sType);
++    }
++    vn_encode_simple_pointer(&enc, &flags3);
++    vn_encode_VkStructureType(&enc, &flags3.sType);
++    vn_encode_simple_pointer(&enc, NULL);
++    vn_encode_VkMemoryBarrierAccessFlags3KHR_self(&enc, &flags3);
++    if (after_range_info)
++        vn_encode_VkMemoryRangeBarriersInfoKHR_self(&enc, &range_info);
++}
+diff --git a/tests/main.c b/tests/main.c
+index 5792f2cf7eb5c3abf5746986009b1f847df1088b..bd8881f278c70372ebbe4e54a66d17fc26a3d97a 100644
+--- a/tests/main.c
++++ b/tests/main.c
+@@ -3,7 +3,164 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
+-int main(int argc, char **argv)
++#include <stdio.h>
++
++#include "test_stream.h"
++
++#define CHECK(cond) do { \
++    if (!(cond)) { \
++        fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #cond); \
++        return false; \
++    } \
++} while (0)
++
++static bool
++test_memory_barriers(bool with_flags3, bool with_ranges)
++{
++    const VkMemoryBarrierAccessFlags3KHR flags3 = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR,
++        .srcAccessMask3 = VK_ACCESS_3_NONE_KHR,
++        .dstAccessMask3 = VK_ACCESS_3_NONE_KHR,
++    };
++    VkMemoryBarrier2 barriers[3];
++    for (unsigned i = 0; i < 3; i++) {
++        barriers[i] = (VkMemoryBarrier2) {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
++            .pNext = with_flags3 && i != 1 ? &flags3 : NULL,
++            .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
++            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++            .dstAccessMask = i == 1 ? VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT :
++                                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
++        };
++    }
++    const VkMemoryRangeBarrierKHR range = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_RANGE_BARRIER_KHR,
++        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
++        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++        .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
++        .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .addressRange = { .address = UINT64_C(0x12345678000), .size = 4096 },
++    };
++    const VkMemoryRangeBarriersInfoKHR ranges = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_RANGE_BARRIERS_INFO_KHR,
++        .memoryRangeBarrierCount = 1,
++        .pMemoryRangeBarriers = &range,
++    };
++    const VkDependencyInfo input = {
++        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .pNext = with_ranges ? &ranges : NULL,
++        .memoryBarrierCount = 3,
++        .pMemoryBarriers = barriers,
++    };
++    struct vn_test_stream stream;
++    struct vn_test_decoder storage;
++    VkDependencyInfo output;
++    CHECK(vn_test_encode_dependency(&input, &stream));
++    CHECK(vn_test_decode_dependency(&stream, &storage, &output));
++    CHECK(output.sType == input.sType);
++    CHECK(output.dependencyFlags == input.dependencyFlags);
++    CHECK(output.memoryBarrierCount == 3 && output.pMemoryBarriers);
++    CHECK(output.bufferMemoryBarrierCount == 0 && !output.pBufferMemoryBarriers);
++    CHECK(output.imageMemoryBarrierCount == 0 && !output.pImageMemoryBarriers);
++    for (unsigned i = 0; i < 3; i++) {
++        const VkMemoryBarrier2 *barrier = &output.pMemoryBarriers[i];
++        CHECK(barrier->sType == barriers[i].sType);
++        CHECK(barrier->srcStageMask == barriers[i].srcStageMask);
++        CHECK(barrier->srcAccessMask == barriers[i].srcAccessMask);
++        CHECK(barrier->dstStageMask == barriers[i].dstStageMask);
++        CHECK(barrier->dstAccessMask == barriers[i].dstAccessMask);
++        if (barriers[i].pNext) {
++            /* Even a zero-valued Flags3 node must survive the wire. */
++            const VkMemoryBarrierAccessFlags3KHR *out_flags = barrier->pNext;
++            CHECK(out_flags && out_flags->sType == flags3.sType);
++            CHECK(!out_flags->pNext);
++            CHECK(out_flags->srcAccessMask3 == flags3.srcAccessMask3);
++            CHECK(out_flags->dstAccessMask3 == flags3.dstAccessMask3);
++        } else {
++            CHECK(!barrier->pNext);
++        }
++    }
++    if (with_ranges) {
++        const VkMemoryRangeBarriersInfoKHR *out_ranges = output.pNext;
++        CHECK(out_ranges && out_ranges->sType == ranges.sType);
++        CHECK(!out_ranges->pNext && out_ranges->memoryRangeBarrierCount == 1);
++        CHECK(out_ranges->pMemoryRangeBarriers);
++        const VkMemoryRangeBarrierKHR *out_range = out_ranges->pMemoryRangeBarriers;
++        CHECK(out_range->sType == range.sType && !out_range->pNext);
++        CHECK(out_range->srcStageMask == range.srcStageMask);
++        CHECK(out_range->srcAccessMask == range.srcAccessMask);
++        CHECK(out_range->dstStageMask == range.dstStageMask);
++        CHECK(out_range->dstAccessMask == range.dstAccessMask);
++        CHECK(out_range->srcQueueFamilyIndex == range.srcQueueFamilyIndex);
++        CHECK(out_range->dstQueueFamilyIndex == range.dstQueueFamilyIndex);
++        CHECK(out_range->addressRange.address == range.addressRange.address);
++        CHECK(out_range->addressRange.size == range.addressRange.size);
++        CHECK(out_range->addressFlags == range.addressFlags);
++    } else {
++        CHECK(!output.pNext);
++    }
++
++    /* Exercise the bounded reader and temporary storage on every truncation. */
++    const size_t size = stream.size;
++    for (size_t i = 0; i < size; i++) {
++        stream.size = i;
++        CHECK(!vn_test_decode_dependency(&stream, &storage, &output));
++        CHECK(storage.fatal);
++    }
++    return true;
++}
++
++static bool
++test_root_chain_scope(void)
++{
++    VkMemoryBarrierAccessFlags3KHR flags3 = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR,
++    };
++    VkMemoryRangeBarriersInfoKHR ranges = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_RANGE_BARRIERS_INFO_KHR,
++    };
++    VkDependencyInfo info = {
++        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .pNext = &ranges,
++    };
++    struct vn_test_stream baseline, filtered;
++    CHECK(vn_test_encode_dependency(&info, &baseline));
++
++    /* Flags3 is not a legal sibling before or after the root RangeInfo. */
++    ranges.pNext = &flags3;
++    CHECK(vn_test_encode_dependency(&info, &filtered));
++    CHECK(filtered.size == baseline.size);
++    CHECK(!memcmp(filtered.data, baseline.data, baseline.size));
++    ranges.pNext = NULL;
++    flags3.pNext = &ranges;
++    info.pNext = &flags3;
++    CHECK(vn_test_encode_dependency(&info, &filtered));
++    CHECK(filtered.size == baseline.size);
++    CHECK(!memcmp(filtered.data, baseline.data, baseline.size));
++
++    for (unsigned after_range = 0; after_range < 2; after_range++) {
++        struct vn_test_decoder storage;
++        vn_test_encode_invalid_dependency_chain(&filtered, after_range);
++        CHECK(!filtered.fatal);
++        CHECK(!vn_test_decode_dependency_chain(&filtered, &storage));
++        CHECK(storage.fatal);
++    }
++    return true;
++}
++
++int main(void)
+ {
+-	return 0;
++    for (unsigned flags3 = 0; flags3 < 2; flags3++) {
++        for (unsigned ranges = 0; ranges < 2; ranges++) {
++            if (!test_memory_barriers(flags3, ranges))
++                return 1;
++        }
++    }
++    if (!test_root_chain_scope())
++        return 1;
++    puts("maintenance8 codec roundtrip and chain-scope checks passed");
++    return 0;
+ }
+diff --git a/tests/meson.build b/tests/meson.build
+index dd1f9ee1f5f3322f93513e025792b433490664b7..17a4fe4ac2bc1b486eb3a07677a84039f768720e 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -27,5 +27,8 @@ vn_protocol_tests = executable(
+   include_directories: vulkan_headers_inc,
+ )
+ 
++test('protocol roundtrip', vn_protocol_tests)
++test('protocol pNext scope', py,
++     args: [files('test_vn_protocol.py'), '--registry', vulkan_registry])
+ test('vkxml aliases', py, args: files('test_vkxml.py'))
+ test('explicit Vulkan inputs', py, args: files('test_vulkan_inputs.py'))
+diff --git a/tests/renderer.c b/tests/renderer.c
+index 602dda43b684635b140a59ccb5859c5cf04017f9..bb3814dd64891c7644be8ac59d4dde18a618eff0 100644
+--- a/tests/renderer.c
++++ b/tests/renderer.c
+@@ -4,3 +4,24 @@
+  */
+ 
+ #include "vn_protocol_renderer.h"
++
++bool
++vn_test_decode_dependency(const struct vn_test_stream *stream,
++                          struct vn_test_decoder *storage, VkDependencyInfo *info)
++{
++    *storage = (struct vn_test_decoder){ .stream = stream };
++    *info = (VkDependencyInfo){ 0 };
++    struct vkr_cs_decoder dec = { .storage = storage };
++    vn_decode_VkDependencyInfo_temp((struct vn_cs_decoder *)&dec, info);
++    return !storage->fatal && storage->offset == stream->size;
++}
++
++bool
++vn_test_decode_dependency_chain(const struct vn_test_stream *stream,
++                                struct vn_test_decoder *storage)
++{
++    *storage = (struct vn_test_decoder){ .stream = stream };
++    struct vkr_cs_decoder dec = { .storage = storage };
++    vn_decode_VkDependencyInfo_pnext_temp((struct vn_cs_decoder *)&dec);
++    return !storage->fatal && storage->offset == stream->size;
++}
+diff --git a/tests/test_stream.h b/tests/test_stream.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e321c6bbf8d3d0ed49f665771241078aef10088
+--- /dev/null
++++ b/tests/test_stream.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef VN_TEST_STREAM_H
++#define VN_TEST_STREAM_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <vulkan/vulkan.h>
++
++/* A bounded, test-only command stream and aligned decoder allocation pool. */
++struct vn_test_stream {
++    uint8_t data[4096];
++    size_t size;
++    bool fatal;
++};
++
++struct vn_test_decoder {
++    const struct vn_test_stream *stream;
++    size_t offset;
++    size_t temp_used;
++    bool fatal;
++    _Alignas(max_align_t) uint8_t temp[4096];
++};
++
++static inline void
++vn_test_write(struct vn_test_stream *stream, size_t size,
++              const void *val, size_t val_size)
++{
++    if (stream->fatal || val_size > size ||
++        size > sizeof(stream->data) - stream->size) {
++        stream->fatal = true;
++        return;
++    }
++    if (val_size)
++        memcpy(stream->data + stream->size, val, val_size);
++    memset(stream->data + stream->size + val_size, 0, size - val_size);
++    stream->size += size;
++}
++
++static inline void
++vn_test_read(struct vn_test_decoder *dec, size_t size,
++             void *val, size_t val_size, bool advance)
++{
++    if (dec->fatal || val_size > size ||
++        size > dec->stream->size - dec->offset) {
++        dec->fatal = true;
++        if (val_size)
++            memset(val, 0, val_size);
++        return;
++    }
++    if (val_size)
++        memcpy(val, dec->stream->data + dec->offset, val_size);
++    if (advance)
++        dec->offset += size;
++}
++
++static inline void *
++vn_test_alloc(struct vn_test_decoder *dec, size_t size)
++{
++    const size_t alignment = _Alignof(max_align_t);
++    const size_t offset = (dec->temp_used + alignment - 1) & ~(alignment - 1);
++    if (dec->fatal || offset > sizeof(dec->temp) ||
++        size > sizeof(dec->temp) - offset) {
++        dec->fatal = true;
++        return NULL;
++    }
++    dec->temp_used = offset + size;
++    return dec->temp + offset;
++}
++
++bool vn_test_encode_dependency(const VkDependencyInfo *info,
++                               struct vn_test_stream *stream);
++bool vn_test_decode_dependency(const struct vn_test_stream *stream,
++                               struct vn_test_decoder *storage,
++                               VkDependencyInfo *info);
++void vn_test_encode_invalid_dependency_chain(struct vn_test_stream *stream,
++                                             bool after_range_info);
++bool vn_test_decode_dependency_chain(const struct vn_test_stream *stream,
++                                     struct vn_test_decoder *storage);
++
++#endif /* VN_TEST_STREAM_H */
+diff --git a/tests/test_vn_protocol.py b/tests/test_vn_protocol.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..381630f2ed5490faee2a4e23bbb4de80687d8481
+--- /dev/null
++++ b/tests/test_vn_protocol.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: MIT
++
++import argparse
++from pathlib import Path
++import sys
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from vkxml import VkRegistry
++from vn_protocol import Gen, VN_PROTOCOL_DIR, get_vk_xmls
++
++
++class MemoryBarrierChains(unittest.TestCase):
++    registry_path = None
++
++    @classmethod
++    def setUpClass(cls):
++        if cls.registry_path is None:
++            raise ValueError('test requires an explicit --registry input')
++        _, private_xmls = get_vk_xmls(VN_PROTOCOL_DIR)
++        cls.registry = VkRegistry.parse(cls.registry_path, private_xmls)
++        cls.generators = [Gen(is_driver, cls.registry)
++                          for is_driver in (True, False)]
++
++    def test_contextual_memory_barrier_child(self):
++        for generator in self.generators:
++            with self.subTest(driver=generator.is_driver):
++                barrier = generator.reg.type_table['VkMemoryBarrier2']
++                children, skipped = generator.get_chain(barrier)
++                self.assertEqual([ty.name for ty in children],
++                                 ['VkMemoryBarrierAccessFlags3KHR'])
++                self.assertEqual(skipped, [])
++
++    def test_root_chain_does_not_gain_transitive_children(self):
++        for generator in self.generators:
++            with self.subTest(driver=generator.is_driver):
++                dependency = generator.reg.type_table['VkDependencyInfo']
++                children, skipped = generator.get_chain(dependency)
++                self.assertEqual([ty.name for ty in children],
++                                 ['VkMemoryRangeBarriersInfoKHR'])
++                self.assertEqual(skipped, [])
++
++    def test_fixup_does_not_mutate_imported_registry(self):
++        barrier = self.registry.type_table['VkMemoryBarrier2']
++        self.assertEqual(barrier.p_next, [])
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--registry', required=True, type=Path)
++    options, unittest_arguments = parser.parse_known_args()
++    MemoryBarrierChains.registry_path = options.registry
++    unittest.main(argv=[sys.argv[0], *unittest_arguments])
+diff --git a/tests/vkr_cs.h b/tests/vkr_cs.h
+index 5f6b0c1ea02afc5994daedffcaa9a8fa423a3177..2ec6191ee761bcf47d5fc0bee72816dc159c6189 100644
+--- a/tests/vkr_cs.h
++++ b/tests/vkr_cs.h
+@@ -12,8 +12,15 @@
+ 
+ #include <vulkan/vulkan.h>
+ 
+-struct vkr_cs_encoder;
+-struct vkr_cs_decoder;
++#include "test_stream.h"
++
++struct vkr_cs_encoder {
++    struct vn_test_stream *stream;
++};
++
++struct vkr_cs_decoder {
++    struct vn_test_decoder *storage;
++};
+ 
+ typedef uint64_t vkr_object_id;
+ 
+@@ -40,17 +47,19 @@ vkr_cs_encoder_write(struct vkr_cs_encoder *enc,
+                      const void *val,
+                      size_t val_size)
+ {
++   vn_test_write(enc->stream, size, val, val_size);
+ }
+ 
+ static inline void
+ vkr_cs_decoder_set_fatal(const struct vkr_cs_decoder *dec)
+ {
++   dec->storage->fatal = true;
+ }
+ 
+ static inline bool
+ vkr_cs_decoder_get_fatal(const struct vkr_cs_decoder *dec)
+ {
+-   return false;
++   return dec->storage->fatal;
+ }
+ 
+ static inline void
+@@ -59,6 +68,7 @@ vkr_cs_decoder_read(struct vkr_cs_decoder *dec,
+                     void *val,
+                     size_t val_size)
+ {
++   vn_test_read(dec->storage, size, val, val_size, true);
+ }
+ 
+ static inline void
+@@ -67,6 +77,7 @@ vkr_cs_decoder_peek(const struct vkr_cs_decoder *dec,
+                     void *val,
+                     size_t val_size)
+ {
++   vn_test_read(dec->storage, size, val, val_size, false);
+ }
+ 
+ static inline struct vkr_object *
+@@ -80,12 +91,13 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
+ static inline void
+ vkr_cs_decoder_reset_temp_pool(struct vkr_cs_decoder *dec)
+ {
++    dec->storage->temp_used = 0;
+ }
+ 
+ static inline void *
+ vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
+ {
+-    return NULL;
++    return vn_test_alloc(dec->storage, size);
+ }
+ 
+ static inline void *
+@@ -93,7 +105,11 @@ vkr_cs_decoder_alloc_temp_array(struct vkr_cs_decoder *dec,
+                                 size_t size,
+                                 size_t count)
+ {
+-    return NULL;
++    if (count && size > SIZE_MAX / count) {
++        dec->storage->fatal = true;
++        return NULL;
++    }
++    return vn_test_alloc(dec->storage, size * count);
+ }
+ 
+ static inline void *
+diff --git a/tests/vn_cs.h b/tests/vn_cs.h
+index 67fbd3281ef9e5c000512ac783d9a196057a3d33..07e6474432080b5642b83ad6cd6b9bd1f64a5e75 100644
+--- a/tests/vn_cs.h
++++ b/tests/vn_cs.h
+@@ -12,10 +12,17 @@
+ 
+ #include <vulkan/vulkan.h>
+ 
++#include "test_stream.h"
++
+ typedef uint64_t vn_object_id;
+ 
+-struct vn_cs_encoder;
+-struct vn_cs_decoder;
++struct vn_cs_encoder {
++    struct vn_test_stream *stream;
++};
++
++struct vn_cs_decoder {
++    struct vn_test_decoder *storage;
++};
+ 
+ static inline bool
+ vn_cs_renderer_protocol_has_api_version(uint32_t api_version)
+@@ -32,33 +39,37 @@ vn_cs_renderer_protocol_has_extension(uint32_t ext_number)
+ static inline size_t
+ vn_cs_encoder_get_len(const struct vn_cs_encoder *enc)
+ {
+-    return 0;
++    return enc->stream->size;
+ }
+ 
+ static inline bool
+ vn_cs_encoder_reserve(struct vn_cs_encoder *cs, size_t size)
+ {
+-    return true;
++    return !cs->stream->fatal && size <= sizeof(cs->stream->data) - cs->stream->size;
+ }
+ 
+ static inline void
+ vn_cs_encoder_write(struct vn_cs_encoder *cs, size_t size, const void *val, size_t val_size)
+ {
++    vn_test_write(cs->stream, size, val, val_size);
+ }
+ 
+ static inline void
+ vn_cs_decoder_set_fatal(struct vn_cs_decoder *dec)
+ {
++    dec->storage->fatal = true;
+ }
+ 
+ static inline void
+ vn_cs_decoder_read(struct vn_cs_decoder *dec, size_t size, void *val, size_t val_size)
+ {
++    vn_test_read(dec->storage, size, val, val_size, true);
+ }
+ 
+ static inline void
+ vn_cs_decoder_peek(struct vn_cs_decoder *dec, size_t size, void *val, size_t val_size)
+ {
++    vn_test_read(dec->storage, size, val, val_size, false);
+ }
+ 
+ static inline vn_object_id
+diff --git a/vn_protocol.py b/vn_protocol.py
+index dd84c99a4c53d375c0083d0940f96d090eafdb3a..cb932afca427caff5d58fbecdf942f7113d172f7 100755
+--- a/vn_protocol.py
++++ b/vn_protocol.py
+@@ -122,6 +122,7 @@ VK_XML_EXTENSION_LIST = [
+     'VK_KHR_copy_memory_indirect',
+     'VK_KHR_deferred_host_operations',
+     'VK_KHR_depth_clamp_zero_one',
++    'VK_KHR_device_address_commands',
+     'VK_KHR_external_fence_fd',
+     'VK_KHR_external_memory_fd',
+     'VK_KHR_external_semaphore_fd',
+@@ -357,6 +358,16 @@ class Gen:
+                 ty.ret.ty.set_attribute('need_encode', True)
+ 
+     def _fixup_registry(self):
++        # VkMemoryBarrier2 is also a pNext node of VkSubpassDependency2, so
++        # vk.xml does not list its context-dependent child in structextends.
++        # VUID-VkDependencyInfo-pMemoryBarriers-10606 explicitly permits this
++        # child when the barrier is an element of pMemoryBarriers.  Do not
++        # infer transitive children for VkDependencyInfo's own pNext chain.
++        barrier = self.reg.type_table['VkMemoryBarrier2']
++        flags3 = self.reg.type_table['VkMemoryBarrierAccessFlags3KHR']
++        if flags3 not in barrier.p_next:
++            barrier.p_next.append(flags3)
++
+         for ty in self.reg.type_table.values():
+             if ty.category == ty.COMMAND:
+                 ty.attrs['c_type'] = 'VK_COMMAND_TYPE_' + ty.name + '_EXT'
+diff --git a/xmls/VK_EXT_command_serialization.xml b/xmls/VK_EXT_command_serialization.xml
+index d20583896147579596da2586b1162ca09637dead..93e2c69fc85f0994e52ca25b08b0ecf8dec6fa20 100644
+--- a/xmls/VK_EXT_command_serialization.xml
++++ b/xmls/VK_EXT_command_serialization.xml
+@@ -549,6 +549,29 @@ virtualization or remoting, and are not exposed to applications.
+         <comment>VK_EXT_primitive_restart_index</comment>
+         <enum value="347"   name="VK_COMMAND_TYPE_vkCmdSetPrimitiveRestartIndexEXT_EXT"/>
+ 
++        <comment>VK_KHR_device_address_commands</comment>
++        <enum value="350"   name="VK_COMMAND_TYPE_vkCmdBindIndexBuffer3KHR_EXT"/>
++        <enum value="351"   name="VK_COMMAND_TYPE_vkCmdBindVertexBuffers3KHR_EXT"/>
++        <enum value="352"   name="VK_COMMAND_TYPE_vkCmdDrawIndirect2KHR_EXT"/>
++        <enum value="353"   name="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirect2KHR_EXT"/>
++        <enum value="354"   name="VK_COMMAND_TYPE_vkCmdDispatchIndirect2KHR_EXT"/>
++        <enum value="355"   name="VK_COMMAND_TYPE_vkCmdCopyMemoryKHR_EXT"/>
++        <enum value="356"   name="VK_COMMAND_TYPE_vkCmdCopyMemoryToImageKHR_EXT"/>
++        <enum value="357"   name="VK_COMMAND_TYPE_vkCmdCopyImageToMemoryKHR_EXT"/>
++        <enum value="358"   name="VK_COMMAND_TYPE_vkCmdUpdateMemoryKHR_EXT"/>
++        <enum value="359"   name="VK_COMMAND_TYPE_vkCmdFillMemoryKHR_EXT"/>
++        <enum value="360"   name="VK_COMMAND_TYPE_vkCmdCopyQueryPoolResultsToMemoryKHR_EXT"/>
++        <enum value="361"   name="VK_COMMAND_TYPE_vkCmdDrawIndirectCount2KHR_EXT"/>
++        <enum value="362"   name="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirectCount2KHR_EXT"/>
++        <enum value="363"   name="VK_COMMAND_TYPE_vkCmdBeginConditionalRendering2EXT_EXT"/>
++        <enum value="364"   name="VK_COMMAND_TYPE_vkCmdBindTransformFeedbackBuffers2EXT_EXT"/>
++        <enum value="365"   name="VK_COMMAND_TYPE_vkCmdBeginTransformFeedback2EXT_EXT"/>
++        <enum value="366"   name="VK_COMMAND_TYPE_vkCmdEndTransformFeedback2EXT_EXT"/>
++        <enum value="367"   name="VK_COMMAND_TYPE_vkCmdDrawIndirectByteCount2EXT_EXT"/>
++        <enum value="368"   name="VK_COMMAND_TYPE_vkCmdDrawMeshTasksIndirect2EXT_EXT"/>
++        <enum value="369"   name="VK_COMMAND_TYPE_vkCmdDrawMeshTasksIndirectCount2EXT_EXT"/>
++        <enum value="370"   name="VK_COMMAND_TYPE_vkCreateAccelerationStructure2KHR_EXT"/>
++
+         <comment>VK_MESA_venus_protocol</comment>
+         <enum value="178"   name="VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT"/>
+         <enum value="179"   name="VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT"/>

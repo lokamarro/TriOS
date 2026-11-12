@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 13:35:41 +0900
+Subject: [PATCH] v4l2: keep the 10 bits of a stream for an encoder that reads
+ the decoder's Surface
+
+A client that renders to a Surface makes the framework set the decoder's pixel
+format to IMPLEMENTATION_DEFINED. The decoder listed no such value, so the
+setter refused it and the format stayed at 8-bit YUV 4:2:0: a Main 10 stream
+decoded onto the input Surface of a video encoder (a transcode, and CTS
+CodecEncoderSurfaceTest) reached a Main 10 encoder as 8-bit NV12.
+
+List IMPLEMENTATION_DEFINED, and take the usage of the Surface's consumer
+(C2_PARAMKEY_OUTPUT_STREAM_USAGE, which the framework sets from the Surface).
+When the consumer is a video encoder the decoder asks the device for P010 if
+the device describes the stream as P010: TRY_FMT refuses it for a stream with
+8-bit samples, which keeps the layout the device chose. Any other Surface, a
+display, still gets 8-bit samples, since the host cannot show P010. The
+decoder reads the client's format at every resolution change, because the
+usage arrives after the decoder starts. V4L2Queue::tryFormat's refusal is a
+probe, so it is logged at debug level.
+---
+ common/VideoTypes.cpp                         |  2 +
+ .../include/v4l2_codec2/common/VideoTypes.h   |  2 +
+ components/DecodeInterface.cpp                | 22 +++++++++++
+ .../v4l2_codec2/components/DecodeInterface.h  | 14 ++++---
+ .../v4l2_codec2/components/VideoDecoder.h     |  2 +
+ v4l2/V4L2DecodeComponent.cpp                  |  3 +-
+ v4l2/V4L2Decoder.cpp                          | 37 ++++++++++++++-----
+ v4l2/V4L2Device.cpp                           |  3 +-
+ v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h   | 14 ++++---
+ 9 files changed, 76 insertions(+), 23 deletions(-)
+
+diff --git a/common/VideoTypes.cpp b/common/VideoTypes.cpp
+index d9f40a94afe90c0ad1ee890a8f464eb9f9e1d34f..76b0b9d29aef2be2d7944932d5e4c6cf3aa88e98 100644
+--- a/common/VideoTypes.cpp
++++ b/common/VideoTypes.cpp
+@@ -91,6 +91,8 @@ const char* HalPixelFormatToString(HalPixelFormat format) {
+     switch (format) {
+     case HalPixelFormat::UNKNOWN:
+         return "Unknown";
++    case HalPixelFormat::IMPLEMENTATION_DEFINED:
++        return "IMPLEMENTATION_DEFINED";
+     case HalPixelFormat::YCBCR_420_888:
+         return "YCBCR_420_888";
+     case HalPixelFormat::YCBCR_P010:
+diff --git a/common/include/v4l2_codec2/common/VideoTypes.h b/common/include/v4l2_codec2/common/VideoTypes.h
+index 22ea0bc13ada4764010742b6373a9947e0a82de5..3972e216f6d00bc7c81f23b2fe44a347520af5e1 100644
+--- a/common/include/v4l2_codec2/common/VideoTypes.h
++++ b/common/include/v4l2_codec2/common/VideoTypes.h
+@@ -34,6 +34,8 @@ const char* profileToString(C2Config::profile_t profile);
+ using HPixelFormat = ::android::hardware::graphics::common::V1_1::PixelFormat;
+ enum class HalPixelFormat : int32_t {
+     UNKNOWN = 0x0,
++    // The client renders to a Surface and takes the format the decoder picks for the stream.
++    IMPLEMENTATION_DEFINED = static_cast<int32_t>(HPixelFormat::IMPLEMENTATION_DEFINED),
+     YCBCR_420_888 = static_cast<int32_t>(HPixelFormat::YCBCR_420_888),
+     YV12 = static_cast<int32_t>(HPixelFormat::YV12),
+     YCBCR_P010 = static_cast<int32_t>(HPixelFormat::YCBCR_P010),
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 1735a98911d7451468550f9b2839b15c951f7f26..d882db3342bada2a134e20fdb1170942471f3e40 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -359,18 +359,28 @@ DecodeInterface::DecodeInterface(const std::string& name,
+ 
+     // The raw formats the decoder can produce. Codec2InfoBuilder lists the colour formats of a
+     // decoder from this parameter, so P010 is what makes a 10-bit decoder offer COLOR_FormatYUVP010.
++    // The framework sets IMPLEMENTATION_DEFINED when the client renders to a Surface; a decoder
++    // that does not list it never learns that, and the setter refuses the value.
+     std::vector<uint32_t> pixelFormats = {HAL_PIXEL_FORMAT_YCBCR_420_888};
+     if (std::any_of(profiles.begin(), profiles.end(), [](uint32_t profile) {
+             return profile == C2Config::PROFILE_HEVC_MAIN_10 || profile == C2Config::PROFILE_VP9_2;
+         })) {
+         pixelFormats.push_back(HAL_PIXEL_FORMAT_YCBCR_P010);
+     }
++    pixelFormats.push_back(HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED);
+     addParameter(DefineParam(mPixelFormat, C2_PARAMKEY_PIXEL_FORMAT)
+                          .withDefault(new C2StreamPixelFormatInfo::output(
+                                  0u, HAL_PIXEL_FORMAT_YCBCR_420_888))
+                          .withFields({C2F(mPixelFormat, value).oneOf(pixelFormats)})
+                          .withSetter(Setter<decltype(*mPixelFormat)>::NonStrictValueWithNoDeps)
+                          .build());
++    // The framework sets the usage of the Surface's consumer here, which tells a video encoder's
++    // input from a display: see getOutputPixelFormat().
++    addParameter(DefineParam(mOutputMemoryUsage, C2_PARAMKEY_OUTPUT_STREAM_USAGE)
++                         .withDefault(new C2StreamUsageTuning::output(0u, 0u))
++                         .withFields({C2F(mOutputMemoryUsage, value).any()})
++                         .withSetter(Setter<decltype(*mOutputMemoryUsage)>::NonStrictValueWithNoDeps)
++                         .build());
+     addParameter(
+             DefineParam(mOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
+                     .withConstValue(new C2PortDelayTuning::output(getOutputDelay(*mVideoCodec)))
+@@ -567,6 +577,18 @@ c2_status_t DecodeInterface::updatePictureSize(uint32_t width, uint32_t height)
+     return config({&size}, C2_MAY_BLOCK, &failures);
+ }
+ 
++HalPixelFormat DecodeInterface::getOutputPixelFormat() const {
++    Lock lock = this->lock();
++    const HalPixelFormat format = static_cast<HalPixelFormat>(mPixelFormat->value);
++    if (format != HalPixelFormat::IMPLEMENTATION_DEFINED) return format;
++
++    // A Surface keeps the 10 bits of a 10-bit stream only where a video encoder reads them. The
++    // host has no P010 sampler, so a display that is given P010 cannot show it correctly.
++    const uint64_t usage =
++            C2AndroidMemoryUsage(C2MemoryUsage(mOutputMemoryUsage->value)).asGrallocUsage();
++    return (usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) ? format : HalPixelFormat::YCBCR_420_888;
++}
++
+ size_t DecodeInterface::getInputBufferSize() const {
+     return mMaxInputSize->value;
+ }
+diff --git a/components/include/v4l2_codec2/components/DecodeInterface.h b/components/include/v4l2_codec2/components/DecodeInterface.h
+index f7942a9f0d23b587df103ee81412c64abf307340..7e5d900cb0de023d94c2a7af54e1725d07f028bf 100644
+--- a/components/include/v4l2_codec2/components/DecodeInterface.h
++++ b/components/include/v4l2_codec2/components/DecodeInterface.h
+@@ -29,10 +29,9 @@ public:
+     c2_status_t status() const { return mInitStatus; }
+     C2BlockPool::local_id_t getBlockPoolId() const { return mOutputBlockPoolIds->m.values[0]; }
+     std::optional<VideoCodec> getVideoCodec() const { return mVideoCodec; }
+-    // The raw format the client asked the decoder to produce.
+-    HalPixelFormat getOutputPixelFormat() const {
+-        return static_cast<HalPixelFormat>(mPixelFormat->value);
+-    }
++    // The raw format the decoder produces for the client: the one it asked for, except that a
++    // Surface which no video encoder reads gets 8-bit YUV 4:2:0, since the host cannot show P010.
++    HalPixelFormat getOutputPixelFormat() const;
+ 
+     static uint32_t getOutputDelay(VideoCodec codec);
+ 
+@@ -86,8 +85,13 @@ private:
+     // The output format kind; should be C2FormatVideo.
+     std::shared_ptr<C2StreamBufferTypeSetting::output> mOutputFormat;
+     // The raw format of the decoded pictures, which the client chooses among the ones the codec
+-    // can produce: flexible YUV 4:2:0 at 8 bits, and P010 for a profile with 10-bit samples.
++    // can produce: flexible YUV 4:2:0 at 8 bits, P010 for a profile with 10-bit samples, and
++    // IMPLEMENTATION_DEFINED when it renders to a Surface, which getOutputPixelFormat() turns into
++    // 8-bit YUV unless a video encoder reads the Surface.
+     std::shared_ptr<C2StreamPixelFormatInfo::output> mPixelFormat;
++    // The usage of the consumer of the output buffers, which the framework sets from the Surface
++    // the client renders to.
++    std::shared_ptr<C2StreamUsageTuning::output> mOutputMemoryUsage;
+     // The MIME type of input port.
+     std::shared_ptr<C2PortMediaTypeSetting::input> mInputMediaType;
+     // The MIME type of output port; should be MEDIA_MIMETYPE_VIDEO_RAW.
+diff --git a/components/include/v4l2_codec2/components/VideoDecoder.h b/components/include/v4l2_codec2/components/VideoDecoder.h
+index 3e3fec47588da515d5e2a5038c3de0fe728bfbcb..623a9ada6e81dacb25f7c5826da15f12873e6a4f 100644
+--- a/components/include/v4l2_codec2/components/VideoDecoder.h
++++ b/components/include/v4l2_codec2/components/VideoDecoder.h
+@@ -28,6 +28,8 @@ public:
+ 
+     using GetPoolCB = ::base::RepeatingCallback<std::unique_ptr<VideoFramePool>(
+             const ui::Size& size, HalPixelFormat pixelFormat, size_t numOutputBuffers)>;
++    // Returns the raw format the client wants the decoder to produce, as it is now.
++    using GetOutputFormatCB = ::base::RepeatingCallback<HalPixelFormat()>;
+     using DecodeCB = ::base::OnceCallback<void(DecodeStatus)>;
+     using OutputCB = ::base::RepeatingCallback<void(std::unique_ptr<VideoFrame>)>;
+     using ErrorCB = ::base::RepeatingCallback<void()>;
+diff --git a/v4l2/V4L2DecodeComponent.cpp b/v4l2/V4L2DecodeComponent.cpp
+index 7107c428fe24882af83c6b2e7d731d206319de13..d6f38114093a185430a5b64389c08c8764193b42 100644
+--- a/v4l2/V4L2DecodeComponent.cpp
++++ b/v4l2/V4L2DecodeComponent.cpp
+@@ -107,7 +107,8 @@ void V4L2DecodeComponent::startTask(c2_status_t* status, ::base::WaitableEvent*
+                                    ::base::BindRepeating(&V4L2DecodeComponent::reportError,
+                                                          ::base::Unretained(this), C2_CORRUPTED),
+                                    mDecoderTaskRunner, mIsSecure,
+-                                   mIntfImpl->getOutputPixelFormat());
++                                   ::base::BindRepeating(&DecodeInterface::getOutputPixelFormat,
++                                                         ::base::Unretained(mIntfImpl.get())));
+     if (!mDecoder) {
+         ALOGE("Failed to create V4L2Decoder for %s", VideoCodecToString(*codec));
+         return;
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index 7ed6e8a383e17b0e010e31b4222a94f9dbfbfb80..83fad685e1cd020046159a7ee54f6605c593c0e4 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -71,11 +71,12 @@ std::unique_ptr<VideoDecoder> V4L2Decoder::Create(
+         uint32_t debugStreamId, const VideoCodec& codec, const size_t inputBufferSize,
+         const size_t minNumOutputBuffers, GetPoolCB getPoolCb, OutputCB outputCb, ErrorCB errorCb,
+         scoped_refptr<::base::SequencedTaskRunner> taskRunner, bool isSecure,
+-        HalPixelFormat outputFormat) {
++        GetOutputFormatCB getOutputFormatCb) {
+     std::unique_ptr<V4L2Decoder> decoder =
+             ::base::WrapUnique<V4L2Decoder>(new V4L2Decoder(debugStreamId, taskRunner));
+     if (!decoder->start(codec, inputBufferSize, minNumOutputBuffers, std::move(getPoolCb),
+-                        std::move(outputCb), std::move(errorCb), isSecure, outputFormat)) {
++                        std::move(outputCb), std::move(errorCb), isSecure,
++                        std::move(getOutputFormatCb))) {
+         return nullptr;
+     }
+     return decoder;
+@@ -117,7 +118,7 @@ V4L2Decoder::~V4L2Decoder() {
+ 
+ bool V4L2Decoder::start(const VideoCodec& codec, const size_t inputBufferSize,
+                         const size_t minNumOutputBuffers, GetPoolCB getPoolCb, OutputCB outputCb,
+-                        ErrorCB errorCb, bool isSecure, HalPixelFormat outputFormat) {
++                        ErrorCB errorCb, bool isSecure, GetOutputFormatCB getOutputFormatCb) {
+     ATRACE_CALL();
+     ALOGV("%s(codec=%s, inputBufferSize=%zu, minNumOutputBuffers=%zu)", __func__,
+           VideoCodecToString(codec), inputBufferSize, minNumOutputBuffers);
+@@ -129,7 +130,7 @@ bool V4L2Decoder::start(const VideoCodec& codec, const size_t inputBufferSize,
+     mErrorCb = std::move(errorCb);
+     mCodec = codec;
+     mIsSecure = isSecure;
+-    mOutputFormat = outputFormat;
++    mGetOutputFormatCb = std::move(getOutputFormatCb);
+ 
+     if (mState == State::Error) {
+         ALOGE("Ignore due to error state.");
+@@ -312,12 +313,12 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+     const ui::Size codedSize(format->fmt.pix_mp.width, format->fmt.pix_mp.height);
+     // Before the first picture is parsed there is no stream to ask a layout for: the initial
+     // buffers are 8-bit and take the device's own choice.
+-    const uint32_t preferred = streamKnown ? preferredOutputFormat(format->fmt.pix_mp.pixelformat)
++    const uint32_t preferred = streamKnown ? preferredOutputFormat(format->fmt.pix_mp.pixelformat,
++                                                                   codedSize)
+                                            : format->fmt.pix_mp.pixelformat;
+     ALOGI("Output format: the device has %s, the client asked for %s: requesting %s",
+           fourccToString(format->fmt.pix_mp.pixelformat).c_str(),
+-          mOutputFormat == HalPixelFormat::YCBCR_P010 ? "P010" : "8-bit",
+-          fourccToString(preferred).c_str());
++          HalPixelFormatToString(outputFormat()), fourccToString(preferred).c_str());
+     if (!setupOutputFormat(codedSize, preferred)) {
+         return false;
+     }
+@@ -787,21 +788,37 @@ bool V4L2Decoder::changeResolution() {
+     return true;
+ }
+ 
+-uint32_t V4L2Decoder::preferredOutputFormat(uint32_t deviceFormat) {
++HalPixelFormat V4L2Decoder::outputFormat() const {
++    return mGetOutputFormatCb ? mGetOutputFormatCb.Run() : HalPixelFormat::YCBCR_420_888;
++}
++
++uint32_t V4L2Decoder::preferredOutputFormat(uint32_t deviceFormat, const ui::Size& size) {
++    const HalPixelFormat clientFormat = outputFormat();
+     const std::vector<uint32_t> offered =
+             mDevice->enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+     const auto isOffered = [&offered](uint32_t pixfmt) {
+         return std::find(offered.begin(), offered.end(), pixfmt) != offered.end();
+     };
+ 
+-    if (mOutputFormat == HalPixelFormat::YCBCR_P010) {
++    if (clientFormat == HalPixelFormat::YCBCR_P010) {
+         // A client that asked for P010 gets 10-bit samples whatever layout the device kept from
+         // an earlier choice. The device refuses P010 for a stream with 8-bit samples, and the
+         // caller then falls back to the layout the device offers.
+         return isOffered(Fourcc::P010) ? Fourcc::P010 : deviceFormat;
+     }
+ 
+-    if (mOutputFormat != HalPixelFormat::YCBCR_420_888 || deviceFormat != Fourcc::P010) {
++    if (clientFormat == HalPixelFormat::IMPLEMENTATION_DEFINED) {
++        // The client renders to the input Surface of a video encoder, which reads the samples
++        // and takes all 10 bits of a 10-bit stream: P010 for such a stream, which the device
++        // refuses to describe as P010 otherwise, and the layout the device chose for any other.
++        if (deviceFormat != Fourcc::P010 && isOffered(Fourcc::P010) &&
++            mOutputQueue->tryFormat(Fourcc::P010, size, 0) != std::nullopt) {
++            return Fourcc::P010;
++        }
++        return deviceFormat;
++    }
++
++    if (clientFormat != HalPixelFormat::YCBCR_420_888 || deviceFormat != Fourcc::P010) {
+         return deviceFormat;
+     }
+ 
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index d74af993fcb7338f2b94f11a9f9691389f426374..8a4b902b64d0d32e73f3ddbcafaa6974333173e3 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -774,7 +774,8 @@ std::optional<struct v4l2_format> V4L2Queue::tryFormat(uint32_t fourcc, const ui
+                                                        size_t bufferSize) {
+     struct v4l2_format format = buildV4L2Format(mType, fourcc, size, bufferSize, 0);
+     if (mDevice->ioctl(VIDIOC_TRY_FMT, &format) != 0 || format.fmt.pix_mp.pixelformat != fourcc) {
+-        ALOGEQ("Tried format not supported (format_fourcc=0x%" PRIx32 ")", fourcc);
++        // A probe: the callers report what they need from a format the device refuses.
++        ALOGVQ("Tried format not supported (format_fourcc=0x%" PRIx32 ")", fourcc);
+         return std::nullopt;
+     }
+ 
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+index 8055960fb6825cb64434b8814cbcf6da3803d14b..3a35831e9e86fcaa7edd51202e47429cefda64c3 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -42,7 +42,7 @@ public:
+             uint32_t debugStreamId, const VideoCodec& codec, const size_t inputBufferSize,
+             const size_t minNumOutputBuffers, GetPoolCB getPoolCB, OutputCB outputCb,
+             ErrorCB errorCb, scoped_refptr<::base::SequencedTaskRunner> taskRunner, bool isSecure,
+-            HalPixelFormat outputFormat = HalPixelFormat::YCBCR_420_888);
++            GetOutputFormatCB getOutputFormatCb = GetOutputFormatCB());
+     ~V4L2Decoder() override;
+ 
+     void decode(std::unique_ptr<ConstBitstreamBuffer> buffer, DecodeCB decodeCb) override;
+@@ -73,7 +73,7 @@ private:
+     V4L2Decoder(uint32_t debugStreamId, scoped_refptr<::base::SequencedTaskRunner> taskRunner);
+     bool start(const VideoCodec& codec, const size_t inputBufferSize,
+                const size_t minNumOutputBuffers, GetPoolCB getPoolCb, OutputCB outputCb,
+-               ErrorCB errorCb, bool isSecure, HalPixelFormat outputFormat);
++               ErrorCB errorCb, bool isSecure, GetOutputFormatCB getOutputFormatCb);
+     bool setupInputFormat(const uint32_t inputPixelFormat, const size_t inputBufferSize);
+ 
+     // Sets minimal resolution and allocates minimal amount of output buffers for
+@@ -93,8 +93,9 @@ private:
+     bool setupOutputFormat(const ui::Size& size, const uint32_t requestedpixfmt);
+     // Returns the capture format to ask for when the device offers |deviceFormat| by default: the
+     // 8-bit planar format when the client wants 8-bit YUV and the device would decode a 10-bit
+-    // stream to P010, |deviceFormat| otherwise.
+-    uint32_t preferredOutputFormat(uint32_t deviceFormat);
++    // stream to P010, |deviceFormat| otherwise. A client that asked for P010, or that renders to a
++    // video encoder's input Surface and has a stream with 10-bit samples, gets P010.
++    uint32_t preferredOutputFormat(uint32_t deviceFormat, const ui::Size& size);
+ 
+     void tryFetchVideoFrame();
+     void onVideoFrameReady(std::optional<VideoFramePool::FrameWithBlockId> frameWithBlockId);
+@@ -128,8 +129,9 @@ private:
+     // for pending DRC).
+     bool mIsSecure;
+     VideoCodec mCodec;
+-    // The raw format the client asked for.
+-    HalPixelFormat mOutputFormat = HalPixelFormat::YCBCR_420_888;
++    // The raw format the client wants, which changes as it sets the output surface.
++    GetOutputFormatCB mGetOutputFormatCb;
++    HalPixelFormat outputFormat() const;
+ 
+     // Tracks the last DMA buffer ID which was used for a given V4L2 input
+     // buffer ID. Used to try to avoid re-importing buffers.

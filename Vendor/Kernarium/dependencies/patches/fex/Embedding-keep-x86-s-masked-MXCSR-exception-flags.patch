@@ -1,0 +1,1164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:03:27 +0900
+Subject: [PATCH] Embedding: keep x86's masked MXCSR exception flags
+
+While MXCSR masked every exception, MXCSR kept no flags: a DIVSS by
+zero left 0x1f80 where x86 leaves 0x1f84, and glibc's fadd, which
+reads the precision flag to round to odd, returned another value.
+
+Embedded, the host's FPSR now accumulates them. EmbedderReadFPFlags
+reads FPSR's IOC, DZC, OFC, UFC and IXC as MXCSR's IE, ZE, OE, UE and
+PE; IDC is not DE, since FPCR.FZ raises it for an input DAZ flushes,
+where x86 raises nothing. STMXCSR, FXSAVE and XSAVE fold them into the
+MXCSR they store, except under EMBEDDER_FP_MODE_CHECK_ALL, where the
+host's helper settles every instruction's flags into the state;
+LDMXCSR, FXRSTOR and XRSTOR clear FPSR with EmbedderClearFPFlags. The
+embedding host clears FPSR as a dispatch starts and folds it as it
+ends.
+
+Host code a dispatch calls keeps FPSR as it found it: the compiler
+raised flags of its own. CompileBlock, CompileSingleStep and
+ExitFunctionLink hold an EmbedderFPSRGuard. The x87 fallbacks compute
+in software and raise no host flags. MXCSR does not govern 3DNow!, so
+a 3DNow! instruction puts back FPSR and the state's MXCSR after itself
+(EmbedderReadFPSR, EmbedderWriteFPSR).
+
+Under EMBEDDER_FP_MODE_CHECK_SPECIAL, an instruction whose checks may
+fault or run it again saves FPSR in Embedder.FPSRBefore as it starts
+(EmbedderSaveFPFlags), for the helper to put back when it abandons the
+instruction: its other lanes may have raised flags x86's fault never
+computes.
+
+Under DAZ without FTZ, FPCR.FZ flushes a result x86 keeps and raises
+underflow where the result is exact. The checks already send every
+flushed result to the helper; each part of an instruction they check
+now saves FPSR in Embedder.FPSRPart, and the helper's flags replace
+those the part raised.
+
+Where the host's instructions raise other flags than x86's:
+
+- COMISS and COMISD compare with FCMPE, which raises invalid operation
+  for a quiet NaN as they do; UCOMISS and UCOMISD keep FCMP. MINSS,
+  MINSD, MAXSS and MAXSD compare with FCMPE too. The flag pass keeps a
+  compare whose flags go unused, which still raises the flag.
+- CMPPS, CMPPD, CMPSS, CMPSD and VCMP raise invalid operation for each
+  of x86's 32 predicates as it does: a quiet relation compares operands
+  whose NaN lanes a quiet ordered test cleared, and FALSE and TRUE
+  compare for the exceptions alone. A scalar form compares its low
+  elements alone.
+- ROUND raises inexact with FRINTX (EmbedderRaiseInexact) unless its
+  immediate suppresses it.
+- DPPS and DPPD with no destination lane compute the sum for its
+  exceptions (EmbedderKeep).
+- RCPPS, RCPSS, RSQRTPS and RSQRTSS raise nothing: the reciprocal
+  square root of an infinity or a NaN goes to the helper, and the
+  quotient's inexact flag is put back unless the guest already holds
+  the precision flag. While MXCSR holds it, they read no FPSR, which
+  waits for the floating-point instructions before it: reading it at
+  every estimate cost Geekbench's Ray Tracer 2 to 3%.
+- The in-line tests compare the lanes of the operation alone: a scalar
+  operation's other lanes, or a memory source's padding, may hold
+  signalling NaNs, for which even FCMEQ raises invalid operation. A
+  one-lane test branches on its lane with CBZ.
+---
+ CodeEmitter/CodeEmitter/Emitter.h             |   1 +
+ CodeEmitter/CodeEmitter/ScalarOps.inl         |  11 +
+ FEXCore/Source/Interface/Context/Context.h    |  35 +++
+ FEXCore/Source/Interface/Core/Core.cpp        |  22 +-
+ FEXCore/Source/Interface/Core/JIT/ALUOps.cpp  |   6 +-
+ .../Interface/Core/JIT/EmbedderFloat.cpp      | 212 ++++++++++++++----
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |   1 +
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |   6 +-
+ .../Source/Interface/Core/JIT/VectorOps.cpp   |   7 +-
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  31 ++-
+ .../Core/OpcodeDispatcher/AVX_128.cpp         |  17 +-
+ .../Core/OpcodeDispatcher/Vector.cpp          | 164 ++++++++++++--
+ FEXCore/Source/Interface/IR/IR.json           |  49 +++-
+ .../RedundantFlagCalculationElimination.cpp   |   5 +
+ .../IR/Passes/x87StackOptimizationPass.cpp    |   6 +-
+ FEXCore/include/FEXCore/Core/CoreState.h      |   7 +
+ 16 files changed, 492 insertions(+), 88 deletions(-)
+
+diff --git a/CodeEmitter/CodeEmitter/Emitter.h b/CodeEmitter/CodeEmitter/Emitter.h
+index 001adcbaf6021b7a10fc55d0c441c597b40a2c89..207890dfd279c57617c780c19424c867f610767e 100644
+--- a/CodeEmitter/CodeEmitter/Emitter.h
++++ b/CodeEmitter/CodeEmitter/Emitter.h
+@@ -361,6 +361,7 @@ enum class SystemRegister : uint32_t {
+   RNDRRS = GenSystemReg<0b11, 0b011, 0b0010, 0b0100, 0b001>,
+   NZCV = GenSystemReg<0b11, 0b011, 0b0100, 0b0010, 0b000>,
+   FPCR = GenSystemReg<0b11, 0b011, 0b0100, 0b0100, 0b000>,
++  FPSR = GenSystemReg<0b11, 0b011, 0b0100, 0b0100, 0b001>,
+   TPIDRRO_EL0 = GenSystemReg<0b11, 0b011, 0b1101, 0b0000, 0b011>,
+   CNTFRQ_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b000>,
+   CNTVCT_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b010>,
+diff --git a/CodeEmitter/CodeEmitter/ScalarOps.inl b/CodeEmitter/CodeEmitter/ScalarOps.inl
+index 504ad81ab1d6f303bccfa53fd01bae0e792a34be..07d29e538d4119f389427305d6871be82a56faaa 100644
+--- a/CodeEmitter/CodeEmitter/ScalarOps.inl
++++ b/CodeEmitter/CodeEmitter/ScalarOps.inl
+@@ -1000,6 +1000,17 @@ public:
+ 
+     FloatCompare(0, 0, ConvertedSize, 0b00, 0b00000, rn, rm);
+   }
++  // Signalling: invalid operation for a quiet NaN too.
++  void fcmpe(ScalarRegSize Size, VRegister rn, VRegister rm) {
++    LOGMAN_THROW_A_FMT(Size != ScalarRegSize::i8Bit, "8-bit destination not supported");
++
++    const auto ConvertedSize = Size == ARMEmitter::ScalarRegSize::i64Bit ? 0b01 :
++                               Size == ARMEmitter::ScalarRegSize::i32Bit ? 0b00 :
++                               Size == ARMEmitter::ScalarRegSize::i16Bit ? 0b11 :
++                                                                           0;
++
++    FloatCompare(0, 0, ConvertedSize, 0b00, 0b10000, rn, rm);
++  }
+ 
+   void fcmp(SRegister rn, SRegister rm) {
+     FloatCompare(0, 0, 0b00, 0b00, 0b00000, rn.V(), rm.V());
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 4ee4a22605e3bd17211b13b2d0d789e22dea918c..62b3fc1f168e6549775d267b8c39f9d6e12805a6 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -139,6 +139,41 @@ public:
+                                   std::span<const DiskCache::BlobThunkRelocation> ThunkRelocs);
+ };
+ 
++// Embedded: while a dispatch runs, the host's FPSR holds the guest's MXCSR
++// exception flags (EmbedderReadFPFlags), so host code the dispatch calls,
++// such as the compiler, leaves FPSR as it found it.
++class EmbedderFPSRGuard final {
++public:
++  explicit EmbedderFPSRGuard(bool Embedded) {
++#if defined(ARCHITECTURE_arm64)
++    Active = Embedded;
++    if (Active) {
++      __asm__ volatile("mrs %0, fpsr" : "=r"(Value)::"memory");
++    }
++#else
++    (void)Embedded;
++#endif
++  }
++  ~EmbedderFPSRGuard() {
++#if defined(ARCHITECTURE_arm64)
++    if (!Active) {
++      return;
++    }
++    uint64_t Now;
++    __asm__ volatile("mrs %0, fpsr" : "=r"(Now)::"memory");
++    if (Now != Value) {
++      __asm__ volatile("msr fpsr, %0" ::"r"(Value) : "memory");
++    }
++#endif
++  }
++  EmbedderFPSRGuard(const EmbedderFPSRGuard&) = delete;
++  EmbedderFPSRGuard& operator=(const EmbedderFPSRGuard&) = delete;
++
++private:
++  uint64_t Value {};
++  bool Active {};
++};
++
+ class ContextImpl final : public FEXCore::Context::Context, public CPU::SharedCodeBufferManager {
+ public:
+   // Context base class implementation.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 5ec8123ba8e8b284fe3d4664d94f8f89a5e6a3a5..0bf876cff72f1e48073ccb505b44379d5728abe7 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -651,7 +651,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         Thread->OpDispatcher->FlushRegisterCache(!Embedded);
+ 
+         if (ExtendedDebugInfo || Embedded || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
+-          Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
++          IR::Ref Start = Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
++          if (Embedded) {
++            Thread->OpDispatcher->EmbedderStartInstruction(Start);
++          }
+         }
+ 
+         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+@@ -705,7 +708,22 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);
++          // Embedded: MXCSR does not govern 3DNow!, whose host arithmetic
++          // and checks leave the guest's MXCSR flags, in FPSR and in the
++          // state, as they were.
++          const auto& DDDNow = FEXCore::X86Tables::DDDNowOps;
++          const bool Is3DNow = Embedded && TableInfo >= DDDNow.data() && TableInfo < DDDNow.data() + DDDNow.size();
++          IR::Ref SavedFPSR {};
++          IR::Ref SavedMXCSR {};
++          if (Is3DNow) {
++            SavedFPSR = Thread->OpDispatcher->_EmbedderReadFPSR();
++            SavedMXCSR = Thread->OpDispatcher->_LoadContextGPR(IR::OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, mxcsr));
++          }
+           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
++          if (Is3DNow) {
++            Thread->OpDispatcher->_EmbedderWriteFPSR(SavedFPSR);
++            Thread->OpDispatcher->_StoreContextGPR(IR::OpSize::i32Bit, SavedMXCSR, offsetof(FEXCore::Core::CPUState, mxcsr));
++          }
+           if (Embedded) {
+             Thread->OpDispatcher->EmbedderFPEndInstruction();
+           }
+@@ -898,6 +916,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   }
+ 
+   auto Thread = Frame->Thread;
++  EmbedderFPSRGuard FPSRGuard {Embedded};
+   FEXCORE_PROFILE_SCOPED("CompileBlock");
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
+ 
+@@ -1091,6 +1110,7 @@ bool ContextImpl::WaitsForX87(const FEXCore::X86Tables::X86InstInfo* TableInfo,
+ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+   FEXCORE_PROFILE_SCOPED("CompileSingleStep");
+   auto Thread = Frame->Thread;
++  EmbedderFPSRGuard FPSRGuard {Embedded};
+ 
+   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index 7241f17996d2610ec7d2b46676769cdc996e80c0..b9020c8e59eb2c30bfd50813ee893f76300f0957 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -1513,7 +1513,11 @@ DEF_OP(FCmp) {
+   ARMEmitter::VRegister Scalar1 = GetVReg(Op->Scalar1);
+   ARMEmitter::VRegister Scalar2 = GetVReg(Op->Scalar2);
+ 
+-  fcmp(EmitSubSize, Scalar1, Scalar2);
++  if (Op->Signalling) {
++    fcmpe(EmitSubSize, Scalar1, Scalar2);
++  } else {
++    fcmp(EmitSubSize, Scalar1, Scalar2);
++  }
+ }
+ 
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
+index 2ea8f895a1ec2865e51be398196fa849b380520d..b82c6f9136eb66ad761fced628506878028c5040 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
+@@ -178,8 +178,42 @@ ARMEmitter::SubRegSize LaneSize(uint32_t ElementBytes) {
+   return ElementBytes == 8 ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+ }
+ 
++ARMEmitter::ScalarRegSize ScalarSize(uint32_t ElementBytes) {
++  return ElementBytes == 8 ? ARMEmitter::ScalarRegSize::i64Bit : ARMEmitter::ScalarRegSize::i32Bit;
++}
++
+ } // namespace
+ 
++// The floating-point compares of the tests below look at the lanes of the
++// first Bytes bytes alone: the others, a scalar operation's upper lanes or a
++// memory source's padding, may hold signalling NaNs, for which even a quiet
++// compare raises the host's invalid operation flag. A scalar compare clears
++// the rest of Mask.
++
++// Mask = all ones in the lanes of the first Bytes bytes of Value that are
++// not NaNs. No NZCV writes.
++void Arm64JITCore::EmbedderFPOrdered(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes, uint32_t Bytes) {
++  if (Bytes == ElementBytes) {
++    fcmeq(ScalarSize(ElementBytes), Mask, Value, Value);
++  } else if (Bytes == 8) {
++    fcmeq(LaneSize(ElementBytes), Mask.D(), Value.D(), Value.D());
++  } else {
++    fcmeq(LaneSize(ElementBytes), Mask.Q(), Value.Q(), Value.Q());
++  }
++}
++
++// Mask = all ones in the lanes of the first Bytes bytes of Value that are
++// zeros. No NZCV writes.
++void Arm64JITCore::EmbedderFPZero(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes, uint32_t Bytes) {
++  if (Bytes == ElementBytes) {
++    fcmeq(ScalarSize(ElementBytes), Mask, Value);
++  } else if (Bytes == 8) {
++    fcmeq(LaneSize(ElementBytes), Mask.D(), Value.D());
++  } else {
++    fcmeq(LaneSize(ElementBytes), Mask.Q(), Value.Q());
++  }
++}
++
+ // Mask = all ones in the lanes of Value whose exponent is all ones or one
+ // below. No NZCV writes.
+ void Arm64JITCore::EmbedderFPSpecial(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes) {
+@@ -234,8 +268,18 @@ void Arm64JITCore::EmbedderFPBranchIfSpecial(ARMEmitter::VRegister Value, uint32
+ 
+ // Branches to Target when any of the first Bytes bytes of Mask, all ones or
+ // zero in each lane, is clear. No NZCV writes.
+-void Arm64JITCore::EmbedderFPBranchIfAnyClear(ARMEmitter::VRegister Mask, uint32_t Bytes, ARMEmitter::ForwardLabel* Target) {
+-  if (Bytes > 8) {
++void Arm64JITCore::EmbedderFPBranchIfAnyClear(ARMEmitter::VRegister Mask, uint32_t ElementBytes, uint32_t Bytes,
++                                              ARMEmitter::ForwardLabel* Target) {
++  if (Bytes == ElementBytes) {
++    // One lane, all ones or zero.
++    const auto Size = Bytes == 8 ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
++    if (Bytes == 8) {
++      fmov(Size, TMP1, Mask.D());
++    } else {
++      fmov(Size, TMP1.W(), Mask.S());
++    }
++    cbz_OrRestart(Size, TMP1, Target);
++  } else if (Bytes > 8) {
+     uminv(ARMEmitter::SubRegSize::i32Bit, Mask.Q(), Mask.Q());
+     fmov(ARMEmitter::Size::i32Bit, TMP1.W(), Mask.S());
+     cbz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, Target);
+@@ -256,10 +300,10 @@ void Arm64JITCore::EmbedderFPInputTest(const EmbedderFPSite& Site, uint32_t Kind
+   const auto Lane = LaneSize(ElementBytes);
+   if (Kind == Core::EMBEDDER_FP_CMP || Kind == Core::EMBEDDER_FP_COMIS || Kind == Core::EMBEDDER_FP_MIN || Kind == Core::EMBEDDER_FP_MAX) {
+     // All ones in the lanes where neither operand is a NaN.
+-    fcmeq(Lane, VTMP1.Q(), Site.Sources[0].Q(), Site.Sources[0].Q());
+-    fcmeq(Lane, VTMP2.Q(), Site.Sources[1].Q(), Site.Sources[1].Q());
++    EmbedderFPOrdered(VTMP1, Site.Sources[0], ElementBytes, Bytes);
++    EmbedderFPOrdered(VTMP2, Site.Sources[1], ElementBytes, Bytes);
+     and_(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+-    EmbedderFPBranchIfAnyClear(VTMP1, Bytes, Target);
++    EmbedderFPBranchIfAnyClear(VTMP1, ElementBytes, Bytes, Target);
+     return;
+   }
+   for (uint32_t Part = 0; Part < 2 && Part * 16 < Bytes; ++Part) {
+@@ -278,8 +322,8 @@ void Arm64JITCore::EmbedderFPInputTest(const EmbedderFPSite& Site, uint32_t Kind
+       cmhi(ARMEmitter::SubRegSize::i16Bit, VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+       EmbedderFPBranchIfAny(VTMP1, PartBytes, Target);
+     } else {
+-      fcmeq(Lane, VTMP1.Q(), Source.Q(), Source.Q());
+-      EmbedderFPBranchIfAnyClear(VTMP1, PartBytes, Target);
++      EmbedderFPOrdered(VTMP1, Source, ElementBytes, PartBytes);
++      EmbedderFPBranchIfAnyClear(VTMP1, ElementBytes, PartBytes, Target);
+     }
+   }
+ }
+@@ -301,31 +345,35 @@ void Arm64JITCore::EmbedderFPMagnitudeBelow(ARMEmitter::VRegister Mask, ARMEmitt
+ // VTMP1 = all ones in the result lanes of Site that are NaNs, or Special
+ // (EmbedderFPSpecial) ones, or zeros from inputs that are not, for the
+ // precise test under DAZ and FTZ. Uses VTMP2.
+-void Arm64JITCore::EmbedderFPZeroFromNonzero(const EmbedderFPSite& Site, uint32_t Kind, uint32_t ElementBytes, bool Special) {
+-  const auto Lane = LaneSize(ElementBytes);
++void Arm64JITCore::EmbedderFPZeroFromNonzero(const EmbedderFPSite& Site, uint32_t Kind, uint32_t ElementBytes, uint32_t Bytes, bool Special) {
+   // VTMP1: a lane with an input that is zero.
+   switch (Kind) {
+-  case Core::EMBEDDER_FP_NARROW:
+-    fcmeq(ARMEmitter::SubRegSize::i64Bit, VTMP1.Q(), Site.Sources[0].Q());
++  case Core::EMBEDDER_FP_NARROW: {
++    // Doubles, two to a source.
++    const auto SourceBytes = Bytes * 2;
++    EmbedderFPZero(VTMP1, Site.Sources[0], 8, std::min(SourceBytes, 16U));
+     xtn(ARMEmitter::SubRegSize::i32Bit, VTMP1, VTMP1);
+-    fcmeq(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), Site.Sources[1].Q());
+-    xtn2(ARMEmitter::SubRegSize::i32Bit, VTMP1, VTMP2);
++    if (SourceBytes > 16) {
++      EmbedderFPZero(VTMP2, Site.Sources[1], 8, SourceBytes - 16);
++      xtn2(ARMEmitter::SubRegSize::i32Bit, VTMP1, VTMP2);
++    }
+     break;
+-  case Core::EMBEDDER_FP_DIV: fcmeq(Lane, VTMP1.Q(), Site.Sources[0].Q()); break;
++  }
++  case Core::EMBEDDER_FP_DIV: EmbedderFPZero(VTMP1, Site.Sources[0], ElementBytes, Bytes); break;
+   default:
+-    fcmeq(Lane, VTMP1.Q(), Site.Sources[0].Q());
+-    fcmeq(Lane, VTMP2.Q(), Site.Sources[1].Q());
++    EmbedderFPZero(VTMP1, Site.Sources[0], ElementBytes, Bytes);
++    EmbedderFPZero(VTMP2, Site.Sources[1], ElementBytes, Bytes);
+     orr(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+     break;
+   }
+-  fcmeq(Lane, VTMP2.Q(), Site.Result.Q());
++  EmbedderFPZero(VTMP2, Site.Result, ElementBytes, Bytes);
+   bic(VTMP1.Q(), VTMP2.Q(), VTMP1.Q());
+   if (Special) {
+     EmbedderFPSpecial(VTMP2, Site.Result, ElementBytes);
+     orr(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+     return;
+   }
+-  fcmeq(Lane, VTMP2.Q(), Site.Result.Q(), Site.Result.Q());
++  EmbedderFPOrdered(VTMP2, Site.Result, ElementBytes, Bytes);
+   orn(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+ }
+ 
+@@ -350,21 +398,9 @@ void Arm64JITCore::EmbedderFPBranchIfAny(ARMEmitter::VRegister Mask, uint32_t By
+ // writes: guest flags may be live.
+ void Arm64JITCore::EmbedderFPBranchIfNaN(ARMEmitter::VRegister Value, uint32_t ElementBytes, uint32_t Bytes,
+                                          ARMEmitter::ForwardLabel* Target) {
+-  if (Bytes == 16) {
+-    // All ones in the lanes that are not NaNs.
+-    fcmeq(ElementBytes == 8 ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), Value.Q(), Value.Q());
+-    uminv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), VTMP1.Q());
+-    fmov(ARMEmitter::Size::i32Bit, TMP1.W(), VTMP1.S());
+-    cbz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, Target);
+-  } else if (ElementBytes == 8) {
+-    fcmeq(ARMEmitter::ScalarRegSize::i64Bit, VTMP1, Value, Value);
+-    fmov(ARMEmitter::Size::i64Bit, TMP1, VTMP1.D());
+-    cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, Target);
+-  } else {
+-    fcmeq(ARMEmitter::ScalarRegSize::i32Bit, VTMP1, Value, Value);
+-    fmov(ARMEmitter::Size::i32Bit, TMP1.W(), VTMP1.S());
+-    cbz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, Target);
+-  }
++  // All ones in the lanes that are not NaNs.
++  EmbedderFPOrdered(VTMP1, Value, ElementBytes, Bytes);
++  EmbedderFPBranchIfAnyClear(VTMP1, ElementBytes, Bytes, Target);
+ }
+ 
+ // RCPPS, RCPSS, RSQRTPS and RSQRTSS. x86 takes a denormal input as zero,
+@@ -373,25 +409,46 @@ void Arm64JITCore::EmbedderFPBranchIfNaN(ARMEmitter::VRegister Value, uint32_t E
+ // host's correctly rounded quotient lies within x86's error everywhere else.
+ // Lanes needing more than that quotient go to the host first, so the host
+ // raises nothing for them: an exponent of zero, and for RCP one of 0xFD and
+-// above, for RSQRT a negative sign.
++// above, for RSQRT one of all ones or a negative sign.
++//
++// x86 raises no exception for these, and the quotient raises the host's
++// inexact flag alone. It is lost in a precision flag the guest already
++// holds, in MXCSR or in the host's FPSR; without one the host's FPSR is put
++// back after the quotient. MXCSR holds it once a dispatch that raised it
++// has ended, so the common path reads no FPSR, which waits for every
++// floating-point instruction before it.
+ void Arm64JITCore::EmbedderFPEstimate(bool Reciprocal, uint32_t Bytes, ARMEmitter::VRegister Dst, ARMEmitter::VRegister Source,
+                                       ARMEmitter::VRegister Result, ARMEmitter::ForwardLabel* Cold) {
+   using ARMEmitter::SubRegSize;
+   const bool Scalar = Bytes == 4;
+   shl(SubRegSize::i32Bit, VTMP1.Q(), Source.Q(), 1);
+-  if (Reciprocal) {
+-    movi(SubRegSize::i32Bit, VTMP2.Q(), 0x03, 24);
+-    add(SubRegSize::i32Bit, VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+-    movi(SubRegSize::i32Bit, VTMP2.Q(), 0x04, 24);
+-    cmhi(SubRegSize::i32Bit, VTMP1.Q(), VTMP2.Q(), VTMP1.Q());
+-  } else {
+-    movi(SubRegSize::i32Bit, VTMP2.Q(), 0x01, 24);
+-    cmhi(SubRegSize::i32Bit, VTMP1.Q(), VTMP2.Q(), VTMP1.Q());
++  // The exponent plus a bias that wraps the lanes for the host past zero.
++  movi(SubRegSize::i32Bit, VTMP2.Q(), Reciprocal ? 0x03 : 0x01, 24);
++  add(SubRegSize::i32Bit, VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
++  movi(SubRegSize::i32Bit, VTMP2.Q(), Reciprocal ? 0x04 : 0x02, 24);
++  cmhi(SubRegSize::i32Bit, VTMP1.Q(), VTMP2.Q(), VTMP1.Q());
++  if (!Reciprocal) {
+     cmlt(SubRegSize::i32Bit, VTMP2.Q(), Source.Q());
+     orr(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+   }
+   EmbedderFPBranchIfAny(VTMP1, Bytes, Cold);
+ 
++  // TMP3 bit 5: the guest holds the precision flag. TMP2: the host's FPSR,
++  // read only while MXCSR does not hold it. No NZCV writes.
++  constexpr auto i32 = ARMEmitter::Size::i32Bit;
++  ldr(TMP3.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.mxcsr));
++  ARMEmitter::ForwardLabel Held;
++  (void)tbnz(TMP3, 5, &Held);
++  mrs(TMP2, ARMEmitter::SystemRegister::FPSR);
++  orr(i32, TMP3, TMP3, TMP2, ARMEmitter::ShiftType::LSL, 1);
++  (void)Bind(&Held);
++  ARMEmitter::ForwardLabel Sticky;
++  const auto RestoreFlags = [&] {
++    (void)tbnz(TMP3, 5, &Sticky);
++    msr(ARMEmitter::SystemRegister::FPSR, TMP2);
++    (void)Bind(&Sticky);
++  };
++
+   if (Scalar) {
+     if (Reciprocal) {
+       fmov(ARMEmitter::ScalarRegSize::i32Bit, VTMP1, 1.0f);
+@@ -401,6 +458,7 @@ void Arm64JITCore::EmbedderFPEstimate(bool Reciprocal, uint32_t Bytes, ARMEmitte
+       fmov(ARMEmitter::ScalarRegSize::i32Bit, VTMP1, 1.0f);
+       fdiv(VTMP1.S(), VTMP1.S(), VTMP2.S());
+     }
++    RestoreFlags();
+     if (Dst != Result) {
+       mov(Dst.Q(), Result.Q());
+     }
+@@ -415,6 +473,7 @@ void Arm64JITCore::EmbedderFPEstimate(bool Reciprocal, uint32_t Bytes, ARMEmitte
+     fmov(SubRegSize::i32Bit, VTMP1.Q(), 1.0f);
+     fdiv(SubRegSize::i32Bit, Dst.Q(), VTMP1.Q(), VTMP2.Q());
+   }
++  RestoreFlags();
+ }
+ 
+ DEF_OP(EmbedderFPCheck) {
+@@ -446,7 +505,6 @@ DEF_OP(EmbedderFPCheck) {
+   default: {
+     // A NaN differs in which source's the host propagates, in a subtracted
+     // NaN's sign and in the default NaN's sign; TestFor says what else.
+-    const auto Lane = LaneSize(Desc.ResultElementBytes());
+     const auto Result = Site->Result;
+     const auto Test = TestFor(Desc.Kind(), Mode, &Site->Filtered);
+     auto* Target = Site->Filtered ? &Site->Filter : &Site->Entry;
+@@ -454,7 +512,7 @@ DEF_OP(EmbedderFPCheck) {
+     switch (Test) {
+     case FPTest::Special: EmbedderFPBranchIfSpecial(Result, Desc.ResultElementBytes(), Desc.Bytes(), Target); break;
+     case FPTest::SpecialOrZero:
+-      fcmeq(Lane, VTMP1.Q(), Result.Q());
++      EmbedderFPZero(VTMP1, Result, Desc.ResultElementBytes(), Desc.Bytes());
+       EmbedderFPSpecial(VTMP2, Result, Desc.ResultElementBytes());
+       orr(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+       EmbedderFPBranchIfAny(VTMP1, Desc.Bytes(), Target);
+@@ -482,15 +540,15 @@ DEF_OP(EmbedderFPCheck) {
+       break;
+     case FPTest::NaN: EmbedderFPBranchIfNaN(Result, Desc.ResultElementBytes(), Desc.Bytes(), Target); break;
+     case FPTest::NaNOrZero:
+-      fcmeq(Lane, VTMP1.Q(), Result.Q());
+-      fcmeq(Lane, VTMP2.Q(), Result.Q(), Result.Q());
++      EmbedderFPZero(VTMP1, Result, Desc.ResultElementBytes(), Desc.Bytes());
++      EmbedderFPOrdered(VTMP2, Result, Desc.ResultElementBytes(), Desc.Bytes());
+       orn(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+       EmbedderFPBranchIfAny(VTMP1, Desc.Bytes(), Target);
+       break;
+     case FPTest::NaNOrTiny:
+       EmbedderFPMagnitudeBelow(VTMP1, Result, Desc.ResultElementBytes(),
+                                Desc.ResultElementBytes() == 8 ? 0x0020'0000'0000'0000ULL : 0x0100'0000ULL);
+-      fcmeq(Lane, VTMP2.Q(), Result.Q(), Result.Q());
++      EmbedderFPOrdered(VTMP2, Result, Desc.ResultElementBytes(), Desc.Bytes());
+       orn(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+       EmbedderFPBranchIfAny(VTMP1, Desc.Bytes(), Target);
+       break;
+@@ -511,6 +569,64 @@ DEF_OP(EmbedderFPCheck) {
+   EmbedderFPSites.push_back(std::move(Site));
+ }
+ 
++// The guest's MXCSR exception flags while it masks them all: the host's
++// FPSR accumulates them, which the embedding host clears as a dispatch
++// starts and folds into MXCSR as it ends. STMXCSR, FXSAVE and XSAVE fold
++// them into the MXCSR they store, LDMXCSR, FXRSTOR and XRSTOR clear them.
++// Under EMBEDDER_FP_MODE_CHECK_ALL the helper settles every instruction's
++// flags into the state instead, and the host's are not the guest's.
++DEF_OP(EmbedderReadFPFlags) {
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderReadFPFlags outside embedding");
++  constexpr auto i32 = ARMEmitter::Size::i32Bit;
++  const auto Dst = GetReg(Node);
++  // FPSR IOC (bit 0) is MXCSR IE; DZC, OFC, UFC and IXC (bits 1 to 4) are
++  // ZE, OE, UE and PE (bits 2 to 5).
++  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
++  and_(i32, TMP2, TMP1, 0x1e);
++  and_(i32, Dst, TMP1, 1);
++  orr(i32, Dst, Dst, TMP2, ARMEmitter::ShiftType::LSL, 1);
++}
++
++DEF_OP(EmbedderClearFPFlags) {
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderClearFPFlags outside embedding");
++  msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::Reg::zr);
++}
++
++DEF_OP(EmbedderSaveFPFlags) {
++  const auto Op = IROp->C<IR::IROp_EmbedderSaveFPFlags>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderSaveFPFlags outside embedding");
++  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
++  if (!Op->Part) {
++    str(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.FPSRBefore));
++  }
++  str(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.FPSRPart));
++}
++
++DEF_OP(EmbedderReadFPSR) {
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderReadFPSR outside embedding");
++  mrs(GetReg(Node), ARMEmitter::SystemRegister::FPSR);
++}
++
++DEF_OP(EmbedderWriteFPSR) {
++  const auto Op = IROp->C<IR::IROp_EmbedderWriteFPSR>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderWriteFPSR outside embedding");
++  msr(ARMEmitter::SystemRegister::FPSR, GetReg(Op->Value));
++}
++
++DEF_OP(EmbedderRaiseInexact) {
++  const auto Op = IROp->C<IR::IROp_EmbedderRaiseInexact>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderRaiseInexact outside embedding");
++  const auto Vector = GetVReg(Op->Vector);
++  const auto ElementBytes = IR::OpSizeToSize(Op->ElementSize);
++  if (Op->Size == Op->ElementSize) {
++    frintx(ScalarSize(ElementBytes), VTMP1, Vector);
++  } else {
++    frintx(LaneSize(ElementBytes), VTMP1.Q(), Vector.Q());
++  }
++}
++
++DEF_OP(EmbedderKeep) {}
++
+ DEF_OP(EmbedderFPModeCheck) {
+   const auto Op = IROp->C<IR::IROp_EmbedderFPModeCheck>();
+   LOGMAN_THROW_A_FMT(Embedded(), "EmbedderFPModeCheck outside embedding");
+@@ -606,7 +722,7 @@ void Arm64JITCore::EmitEmbedderFPSites() {
+     if (Site->Filtered) {
+       const FPDescriptor Desc {static_cast<uint32_t>(Site->Descriptor)};
+       BindOrRestart(&Site->Filter);
+-      EmbedderFPZeroFromNonzero(*Site, Desc.Kind(), Desc.ResultElementBytes(),
++      EmbedderFPZeroFromNonzero(*Site, Desc.Kind(), Desc.ResultElementBytes(), Desc.Bytes(),
+                                 (CTX->EmbedderFPMode & Core::EMBEDDER_FP_MODE_CHECK_SPECIAL) != 0);
+       EmbedderFPBranchIfAny(VTMP1, Desc.Bytes(), &Site->Entry);
+       if (Site->Dst != Site->Result) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 862cfbf4af6a8c116d6aa083fa94ba00b0724704..bd3480dbb29073c9152ae2e8e549efe1c124f37c 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -608,6 +608,7 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
+ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
+   FEXCore::Allocator::ScopedExecutableWrite ExecutableWriteScope;
+   auto Thread = Frame->Thread;
++  Context::EmbedderFPSRGuard FPSRGuard {static_cast<Context::ContextImpl*>(Thread->CTX)->Embedded};
+   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+   uintptr_t HostCode {};
+   auto GuestRip = Record->GuestRIP;
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 56d14de3b1cf44cac3a2282e403e40dcf0077042..870b4966bd518a275cf2de05c6687915a90b2d2a 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -192,9 +192,11 @@ private:
+   void EmbedderFPEstimate(bool Reciprocal, uint32_t Bytes, ARMEmitter::VRegister Dst, ARMEmitter::VRegister Source,
+                           ARMEmitter::VRegister Result, ARMEmitter::ForwardLabel* Cold);
+   void EmbedderFPMagnitudeBelow(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes, uint64_t Threshold);
+-  void EmbedderFPZeroFromNonzero(const EmbedderFPSite& Site, uint32_t Kind, uint32_t ElementBytes, bool Special);
++  void EmbedderFPZeroFromNonzero(const EmbedderFPSite& Site, uint32_t Kind, uint32_t ElementBytes, uint32_t Bytes, bool Special);
++  void EmbedderFPOrdered(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes, uint32_t Bytes);
++  void EmbedderFPZero(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes, uint32_t Bytes);
+   void EmbedderFPSpecial(ARMEmitter::VRegister Mask, ARMEmitter::VRegister Value, uint32_t ElementBytes);
+-  void EmbedderFPBranchIfAnyClear(ARMEmitter::VRegister Mask, uint32_t Bytes, ARMEmitter::ForwardLabel* Target);
++  void EmbedderFPBranchIfAnyClear(ARMEmitter::VRegister Mask, uint32_t ElementBytes, uint32_t Bytes, ARMEmitter::ForwardLabel* Target);
+   void EmbedderFPBranchIfSpecial(ARMEmitter::VRegister Value, uint32_t ElementBytes, uint32_t Bytes, ARMEmitter::ForwardLabel* Target);
+   void EmbedderFPInputTest(const EmbedderFPSite& Site, uint32_t Kind, uint32_t ElementBytes, uint32_t Bytes, uint32_t Flags, bool Above,
+                            ARMEmitter::ForwardLabel* Target);
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index 43e38d8dd7bd1637491dab2e13cdab37f9ddedc3..3054e8d24519f6a415f2f8882219755a5d03c14a 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -451,8 +451,9 @@ DEF_OP(VFMinScalarInsert) {
+     } else {
+       // Only take the first operand if it is strictly less. Otherwise take
+       // the second. This emulates all the weird x86 rules for signed zero and
+-      // NaNs. No, they're not IEEE-754 semantics.
+-      fcmp(SubRegSize.Scalar, Src1, Src2);
++      // NaNs. No, they're not IEEE-754 semantics. x86 raises invalid
++      // operation for a quiet NaN too, as FCMPE does.
++      fcmpe(SubRegSize.Scalar, Src1, Src2);
+       fcsel(SubRegSize.Scalar, Dst, Src1, Src2, ARMEmitter::Condition::CC_MI);
+     }
+   };
+@@ -478,7 +479,7 @@ DEF_OP(VFMaxScalarInsert) {
+       fmax(SubRegSize.Scalar, Dst, Src1, Src2);
+     } else {
+       // Only take the first operand if it is strictly greater. See fmin.
+-      fcmp(SubRegSize.Scalar, Src1, Src2);
++      fcmpe(SubRegSize.Scalar, Src1, Src2);
+       fcsel(SubRegSize.Scalar, Dst, Src1, Src2, ARMEmitter::Condition::CC_GT);
+     }
+   };
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 67c6ecd1d41bc76e59acbaf11f854c27506594c6..8dc8dd076a081fbae55afaffaa92a4e00a0e6c1e 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -321,8 +321,15 @@ public:
+     return NeedsBlockEnd;
+   }
+ 
++  // Embedded: starts an instruction at its GuestOpcode op, Start.
++  void EmbedderStartInstruction(Ref Start) {
++    EmbedderInstructionStart = Start;
++  }
+   // Embedded: ends an instruction's EmbedderFPCheck ops. Of several that
+-  // settle its exceptions, the last settles those of all.
++  // settle its exceptions, the last settles those of all. Under
++  // EMBEDDER_FP_MODE_CHECK_SPECIAL an instruction one of them may abandon
++  // saves the host's FPSR as it starts, and under DAZ without FTZ each part
++  // of an instruction they check does.
+   void EmbedderFPEndInstruction();
+ 
+   void ResetHandledLock() {
+@@ -1479,6 +1486,11 @@ private:
+   void VMOVScalarOpImpl(OpcodeArgs, IR::OpSize ElementSize);
+ 
+   Ref VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType);
++  // Embedded: VFCMPOpImpl raising x86's exceptions, of Size bytes or of the
++  // low element when Size is ElementSize.
++  Ref EmbedderFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType);
++  // Embedded: the inexact flag of a ROUND with immediate Mode.
++  void EmbedderRoundInexact(OpSize Size, IR::OpSize ElementSize, Ref Src, uint64_t Mode);
+ 
+   void VTESTOpImpl(OpSize SrcSize, IR::OpSize ElementSize, Ref Src1, Ref Src2);
+ 
+@@ -1534,9 +1546,12 @@ private:
+   void X87InvalidForNaN(Ref Unordered);
+   // Sets ES and B to whether FSW holds a flag FCW unmasks.
+   void X87UpdatePending(Ref FSW, Ref FCW);
+-  // Whether this context's checks settle exceptions MXCSR unmasks.
+-  bool EmbedderFPChecksExceptions() const;
+-  fextl::vector<IR::IROp_EmbedderFPCheck*> EmbedderFPInstructionChecks;
++  struct EmbedderFPInstructionCheck {
++    IR::IROp_EmbedderFPCheck* Op;
++    Ref Node;
++  };
++  fextl::vector<EmbedderFPInstructionCheck> EmbedderFPInstructionChecks;
++  Ref EmbedderInstructionStart {};
+   // Ends an instruction that loads MXCSR: a change of the floating-point
+   // mode the context translates for leaves the dispatch.
+   void EmbedderFPModeCheck(OpcodeArgs);
+@@ -2256,11 +2271,13 @@ private:
+     return _NZCVSelect(OpSize, Cond, TrueV, FalseV);
+   }
+ 
+-  // Compares two floats and sets flags for a COMISS instruction
+-  void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2) {
++  // Compares two floats and sets flags for a COMISS instruction, or with
++  // Quiet for a UCOMISS, which raises invalid operation only for a
++  // signalling NaN.
++  void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2, bool Quiet) {
+     // First, set flags according to Arm FCMP.
+     HandleNZCVWrite();
+-    _FCmp(ElementSize, Src1, Src2);
++    _FCmp(ElementSize, Src1, Src2, !Quiet);
+     CFInverted = false;
+     ComissFlags();
+   }
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+index 93eea423cba31076b59b68c44ae2056d0935a7a9..91e85899dff863dff27fe7c03a9b93f5853d3570 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+@@ -676,8 +676,9 @@ void OpDispatchBuilder::AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize) {
+   }
+ 
+   // VEX 2E is VUCOMIS and 2F VCOMIS.
+-  EmbedderFPExceptions(Core::EMBEDDER_FP_COMIS, ElementSize, 1, Src1.Low, Src2.Low, 0, (Op->OP & 1) != 0 ? 0 : Core::EMBEDDER_FP_COMIS_QUIET);
+-  Comiss(ElementSize, Src1.Low, Src2.Low);
++  const bool Quiet = (Op->OP & 1) == 0;
++  EmbedderFPExceptions(Core::EMBEDDER_FP_COMIS, ElementSize, 1, Src1.Low, Src2.Low, 0, Quiet ? Core::EMBEDDER_FP_COMIS_QUIET : 0);
++  Comiss(ElementSize, Src1.Low, Src2.Low, Quiet);
+ }
+ 
+ void OpDispatchBuilder::AVX128_VectorScalarInsertALU(OpcodeArgs, FEXCore::IR::IROps IROp, IR::OpSize ElementSize) {
+@@ -722,7 +723,8 @@ void OpDispatchBuilder::AVX128_VFCMP(OpcodeArgs, IR::OpSize ElementSize) {
+   AVX128_VectorBinaryImpl(Op, OpSizeFromSrc(Op), ElementSize, [this, &Capture](IR::OpSize _ElementSize, Ref Src1, Ref Src2) {
+     EmbedderFPExceptions(Core::EMBEDDER_FP_CMP, _ElementSize, 16 / IR::OpSizeToSize(_ElementSize), Src1, Src2, Capture.CompType,
+                          Core::EMBEDDER_FP_CMP_VEX);
+-    return VFCMPOpImpl(OpSize::i128Bit, _ElementSize, Src1, Src2, Capture.CompType);
++    return CTX->Embedded ? EmbedderFCMPOpImpl(OpSize::i128Bit, _ElementSize, Src1, Src2, Capture.CompType) :
++                           VFCMPOpImpl(OpSize::i128Bit, _ElementSize, Src1, Src2, Capture.CompType);
+   });
+ }
+ 
+@@ -745,7 +747,13 @@ void OpDispatchBuilder::AVX128_InsertScalarFCMP(OpcodeArgs, IR::OpSize ElementSi
+ 
+   EmbedderFPExceptions(Core::EMBEDDER_FP_CMP, ElementSize, 1, Src1.Low, Src2.Low, CompType & 0b11111, Core::EMBEDDER_FP_CMP_VEX);
+   RefPair Result {};
+-  Result.Low = InsertScalarFCMPOpImpl(OpSize::i128Bit, OpSize::i128Bit, ElementSize, Src1.Low, Src2.Low, CompType & 0b11111, false);
++  if (CTX->Embedded) {
++    // The compare looks at the low elements alone.
++    Ref Low = EmbedderFCMPOpImpl(ElementSize, ElementSize, Src1.Low, Src2.Low, CompType & 0b11111);
++    Result.Low = _VInsElement(OpSize::i128Bit, ElementSize, 0, 0, Src1.Low, Low);
++  } else {
++    Result.Low = InsertScalarFCMPOpImpl(OpSize::i128Bit, OpSize::i128Bit, ElementSize, Src1.Low, Src2.Low, CompType & 0b11111, false);
++  }
+   Result.High = LoadZeroVector(OpSize::i128Bit);
+   AVX128_StoreResult_WithOpSize(Op, Op->Dest, Result);
+ }
+@@ -1384,6 +1392,7 @@ void OpDispatchBuilder::AVX128_InsertScalarRound(OpcodeArgs, IR::OpSize ElementS
+ 
+   // If OpSize == ElementSize then it only does the lower scalar op
+   EmbedderFPExceptions(Core::EMBEDDER_FP_ROUND, ElementSize, 1, Src2.Low, nullptr, Op->Src[2].Literal() & 0xFF);
++  EmbedderRoundInexact(ElementSize, ElementSize, Src2.Low, Op->Src[2].Literal());
+   const auto SourceMode = TranslateRoundType(Op->Src[2].Literal());
+ 
+   Ref Result = _VFToIScalarInsert(OpSize::i128Bit, ElementSize, Src1.Low, Src2.Low, SourceMode, false);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index bb8e1a2083764756e7ddeae72f09c3d920355a40..2bedab1c85f76025a79d1dd6f90fa9492106e5e6 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -517,6 +517,7 @@ Ref OpDispatchBuilder::InsertScalarRoundImpl(OpcodeArgs, IR::OpSize DstSize, IR:
+   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Src2Op, SrcSize, Op->Flags, {.AllowUpperGarbage = true});
+ 
+   EmbedderFPExceptions(Core::EMBEDDER_FP_ROUND, ElementSize, 1, Src2, nullptr, Mode & 0xFF);
++  EmbedderRoundInexact(ElementSize, ElementSize, Src2, Mode);
+   const auto SourceMode = TranslateRoundType(Mode);
+   auto ALUOp = _VFToIScalarInsert(DstSize, ElementSize, Src1, Src2, SourceMode, ZeroUpperBits);
+ 
+@@ -638,6 +639,12 @@ void OpDispatchBuilder::InsertScalarFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
+   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags, {.AllowUpperGarbage = true});
+ 
+   EmbedderFPExceptions(Core::EMBEDDER_FP_CMP, ElementSize, 1, Src1, Src2, CompType);
++  if (CTX->Embedded) {
++    // The compare looks at the low elements alone.
++    Ref Low = EmbedderFCMPOpImpl(ElementSize, ElementSize, Src1, Src2, CompType);
++    StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, _VInsElement(OpSizeFromDst(Op), ElementSize, 0, 0, Src1, Low));
++    return;
++  }
+   Ref Result = InsertScalarFCMPOpImpl(DstSize, OpSizeFromDst(Op), ElementSize, Src1, Src2, CompType, false);
+ 
+   // ARM doesn't have any instructions that handle the semantics of NLT and NLE directly.
+@@ -742,10 +749,6 @@ bool OpDispatchBuilder::EmbedderFPChecks(Core::EmbedderFPKind Kind) const {
+   }
+ }
+ 
+-bool OpDispatchBuilder::EmbedderFPChecksExceptions() const {
+-  return CTX->Embedded && (CTX->EmbedderFPMode & (Core::EMBEDDER_FP_MODE_CHECK_SPECIAL | Core::EMBEDDER_FP_MODE_CHECK_ALL)) != 0;
+-}
+-
+ void OpDispatchBuilder::EmbedderFPExceptions(Core::EmbedderFPKind Kind, IR::OpSize ElementSize, uint32_t Lanes, Ref Source1, Ref Source2,
+                                              uint32_t Imm, uint32_t Flags) {
+   (void)EmbedderFPResult(Source1, Core::EmbedderFPDescriptor(Kind, IR::OpSizeToSize(ElementSize), Lanes, Imm, Flags), Source1, Source2);
+@@ -753,21 +756,46 @@ void OpDispatchBuilder::EmbedderFPExceptions(Core::EmbedderFPKind Kind, IR::OpSi
+ 
+ void OpDispatchBuilder::EmbedderFPEndInstruction() {
+   // RCP and RSQRT raise nothing.
+-  fextl::vector<IR::IROp_EmbedderFPCheck*> Settling;
+-  for (auto* Check : EmbedderFPInstructionChecks) {
+-    const auto Kind = Check->Descriptor & 0xFF;
++  fextl::vector<EmbedderFPInstructionCheck> Settling;
++  for (const auto& Check : EmbedderFPInstructionChecks) {
++    const auto Kind = Check.Op->Descriptor & 0xFF;
+     if (Kind != Core::EMBEDDER_FP_RCP && Kind != Core::EMBEDDER_FP_RSQRT) {
+       Settling.push_back(Check);
+     }
+   }
+   EmbedderFPInstructionChecks.clear();
++  // A check that faults or retries abandons the instruction, whose
++  // computation may have raised host flags x86 never raises: the helper
++  // puts back the host's FPSR from before it. Under DAZ without FTZ,
++  // FPCR.FZ flushes a result x86 keeps, which raises underflow where the
++  // result is exact; the checks send every flushed result to the helper,
++  // whose flags then replace those the part it checks raised, from the
++  // FPSR before the part.
++  const auto Mode = CTX->EmbedderFPMode;
++  const bool Abandons = (Mode & Core::EMBEDDER_FP_MODE_CHECK_SPECIAL) != 0;
++  const bool Replaces =
++    (Mode & (Core::EMBEDDER_FP_MODE_DAZ | Core::EMBEDDER_FP_MODE_FTZ | Core::EMBEDDER_FP_MODE_CHECK_ALL)) == Core::EMBEDDER_FP_MODE_DAZ;
++  if (!Settling.empty() && (Abandons || Replaces) && EmbedderInstructionStart) {
++    auto Cursor = GetWriteCursor();
++    SetWriteCursor(EmbedderInstructionStart);
++    _EmbedderSaveFPFlags(false);
++    if (Replaces) {
++      // A part starts where the check of the one before it ends.
++      for (size_t Index = 0; Index + 1 < Settling.size(); ++Index) {
++        SetWriteCursor(Settling[Index].Node);
++        _EmbedderSaveFPFlags(true);
++      }
++    }
++    SetWriteCursor(Cursor);
++  }
++  EmbedderInstructionStart = nullptr;
+   if (Settling.size() < 2) {
+     return;
+   }
+-  for (auto* Check : Settling) {
+-    Check->Descriptor |= Core::EMBEDDER_FP_PART_LOW;
++  for (const auto& Check : Settling) {
++    Check.Op->Descriptor |= Core::EMBEDDER_FP_PART_LOW;
+   }
+-  Settling.back()->Descriptor ^= Core::EMBEDDER_FP_PART_LOW | Core::EMBEDDER_FP_PART_HIGH;
++  Settling.back().Op->Descriptor ^= Core::EMBEDDER_FP_PART_LOW | Core::EMBEDDER_FP_PART_HIGH;
+ }
+ 
+ void OpDispatchBuilder::EmbedderFPModeCheck(OpcodeArgs) {
+@@ -811,7 +839,7 @@ Ref OpDispatchBuilder::EmbedderFPResult(Ref Result, uint32_t Descriptor, Ref Sou
+     return Result;
+   }
+   auto Check = _EmbedderFPCheck(Result, Source1, Source2 ? Source2 : Source1, Source3 ? Source3 : Source1, Descriptor);
+-  EmbedderFPInstructionChecks.push_back(Check.first);
++  EmbedderFPInstructionChecks.push_back({Check.first, Check});
+   return Check;
+ }
+ 
+@@ -3151,6 +3179,82 @@ Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1
+   FEX_UNREACHABLE;
+ }
+ 
++Ref OpDispatchBuilder::EmbedderFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType) {
++  // Each of x86's 32 predicates raises invalid operation for a signalling
++  // NaN operand, and a signalling one (LT_OS, UNORD_S and so on) for a quiet
++  // NaN too. FCMEQ is quiet; FCMGE and FCMGT are signalling, so a quiet
++  // relation compares operands whose NaN lanes an ordered test cleared.
++  // FALSE and TRUE compare for the exceptions alone. Size is the compare's,
++  // the low element alone for a scalar; the bitwise operations take the
++  // whole register, whose other lanes the caller drops.
++  constexpr auto Bits = OpSize::i128Bit;
++  const bool Signalling = ((CompType & 3) == 1 || (CompType & 3) == 2) != ((CompType & 0x10) != 0);
++  // Quiet: all ones where neither operand is a NaN.
++  const auto Ordered = [&] {
++    return _VAnd(Bits, _VFCMPEQ(Size, ElementSize, Src1, Src1), _VFCMPEQ(Size, ElementSize, Src2, Src2));
++  };
++  const auto RaiseForNaN = [&] {
++    _EmbedderKeep(_VFCMPLE(Size, ElementSize, Src1, Src2));
++  };
++
++  switch (CompType & 0xF) {
++  case 0x0:   // EQ
++  case 0x4:   // NEQ, unordered
++  case 0x8:   // EQ, unordered
++  case 0xC: { // NEQ
++    Ref Equal = _VFCMPEQ(Size, ElementSize, Src1, Src2);
++    if (Signalling) {
++      RaiseForNaN();
++    }
++    switch (CompType & 0xF) {
++    case 0x0: return Equal;
++    case 0x4: return _VNot(Bits, Equal);
++    case 0x8: return _VOrn(Bits, Equal, Ordered());
++    default: return _VAndn(Bits, Ordered(), Equal);
++    }
++  }
++  case 0x3:   // UNORD
++  case 0x7: { // ORD
++    Ref Result = Ordered();
++    if (Signalling) {
++      RaiseForNaN();
++    }
++    return (CompType & 0xF) == 0x3 ? _VNot(Bits, Result) : Result;
++  }
++  case 0xB:   // FALSE
++  case 0xF: { // TRUE
++    if (Signalling) {
++      RaiseForNaN();
++    } else {
++      _EmbedderKeep(_VFCMPEQ(Size, ElementSize, Src1, Src2));
++    }
++    return (CompType & 0xF) == 0xB ? LoadZeroVector(Bits) : _VectorImm(Bits, OpSize::i8Bit, -1, 0);
++  }
++  default: break;
++  }
++
++  // The relations: LT, LE, NLT, NLE, NGE, NGT, GE and GT, the last four
++  // with swapped operands; the N forms hold for unordered operands.
++  const auto Base = CompType & 0xF;
++  const bool Swapped = Base >= 0x9;
++  const bool OrEqual = Base == 0x2 || Base == 0x6 || Base == 0x9 || Base == 0xD;
++  const bool Negated = (Base >= 0x5 && Base <= 0x6) || (Base >= 0x9 && Base <= 0xA);
++  Ref A = Swapped ? Src2 : Src1;
++  Ref B = Swapped ? Src1 : Src2;
++  Ref Mask {};
++  if (!Signalling) {
++    Mask = Ordered();
++    A = _VAnd(Bits, A, Mask);
++    B = _VAnd(Bits, B, Mask);
++  }
++  Ref Result = OrEqual ? _VFCMPLE(Size, ElementSize, A, B) : _VFCMPLT(Size, ElementSize, A, B);
++  if (!Signalling && OrEqual) {
++    // Zeros in place of NaNs compare equal.
++    Result = _VAnd(Bits, Result, Mask);
++  }
++  return Negated ? _VNot(Bits, Result) : Result;
++}
++
+ void OpDispatchBuilder::VFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
+   // No need for zero-extending in the scalar case, since
+   // all we need is an insert at the end of the operation.
+@@ -3163,7 +3267,8 @@ void OpDispatchBuilder::VFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
+ 
+   EmbedderFPExceptions(Core::EMBEDDER_FP_CMP, ElementSize, IR::OpSizeToSize(SrcSize) / IR::OpSizeToSize(ElementSize), Dest, Src,
+                        CompType & 0b111);
+-  Ref Result = VFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Dest, Src, CompType & 0b111);
++  Ref Result = CTX->Embedded ? EmbedderFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Dest, Src, CompType & 0b111) :
++                               VFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Dest, Src, CompType & 0b111);
+ 
+   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
+ }
+@@ -3384,6 +3489,11 @@ Ref OpDispatchBuilder::GetMXCSR() {
+   Ref MXCSR = _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, mxcsr));
+   // Mask out unsupported bits
+   MXCSR = _And(OpSize::i32Bit, MXCSR, Constant(MXCSRMask()));
++  if (CTX->Embedded && (CTX->EmbedderFPMode & Core::EMBEDDER_FP_MODE_CHECK_ALL) == 0) {
++    // And the flags the host's FPSR accumulated, which are the guest's
++    // except where the helper settles every instruction.
++    MXCSR = _Or(OpSize::i32Bit, MXCSR, _EmbedderReadFPFlags());
++  }
+   return MXCSR;
+ }
+ 
+@@ -3528,6 +3638,10 @@ void OpDispatchBuilder::RestoreMXCSRState(Ref MXCSR) {
+   MXCSR = _And(OpSize::i32Bit, MXCSR, Constant(MXCSRMask()));
+ 
+   _StoreContextGPR(OpSize::i32Bit, MXCSR, offsetof(FEXCore::Core::CPUState, mxcsr));
++  if (CTX->Embedded) {
++    // The loaded flags replace those the host's FPSR accumulated.
++    _EmbedderClearFPFlags();
++  }
+   // We only support the rounding mode and FTZ bit being set
+   Ref RoundingMode = _Bfe(OpSize::i32Bit, 3, 13, MXCSR);
+   _SetRoundingMode(RoundingMode, true, MXCSR);
+@@ -3629,8 +3743,9 @@ void OpDispatchBuilder::UCOMISxOp(OpcodeArgs, IR::OpSize ElementSize) {
+   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags);
+ 
+   // 0F 2E is UCOMIS and 0F 2F COMIS.
+-  EmbedderFPExceptions(Core::EMBEDDER_FP_COMIS, ElementSize, 1, Src1, Src2, 0, (Op->OP & 1) != 0 ? 0 : Core::EMBEDDER_FP_COMIS_QUIET);
+-  Comiss(ElementSize, Src1, Src2);
++  const bool Quiet = (Op->OP & 1) == 0;
++  EmbedderFPExceptions(Core::EMBEDDER_FP_COMIS, ElementSize, 1, Src1, Src2, 0, Quiet ? Core::EMBEDDER_FP_COMIS_QUIET : 0);
++  Comiss(ElementSize, Src1, Src2, Quiet);
+ }
+ 
+ void OpDispatchBuilder::LDMXCSR(OpcodeArgs) {
+@@ -4386,9 +4501,18 @@ void OpDispatchBuilder::ExtendVectorElements(OpcodeArgs, IR::OpSize ElementSize,
+ }
+ 
+ Ref OpDispatchBuilder::VectorRoundImpl(OpSize Size, IR::OpSize ElementSize, Ref Src, uint64_t Mode) {
++  EmbedderRoundInexact(Size, ElementSize, Src, Mode);
+   return _Vector_FToI(Size, ElementSize, Src, TranslateRoundType(Mode));
+ }
+ 
++void OpDispatchBuilder::EmbedderRoundInexact(OpSize Size, IR::OpSize ElementSize, Ref Src, uint64_t Mode) {
++  // The host rounds to an integer without raising inexact, which x86's
++  // ROUND raises unless its immediate's bit 3 suppresses it.
++  if (CTX->Embedded && (Mode & 0b1000) == 0) {
++    _EmbedderRaiseInexact(Size, ElementSize, Src);
++  }
++}
++
+ void OpDispatchBuilder::VectorRound(OpcodeArgs, IR::OpSize ElementSize) {
+   // No need to zero extend the vector in the event we have a
+   // scalar source, especially since it's only inserted into another vector.
+@@ -4813,9 +4937,10 @@ Ref OpDispatchBuilder::DPPOpImpl(IR::OpSize DstSize, Ref Src1, Ref Src2, uint8_t
+   Ref Result = DPPOpImplHost(DstSize, Src1, Src2, Mask, ElementSize);
+   // The host broadcasts one sum where x86 sums each lane in its own order,
+   // which picks among NaNs differently. With no product or no lane selected,
+-  // the result is zero; with no product, nothing raises an exception.
++  // the result is zero; with no product, nothing raises an exception, but
++  // with no lane selected the sum still raises its exceptions.
+   const uint8_t SizeMask = ElementSize == OpSize::i32Bit ? 0b1111 : 0b11;
+-  if (DstSize > OpSize::i128Bit || ((Mask >> 4) & SizeMask) == 0 || ((Mask & SizeMask) == 0 && !EmbedderFPChecksExceptions())) {
++  if (DstSize > OpSize::i128Bit || ((Mask >> 4) & SizeMask) == 0) {
+     return Result;
+   }
+   return EmbedderFPResult(Result,
+@@ -4844,7 +4969,7 @@ Ref OpDispatchBuilder::DPPOpImplHost(IR::OpSize DstSize, Ref Src1, Ref Src2, uin
+   }();
+ 
+   Ref ZeroVec = LoadZeroVector(DstSize);
+-  if (SrcMask == 0 || DstMask == 0) {
++  if (SrcMask == 0 || (DstMask == 0 && !CTX->Embedded)) {
+     // What are you even doing here? Go away.
+     return ZeroVec;
+   }
+@@ -4881,6 +5006,11 @@ Ref OpDispatchBuilder::DPPOpImplHost(IR::OpSize DstSize, Ref Src1, Ref Src2, uin
+ 
+   // Now due a float reduction
+   Temp = _VFAddV(DstSize, ElementSize, Temp);
++  if (DstMask == 0) {
++    // Embedded: x86 computes the sum for its exceptions, which no lane takes.
++    _EmbedderKeep(Temp);
++    return ZeroVec;
++  }
+ 
+   // Now using the destination mask we choose where the result ends up
+   // It can duplicate and zero results
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 21cb0906b534decc97240ab1dd0cb99fd7dcd6e0..6e938a737a41feca6f25d6e44eb80bb22b14a840 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -711,6 +711,50 @@
+         "HasSideEffects": true,
+         "DestSize": "OpSize::i64Bit"
+       },
++      "GPR = EmbedderReadFPFlags": {
++        "Desc": ["Embedded only: the exception flags the host's FPSR accumulated since the dispatch",
++                 "started or MXCSR was last loaded, as MXCSR's IE, ZE, OE, UE and PE. IDC is not DE: with",
++                 "FPCR.AH clear the host raises it for an input FPCR.FZ flushes, where DAZ raises nothing."
++                ],
++        "HasSideEffects": true,
++        "DestSize": "OpSize::i32Bit"
++      },
++      "EmbedderClearFPFlags": {
++        "Desc": ["Embedded only: clears the host's FPSR, whose flags a loaded MXCSR replaces."],
++        "HasSideEffects": true
++      },
++      "EmbedderSaveFPFlags i1:$Part": {
++        "Desc": ["Embedded: stores the host's FPSR in Embedder.FPSRPart, and unless Part, at the start",
++                 "of an instruction, in Embedder.FPSRBefore too. Under EMBEDDER_FP_MODE_CHECK_SPECIAL an",
++                 "instruction whose checks may abandon it saves it as it starts; under DAZ without FTZ each",
++                 "part of an instruction the checks send to the helper does."
++                ],
++        "HasSideEffects": true
++      },
++      "GPR = EmbedderReadFPSR": {
++        "Desc": ["Embedded only: the host's FPSR, for EmbedderWriteFPSR to put back around code whose host",
++                 "flags are not the guest's."
++                ],
++        "HasSideEffects": true,
++        "DestSize": "OpSize::i64Bit"
++      },
++      "EmbedderWriteFPSR GPR:$Value": {
++        "Desc": ["Embedded only: sets the host's FPSR to Value, which EmbedderReadFPSR read."],
++        "HasSideEffects": true
++      },
++      "EmbedderRaiseInexact OpSize:$Size, OpSize:$ElementSize, FPR:$Vector": {
++        "Desc": ["Embedded only: raises the host's inexact flag when an element of the Size bytes of",
++                 "Vector is not an integer, as an x86 ROUND does whose immediate leaves precision",
++                 "unmasked. A scalar Size tests the low element alone."
++                ],
++        "HasSideEffects": true
++      },
++      "EmbedderKeep FPR:$Value": {
++        "Desc": ["Embedded only: keeps Value, an operation x86 computes for its exceptions alone,",
++                 "from being removed. Emits nothing."
++                ],
++        "HasSideEffects": true
++      },
+       "EmbedderFPModeCheck u64:$NextRIP": {
+         "Desc": ["Embedded only: leaves the dispatch at NextRIP with EMBEDDER_EXIT_MODE when the",
+                  "floating-point mode the state's MXCSR, x87 control word and RFLAGS.AC imply is not the",
+@@ -1689,10 +1733,11 @@
+         "DestSize": "DestElementSize"
+       },
+ 
+-      "FCmp OpSize:$ElementSize, FPR:$Scalar1, FPR:$Scalar2": {
++      "FCmp OpSize:$ElementSize, FPR:$Scalar1, FPR:$Scalar2, i1:$Signalling": {
+         "Desc": ["Does a scalar unordered compare and sets NZCV accordingly.",
+                  "NZCV follows Arm conventions, a separate AXFLAG instruction is required for x86",
+-                 "Ordering flag result is true if either float input is NaN"
++                 "Ordering flag result is true if either float input is NaN",
++                 "Signalling raises invalid operation for a quiet NaN input too, as COMISS does"
+                 ],
+         "HasSideEffects": true
+       }
+diff --git a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+index 873ad68233d1201bb5c0e4437feea6f17120edfb..7da1cd8a79a5b49343360b5ef5cbac8ae01269e1 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+@@ -349,6 +349,11 @@ constexpr auto FlagInfos = [] {
+ }();
+ 
+ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
++  if (Embedded && IROp->Op == OP_FCMP) {
++    // A compare whose flags go unused still raises the guest's invalid
++    // operation flag in FPSR, as COMISS and UCOMISS do.
++    return FlagInfo::Pack({.Write = FLAG_NZCV});
++  }
+   FlagInfo Info = FlagInfos[IROp->Op];
+   if (!Info.Special()) {
+     return Info;
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index 86ea92c7c3b846e96560bb7875e568d16373b496..93a0cc48533db709792bb475847710a59970ac25 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -1280,7 +1280,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+         Ref CmpNode {};
+         if (ReducedPrecisionMode) {
+-          CmpNode = IREmit->_FCmp(OpSize::i64Bit, StackValue1, StackValue2);
++          CmpNode = IREmit->_FCmp(OpSize::i64Bit, StackValue1, StackValue2, false);
+         } else {
+           CmpNode = IREmit->_F80Cmp(StackValue1, StackValue2);
+         }
+@@ -1296,7 +1296,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+         Ref CmpNode {};
+         if (ReducedPrecisionMode) {
+-          CmpNode = IREmit->_FCmp(OpSize::i64Bit, StackNode, ZeroConst);
++          CmpNode = IREmit->_FCmp(OpSize::i64Bit, StackNode, ZeroConst, false);
+         } else {
+           CmpNode = IREmit->_F80Cmp(StackNode, ZeroConst);
+         }
+@@ -1312,7 +1312,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+         Ref CmpNode {};
+         if (ReducedPrecisionMode) {
+-          CmpNode = IREmit->_FCmp(OpSize::i64Bit, StackNode, Value);
++          CmpNode = IREmit->_FCmp(OpSize::i64Bit, StackNode, Value, false);
+         } else {
+           CmpNode = IREmit->_F80Cmp(StackNode, Value);
+         }
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 711e11a6487602b54ee4d4a0c7d2f2a368a86acc..d1a9b88c4dbaa37dd56c684d5c1485f27c6f6f52 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -714,6 +714,13 @@ struct CpuStateFrame {
+     // The x87 exceptions the running instruction raised that the control
+     // word unmasks: bits 0 to 5 as in the status word.
+     uint32_t X87Raised {};
++    // The host's FPSR before the running instruction, which the host
++    // restores when its checks abandon it under
++    // EMBEDDER_FP_MODE_CHECK_SPECIAL, and before the part of it a check
++    // sends to the host under DAZ without FTZ, whose flags the host's
++    // replace (EmbedderSaveFPFlags).
++    uint32_t FPSRBefore {};
++    uint32_t FPSRPart {};
+   } Embedder;
+ 
+   // Pointers that the JIT needs to load to remove relocations

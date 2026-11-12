@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 14:02:27 +0900
+Subject: [PATCH] vrend: refuse a sub-context the host cannot give a GL context
+
+vrend_renderer_create_sub_ctx() took whatever create_gl_context() returned
+and went on. When the host could not create the context, it made the null
+context current, which releases the thread's current context rather than
+failing, then issued GL on a thread with none and registered the
+sub-context with no context behind it. Every later command decoded on
+that sub-context ran the same way. A guest context whose creation failed
+this way reached get_glsl_version() with nothing current before it could
+report the failure, and a failed CREATE_SUB_CTX reported success.
+
+Return whether the sub-context exists. A failed CREATE_SUB_CTX now fails
+its command with ENOMEM, abandoning the rest of that buffer, and leaves the
+guest context on its current sub-context. A guest context whose first
+sub-context cannot be created fails its creation and releases what it had
+set up, since vrend_destroy_context() needs a sub-context to make current.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_decode.c   |  4 +++-
+ src/vrend/vrend_renderer.c | 30 ++++++++++++++++++++++++++----
+ src/vrend/vrend_renderer.h |  2 +-
+ 3 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index eafbab0aa0ffec8b34d15482b6553e863ba733e5..a68f7d4e10b8bcc2b2ccc1d43451cbb85e3ba608 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1232,7 +1232,9 @@ static int vrend_decode_create_sub_ctx(struct vrend_context *ctx, const uint32_t
+ 
+    uint32_t ctx_sub_id = get_buf_entry(buf, 1);
+ 
+-   vrend_renderer_create_sub_ctx(ctx, ctx_sub_id);
++   /* The guest's request is well formed; the host could not serve it. */
++   if (!vrend_renderer_create_sub_ctx(ctx, ctx_sub_id))
++      return ENOMEM;
+    return 0;
+ }
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 79d420d61a0c3240e78998fbf18b2f43aa310c30..6bd8338ee52c4190839921dc077d344ed874c63b 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8544,7 +8544,17 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+    grctx->shader_cfg.has_vs_layer = has_feature(feat_vs_layer_viewport);
+    grctx->shader_cfg.has_vs_viewport_index = has_feature(feat_vs_viewport_index);
+ 
+-   vrend_renderer_create_sub_ctx(grctx, 0);
++   if (!vrend_renderer_create_sub_ctx(grctx, 0)) {
++      /* With no sub-context there is nothing vrend_destroy_context() could
++       * make current, so undo only what was set up above.
++       */
++#ifdef ENABLE_VIDEO
++      vrend_video_destroy_context(grctx->video);
++#endif
++      vrend_ctx_resource_fini_table(grctx->res_hash);
++      FREE(grctx);
++      return NULL;
++   }
+    vrend_renderer_set_sub_ctx(grctx, 0);
+ 
+    int glver = get_glsl_version();
+@@ -14081,26 +14091,37 @@ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+    }
+ }
+ 
+-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
++bool vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+ {
+    struct virgl_gl_ctx_param ctx_params;
+    GLuint i;
+ 
+    list_for_each_entry(struct vrend_sub_context, sub, &ctx->sub_ctxs, head) {
+       if (sub->sub_ctx_id == sub_ctx_id) {
+-         return;
++         return true;
+       }
+    }
+ 
+    struct vrend_sub_context *sub = CALLOC_STRUCT(vrend_sub_context);
+    if (!sub)
+-      return;
++      return false;
+ 
+    ctx_params.shared = (ctx->ctx_id == 0 && sub_ctx_id == 0) ? false : true;
+    ctx_params.major_ver = vrend_state.gl_major_ver;
+    ctx_params.minor_ver = vrend_state.gl_minor_ver;
+    ctx_params.compat_ctx = !vrend_state.use_core_profile && !vrend_state.use_gles;
+    sub->gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
++   if (!sub->gl_context) {
++      /* Every GL call below, and every command later decoded on this
++       * sub-context, needs a current GL context. Making the missing one
++       * current would release the thread's context instead, and the
++       * renderer would go on issuing GL on a thread with none.
++       */
++      virgl_error("context %d: host GL context for sub-context %d unavailable\n",
++                  ctx->ctx_id, sub_ctx_id);
++      FREE(sub);
++      return false;
++   }
+    sub->parent = ctx;
+    vrend_clicbs->make_current(sub->gl_context);
+ 
+@@ -14147,6 +14168,7 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+       ctx->sub0 = sub;
+ 
+    vrend_set_tweak_from_env(&ctx->sub->tweaks);
++   return true;
+ }
+ 
+ unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx, enum virgl_debug_flags flag)
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index d6465e1f4ba53d2671151aecf6e647f66bb330a9..6bc0a60747e4580af7644810f42686f50ff4c365 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -599,7 +599,7 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
+ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+                                 uint32_t *max_size);
+ 
+-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
++bool vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
+ void vrend_renderer_destroy_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
+ void vrend_renderer_set_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
+ 

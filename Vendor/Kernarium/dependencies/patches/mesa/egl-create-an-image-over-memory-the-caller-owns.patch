@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 04:34:25 +0900
+Subject: [PATCH] egl: create an image over memory the caller owns
+
+The Apple GPU host runs vrend on Mesa's Zink driver, where the only way to
+alias memory the caller already owns is GL_AMD_pinned_memory, which aliases it
+as a buffer. A virtio-gpu host has to sample a guest's shared-memory scanout as
+a 2D texture, so today it copies the pages into a texture on every read.
+
+Zink can already build the image: it creates a VkImage with
+VkExternalMemoryImageCreateInfo(HOST_ALLOCATION) and imports the pages with
+VkImportMemoryHostPointerInfoEXT whenever VK_EXT_external_memory_host is
+present, which is how pipe_screen::resource_from_user_memory is implemented.
+What is missing is a GL-visible way to reach it for anything but a buffer.
+
+EGL_MESA_image_host_pointer adds that: eglCreateImageKHR with the new
+EGL_HOST_POINTER_MESA target takes the pointer as the client buffer plus
+EGL_WIDTH, EGL_HEIGHT, EGL_LINUX_DRM_FOURCC_EXT, EGL_HOST_POINTER_PITCH_MESA,
+EGL_HOST_POINTER_SIZE_MESA and an optional EGL_HOST_POINTER_OFFSET_MESA, and
+the resulting image is used through GL_OES_EGL_image like any other. Only the
+producer is new; the consumer half already exists.
+
+The size is how many bytes the caller owns at the pointer, and it is
+required. The driver imports whole rows from the pointer plus the offset, so
+an image whose rows would reach past those bytes is refused: otherwise a
+caller whose width, height, pitch or offset comes from someone it does not
+trust would hand the driver memory it does not own.
+
+Because the caller keeps the storage, the import must be all or nothing: the
+resource is created with PIPE_BIND_LINEAR, and the stride the driver then
+reports through PIPE_RESOURCE_PARAM_STRIDE has to equal the caller's pitch.
+A format, alignment, size or pitch the driver cannot alias returns
+EGL_NO_IMAGE_KHR instead of quietly copying, so the caller can choose its own
+fallback once per resource rather than paying an unannounced copy per frame -
+the reason a GL_APPLE_client_storage-shaped entry point was not used, since
+that one is specified to be free to copy and offers no way to ask whether it
+did.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/EGL/eglmesaext.h             | 10 +++
+ src/egl/drivers/dri2/egl_dri2.c      | 50 +++++++++++++++
+ src/egl/main/eglapi.c                |  4 +-
+ src/egl/main/egldisplay.h            |  1 +
+ src/egl/main/eglimage.c              | 48 +++++++++++++++
+ src/egl/main/eglimage.h              |  5 ++
+ src/gallium/frontends/dri/dri2.c     | 92 ++++++++++++++++++++++++++++
+ src/gallium/frontends/dri/dri_util.h |  5 ++
+ 8 files changed, 214 insertions(+), 1 deletion(-)
+
+diff --git a/include/EGL/eglmesaext.h b/include/EGL/eglmesaext.h
+index f0395a8a58c605b41dab90825ea903da49eff840..00a8515f932df4ec5f7a13a37bf20440244f3085 100644
+--- a/include/EGL/eglmesaext.h
++++ b/include/EGL/eglmesaext.h
+@@ -42,6 +42,16 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLSWAPBUFFERSREGIONNOK) (EGLDisplay dpy, EG
+ #define EGL_NO_CONFIG_MESA			EGL_CAST(EGLConfig,0)
+ #endif
+ 
++#ifndef EGL_MESA_image_host_pointer
++#define EGL_MESA_image_host_pointer 1
++/* Provisional values out of Mesa's own EGL enum block; they become
++ * registry-allocated values if the extension is ever upstreamed. */
++#define EGL_HOST_POINTER_MESA                   0x3293
++#define EGL_HOST_POINTER_PITCH_MESA             0x3294
++#define EGL_HOST_POINTER_OFFSET_MESA            0x3295
++#define EGL_HOST_POINTER_SIZE_MESA              0x3296
++#endif /* EGL_MESA_image_host_pointer */
++
+ #ifndef EGL_MESA_drm_image_formats
+ #define EGL_MESA_drm_image_formats 1
+ #define EGL_DRM_BUFFER_FORMAT_ARGB2101010_MESA  0x3290
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index 484050768c53c11c64e5a718cb4103dce38ac4d4..6521513c73fc78ac86da74ea9636de4bcc92b8c0 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -721,6 +721,10 @@ dri2_setup_screen(_EGLDisplay *disp)
+       disp->Extensions.EXT_image_dma_buf_import_modifiers = EGL_TRUE;
+    }
+ #endif
++   if (pscreen->caps.resource_from_user_memory &&
++       !pscreen->caps.resource_from_user_memory_compute_only)
++      disp->Extensions.MESA_image_host_pointer = EGL_TRUE;
++
+    disp->Extensions.MESA_x11_native_visual_id = EGL_TRUE;
+    disp->Extensions.EXT_surface_compression = EGL_TRUE;
+    disp->Extensions.KHR_image_base = EGL_TRUE;
+@@ -2631,6 +2635,46 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
+ 
+ #endif
+ 
++static _EGLImage *
++dri2_create_image_host_pointer(_EGLDisplay *disp, _EGLContext *ctx,
++                               EGLClientBuffer buffer, const EGLint *attr_list)
++{
++   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
++   _EGLImageAttribs attrs;
++   struct dri_image *dri_image;
++
++   if (ctx != NULL || buffer == NULL) {
++      _eglError(EGL_BAD_PARAMETER, "dri2_create_image_host_pointer");
++      return NULL;
++   }
++
++   if (!_eglParseImageAttribList(&attrs, disp, attr_list))
++      return NULL;
++
++   /* The size is required: without it nothing bounds how much memory past
++    * the pointer the driver takes to be the caller's. */
++   if (attrs.Width <= 0 || attrs.Height <= 0 || !attrs.DMABufFourCC.IsPresent ||
++       !attrs.HostPointerPitch.IsPresent || !attrs.HostPointerSize.IsPresent) {
++      _eglError(EGL_BAD_PARAMETER, "dri2_create_image_host_pointer");
++      return NULL;
++   }
++
++   dri_image = dri_create_image_from_host_pointer(
++      dri2_dpy->dri_screen_render_gpu, buffer, attrs.HostPointerSize.Value,
++      attrs.Width, attrs.Height, attrs.DMABufFourCC.Value,
++      attrs.HostPointerPitch.Value,
++      attrs.HostPointerOffset.IsPresent ? attrs.HostPointerOffset.Value : 0);
++   if (dri_image == NULL) {
++      /* The caller keeps owning the pages, so a layout, format, alignment or
++       * pitch the driver cannot alias has to be reported rather than papered
++       * over with a copy: the caller can then choose its own fallback. */
++      _eglError(EGL_BAD_PARAMETER, "dri2_create_image_host_pointer");
++      return NULL;
++   }
++
++   return dri2_create_image_from_dri(disp, dri_image);
++}
++
+ _EGLImage *
+ dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
+                       EGLClientBuffer buffer, const EGLint *attr_list)
+@@ -2648,6 +2692,12 @@ dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
+                                            attr_list);
+    case EGL_GL_RENDERBUFFER_KHR:
+       return dri2_create_image_khr_renderbuffer(disp, ctx, buffer, attr_list);
++   case EGL_HOST_POINTER_MESA:
++      if (!disp->Extensions.MESA_image_host_pointer) {
++         _eglError(EGL_BAD_PARAMETER, "dri2_create_image_khr");
++         return EGL_NO_IMAGE_KHR;
++      }
++      return dri2_create_image_host_pointer(disp, ctx, buffer, attr_list);
+ #ifdef HAVE_LIBDRM
+    case EGL_LINUX_DMA_BUF_EXT:
+       return dri2_create_image_dma_buf(disp, ctx, buffer, attr_list);
+diff --git a/src/egl/main/eglapi.c b/src/egl/main/eglapi.c
+index a6c6f95f1d53e8289fcc0c420d330bdc431dc0d6..1557dbeb9326a7273eb72db59ec7af81d6892205 100644
+--- a/src/egl/main/eglapi.c
++++ b/src/egl/main/eglapi.c
+@@ -593,6 +593,7 @@ _eglCreateExtensionsString(_EGLDisplay *disp)
+       _eglAppendExtension(&exts, "EGL_MESA_configless_context");
+    _EGL_CHECK_EXTENSION(MESA_gl_interop);
+    _EGL_CHECK_EXTENSION(MESA_image_dma_buf_export);
++   _EGL_CHECK_EXTENSION(MESA_image_host_pointer);
+    _EGL_CHECK_EXTENSION(MESA_query_driver);
+    _EGL_CHECK_EXTENSION(MESA_x11_native_visual_id);
+ 
+@@ -1832,7 +1833,8 @@ _eglCreateImageCommon(_EGLDisplay *disp, EGLContext ctx, EGLenum target,
+    /* "If <target> is EGL_LINUX_DMA_BUF_EXT, <dpy> must be a valid display,
+     *  <ctx> must be EGL_NO_CONTEXT..."
+     */
+-   if (ctx != EGL_NO_CONTEXT && target == EGL_LINUX_DMA_BUF_EXT)
++   if (ctx != EGL_NO_CONTEXT &&
++       (target == EGL_LINUX_DMA_BUF_EXT || target == EGL_HOST_POINTER_MESA))
+       RETURN_EGL_ERROR(disp, EGL_BAD_PARAMETER, EGL_NO_IMAGE_KHR);
+ 
+    egl_relax (disp, context ? &context->Resource : NULL) {
+diff --git a/src/egl/main/egldisplay.h b/src/egl/main/egldisplay.h
+index 6178140e7e74764bb8c6c11e15afb3fe3aa38de2..d081422d32dc55a8fc85d3aad2848ed0886140f4 100644
+--- a/src/egl/main/egldisplay.h
++++ b/src/egl/main/egldisplay.h
+@@ -146,6 +146,7 @@ struct _egl_extensions {
+ 
+    EGLBoolean MESA_gl_interop;
+    EGLBoolean MESA_image_dma_buf_export;
++   EGLBoolean MESA_image_host_pointer;
+    EGLBoolean MESA_query_driver;
+    EGLBoolean MESA_x11_native_visual_id;
+ 
+diff --git a/src/egl/main/eglimage.c b/src/egl/main/eglimage.c
+index 4ff1f96478f7d4e4f83fcc4a05774f3feeadd23e..30c266258b7d05c01fc4e09dd4f943ae3519ee3f 100644
+--- a/src/egl/main/eglimage.c
++++ b/src/egl/main/eglimage.c
+@@ -243,6 +243,50 @@ _eglParseEXTImageDmaBufImportModifiersAttribs(_EGLImageAttribs *attrs,
+    return EGL_SUCCESS;
+ }
+ 
++static EGLint
++_eglParseMESAImageHostPointerAttribs(_EGLImageAttribs *attrs,
++                                     _EGLDisplay *disp, EGLint attr,
++                                     EGLint val)
++{
++   if (!disp->Extensions.MESA_image_host_pointer)
++      return EGL_BAD_PARAMETER;
++
++   switch (attr) {
++   case EGL_WIDTH:
++      attrs->Width = val;
++      break;
++   case EGL_HEIGHT:
++      attrs->Height = val;
++      break;
++   case EGL_LINUX_DRM_FOURCC_EXT:
++      attrs->DMABufFourCC.Value = val;
++      attrs->DMABufFourCC.IsPresent = EGL_TRUE;
++      break;
++   case EGL_HOST_POINTER_PITCH_MESA:
++      if (val <= 0)
++         return EGL_BAD_ATTRIBUTE;
++      attrs->HostPointerPitch.Value = val;
++      attrs->HostPointerPitch.IsPresent = EGL_TRUE;
++      break;
++   case EGL_HOST_POINTER_OFFSET_MESA:
++      if (val < 0)
++         return EGL_BAD_ATTRIBUTE;
++      attrs->HostPointerOffset.Value = val;
++      attrs->HostPointerOffset.IsPresent = EGL_TRUE;
++      break;
++   case EGL_HOST_POINTER_SIZE_MESA:
++      if (val <= 0)
++         return EGL_BAD_ATTRIBUTE;
++      attrs->HostPointerSize.Value = val;
++      attrs->HostPointerSize.IsPresent = EGL_TRUE;
++      break;
++   default:
++      return EGL_BAD_PARAMETER;
++   }
++
++   return EGL_SUCCESS;
++}
++
+ /**
+  * Parse the list of image attributes.
+  *
+@@ -290,6 +334,10 @@ _eglParseImageAttribList(_EGLImageAttribs *attrs, _EGLDisplay *disp,
+       if (err == EGL_SUCCESS)
+          continue;
+ 
++      err = _eglParseMESAImageHostPointerAttribs(attrs, disp, attr, val);
++      if (err == EGL_SUCCESS)
++         continue;
++
+       return _eglError(err, __func__);
+    }
+ 
+diff --git a/src/egl/main/eglimage.h b/src/egl/main/eglimage.h
+index 9eae218fd402b162eb1229b626e494568bd6dced..4ba4a97d71c6efad13d4f98dfda842b5ae46a39f 100644
+--- a/src/egl/main/eglimage.h
++++ b/src/egl/main/eglimage.h
+@@ -69,6 +69,11 @@ struct _egl_image_attribs {
+    struct _egl_image_attrib_int DMABufChromaHorizontalSiting;
+    struct _egl_image_attrib_int DMABufChromaVerticalSiting;
+ 
++   /* EGL_MESA_image_host_pointer */
++   struct _egl_image_attrib_int HostPointerPitch;
++   struct _egl_image_attrib_int HostPointerOffset;
++   struct _egl_image_attrib_int HostPointerSize;
++
+    /* EGL_EXT_protected_content || EGL_EXT_protected_surface */
+    EGLBoolean ProtectedContent;
+ };
+diff --git a/src/gallium/frontends/dri/dri2.c b/src/gallium/frontends/dri/dri2.c
+index 0e06f8c5346d004be9f1165e78465dec8bfc32aa..d22162f8a45e9de47e558a5eca725b1c08404970 100644
+--- a/src/gallium/frontends/dri/dri2.c
++++ b/src/gallium/frontends/dri/dri2.c
+@@ -1013,6 +1013,98 @@ dri_create_image(struct dri_screen *screen,
+    return img;
+ }
+ 
++/**
++ * Alias memory the caller owns as a single-plane 2D texture.
++ *
++ * The caller keeps the storage, so this can only succeed when the driver is
++ * willing to lay the image out exactly the way the caller already has it: the
++ * resource is asked for linearly, and the stride the driver then reports has
++ * to equal the caller's pitch. Everything that does not hold is a NULL return
++ * rather than a silent copy, because the point of the entry point is that
++ * there is no copy.
++ *
++ * The caller owns size bytes at host_pointer, and every row of the image, in
++ * full, has to lie inside them: a linear driver imports whole rows, and its
++ * import rounds up only to the page the last row ends in, which a mapping of
++ * those bytes covers.
++ */
++struct dri_image *
++dri_create_image_from_host_pointer(struct dri_screen *screen,
++                                   void *host_pointer, uint64_t size,
++                                   int width, int height, int fourcc,
++                                   unsigned pitch, unsigned offset)
++{
++   const struct dri2_format_mapping *map = dri2_get_mapping_by_fourcc(fourcc);
++   struct pipe_screen *pscreen = screen->base.screen;
++   struct pipe_resource templ;
++   struct dri_image *img;
++   uint64_t stride = 0;
++
++   if (!map || !host_pointer || !pscreen->resource_from_user_memory ||
++       !pscreen->caps.resource_from_user_memory ||
++       pscreen->caps.resource_from_user_memory_compute_only)
++      return NULL;
++
++   if (width <= 0 || height <= 0 ||
++       width > pscreen->caps.max_texture_2d_size ||
++       height > pscreen->caps.max_texture_2d_size)
++      return NULL;
++
++   if (util_format_get_num_planes(map->pipe_format) != 1 ||
++       util_format_is_compressed(map->pipe_format))
++      return NULL;
++
++   if (pitch < util_format_get_stride(map->pipe_format, width))
++      return NULL;
++
++   if (offset > size || (uint64_t)pitch * height > size - offset)
++      return NULL;
++
++   if (!pscreen->is_format_supported(pscreen, map->pipe_format,
++                                     PIPE_TEXTURE_2D, 0, 0,
++                                     PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR))
++      return NULL;
++
++   img = CALLOC_STRUCT(dri_image);
++   if (!img)
++      return NULL;
++
++   memset(&templ, 0, sizeof(templ));
++   templ.target = PIPE_TEXTURE_2D;
++   templ.format = map->pipe_format;
++   templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR;
++   templ.last_level = 0;
++   templ.width0 = width;
++   templ.height0 = height;
++   templ.depth0 = 1;
++   templ.array_size = 1;
++
++   img->texture = pscreen->resource_from_user_memory(
++      pscreen, &templ, (char *)host_pointer + offset);
++   if (!img->texture) {
++      FREE(img);
++      return NULL;
++   }
++
++   if (!pscreen->resource_get_param(pscreen, NULL, img->texture, 0, 0, 0,
++                                    PIPE_RESOURCE_PARAM_STRIDE, 0, &stride) ||
++       stride != pitch) {
++      pipe_resource_reference(&img->texture, NULL);
++      FREE(img);
++      return NULL;
++   }
++
++   img->level = 0;
++   img->layer = 0;
++   img->dri_format = map->dri_format;
++   img->dri_fourcc = fourcc;
++   img->use = 0;
++   img->in_fence_fd = -1;
++   img->loader_private = NULL;
++   img->screen = screen;
++   return img;
++}
++
+ static bool
+ dri2_query_image_common(struct dri_image *image, int attrib, int *value)
+ {
+diff --git a/src/gallium/frontends/dri/dri_util.h b/src/gallium/frontends/dri/dri_util.h
+index 96713679a2314c0d2e506fe4fab54b03554f096f..1ff5a43b8c3f176d3828d6d777e7b32ad2044fea 100644
+--- a/src/gallium/frontends/dri/dri_util.h
++++ b/src/gallium/frontends/dri/dri_util.h
+@@ -294,6 +294,11 @@ dri_create_image_with_modifiers(struct dri_screen *screen,
+                                  const uint64_t *modifiers,
+                                  unsigned int modifiers_count,
+                                  void *loaderPrivate);
++PUBLIC struct dri_image *
++dri_create_image_from_host_pointer(struct dri_screen *screen,
++                                   void *host_pointer, uint64_t size,
++                                   int width, int height, int fourcc,
++                                   unsigned pitch, unsigned offset);
+ PUBLIC int
+ dri_query_compatible_render_only_device_fd(int kms_only_fd);
+ 

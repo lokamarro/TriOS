@@ -1,0 +1,2964 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 17:57:39 +0900
+Subject: [PATCH] kosmickrisp: size the geometry heap from measurement
+
+The per-device geometry heap was a fixed 128 MiB placement heap, taken whole
+the first time a command buffer draws through it. The size was a placeholder,
+not a bound, and a Venus host pays all of it once per guest VkDevice, so the
+cost scales with however many devices a guest keeps alive.
+
+It now starts at 16 MiB and grows. The heaviest single command buffer across
+the CTS tessellation, geometry, draw and rasterization groups asks the heap
+for 1.53 MiB; one mebibyte fails those groups and two passes them, and
+sixteen ran a full released mustpass fraction clean. A CTS-only measurement
+under-measured real heap demand, though: demand is linear in patches and
+primitives, which the API does not bound, and 130 quad patches at level 64
+already need 17.2 MB. So the measurement sets where the heap starts, and the
+heap grows, at least doubling and in one step to what a draw is known to
+need, up to 128 MiB or the starting size, whichever is larger:
+
+- A direct draw whose reservations the host can bound grows it before it is
+  recorded and renders on its first submission. The restart unroll reserves
+  a known bound. Tessellation is bounded by every patch at the largest level
+  the TCS writes when every level the domain reads is a constant, and at the
+  level-64 maximum, 132 KB for a quad patch, otherwise; kk_tess_bound.h
+  gives each domain's bound at a level. The first heap is created at the
+  size the draw that needs it takes, and a multi-draw grows the heap once
+  for all its entries. A draw that does not fit beside the earlier draws of
+  its render segment moves the segment to the grown heap. A bound past the
+  cap grows the heap to the cap and leaves the rest to the GPU.
+- A reservation only the GPU can size is refused when it does not fit, and
+  its draw loses its output. The heap header counts refusals, and the next
+  draw that pins the heap, or the reset of a recording that used it, grows it
+  for later command buffers in one step to hold what every refused render
+  segment needed: what it reserved plus every size it was refused. The kernel
+  that resets the heap for each segment folds the segment before it into the
+  header, and the host adds the segment still open. The first loss is logged
+  once per device. Vulkan cannot fail a command buffer after it ran short of
+  losing the device, so none fails.
+
+A recording pins every heap it reserved from until it is reset, re-recorded
+or freed, and a heap that grew is freed with its last pin. A device that
+never draws through the heap allocates none.
+
+MESA_KK_HEAP_SIZE_MIB sets the starting size. It only takes 1 to 4095 MiB,
+the range the header's 32-bit size can describe, and any other value keeps
+sixteen: a count that wrapped the byte size to zero, one Metal refuses and one
+past 4 GiB used to crash the first draw that needed the heap or leave the GPU
+a bound larger than the heap. A device Metal refuses its first heap keeps
+none, and a draw that needs it fails its command buffer's recording and
+records nothing instead of dereferencing it. A device Metal refuses a larger
+heap keeps the one it has.
+
+kosmickrisp_heap_size_override draws a triangle fan, which is unrolled through
+the heap, under each kind of bad value and under a valid one.
+kosmickrisp_heap_growth runs each case on a fresh device and reports the heap
+it leaves and the most heap memory it held at once. A 24 MB fan and 130 and
+256 quad patches at level 64, whether the TCS writes the level as a constant
+or not, render whole on the first submission when drawn directly and hold
+only the 32 or 64 MiB heap they leave. Drawn indirectly, the first
+submission loses them and reports it, and the second renders them whole. 100
+and then 120 patches, which each fit 16 MiB but not together, both render on
+the first submission, as do the same patches in one multi-draw, which holds
+only 32 MiB. At a constant level 1, 256 patches and 500 draws of 64 stay at
+16 MiB; at a level the compiler cannot see, the 500 draws grow the heap in
+steps to 128 MiB and hold 240 MiB at most. A device that draws a triangle
+list has no heap, and one whose fan fits keeps 16 MiB. Six indirect draws of
+39 patches at level 64 and then one of 64 lose their last four on the
+first submission, and the second renders them whole: the render pass needs
+what the first three reserved plus every refused size, more than either
+the largest refused end or the refused sizes alone.
+
+kosmickrisp_heap_overflow_gpu checks that the heap's reset folds a segment's
+reserved and refused units into the need, keeps a larger need, and
+saturates a sum past 2^32.
+
+kosmickrisp_tess_bound_gpu tessellates patches at levels up to each of 19
+maxima from 0.5 to 64, for every domain, partitioning and point mode, and
+checks that none exceeds the bound kk_tess_patch_bound() gives.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/libkk/kk_geometry.cl          |   8 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        |   7 +-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  24 +-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 487 ++++++++++++--
+ src/kosmickrisp/vulkan/kk_device.c            |   8 +-
+ src/kosmickrisp/vulkan/kk_device.h            |  37 +-
+ src/kosmickrisp/vulkan/kk_shader.c            |  60 ++
+ src/kosmickrisp/vulkan/kk_shader.h            |   6 +
+ src/kosmickrisp/vulkan/kk_tess_bound.h        |  53 ++
+ src/kosmickrisp/vulkan/meson.build            |  61 ++
+ .../tests/heap_growth_shaders/dynamic.tesc    |  18 +
+ .../tests/heap_growth_shaders/dynamic.tesc.h  |  89 +++
+ .../tests/heap_growth_shaders/generate.sh     |   7 +
+ .../tests/heap_growth_shaders/level1.tesc     |  14 +
+ .../tests/heap_growth_shaders/level1.tesc.h   |  79 +++
+ .../tests/heap_growth_shaders/level64.tesc    |  14 +
+ .../tests/heap_growth_shaders/level64.tesc.h  |  79 +++
+ .../tests/heap_growth_shaders/tile.tese       |   9 +
+ .../tests/heap_growth_shaders/tile.tese.h     |  63 ++
+ .../vulkan/tests/test_heap_growth.c           | 627 ++++++++++++++++++
+ .../vulkan/tests/test_heap_overflow_gpu.c     |  35 +
+ .../vulkan/tests/test_heap_size_override.c    | 419 ++++++++++++
+ .../vulkan/tests/test_tess_bound_gpu.c        | 246 +++++++
+ 23 files changed, 2399 insertions(+), 51 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_tess_bound.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/heap_growth_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese
+ create mode 100644 src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_heap_growth.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_heap_size_override.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_tess_bound_gpu.c
+
+diff --git a/src/kosmickrisp/libkk/kk_geometry.cl b/src/kosmickrisp/libkk/kk_geometry.cl
+index b16501d89a4447da46c9765cd87e54e8add420a8..bc56afd6293d53a6e3add7fea93f19063d03c7dd 100644
+--- a/src/kosmickrisp/libkk/kk_geometry.cl
++++ b/src/kosmickrisp/libkk/kk_geometry.cl
+@@ -24,6 +24,14 @@ libkk_primitive_count(enum mesa_prim prim, uint vertices,
+              : poly_decomposed_prims_for_vertices_u32(prim, vertices);
+ }
+ 
++/* Starts a render segment on the heap: folds the segment before it into what
++ * the heap needed and frees what that segment reserved. */
++KERNEL(1)
++libkk_heap_reset(global struct poly_heap *heap)
++{
++   poly_heap_reset(heap);
++}
++
+ KERNEL(1)
+ libkk_increment_ia(global uint32_t *ia_vertices,
+                    global uint32_t *ia_primitives,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index fcb0582b3f6092b1eeec6b2d258a5e2b47c4a770..684b2e0e12c067bbc42bbe6cc08f3ce4f43256de 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -56,6 +56,8 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+       kk_destroy_bo(dev, *bo);
+    }
+    util_dynarray_clear(&cmd->large_bos);
++
++   kk_cmd_release_heaps(cmd);
+ }
+ 
+ /* Drops a lane's pending timestamp work and the query-pool objects it holds. */
+@@ -107,6 +109,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    util_dynarray_fini(&cmd->statistics_queries);
+    util_dynarray_fini(&cmd->submit_cmd_bufs);
+    util_dynarray_fini(&cmd->large_bos);
++   util_dynarray_fini(&cmd->pinned_heaps);
+ 
+    vk_free(&pool->vk.alloc, cmd);
+ }
+@@ -189,6 +192,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->statistics_queries = UTIL_DYNARRAY_INIT;
+    cmd->submit_cmd_bufs = UTIL_DYNARRAY_INIT;
+    cmd->large_bos = UTIL_DYNARRAY_INIT;
++   cmd->pinned_heaps = UTIL_DYNARRAY_INIT;
+ 
+    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
+    cmd->vk.dynamic_graphics_state.ms.sample_locations =
+@@ -238,7 +242,8 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+    cmd->uploader.offset = 0;
+ 
+    memset(&cmd->state, 0, sizeof(cmd->state));
+-   cmd->uses_heap = false;
++   cmd->heap = NULL;
++   cmd->heap_demand_B = 0;
+ }
+ 
+ static void
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 92ae55f0bf63d4bedddc67b24a96dd389d46c762..3f05efbb0b72b5b5ca7564475f4eac175d8f75b0 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -386,8 +386,17 @@ struct kk_cmd_buffer {
+    /* Owned large BOs */
+    struct util_dynarray large_bos;
+ 
+-   /* Does the command buffer use the geometry heap? */
+-   bool uses_heap;
++   /* The geometry heap the recording last reserved from, NULL until a draw
++    * needs it. The stages of a draw read what they reserved from it even
++    * after a render encoder restart has ended its segment. heap_in_segment
++    * says whether the current segment has pinned it and queued its reset, and
++    * heap_demand_B is what the segment's draws are known to reserve. */
++   struct kk_geometry_heap *heap;
++   bool heap_in_segment;
++   uint64_t heap_demand_B;
++   /* Every geometry heap this recording reserved from. Each holds a
++    * reference until the recording is reset, re-recorded or freed. */
++   struct util_dynarray pinned_heaps;
+    /* Set at vkBeginCommandBuffer. One-time-submit buffers skip command
+     * enqueueing in the trampolines since they can never be replayed. */
+    bool one_time_submit;
+@@ -428,6 +437,9 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+ };
+ 
+ void kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd);
++/* Reads the refusals of every geometry heap the recording pinned, then drops
++ * the pins. */
++void kk_cmd_release_heaps(struct kk_cmd_buffer *cmd);
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+ void kk_cmd_buffer_set_vertex_amplification(struct kk_cmd_buffer *cmd,
+@@ -447,10 +459,10 @@ kk_cmd_buffer_dirty_all_gfx(struct kk_cmd_buffer *cmd)
+    cmd->state.gfx.dirty = ~0u;
+    cmd->state.gfx.descriptors.root_dirty = true;
+ 
+-   /* We just flushed out the heap use. If we want to use it again, we'll need
+-    * to queue a free for it again.
+-    */
+-   cmd->uses_heap = false;
++   /* The segment's heap reset is queued. A draw that needs the heap again
++    * pins it for the new segment and queues another. */
++   cmd->heap_in_segment = false;
++   cmd->heap_demand_B = 0;
+ }
+ 
+ void kk_cmd_release_dynamic_ds_state(struct kk_cmd_buffer *cmd);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index a368cf60c9d750005d83a2efad44e97cc472c576..dee753c51689efdd6341e640adbddef2274ef0e8 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -16,6 +16,7 @@
+ #include "kk_image_view.h"
+ #include "kk_line_raster.h"
+ #include "kk_raster_edge.h"
++#include "kk_tess_bound.h"
+ #include "kk_logic_op.h"
+ #include "kk_query_pool.h"
+ 
+@@ -27,6 +28,8 @@
+ 
+ #include "util/u_math.h"
+ 
++#include <stdlib.h>
++
+ #include "poly/geometry.h"
+ #include "poly/tessellator.h"
+ 
+@@ -1128,43 +1131,358 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+    }
+ }
+ 
+-static void
+-kk_init_heap(const void *data)
++/* The geometry heap holds what the emulated stages reserve on the GPU: unrolled
++ * index buffers, tessellated domain points and indices, geometry and line
++ * outputs. A render segment resets it after its work, so a heap only has to
++ * hold one segment's reservations.
++ *
++ * It starts at 16 MiB, because a Venus host pays it once per guest VkDevice
++ * that draws through it. The heaviest command buffer in the CTS
++ * tessellation, geometry, draw and rasterization groups asks it for 1.53 MiB,
++ * but demand is linear in patches and primitives, which the API does not
++ * bound, and 130 quad patches at level 64 already need 17.2 MB. So the heap
++ * grows, at least doubling, up to a cap:
++ *
++ * - A direct draw whose reservations the host can bound, the restart unroll
++ *   and tessellation at the largest level its TCS can write, grows it before
++ *   it is recorded and renders on its first submission. A bound past the cap
++ *   grows the heap to the cap, and the GPU reports the rest.
++ * - A reservation only the GPU can size is refused when it does not fit, and
++ *   its draw loses its output: kernels that reserve suppress their draw
++ *   instead of aborting, because a shader abort() ends only the invocation
++ *   that calls it. The header counts refusals and what each refused render
++ *   segment needed, what it reserved plus every size it was refused, and the
++ *   next draw that pins the heap, or the reset of a recording that used it,
++ *   grows it for later command buffers to hold that in one step. The first
++ *   loss is logged once per device. Vulkan has no way to fail a command
++ *   buffer after it ran short of losing the device, so none fails.
++ *
++ * MESA_KK_HEAP_SIZE_MIB sets the starting size. The header's size is 32-bit,
++ * so only 1 to 4095 MiB is honoured, and any other value keeps 16 MiB. The cap
++ * is 128 MiB or the starting size, whichever is larger. */
++#define KK_HEAP_START_MIB   16u
++#define KK_HEAP_MIN_CAP_MIB 128u
++
++static uint64_t
++kk_heap_start_B(void)
+ {
+-   struct kk_cmd_buffer *cmd = (struct kk_cmd_buffer *)data;
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   uint64_t mib = KK_HEAP_START_MIB;
++   const char *size_override = getenv("MESA_KK_HEAP_SIZE_MIB");
++   if (size_override != NULL) {
++      long requested = strtol(size_override, NULL, 10);
++      if (requested >= 1 && requested <= 4095)
++         mib = (uint64_t)requested;
++   }
++   return mib << 20;
++}
+ 
+-   size_t size = 128 * 1024 * 1024;
+-   kk_alloc_bo(dev, &dev->vk.base, size, 0, &dev->heap);
++static struct kk_geometry_heap *
++kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B)
++{
++   struct kk_geometry_heap *heap = calloc(1, sizeof(*heap));
++   if (heap == NULL)
++      return NULL;
+ 
+-   struct poly_heap *map = (struct poly_heap *)dev->heap->cpu;
++   if (kk_alloc_bo(dev, &dev->vk.base, size_B, 0, &heap->bo) != VK_SUCCESS) {
++      free(heap);
++      return NULL;
++   }
++
++   heap->usable_B = size_B - sizeof(struct poly_heap);
++   heap->refcount = 1;
++   const uint64_t live_B =
++      p_atomic_add_return(&dev->heap_live_B, heap->bo->size_B);
++   dev->heap_peak_B = MAX2(dev->heap_peak_B, live_B);
+ 
+    /* TODO_KOSMICKRISP Self-contained until we have rodata at the device. */
+-   *map = (struct poly_heap){
+-      .base = dev->heap->gpu + sizeof(struct poly_heap),
+-      .size = size - sizeof(struct poly_heap),
++   *(struct poly_heap *)heap->bo->cpu = (struct poly_heap){
++      .base = heap->bo->gpu + sizeof(struct poly_heap),
++      .size = heap->usable_B,
+    };
++   return heap;
++}
++
++static void
++kk_geometry_heap_free(struct kk_device *dev, struct kk_geometry_heap *heap)
++{
++   p_atomic_add(&dev->heap_live_B, -(int64_t)heap->bo->size_B);
++   kk_destroy_bo(dev, heap->bo);
++   free(heap);
++}
++
++void
++kk_geometry_heap_unref(struct kk_device *dev, struct kk_geometry_heap *heap)
++{
++   simple_mtx_lock(&dev->heap_lock);
++   assert(heap->refcount > 0);
++   const bool last = --heap->refcount == 0;
++   simple_mtx_unlock(&dev->heap_lock);
++
++   if (last)
++      kk_geometry_heap_free(dev, heap);
+ }
+ 
++/* Takes the refusals the GPU counted in a heap since the host last read them,
++ * asks the next pin to grow the heap by what they needed, and logs the first
++ * loss. Called with heap_lock held. */
++static void
++kk_heap_observe_locked(struct kk_device *dev, struct kk_geometry_heap *heap)
++{
++   /* struct poly_heap is packed, so its words are read through a plain
++    * pointer. */
++   const uint32_t *words = heap->bo->cpu;
++   const uint32_t refusals =
++      p_atomic_read(&words[offsetof(struct poly_heap, refusals) / 4]);
++   if (refusals == heap->seen_refusals)
++      return;
++
++   /* Every render segment that was refused needed what it reserved plus
++    * every size it was refused. The GPU folded each segment the heap has
++    * reset since into needed_units; the one still open is its bottom and
++    * refused sizes. Growing to hold the larger holds each of them. */
++   const uint64_t needed_B =
++      (uint64_t)p_atomic_read(
++         &words[offsetof(struct poly_heap, needed_units) / 4]) *
++      16u;
++   const uint64_t open_B =
++      p_atomic_read(&words[offsetof(struct poly_heap, bottom) / 4]) +
++      (uint64_t)p_atomic_read(
++         &words[offsetof(struct poly_heap, segment_refused_units) / 4]) *
++         16u;
++   heap->seen_refusals = refusals;
++   dev->heap_wanted_B =
++      MAX2(dev->heap_wanted_B, MAX2(needed_B, open_B));
++
++   if (!dev->heap_loss_reported) {
++      dev->heap_loss_reported = true;
++      fprintf(stderr,
++              "KosmicKrisp's %u MiB geometry heap refused a reservation, and "
++              "the draw that made it lost its output; later command buffers "
++              "get a heap of up to %u MiB, which MESA_KK_HEAP_SIZE_MIB "
++              "raises\n",
++              (unsigned)((heap->usable_B + sizeof(struct poly_heap)) >> 20),
++              (unsigned)(dev->heap_cap_B >> 20));
++   }
++}
++
++/* The size of a heap whose usable size exceeds want_B, in one step however
++ * far that is, at least floor_B and at most the cap. */
+ static uint64_t
+-kk_heap(struct kk_cmd_buffer *cmd)
++kk_heap_size_for(const struct kk_device *dev, uint64_t floor_B,
++                 uint64_t want_B)
++{
++   /* The GPU grants a reservation only if it ends before the usable size. */
++   const uint64_t size_B =
++      MAX2(floor_B,
++           util_next_power_of_two64(want_B + sizeof(struct poly_heap) + 16u));
++   return MIN2(size_B, dev->heap_cap_B);
++}
++
++/* Creates the device's first heap, at the starting size or, when the draw
++ * that asks for it already needs more, at the size that holds it. Called
++ * with heap_lock held. */
++static void
++kk_heap_create_first_locked(struct kk_device *dev, uint64_t want_B)
++{
++   dev->heap_attempted = true;
++   const uint64_t start_B = kk_heap_start_B();
++   dev->heap_cap_B = MAX2(start_B, (uint64_t)KK_HEAP_MIN_CAP_MIB << 20);
++
++   const uint64_t size_B = kk_heap_size_for(dev, start_B, want_B);
++   dev->heap = kk_geometry_heap_create(dev, size_B);
++   if (dev->heap == NULL && size_B > start_B)
++      dev->heap = kk_geometry_heap_create(dev, start_B);
++}
++
++/* Replaces the device's heap with one whose usable size exceeds want_B, at
++ * least twice the old size and at most the cap, and returns the old heap when
++ * nothing else holds it, for the caller to free once it has unlocked. When
++ * Metal refuses the larger heap the device keeps the one it has and stops
++ * growing. Called with heap_lock held. */
++static struct kk_geometry_heap *
++kk_heap_grow_locked(struct kk_device *dev, uint64_t want_B)
++{
++   struct kk_geometry_heap *old = dev->heap;
++   const uint64_t old_B = old->usable_B + sizeof(struct poly_heap);
++   if (want_B < old->usable_B || old_B >= dev->heap_cap_B)
++      return NULL;
++
++   const uint64_t size_B = kk_heap_size_for(dev, old_B * 2u, want_B);
++   struct kk_geometry_heap *heap = kk_geometry_heap_create(dev, size_B);
++   if (heap == NULL) {
++      dev->heap_cap_B = old_B;
++      return NULL;
++   }
++
++   dev->heap = heap;
++   assert(old->refcount > 0);
++   return --old->refcount == 0 ? old : NULL;
++}
++
++/* Pins a heap for the render segment being recorded, grown first to hold
++ * direct_B, the most the draw about to be recorded is known to reserve, and
++ * whatever refusals asked for, and queues the heap's reset for the segment.
++ * A draw that does not fit beside the segment's earlier ones moves the
++ * segment to the grown heap; those already recorded keep theirs. A call that
++ * knows no bound, from a stage re-pinning after a render encoder restarted
++ * inside its draw, keeps the heap the draw's earlier stages reserved from,
++ * however another recording has grown the device's. Only a device with no
++ * heap at all fails the draw, and its recording. */
++static bool
++kk_heap_prepare(struct kk_cmd_buffer *cmd, uint64_t direct_B)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++
++   if (cmd->heap_in_segment &&
++       cmd->heap_demand_B + direct_B < cmd->heap->usable_B) {
++      cmd->heap_demand_B += direct_B;
++      return true;
++   }
++
++   simple_mtx_lock(&dev->heap_lock);
++   if (!dev->heap_attempted)
++      kk_heap_create_first_locked(dev, MAX2(dev->heap_wanted_B, direct_B));
++   if (dev->heap == NULL) {
++      simple_mtx_unlock(&dev->heap_lock);
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return false;
++   }
++
++   /* A draw that does not fit beside the segment's earlier draws on the
++    * device's heap needs a larger one, which it then starts on alone. */
++   kk_heap_observe_locked(dev, dev->heap);
++   const uint64_t need_B = cmd->heap_in_segment && cmd->heap == dev->heap
++                              ? cmd->heap_demand_B + direct_B
++                              : direct_B;
++   struct kk_geometry_heap *retired =
++      kk_heap_grow_locked(dev, MAX2(dev->heap_wanted_B, need_B));
++
++   struct kk_geometry_heap *heap =
++      direct_B == 0 && cmd->heap != NULL ? cmd->heap : dev->heap;
++   const bool switched = heap != cmd->heap || !cmd->heap_in_segment;
++   if (switched) {
++      bool pinned = false;
++      util_dynarray_foreach(&cmd->pinned_heaps, struct kk_geometry_heap *, h)
++         pinned |= *h == heap;
++
++      if (!pinned) {
++         struct kk_geometry_heap **slot = util_dynarray_grow(
++            &cmd->pinned_heaps, struct kk_geometry_heap *, 1);
++         if (slot == NULL) {
++            simple_mtx_unlock(&dev->heap_lock);
++            if (retired != NULL)
++               kk_geometry_heap_free(dev, retired);
++            vk_command_buffer_set_error(&cmd->vk,
++                                        VK_ERROR_OUT_OF_HOST_MEMORY);
++            return false;
++         }
++         *slot = heap;
++         heap->refcount++;
++      }
++
++      cmd->heap = heap;
++      cmd->heap_in_segment = true;
++      cmd->heap_demand_B = direct_B;
++   } else {
++      cmd->heap_demand_B += direct_B;
++   }
++   simple_mtx_unlock(&dev->heap_lock);
++
++   if (retired != NULL)
++      kk_geometry_heap_free(dev, retired);
++
++   /* The reset frees everything the segment before reserved, after folding
++    * what that segment needed into the header. Recorded mid-render, it lands
++    * after the segment's work. */
++   if (switched)
++      libkk_heap_reset(cmd, kk_grid_1d(1), !cmd->gfx.encoder, heap->bo->gpu);
++   return true;
++}
++
++/* Grows the device's heap ahead of a multi-draw whose entries together are
++ * known to reserve total_B, when they do not fit beside the render
++ * segment's earlier draws, so the first entry moves the segment to a heap
++ * that holds them all instead of each entry growing it a step. */
++static void
++kk_heap_expect(struct kk_cmd_buffer *cmd, uint64_t total_B)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   if (cmd->heap_in_segment &&
++       cmd->heap_demand_B + total_B < cmd->heap->usable_B)
++      return;
+ 
+-   util_call_once_data(&dev->heap_init_once, kk_init_heap, cmd);
++   simple_mtx_lock(&dev->heap_lock);
++   struct kk_geometry_heap *retired = NULL;
++   if (!dev->heap_attempted) {
++      kk_heap_create_first_locked(dev, MAX2(dev->heap_wanted_B, total_B));
++   } else if (dev->heap != NULL) {
++      const uint64_t need_B = cmd->heap_in_segment && cmd->heap == dev->heap
++                                 ? cmd->heap_demand_B + total_B
++                                 : total_B;
++      retired = kk_heap_grow_locked(dev, MAX2(dev->heap_wanted_B, need_B));
++   }
++   simple_mtx_unlock(&dev->heap_lock);
+ 
+-   /* We need to free all allocations after each command buffer execution */
+-   if (!cmd->uses_heap) {
+-      uint64_t addr = dev->heap->gpu;
++   if (retired != NULL)
++      kk_geometry_heap_free(dev, retired);
++}
+ 
+-      /* Zeroing the allocated index frees everything */
+-      kk_cmd_write(cmd, (struct libkk_imm_write){
+-                           addr + offsetof(struct poly_heap, bottom), 0});
++void
++kk_cmd_release_heaps(struct kk_cmd_buffer *cmd)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_geometry_heap **heaps = cmd->pinned_heaps.data;
++   const unsigned count = util_dynarray_num_elements(
++      &cmd->pinned_heaps, struct kk_geometry_heap *);
++   cmd->heap = NULL;
++   cmd->heap_in_segment = false;
++   cmd->heap_demand_B = 0;
++   if (count == 0)
++      return;
+ 
+-      cmd->uses_heap = true;
++   /* Vulkan forbids resetting or freeing a pending command buffer, and a
++    * re-record waits for the last submission, so the work that used these
++    * heaps has run, and what it had refused is in their headers. */
++   unsigned unused = 0;
++   simple_mtx_lock(&dev->heap_lock);
++   for (unsigned i = 0; i < count; ++i) {
++      kk_heap_observe_locked(dev, heaps[i]);
++      assert(heaps[i]->refcount > 0);
++      if (--heaps[i]->refcount == 0)
++         heaps[unused++] = heaps[i];
+    }
++   simple_mtx_unlock(&dev->heap_lock);
++
++   for (unsigned i = 0; i < unused; ++i)
++      kk_geometry_heap_free(dev, heaps[i]);
++   util_dynarray_clear(&cmd->pinned_heaps);
++}
++
++/* The pinned heap's GPU address, for a stage about to reserve from it. A
++ * draw pins the heap before recording its stages, but a render encoder that
++ * restarts between the entries of a multi-draw begins a segment that pins it
++ * again. */
++static uint64_t
++kk_heap(struct kk_cmd_buffer *cmd)
++{
++   if (!cmd->heap_in_segment && !kk_heap_prepare(cmd, 0))
++      return 0;
++
++   return cmd->heap->bo->gpu;
++}
++
++/* The reservable bytes, after its header, of the heap the draw's stages
++ * reserved from, as the range the stages after them read. */
++static struct kk_addr_range
++kk_heap_data(struct kk_cmd_buffer *cmd)
++{
++   if (cmd->heap == NULL)
++      return (struct kk_addr_range){0};
+ 
+-   return dev->heap->gpu;
++   return (struct kk_addr_range){
++      .addr = cmd->heap->bo->gpu + sizeof(struct poly_heap),
++      .range = cmd->heap->bo->size_B - sizeof(struct poly_heap),
++   };
+ }
+ 
+ enum kk_predicate_op : uint16_t {
+@@ -1375,7 +1693,6 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+                           const struct poly_gs_info *gsi,
+                           bool application_gs)
+ {
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+    const uint32_t wg_size[3] = {KK_GEOMETRY_THREADGROUP_WIDTH, 1, 1};
+@@ -1427,10 +1744,7 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+    if (indirect) {
+       if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+          kk_heap(cmd);
+-         gfx->geometry.index.addr =
+-            dev->heap->gpu + sizeof(struct poly_heap);
+-         gfx->geometry.index.range =
+-            dev->heap->size_B - sizeof(struct poly_heap);
++         gfx->geometry.index = kk_heap_data(cmd);
+       }
+    } else {
+       if (gsi->output_vertex_stride) {
+@@ -2100,7 +2414,6 @@ static bool
+ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+                    bool rotate_provoking_to_first, bool discard_adjacency)
+ {
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
+       return false;
+@@ -2146,8 +2459,7 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+    data->prim = discard_adjacency ? u_reduced_prim(data->prim)
+                                   : u_decomposed_prim(data->prim);
+    /* TODO_KOSMICKRISP Self-contained until we have rodata at the device. */
+-   data->index_buffer.addr = dev->heap->gpu + sizeof(struct poly_heap);
+-   data->index_buffer.range = dev->heap->size_B - sizeof(struct poly_heap);
++   data->index_buffer = kk_heap_data(cmd);
+    data->restart_index = UINT32_MAX;
+    data->index_buffer_el_size_B = 4u;
+    data->indirect = true;
+@@ -2185,7 +2497,6 @@ kk_unroll_raster_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data draw,
+        !rotate_provoking_to_first)
+       return draw;
+ 
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    uint64_t in_draw;
+    uint32_t in_draw_stride_el;
+ 
+@@ -2258,10 +2569,7 @@ kk_unroll_raster_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data draw,
+    libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024), true, args);
+ 
+    draw.grid = kk_grid_indirect(out_draw.gpu);
+-   draw.index.gpu = (struct kk_addr_range){
+-      .addr = dev->heap->gpu + sizeof(struct poly_heap),
+-      .range = dev->heap->size_B - sizeof(struct poly_heap),
+-   };
++   draw.index.gpu = kk_heap_data(cmd);
+    draw.index.el_size_B = sizeof(uint32_t);
+    draw.vertex_offset = 0;
+    draw.line_raster_run_starts_addr =
+@@ -2735,7 +3043,6 @@ kk_dispatch_compute(mtl_compute_encoder *enc, struct kk_grid grid,
+ static struct kk_draw_data
+ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+ {
+-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_grid grid_vs, grid_tcs, grid_tess;
+ 
+@@ -2837,8 +3144,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+ 
+    draw.grid = kk_grid_indirect(gfx->tess.out_draws_addr);
+ 
+-   draw.index.gpu.addr = dev->heap->gpu + sizeof(struct poly_heap);
+-   draw.index.gpu.range = dev->heap->size_B - sizeof(struct poly_heap);
++   draw.index.gpu = kk_heap_data(cmd);
+    draw.index.el_size_B = 4u;
+    draw.primitive_type = mesa_prim_to_mtl_primitive_type(gfx->tess.prim);
+    return draw;
+@@ -3409,6 +3715,78 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+    return draw;
+ }
+ 
++/* The most a direct draw's restart unroll reserves: the bound
++ * poly_setup_unroll_for_draw() reserves for each of its draws, as if none had
++ * a restart. */
++static uint64_t
++kk_unroll_heap_bound(const struct kk_draw_command *data,
++                     bool discard_adjacency)
++{
++   if (data->indirect)
++      return 0;
++
++   const uint64_t per_prim =
++      discard_adjacency ? mesa_vertices_per_prim(u_reduced_prim(data->prim))
++                        : mesa_vertices_per_prim(data->prim);
++   uint64_t total_B = 0;
++   for (uint32_t i = 0; i < data->draw_count; ++i) {
++      const uint32_t count = data->indexed ? data->indexed_draws[i].indexCount
++                                           : data->draws[i].vertexCount;
++      const uint64_t prims =
++         poly_decomposed_prims_for_vertices_u32(data->prim, count);
++      uint64_t draw_B = prims * per_prim * sizeof(uint32_t);
++      if (data->line_raster_runs)
++         draw_B += prims * sizeof(uint32_t);
++      total_B += align64(draw_B, 16);
++   }
++   return total_B;
++}
++
++/* The most a direct tessellated draw reserves: its index buffer and then the
++ * domain points of every patch, which the prefix sum reserves together. Each
++ * patch is bounded by the levels its TCS writes when they are all constants,
++ * and by level 64 otherwise. Points are 8 bytes and indices 4. */
++static uint64_t
++kk_tess_heap_bound(struct kk_cmd_buffer *cmd, const struct kk_draw_data *draw)
++{
++   const uint32_t patch_vertices =
++      cmd->vk.dynamic_graphics_state.ts.patch_control_points;
++   if (kk_grid_is_indirect(draw->grid) || patch_vertices == 0)
++      return 0;
++
++   const enum tess_primitive_mode mode = cmd->state.gfx.tess.info.mode;
++   const struct kk_shader *tcs = cmd->state.shaders[MESA_SHADER_TESS_CTRL];
++   uint8_t outer_needed, inner_needed;
++   switch (mode) {
++   case TESS_PRIMITIVE_QUADS:
++      outer_needed = 0xf;
++      inner_needed = 0x3;
++      break;
++   case TESS_PRIMITIVE_ISOLINES:
++      outer_needed = 0x3;
++      inner_needed = 0;
++      break;
++   default:
++      outer_needed = 0x7;
++      inner_needed = 0x1;
++      break;
++   }
++
++   float max_level = 64.0f;
++   if (tcs &&
++       (tcs->info.tess.tcs_constant_outer & outer_needed) == outer_needed &&
++       (tcs->info.tess.tcs_constant_inner & inner_needed) == inner_needed)
++      max_level = tcs->info.tess.tcs_max_constant_level;
++
++   uint32_t points, indices;
++   kk_tess_patch_bound(mode, max_level, &points, &indices);
++
++   const uint64_t patches =
++      (uint64_t)(draw->grid.size.x / patch_vertices) * draw->grid.size.y;
++   return align64(patches * indices * sizeof(uint32_t), 16) +
++          align64(patches * points * 8u, 16);
++}
++
+ static void
+ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+@@ -3478,15 +3856,41 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+        requires_index_promotion(data) || requires_unroll_robustness(cmd, data) ||
+        requires_unroll_restart(cmd, data) || rewrite_direct_provoking ||
+        (discard_adjacency && !emulate_line_raster));
++   /* Every stage the driver emulates, and every unroll, allocates from the
++    * device heap. */
++   const bool needs_heap = requires_unroll || tess || emulate_geometry ||
++                           emulate_transform_feedback ||
++                           emulate_line_raster || emulate_polygon_points ||
++                           materialize_line_raster;
+    if (requires_unroll) {
+       data->line_raster_runs =
+          emulate_line_raster &&
+          (!materialize_line_raster || emulate_transform_feedback) &&
+          (data->prim == MESA_PRIM_LINE_STRIP ||
+           data->prim == MESA_PRIM_LINE_STRIP_ADJACENCY);
+-      if (!kk_unroll_geometry(cmd, data, rewrite_direct_provoking,
+-                              discard_adjacency))
+-         return;
++   }
++   /* A tessellated draw pins the heap for each of its draws below, before
++    * anything uses it, so that the first heap is already large enough. */
++   if (needs_heap && !tess &&
++       !kk_heap_prepare(cmd, requires_unroll ? kk_unroll_heap_bound(
++                                                  data, discard_adjacency)
++                                             : 0))
++      return;
++
++   if (requires_unroll && !kk_unroll_geometry(cmd, data,
++                                              rewrite_direct_provoking,
++                                              discard_adjacency))
++      return;
++
++   /* The entries of a direct multi-draw pin the heap one by one; grow it once
++    * for all of them. */
++   if (tess && data->draw_count > 1u) {
++      uint64_t total_B = 0;
++      for (uint32_t i = 0; i < data->draw_count; i++) {
++         const struct kk_draw_data entry = build_draw_data(cmd, data, i);
++         total_B += kk_tess_heap_bound(cmd, &entry);
++      }
++      kk_heap_expect(cmd, total_B);
+    }
+ 
+    for (uint32_t i = 0; i < data->draw_count; i++) {
+@@ -3498,6 +3902,11 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ 
+       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
+ 
++      /* The per-draw upload records the heap the tessellator reserves from,
++       * so it has to grow first. */
++      if (tess && !kk_heap_prepare(cmd, kk_tess_heap_bound(cmd, &draw_data)))
++         return;
++
+       if (data->upload_mask &&
+           !kk_upload_per_draw_data(cmd, data->upload_mask, i, &draw_data,
+                                    data->prim))
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 954f3eb96626ab721bcf0af834f2e955df797655..83ccc40a2920313e3978351cc724e76cd4f49e37 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -410,6 +410,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    simple_mtx_init(&dev->address_space.mutex, mtx_plain);
+    list_inithead(&dev->address_space.allocations);
++   simple_mtx_init(&dev->heap_lock, mtx_plain);
+ 
+    dev->allocator_cache = kk_command_allocator_cache_create();
+    if (dev->allocator_cache == NULL) {
+@@ -460,6 +461,7 @@ fail_mem_cache:
+ fail_vab_memory:
+    if (dev->allocator_cache)
+       kk_command_allocator_cache_unref(dev->allocator_cache);
++   simple_mtx_destroy(&dev->heap_lock);
+    simple_mtx_destroy(&dev->address_space.mutex);
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+@@ -500,9 +502,11 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    kk_query_table_finish(dev, &dev->occlusion_queries);
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ 
+-   /* Geometry heap */
++   /* Geometry heap. Every command buffer is freed by now, so the device holds
++    * the last reference. */
+    if (dev->heap)
+-      kk_destroy_bo(dev, dev->heap);
++      kk_geometry_heap_unref(dev, dev->heap);
++   simple_mtx_destroy(&dev->heap_lock);
+ 
+    /* Outstanding completion callbacks keep their own reference. */
+    kk_command_allocator_cache_unref(dev->allocator_cache);
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 16ec133e7201e835ec4678e0340a00a572616b12..b6abffab30bf792984aa9890ae4d44b0abf3ba76 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -68,6 +68,20 @@ struct kk_rc_sampler {
+    uint16_t index;
+ };
+ 
++/* One allocation of the geometry heap the emulated stages reserve from. The
++ * device holds the current one, and a recording holds every one it reserved
++ * from until it is reset, re-recorded or freed, so a heap that grew is freed
++ * only once no work recorded against it can still run. */
++struct kk_geometry_heap {
++   struct kk_bo *bo;
++   /* The size in the header: the bytes after it the GPU may reserve. */
++   uint32_t usable_B;
++   /* The rest is protected by kk_device::heap_lock. */
++   uint32_t refcount;
++   /* The header's refusal count when the host last read it. */
++   uint32_t seen_refusals;
++};
++
+ struct kk_sampler_heap {
+    simple_mtx_t lock;
+ 
+@@ -156,9 +170,23 @@ struct kk_device {
+ 
+    struct vk_meta_device meta;
+ 
+-   /* Geomtry heap */
+-   struct kk_bo *heap;
+-   util_once_flag heap_init_once;
++   /* Geometry heap, created by the first draw that needs it and grown for
++    * later command buffers; see kk_heap_prepare(). heap_lock protects the
++    * fields after it. */
++   simple_mtx_t heap_lock;
++   struct kk_geometry_heap *heap;
++   /* Whether the first heap was attempted: a device Metal refused it keeps
++    * none. */
++   bool heap_attempted;
++   bool heap_loss_reported;
++   /* The largest the heap may grow to, and the usable size refusals the GPU
++    * counted ask the next pin to grow it to. */
++   uint64_t heap_cap_B;
++   uint64_t heap_wanted_B;
++   /* The bytes of every geometry heap alive, the current one and those
++    * recordings still pin, and the most there have been. */
++   uint64_t heap_live_B;
++   uint64_t heap_peak_B;
+ 
+    uint64_t disabled_workarounds;
+    bool gpu_capture_enabled;
+@@ -179,6 +207,9 @@ void kk_device_finish_lib(struct kk_device *dev);
+ VkResult kk_linked_graphics_pipeline_cache_init(struct kk_device *dev);
+ void kk_linked_graphics_pipeline_cache_finish(struct kk_device *dev);
+ void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
++/* Drops a reference to a geometry heap, freeing it with the last one. */
++void kk_geometry_heap_unref(struct kk_device *dev,
++                            struct kk_geometry_heap *heap);
+ void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
+                                               mtl_heap *heap);
+ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 17fa07010f1e2ce21974d0d7cdb07f28529b0b27..95605adc464b416be9f6a530a222b13866e3434d 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1528,6 +1528,65 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+ 
++/* Records which tessellation levels the TCS writes only with constants, and
++ * the largest constant, so a direct draw can bound its tessellation by it
++ * rather than by level 64. A level that some store writes with a value only
++ * the GPU knows, or through an offset only the GPU knows, is left out, and
++ * so is every level when any store's offset is unknown: that store may land
++ * on one. A level the TCS never writes is left out as well, since its value
++ * is undefined. */
++static void
++kk_gather_tcs_levels(struct kk_shader *shader, nir_shader *nir)
++{
++   uint8_t written[2] = {0, 0}, variable[2] = {0, 0};
++   float max_level = 0.0f;
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_store_output)
++               continue;
++
++            const unsigned location = nir_intrinsic_io_semantics(intr).location;
++            const bool outer = location == VARYING_SLOT_TESS_LEVEL_OUTER;
++            const bool inner = location == VARYING_SLOT_TESS_LEVEL_INNER;
++            if (!nir_src_is_const(*nir_get_io_offset_src(intr))) {
++               variable[0] = variable[1] = 0xff;
++               continue;
++            }
++            if ((!outer && !inner) ||
++                nir_src_as_uint(*nir_get_io_offset_src(intr)) != 0)
++               continue;
++
++            const unsigned level = inner ? 1 : 0;
++            const unsigned first = nir_intrinsic_component(intr);
++            u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
++               const unsigned bit = 1u << (first + c);
++               written[level] |= bit;
++               nir_scalar value = nir_scalar_resolved(intr->src[0].ssa, c);
++               if (intr->src[0].ssa->bit_size != 32 ||
++                   !nir_scalar_is_const(value)) {
++                  variable[level] |= bit;
++                  continue;
++               }
++
++               /* NaN and anything past the largest level count as 64. */
++               const float f = nir_scalar_as_float(value);
++               max_level = MAX2(max_level, f >= 0.0f && f <= 64.0f ? f : 64.0f);
++            }
++         }
++      }
++   }
++
++   shader->info.tess.tcs_constant_outer = written[0] & ~variable[0];
++   shader->info.tess.tcs_constant_inner = written[1] & ~variable[1];
++   shader->info.tess.tcs_max_constant_level = max_level;
++}
++
+ static void
+ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+                    const struct vk_graphics_pipeline_state *state)
+@@ -1694,6 +1753,7 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+           * For the non-emulated path we need to subtract base_instance... */
+          NIR_PASS(_, nir, msl_nir_lower_instance_id);
+    } else if (stage == MESA_SHADER_TESS_CTRL) {
++      kk_gather_tcs_levels(shader, nir);
+       NIR_PASS(_, nir, poly_nir_lower_tcs, false);
+ 
+       shader->info.tess.info.ccw = nir->info.tess.ccw;
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 138de17daa7a8769e539537b27a22048f7f0b9d6..0fe1e8a99b062c08deddf8dff0b84e0ffbcb51ed 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -173,6 +173,12 @@ struct kk_shader_info {
+          uint32_t tcs_output_stride;
+          uint8_t tcs_output_patch_size;
+          uint8_t tcs_nr_patch_outputs;
++         /* The outer and inner tessellation levels the TCS writes only with
++          * constants, and the largest of those constants; see
++          * kk_gather_tcs_levels(). */
++         uint8_t tcs_constant_outer;
++         uint8_t tcs_constant_inner;
++         float tcs_max_constant_level;
+ 
+          struct kk_tess_info info;
+       } tess;
+diff --git a/src/kosmickrisp/vulkan/kk_tess_bound.h b/src/kosmickrisp/vulkan/kk_tess_bound.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..65ad692a99d258a32b9bcb17037d6dc25ee12d72
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_tess_bound.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#pragma once
++
++#include "compiler/shader_enums.h"
++#include "util/macros.h"
++
++#include <math.h>
++#include <stdint.h>
++
++/* The most domain points and indices the tessellator gives one patch of the
++ * domain when no level it reads exceeds max_level, or any level up to 64
++ * when max_level is 64 or more.
++ *
++ * Below 62 the bound is generous rather than exact. The tessellator rounds a
++ * level up to an integer, or to an odd or even one for fractional
++ * partitioning, and treats an inner level of 1 beside a larger outer one as
++ * 2 or 3, so no level it uses exceeds l = max(ceil(max_level) + 1, 2). The
++ * bound is the domain's count with every level at l, and at 62 or more the
++ * count at 64. kosmickrisp_tess_bound_gpu checks it against the tessellator
++ * for every domain and partitioning. */
++static inline void
++kk_tess_patch_bound(enum tess_primitive_mode mode, float max_level,
++                    uint32_t *points, uint32_t *indices)
++{
++   const uint32_t l =
++      max_level < 62.0f
++         ? MAX2((uint32_t)ceilf(MAX2(max_level, 0.0f)) + 1, 2)
++         : 64;
++
++   switch (mode) {
++   case TESS_PRIMITIVE_QUADS:
++      /* (l + 1)^2 points, two triangles per unit square. */
++      *points = (l + 1) * (l + 1);
++      *indices = l * l * 2 * 3;
++      break;
++   case TESS_PRIMITIVE_ISOLINES:
++      /* l lines of l + 1 points, l segments each. */
++      *points = l * (l + 1);
++      *indices = l * l * 2;
++      break;
++   default:
++      /* Rings of 3(l - 2k) points around the centre, 3(l^2 / 4 + l / 2) + 1
++       * points for even l and fewer for odd, and at most 1.5 l^2
++       * triangles. */
++      *points = (3 * l * l + 6 * l + 4 + 3) / 4;
++      *indices = (3 * l * l + 1) / 2 * 3;
++      break;
++   }
++}
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index e0a1cdeddc95115ce4211138dab6fb71723d1176..28aa9f23a9ab108a2b155f7ce1eb9330cd5282e4 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -95,6 +95,7 @@ kk_files = files(
+   'kk_line_raster.h',
+   'kk_raster_variant.h',
+   'kk_raster_edge.h',
++  'kk_tess_bound.h',
+   'kk_instance.h',
+   'kk_instance.c',
+   'kk_nir_lower_custom_border.c',
+@@ -281,6 +282,26 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_tess_bound_gpu',
++      executable(
++        'test_kosmickrisp_tess_bound_gpu',
++        files('tests/test_tess_bound_gpu.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_tess_setup_gpu',
+       executable(
+@@ -907,6 +928,46 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 60,
+     )
++    test(
++      'kosmickrisp_heap_size_override',
++      executable(
++        'test_kosmickrisp_heap_size_override',
++        files('tests/test_heap_size_override.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
++    test(
++      'kosmickrisp_heap_growth',
++      executable(
++        'test_kosmickrisp_heap_growth',
++        files('tests/test_heap_growth.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc
+new file mode 100644
+index 0000000000000000000000000000000000000000..05595144ab1f71635218f1ab92d172576cf4b5c7
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++/* One-vertex patches at a level the compiler cannot see: the specialization
++ * constant, times one plus the primitive ID shifted past any the draws
++ * reach. */
++layout(vertices = 1) out;
++layout(constant_id = 0) const float scale = 64.0;
++void main()
++{
++   gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
++   float level = scale * float(1 + (gl_PrimitiveID >> 30));
++   gl_TessLevelOuter[0] = level;
++   gl_TessLevelOuter[1] = level;
++   gl_TessLevelOuter[2] = level;
++   gl_TessLevelOuter[3] = level;
++   gl_TessLevelInner[0] = level;
++   gl_TessLevelInner[1] = level;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc.h b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ef4a542f5e836860ba4bea8b681e51ae86494c1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/dynamic.tesc.h
+@@ -0,0 +1,89 @@
++{0x07230203,0x00010600,0x000d000b,0x00000041,
++0x00000000,0x00020011,0x00000003,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000b000f,0x00000001,0x00000004,0x6e69616d,
++0x00000000,0x0000000e,0x00000011,0x00000018,
++0x00000023,0x0000002d,0x0000003c,0x00040010,
++0x00000004,0x0000001a,0x00000001,0x00030047,
++0x0000000b,0x00000002,0x00050048,0x0000000b,
++0x00000000,0x0000000b,0x00000000,0x00050048,
++0x0000000b,0x00000001,0x0000000b,0x00000001,
++0x00050048,0x0000000b,0x00000002,0x0000000b,
++0x00000003,0x00050048,0x0000000b,0x00000003,
++0x0000000b,0x00000004,0x00040047,0x00000011,
++0x0000000b,0x00000008,0x00030047,0x00000014,
++0x00000002,0x00050048,0x00000014,0x00000000,
++0x0000000b,0x00000000,0x00050048,0x00000014,
++0x00000001,0x0000000b,0x00000001,0x00050048,
++0x00000014,0x00000002,0x0000000b,0x00000003,
++0x00050048,0x00000014,0x00000003,0x0000000b,
++0x00000004,0x00040047,0x00000021,0x00000001,
++0x00000000,0x00040047,0x00000023,0x0000000b,
++0x00000007,0x00040047,0x0000002d,0x0000000b,
++0x0000000b,0x00030047,0x0000002d,0x0000000f,
++0x00040047,0x0000003c,0x0000000b,0x0000000c,
++0x00030047,0x0000003c,0x0000000f,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000004,0x00040015,
++0x00000008,0x00000020,0x00000000,0x0004002b,
++0x00000008,0x00000009,0x00000001,0x0004001c,
++0x0000000a,0x00000006,0x00000009,0x0006001e,
++0x0000000b,0x00000007,0x00000006,0x0000000a,
++0x0000000a,0x0004001c,0x0000000c,0x0000000b,
++0x00000009,0x00040020,0x0000000d,0x00000003,
++0x0000000c,0x0004003b,0x0000000d,0x0000000e,
++0x00000003,0x00040015,0x0000000f,0x00000020,
++0x00000001,0x00040020,0x00000010,0x00000001,
++0x0000000f,0x0004003b,0x00000010,0x00000011,
++0x00000001,0x0004002b,0x0000000f,0x00000013,
++0x00000000,0x0006001e,0x00000014,0x00000007,
++0x00000006,0x0000000a,0x0000000a,0x0004002b,
++0x00000008,0x00000015,0x00000020,0x0004001c,
++0x00000016,0x00000014,0x00000015,0x00040020,
++0x00000017,0x00000001,0x00000016,0x0004003b,
++0x00000017,0x00000018,0x00000001,0x00040020,
++0x0000001a,0x00000001,0x00000007,0x00040020,
++0x0000001d,0x00000003,0x00000007,0x00040032,
++0x00000006,0x00000021,0x42800000,0x0004002b,
++0x0000000f,0x00000022,0x00000001,0x0004003b,
++0x00000010,0x00000023,0x00000001,0x0004002b,
++0x0000000f,0x00000025,0x0000001e,0x0004002b,
++0x00000008,0x0000002a,0x00000004,0x0004001c,
++0x0000002b,0x00000006,0x0000002a,0x00040020,
++0x0000002c,0x00000003,0x0000002b,0x0004003b,
++0x0000002c,0x0000002d,0x00000003,0x00040020,
++0x0000002f,0x00000003,0x00000006,0x0004002b,
++0x0000000f,0x00000033,0x00000002,0x0004002b,
++0x0000000f,0x00000036,0x00000003,0x0004002b,
++0x00000008,0x00000039,0x00000002,0x0004001c,
++0x0000003a,0x00000006,0x00000039,0x00040020,
++0x0000003b,0x00000003,0x0000003a,0x0004003b,
++0x0000003b,0x0000003c,0x00000003,0x00050036,
++0x00000002,0x00000004,0x00000000,0x00000003,
++0x000200f8,0x00000005,0x0004003d,0x0000000f,
++0x00000012,0x00000011,0x00060041,0x0000001a,
++0x0000001b,0x00000018,0x00000012,0x00000013,
++0x0004003d,0x00000007,0x0000001c,0x0000001b,
++0x00060041,0x0000001d,0x0000001e,0x0000000e,
++0x00000012,0x00000013,0x0003003e,0x0000001e,
++0x0000001c,0x0004003d,0x0000000f,0x00000024,
++0x00000023,0x000500c3,0x0000000f,0x00000026,
++0x00000024,0x00000025,0x00050080,0x0000000f,
++0x00000027,0x00000022,0x00000026,0x0004006f,
++0x00000006,0x00000028,0x00000027,0x00050085,
++0x00000006,0x00000029,0x00000021,0x00000028,
++0x00050041,0x0000002f,0x00000030,0x0000002d,
++0x00000013,0x0003003e,0x00000030,0x00000029,
++0x00050041,0x0000002f,0x00000032,0x0000002d,
++0x00000022,0x0003003e,0x00000032,0x00000029,
++0x00050041,0x0000002f,0x00000035,0x0000002d,
++0x00000033,0x0003003e,0x00000035,0x00000029,
++0x00050041,0x0000002f,0x00000038,0x0000002d,
++0x00000036,0x0003003e,0x00000038,0x00000029,
++0x00050041,0x0000002f,0x0000003e,0x0000003c,
++0x00000013,0x0003003e,0x0000003e,0x00000029,
++0x00050041,0x0000002f,0x00000040,0x0000003c,
++0x00000022,0x0003003e,0x00000040,0x00000029,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..321b79d662f0157d0813e6dc1965f9fbc496b4ff
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in level64.tesc level1.tesc dynamic.tesc tile.tese; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc
+new file mode 100644
+index 0000000000000000000000000000000000000000..e08f29abd746affaaabe0845ee8f985b037963a4
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++/* One-vertex patches at the constant level 1. */
++layout(vertices = 1) out;
++void main()
++{
++   gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
++   gl_TessLevelOuter[0] = 1.0;
++   gl_TessLevelOuter[1] = 1.0;
++   gl_TessLevelOuter[2] = 1.0;
++   gl_TessLevelOuter[3] = 1.0;
++   gl_TessLevelInner[0] = 1.0;
++   gl_TessLevelInner[1] = 1.0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc.h b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c37083d0aa76358040a1682ea51a441d685e933
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level1.tesc.h
+@@ -0,0 +1,79 @@
++{0x07230203,0x00010600,0x000d000b,0x00000032,
++0x00000000,0x00020011,0x00000003,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000a000f,0x00000001,0x00000004,0x6e69616d,
++0x00000000,0x0000000e,0x00000011,0x00000018,
++0x00000022,0x0000002f,0x00040010,0x00000004,
++0x0000001a,0x00000001,0x00030047,0x0000000b,
++0x00000002,0x00050048,0x0000000b,0x00000000,
++0x0000000b,0x00000000,0x00050048,0x0000000b,
++0x00000001,0x0000000b,0x00000001,0x00050048,
++0x0000000b,0x00000002,0x0000000b,0x00000003,
++0x00050048,0x0000000b,0x00000003,0x0000000b,
++0x00000004,0x00040047,0x00000011,0x0000000b,
++0x00000008,0x00030047,0x00000014,0x00000002,
++0x00050048,0x00000014,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x00000014,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x00000014,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x00000014,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000022,0x0000000b,0x0000000b,
++0x00030047,0x00000022,0x0000000f,0x00040047,
++0x0000002f,0x0000000b,0x0000000c,0x00030047,
++0x0000002f,0x0000000f,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000001,0x0004001c,0x0000000a,
++0x00000006,0x00000009,0x0006001e,0x0000000b,
++0x00000007,0x00000006,0x0000000a,0x0000000a,
++0x0004001c,0x0000000c,0x0000000b,0x00000009,
++0x00040020,0x0000000d,0x00000003,0x0000000c,
++0x0004003b,0x0000000d,0x0000000e,0x00000003,
++0x00040015,0x0000000f,0x00000020,0x00000001,
++0x00040020,0x00000010,0x00000001,0x0000000f,
++0x0004003b,0x00000010,0x00000011,0x00000001,
++0x0004002b,0x0000000f,0x00000013,0x00000000,
++0x0006001e,0x00000014,0x00000007,0x00000006,
++0x0000000a,0x0000000a,0x0004002b,0x00000008,
++0x00000015,0x00000020,0x0004001c,0x00000016,
++0x00000014,0x00000015,0x00040020,0x00000017,
++0x00000001,0x00000016,0x0004003b,0x00000017,
++0x00000018,0x00000001,0x00040020,0x0000001a,
++0x00000001,0x00000007,0x00040020,0x0000001d,
++0x00000003,0x00000007,0x0004002b,0x00000008,
++0x0000001f,0x00000004,0x0004001c,0x00000020,
++0x00000006,0x0000001f,0x00040020,0x00000021,
++0x00000003,0x00000020,0x0004003b,0x00000021,
++0x00000022,0x00000003,0x0004002b,0x00000006,
++0x00000023,0x3f800000,0x00040020,0x00000024,
++0x00000003,0x00000006,0x0004002b,0x0000000f,
++0x00000026,0x00000001,0x0004002b,0x0000000f,
++0x00000028,0x00000002,0x0004002b,0x0000000f,
++0x0000002a,0x00000003,0x0004002b,0x00000008,
++0x0000002c,0x00000002,0x0004001c,0x0000002d,
++0x00000006,0x0000002c,0x00040020,0x0000002e,
++0x00000003,0x0000002d,0x0004003b,0x0000002e,
++0x0000002f,0x00000003,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x0000000f,0x00000012,
++0x00000011,0x00060041,0x0000001a,0x0000001b,
++0x00000018,0x00000012,0x00000013,0x0004003d,
++0x00000007,0x0000001c,0x0000001b,0x00060041,
++0x0000001d,0x0000001e,0x0000000e,0x00000012,
++0x00000013,0x0003003e,0x0000001e,0x0000001c,
++0x00050041,0x00000024,0x00000025,0x00000022,
++0x00000013,0x0003003e,0x00000025,0x00000023,
++0x00050041,0x00000024,0x00000027,0x00000022,
++0x00000026,0x0003003e,0x00000027,0x00000023,
++0x00050041,0x00000024,0x00000029,0x00000022,
++0x00000028,0x0003003e,0x00000029,0x00000023,
++0x00050041,0x00000024,0x0000002b,0x00000022,
++0x0000002a,0x0003003e,0x0000002b,0x00000023,
++0x00050041,0x00000024,0x00000030,0x0000002f,
++0x00000013,0x0003003e,0x00000030,0x00000023,
++0x00050041,0x00000024,0x00000031,0x0000002f,
++0x00000026,0x0003003e,0x00000031,0x00000023,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a5f09e45547e3ab328d89bbb4927b50a7b25ca3
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++/* One-vertex patches at the maximum tessellation level, 64. */
++layout(vertices = 1) out;
++void main()
++{
++   gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
++   gl_TessLevelOuter[0] = 64.0;
++   gl_TessLevelOuter[1] = 64.0;
++   gl_TessLevelOuter[2] = 64.0;
++   gl_TessLevelOuter[3] = 64.0;
++   gl_TessLevelInner[0] = 64.0;
++   gl_TessLevelInner[1] = 64.0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc.h b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..199a13b6f610c01f65ecaed4813e1d518d54d0ce
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/level64.tesc.h
+@@ -0,0 +1,79 @@
++{0x07230203,0x00010600,0x000d000b,0x00000032,
++0x00000000,0x00020011,0x00000003,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000a000f,0x00000001,0x00000004,0x6e69616d,
++0x00000000,0x0000000e,0x00000011,0x00000018,
++0x00000022,0x0000002f,0x00040010,0x00000004,
++0x0000001a,0x00000001,0x00030047,0x0000000b,
++0x00000002,0x00050048,0x0000000b,0x00000000,
++0x0000000b,0x00000000,0x00050048,0x0000000b,
++0x00000001,0x0000000b,0x00000001,0x00050048,
++0x0000000b,0x00000002,0x0000000b,0x00000003,
++0x00050048,0x0000000b,0x00000003,0x0000000b,
++0x00000004,0x00040047,0x00000011,0x0000000b,
++0x00000008,0x00030047,0x00000014,0x00000002,
++0x00050048,0x00000014,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x00000014,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x00000014,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x00000014,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000022,0x0000000b,0x0000000b,
++0x00030047,0x00000022,0x0000000f,0x00040047,
++0x0000002f,0x0000000b,0x0000000c,0x00030047,
++0x0000002f,0x0000000f,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000001,0x0004001c,0x0000000a,
++0x00000006,0x00000009,0x0006001e,0x0000000b,
++0x00000007,0x00000006,0x0000000a,0x0000000a,
++0x0004001c,0x0000000c,0x0000000b,0x00000009,
++0x00040020,0x0000000d,0x00000003,0x0000000c,
++0x0004003b,0x0000000d,0x0000000e,0x00000003,
++0x00040015,0x0000000f,0x00000020,0x00000001,
++0x00040020,0x00000010,0x00000001,0x0000000f,
++0x0004003b,0x00000010,0x00000011,0x00000001,
++0x0004002b,0x0000000f,0x00000013,0x00000000,
++0x0006001e,0x00000014,0x00000007,0x00000006,
++0x0000000a,0x0000000a,0x0004002b,0x00000008,
++0x00000015,0x00000020,0x0004001c,0x00000016,
++0x00000014,0x00000015,0x00040020,0x00000017,
++0x00000001,0x00000016,0x0004003b,0x00000017,
++0x00000018,0x00000001,0x00040020,0x0000001a,
++0x00000001,0x00000007,0x00040020,0x0000001d,
++0x00000003,0x00000007,0x0004002b,0x00000008,
++0x0000001f,0x00000004,0x0004001c,0x00000020,
++0x00000006,0x0000001f,0x00040020,0x00000021,
++0x00000003,0x00000020,0x0004003b,0x00000021,
++0x00000022,0x00000003,0x0004002b,0x00000006,
++0x00000023,0x42800000,0x00040020,0x00000024,
++0x00000003,0x00000006,0x0004002b,0x0000000f,
++0x00000026,0x00000001,0x0004002b,0x0000000f,
++0x00000028,0x00000002,0x0004002b,0x0000000f,
++0x0000002a,0x00000003,0x0004002b,0x00000008,
++0x0000002c,0x00000002,0x0004001c,0x0000002d,
++0x00000006,0x0000002c,0x00040020,0x0000002e,
++0x00000003,0x0000002d,0x0004003b,0x0000002e,
++0x0000002f,0x00000003,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x0000000f,0x00000012,
++0x00000011,0x00060041,0x0000001a,0x0000001b,
++0x00000018,0x00000012,0x00000013,0x0004003d,
++0x00000007,0x0000001c,0x0000001b,0x00060041,
++0x0000001d,0x0000001e,0x0000000e,0x00000012,
++0x00000013,0x0003003e,0x0000001e,0x0000001c,
++0x00050041,0x00000024,0x00000025,0x00000022,
++0x00000013,0x0003003e,0x00000025,0x00000023,
++0x00050041,0x00000024,0x00000027,0x00000022,
++0x00000026,0x0003003e,0x00000027,0x00000023,
++0x00050041,0x00000024,0x00000029,0x00000022,
++0x00000028,0x0003003e,0x00000029,0x00000023,
++0x00050041,0x00000024,0x0000002b,0x00000022,
++0x0000002a,0x0003003e,0x0000002b,0x00000023,
++0x00050041,0x00000024,0x00000030,0x0000002f,
++0x00000013,0x0003003e,0x00000030,0x00000023,
++0x00050041,0x00000024,0x00000031,0x0000002f,
++0x00000026,0x0003003e,0x00000031,0x00000023,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese
+new file mode 100644
+index 0000000000000000000000000000000000000000..ecf6902f3fe67e20f0e4f2650d9743ea2230ad55
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++/* Each patch covers its own tile of a 16 x 16 grid over the framebuffer. */
++layout(quads, equal_spacing, ccw) in;
++void main()
++{
++   vec2 tile = vec2(gl_PrimitiveID % 16, gl_PrimitiveID / 16);
++   gl_Position = vec4((tile + gl_TessCoord.xy) / 8.0 - 1.0, 0.5, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese.h b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc45533d63f086795bfbcc8fcadd2d7431026345
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/heap_growth_shaders/tile.tese.h
+@@ -0,0 +1,63 @@
++{0x07230203,0x00010600,0x000d000b,0x00000034,
++0x00000000,0x00020011,0x00000003,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000002,0x00000004,0x6e69616d,
++0x00000000,0x0000000c,0x0000001b,0x00000020,
++0x00030010,0x00000004,0x00000018,0x00030010,
++0x00000004,0x00000001,0x00030010,0x00000004,
++0x00000005,0x00040047,0x0000000c,0x0000000b,
++0x00000007,0x00030047,0x00000019,0x00000002,
++0x00050048,0x00000019,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x00000019,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x00000019,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x00000019,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000020,0x0000000b,0x0000000d,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00030016,0x00000006,0x00000020,
++0x00040017,0x00000007,0x00000006,0x00000002,
++0x00040015,0x0000000a,0x00000020,0x00000001,
++0x00040020,0x0000000b,0x00000001,0x0000000a,
++0x0004003b,0x0000000b,0x0000000c,0x00000001,
++0x0004002b,0x0000000a,0x0000000e,0x00000010,
++0x00040017,0x00000015,0x00000006,0x00000004,
++0x00040015,0x00000016,0x00000020,0x00000000,
++0x0004002b,0x00000016,0x00000017,0x00000001,
++0x0004001c,0x00000018,0x00000006,0x00000017,
++0x0006001e,0x00000019,0x00000015,0x00000006,
++0x00000018,0x00000018,0x00040020,0x0000001a,
++0x00000003,0x00000019,0x0004003b,0x0000001a,
++0x0000001b,0x00000003,0x0004002b,0x0000000a,
++0x0000001c,0x00000000,0x00040017,0x0000001e,
++0x00000006,0x00000003,0x00040020,0x0000001f,
++0x00000001,0x0000001e,0x0004003b,0x0000001f,
++0x00000020,0x00000001,0x0004002b,0x00000006,
++0x00000027,0x3f800000,0x0004002b,0x00000006,
++0x0000002a,0x3f000000,0x00040020,0x0000002e,
++0x00000003,0x00000015,0x0005002c,0x00000007,
++0x00000031,0x00000027,0x00000027,0x0004002b,
++0x00000006,0x00000032,0x3e000000,0x0005002c,
++0x00000007,0x00000033,0x00000032,0x00000032,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x0000000a,0x0000000d,0x0000000c,0x0005008b,
++0x0000000a,0x0000000f,0x0000000d,0x0000000e,
++0x0004006f,0x00000006,0x00000010,0x0000000f,
++0x00050087,0x0000000a,0x00000012,0x0000000d,
++0x0000000e,0x0004006f,0x00000006,0x00000013,
++0x00000012,0x00050050,0x00000007,0x00000014,
++0x00000010,0x00000013,0x0004003d,0x0000001e,
++0x00000021,0x00000020,0x0007004f,0x00000007,
++0x00000022,0x00000021,0x00000021,0x00000000,
++0x00000001,0x00050081,0x00000007,0x00000023,
++0x00000014,0x00000022,0x00050085,0x00000007,
++0x00000026,0x00000023,0x00000033,0x00050083,
++0x00000007,0x00000029,0x00000026,0x00000031,
++0x00050051,0x00000006,0x0000002b,0x00000029,
++0x00000000,0x00050051,0x00000006,0x0000002c,
++0x00000029,0x00000001,0x00070050,0x00000015,
++0x0000002d,0x0000002b,0x0000002c,0x0000002a,
++0x00000027,0x00050041,0x0000002e,0x0000002f,
++0x0000001b,0x0000001c,0x0003003e,0x0000002f,
++0x0000002d,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_heap_growth.c b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f3f81d0b81d24ea29d4fe1d8230594da31bc9f9
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_heap_growth.c
+@@ -0,0 +1,627 @@
++/* SPDX-License-Identifier: MIT */
++
++/* The geometry heap grows for draws that need more than it holds.
++ *
++ * A direct draw whose reservations the host can bound, a triangle fan the
++ * driver unrolls through the heap or a tessellated draw, renders whole on its
++ * first submission. Tessellation is bounded by the levels the TCS writes when
++ * they are constants and by level 64 otherwise. An indirect draw is sized
++ * only on the GPU: its first submission loses its output, which the device
++ * reports, and a later submission of the same command buffer renders whole.
++ * Each case runs on a device of its own at the default 16 MiB and reports the
++ * heap it leaves and the most heap memory it held at once. A device that
++ * never draws through the heap has none. */
++
++#define VK_NO_PROTOTYPES
++#include "kk_bo.h"
++#include "kk_device.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define VK_CHECK(x) CHECK((x) == VK_SUCCESS)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++static const uint32_t fullscreen_spirv[] =
++#include "statistics_shaders/fullscreen.vert.h"
++   ;
++static const uint32_t point_spirv[] =
++#include "geometry_draw_size_shaders/points.vert.h"
++   ;
++static const uint32_t level64_spirv[] =
++#include "heap_growth_shaders/level64.tesc.h"
++   ;
++static const uint32_t level1_spirv[] =
++#include "heap_growth_shaders/level1.tesc.h"
++   ;
++static const uint32_t dynamic_spirv[] =
++#include "heap_growth_shaders/dynamic.tesc.h"
++   ;
++static const uint32_t evaluation_spirv[] =
++#include "heap_growth_shaders/tile.tese.h"
++   ;
++static const uint32_t red_spirv[] =
++#include "alpha_to_coverage_shaders/a2c_red.frag.h"
++   ;
++
++/* A 16 x 16 grid of 4 x 4 tiles, one per patch. */
++#define EXTENT 64u
++#define TILE_TEXELS 16u
++/* 2,000,000 vertices unroll to 1,999,998 triangles of three 4-byte indices,
++ * 24 MB, past the 16 MiB default. */
++#define FAN_VERTICES 2000000u
++
++enum draw_kind {
++   /* A triangle list, which needs no heap. */
++   LIST,
++   /* A triangle fan, which the driver unrolls through the heap. */
++   FAN,
++   /* One-vertex quad patches, each covering its own tile, at the constant
++    * level 64, at the constant level 1, and at level 64 or 1 through a
++    * level the compiler cannot see. */
++   TESS,
++   TESS_LEVEL1,
++   TESS_DYNAMIC64,
++   TESS_DYNAMIC1,
++};
++
++static const char *const kind_names[] = {
++   "list", "fan", "tess", "tess level 1", "tess dynamic 64", "tess dynamic 1",
++};
++
++struct draw_case {
++   enum draw_kind kind;
++   /* Draws count vertices, draws times, and then second more when it is not
++    * zero, all in one render pass and all indirectly or none, or count and
++    * second as the two entries of one multi-draw. */
++   uint32_t count, draws, second;
++   bool indirect, multi;
++   /* How many times the command buffer is submitted. */
++   unsigned submissions;
++};
++
++struct outcome {
++   uint32_t red[2];
++   uint64_t heap_B, peak_B;
++   bool loss_reported;
++};
++
++static struct outcome
++run(VkInstance instance, VkPhysicalDevice physical, const struct draw_case *c)
++{
++   const enum draw_kind kind = c->kind;
++   const uint32_t count = c->count, second = c->second;
++   const bool indirect = c->indirect;
++   const unsigned submissions = c->submissions;
++   const bool tess = kind >= TESS;
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceMultiDrawFeaturesEXT multi_draw = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT,
++      .multiDraw = c->multi,
++   };
++   VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .pNext = &multi_draw,
++      .dynamicRendering = VK_TRUE,
++   };
++   VkPhysicalDeviceFeatures features = {
++      .tessellationShader = tess,
++   };
++   const char *const extensions[] = {VK_EXT_MULTI_DRAW_EXTENSION_NAME};
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features13,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = c->multi ? 1 : 0,
++      .ppEnabledExtensionNames = extensions,
++      .pEnabledFeatures = &features,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateDevice(physical, &device_info, NULL, &device));
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateShaderModule);
++   LOAD_D(vkDestroyShaderModule);
++   LOAD_D(vkCreatePipelineLayout);
++   LOAD_D(vkDestroyPipelineLayout);
++   LOAD_D(vkCreateGraphicsPipelines);
++   LOAD_D(vkDestroyPipeline);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkMapMemory);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdBeginRendering);
++   LOAD_D(vkCmdEndRendering);
++   LOAD_D(vkCmdBindPipeline);
++   LOAD_D(vkCmdDraw);
++   LOAD_D(vkCmdDrawIndirect);
++   PFN_vkCmdDrawMultiEXT vkCmdDrawMultiEXT =
++      (PFN_vkCmdDrawMultiEXT)vkGetDeviceProcAddr(device, "vkCmdDrawMultiEXT");
++   CHECK(!c->multi || vkCmdDrawMultiEXT);
++   LOAD_D(vkCmdPipelineBarrier);
++   LOAD_D(vkCmdCopyImageToBuffer);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, 0, 0, &queue);
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++
++   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = {EXTENT, EXTENT, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage =
++         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateImage(device, &image_info, NULL, &image));
++   VkMemoryRequirements image_requirements;
++   vkGetImageMemoryRequirements(device, image, &image_requirements);
++   uint32_t image_type = 0u;
++   while (image_type < memory_properties.memoryTypeCount &&
++          !(image_requirements.memoryTypeBits & (1u << image_type)))
++      image_type++;
++   CHECK(image_type < memory_properties.memoryTypeCount);
++   VkMemoryAllocateInfo image_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = image_requirements.size,
++      .memoryTypeIndex = image_type,
++   };
++   VkDeviceMemory image_memory = VK_NULL_HANDLE;
++   VK_CHECK(vkAllocateMemory(device, &image_allocate, NULL, &image_memory));
++   VK_CHECK(vkBindImageMemory(device, image, image_memory, 0));
++   VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = format,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   VkImageView view = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateImageView(device, &view_info, NULL, &view));
++
++   /* One host-visible buffer holds the pixels and, after them, the indirect
++    * draw. */
++   const VkDeviceSize pixels_B = EXTENT * EXTENT * 4u;
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = pixels_B + 2u * sizeof(VkDrawIndirectCommand),
++      .usage =
++         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
++   };
++   VkBuffer buffer = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer));
++   VkMemoryRequirements buffer_requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &buffer_requirements);
++   const VkMemoryPropertyFlags host =
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   uint32_t buffer_type = 0u;
++   while (buffer_type < memory_properties.memoryTypeCount &&
++          (!(buffer_requirements.memoryTypeBits & (1u << buffer_type)) ||
++           (memory_properties.memoryTypes[buffer_type].propertyFlags & host) !=
++              host))
++      buffer_type++;
++   CHECK(buffer_type < memory_properties.memoryTypeCount);
++   VkMemoryAllocateInfo buffer_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = buffer_requirements.size,
++      .memoryTypeIndex = buffer_type,
++   };
++   VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
++   VK_CHECK(vkAllocateMemory(device, &buffer_allocate, NULL, &buffer_memory));
++   VK_CHECK(vkBindBufferMemory(device, buffer, buffer_memory, 0));
++   uint8_t *pixels = NULL;
++   VK_CHECK(vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0,
++                        (void **)&pixels));
++   const VkDrawIndirectCommand draws[2] = {{count, 1, 0, 0},
++                                           {second, 1, 0, 0}};
++   memcpy(pixels + pixels_B, draws, sizeof(draws));
++
++   const uint32_t *control =
++      kind == TESS_LEVEL1 ? level1_spirv
++      : kind == TESS_DYNAMIC64 || kind == TESS_DYNAMIC1 ? dynamic_spirv
++                                                       : level64_spirv;
++   const size_t control_size =
++      kind == TESS_LEVEL1 ? sizeof(level1_spirv)
++      : kind == TESS_DYNAMIC64 || kind == TESS_DYNAMIC1 ? sizeof(dynamic_spirv)
++                                                       : sizeof(level64_spirv);
++   const uint32_t *codes[4] = {
++      tess ? point_spirv : fullscreen_spirv,
++      control,
++      evaluation_spirv,
++      red_spirv,
++   };
++   const size_t sizes[4] = {
++      tess ? sizeof(point_spirv) : sizeof(fullscreen_spirv),
++      control_size,
++      sizeof(evaluation_spirv),
++      sizeof(red_spirv),
++   };
++   /* The dynamic control shader's level is this times one plus a bit of the
++    * primitive ID that no draw here reaches. */
++   const float scale = kind == TESS_DYNAMIC1 ? 1.0f : 64.0f;
++   const VkSpecializationMapEntry scale_entry = {0, 0, sizeof(scale)};
++   const VkSpecializationInfo specialization = {1, &scale_entry,
++                                                sizeof(scale), &scale};
++   const VkShaderStageFlagBits stage_bits[4] = {
++      VK_SHADER_STAGE_VERTEX_BIT,
++      VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
++      VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
++      VK_SHADER_STAGE_FRAGMENT_BIT,
++   };
++   VkShaderModule modules[4] = {VK_NULL_HANDLE};
++   VkPipelineShaderStageCreateInfo stages[4];
++   uint32_t stage_count = 0u;
++   for (uint32_t i = 0u; i < 4u; i++) {
++      if (!tess && (i == 1u || i == 2u))
++         continue;
++      VkShaderModuleCreateInfo module_info = {
++         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++         .codeSize = sizes[i],
++         .pCode = codes[i],
++      };
++      VK_CHECK(vkCreateShaderModule(device, &module_info, NULL, &modules[i]));
++      stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++         .stage = stage_bits[i],
++         .module = modules[i],
++         .pName = "main",
++         .pSpecializationInfo = i == 1u ? &specialization : NULL,
++      };
++   }
++   VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++   };
++   VkPipelineLayout layout = VK_NULL_HANDLE;
++   VK_CHECK(vkCreatePipelineLayout(device, &layout_info, NULL, &layout));
++   VkPipelineVertexInputStateCreateInfo vertex_input = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
++   };
++   VkPipelineInputAssemblyStateCreateInfo assembly = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = tess          ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
++                  : kind == FAN ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
++                                : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
++   };
++   VkPipelineTessellationStateCreateInfo tessellation = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
++      .patchControlPoints = 1,
++   };
++   VkViewport viewport = {0, 0, EXTENT, EXTENT, 0, 1};
++   VkRect2D scissor = {{0, 0}, {EXTENT, EXTENT}};
++   VkPipelineViewportStateCreateInfo viewport_state = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1,
++      .pViewports = &viewport,
++      .scissorCount = 1,
++      .pScissors = &scissor,
++   };
++   VkPipelineRasterizationStateCreateInfo raster = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL,
++      .cullMode = VK_CULL_MODE_NONE,
++      .lineWidth = 1,
++   };
++   VkPipelineMultisampleStateCreateInfo multisample = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
++   };
++   VkPipelineColorBlendAttachmentState blend_attachment = {
++      .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
++   };
++   VkPipelineColorBlendStateCreateInfo blend = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .attachmentCount = 1,
++      .pAttachments = &blend_attachment,
++   };
++   VkPipelineRenderingCreateInfo rendering_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1,
++      .pColorAttachmentFormats = &format,
++   };
++   VkGraphicsPipelineCreateInfo pipeline_info = {
++      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++      .pNext = &rendering_info,
++      .stageCount = stage_count,
++      .pStages = stages,
++      .pVertexInputState = &vertex_input,
++      .pInputAssemblyState = &assembly,
++      .pTessellationState = tess ? &tessellation : NULL,
++      .pViewportState = &viewport_state,
++      .pRasterizationState = &raster,
++      .pMultisampleState = &multisample,
++      .pColorBlendState = &blend,
++      .layout = layout,
++   };
++   VkPipeline pipeline = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                      &pipeline_info, NULL, &pipeline));
++
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = 0,
++   };
++   VkCommandPool pool = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool));
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VkCommandBuffer commands = VK_NULL_HANDLE;
++   VK_CHECK(vkAllocateCommandBuffers(device, &command_info, &commands));
++   /* Not one-time: a second submission records the commands again. */
++   VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++   };
++   VK_CHECK(vkBeginCommandBuffer(commands, &begin));
++   VkRenderingAttachmentInfo color_attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++   };
++   VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = scissor,
++      .layerCount = 1,
++      .colorAttachmentCount = 1,
++      .pColorAttachments = &color_attachment,
++   };
++   vkCmdBeginRendering(commands, &rendering);
++   vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++   if (c->multi) {
++      const VkMultiDrawInfoEXT entries[2] = {{0, count}, {0, second}};
++      vkCmdDrawMultiEXT(commands, 2, entries, 1, 0,
++                        sizeof(VkMultiDrawInfoEXT));
++   } else {
++      for (uint32_t d = 0u; d < c->draws; d++) {
++         if (indirect)
++            vkCmdDrawIndirect(commands, buffer, pixels_B, 1, 0);
++         else
++            vkCmdDraw(commands, count, 1, 0, 0);
++      }
++      if (second != 0u && indirect)
++         vkCmdDrawIndirect(commands, buffer,
++                           pixels_B + sizeof(VkDrawIndirectCommand), 1, 0);
++      else if (second != 0u)
++         vkCmdDraw(commands, second, 1, 0, 0);
++   }
++   vkCmdEndRendering(commands);
++   VkImageMemoryBarrier to_transfer = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
++                        &to_transfer);
++   VkBufferImageCopy copy = {
++      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .imageExtent = {EXTENT, EXTENT, 1},
++   };
++   vkCmdCopyImageToBuffer(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                          buffer, 1, &copy);
++   VK_CHECK(vkEndCommandBuffer(commands));
++
++   struct outcome outcome = {0};
++   VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &commands,
++   };
++   for (unsigned s = 0u; s < submissions; s++) {
++      memset(pixels, 0, (size_t)pixels_B);
++      VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
++      VK_CHECK(vkQueueWaitIdle(queue));
++      for (uint32_t texel = 0u; texel < EXTENT * EXTENT; texel++) {
++         if (pixels[texel * 4u] == 255u && pixels[texel * 4u + 1u] == 0u &&
++             pixels[texel * 4u + 3u] == 255u)
++            outcome.red[s]++;
++      }
++   }
++
++   /* Freeing the command buffer reads the refusals of the last submission. */
++   vkDestroyCommandPool(device, pool, NULL);
++   struct kk_device *dev = kk_device_from_handle(device);
++   outcome.heap_B = dev->heap ? dev->heap->bo->size_B : 0u;
++   outcome.peak_B = dev->heap_peak_B;
++   outcome.loss_reported = dev->heap_loss_reported;
++
++   vkDestroyPipeline(device, pipeline, NULL);
++   vkDestroyPipelineLayout(device, layout, NULL);
++   for (uint32_t i = 0u; i < 4u; i++) {
++      if (modules[i] != VK_NULL_HANDLE)
++         vkDestroyShaderModule(device, modules[i], NULL);
++   }
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, buffer_memory, NULL);
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, image_memory, NULL);
++   vkDestroyDevice(device, NULL);
++   return outcome;
++}
++
++static struct outcome
++report(VkInstance instance, VkPhysicalDevice physical,
++       const struct draw_case *c)
++{
++   struct outcome outcome = run(instance, physical, c);
++   printf("%s %s %u", c->indirect ? "indirect" : "direct",
++          kind_names[c->kind], c->count);
++   if (c->draws > 1u)
++      printf(" x %u draws", c->draws);
++   if (c->second != 0u)
++      printf(c->multi ? " and %u in one multi-draw" : " then %u", c->second);
++   printf(":");
++   for (unsigned s = 0u; s < c->submissions; s++)
++      printf(" submission %u %u red,", s + 1u, outcome.red[s]);
++   printf(" heap %llu MiB, at most %llu MiB%s\n",
++          (unsigned long long)(outcome.heap_B >> 20),
++          (unsigned long long)(outcome.peak_B >> 20),
++          outcome.loss_reported ? ", loss reported" : "");
++   return outcome;
++}
++
++#define MIB(n) ((uint64_t)(n) << 20)
++
++int
++main(void)
++{
++   setvbuf(stdout, NULL, _IONBF, 0);
++   unsetenv("MESA_KK_HEAP_SIZE_MIB");
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   VK_CHECK(vkCreateInstance(&instance_info, NULL, &instance));
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++
++   const uint32_t full = EXTENT * EXTENT;
++
++   /* A device that never draws through the heap allocates none, and one
++    * whose draws fit keeps the 16 MiB it started with. */
++   struct outcome o =
++      report(instance, physical, &(struct draw_case){LIST, 3, 1, 0, false, false, 1});
++   CHECK(o.red[0] == full && o.heap_B == 0u && o.peak_B == 0u &&
++         !o.loss_reported);
++   o = report(instance, physical, &(struct draw_case){FAN, 3, 1, 0, false, false, 1});
++   CHECK(o.red[0] == full && o.heap_B == MIB(16) && o.peak_B == MIB(16) &&
++         !o.loss_reported);
++
++   /* The fan's unroll needs 24 MB. Direct, the first heap is made large
++    * enough for it; indirect, only the GPU knows its size, so the first
++    * submission loses it. */
++   o = report(instance, physical,
++              &(struct draw_case){FAN, FAN_VERTICES, 1, 0, false, false, 1});
++   CHECK(o.red[0] == full && o.heap_B == MIB(32) && o.peak_B == MIB(32) &&
++         !o.loss_reported);
++   o = report(instance, physical,
++              &(struct draw_case){FAN, FAN_VERTICES, 1, 0, true, false, 2});
++   CHECK(o.red[0] < full && o.red[1] == full && o.heap_B > MIB(16) &&
++         o.loss_reported);
++
++   /* 130 patches at level 64 need 17.2 MB and 256 need 33.8 MB, whether the
++    * TCS writes 64 or a level the compiler cannot see. */
++   const uint32_t patches[2] = {130u, 256u};
++   const uint64_t grown[2] = {MIB(32), MIB(64)};
++   for (unsigned i = 0u; i < 2u; i++) {
++      const uint32_t tiles = patches[i] * TILE_TEXELS;
++      o = report(instance, physical,
++                 &(struct draw_case){TESS, patches[i], 1, 0, false, false, 1});
++      CHECK(o.red[0] == tiles && o.heap_B == grown[i] &&
++            o.peak_B == grown[i] && !o.loss_reported);
++      o = report(instance, physical,
++                 &(struct draw_case){TESS_DYNAMIC64, patches[i], 1, 0, false,
++                                     false, 1});
++      CHECK(o.red[0] == tiles && o.heap_B == grown[i] &&
++            o.peak_B == grown[i] && !o.loss_reported);
++      o = report(instance, physical,
++                 &(struct draw_case){TESS, patches[i], 1, 0, true, false, 2});
++      CHECK(o.red[0] < tiles && o.red[1] == tiles && o.heap_B > MIB(16) &&
++            o.loss_reported);
++   }
++
++   /* 100 and then 120 patches each fit the 16 MiB heap but not together. The
++    * second draw moves the render pass to a grown heap instead of being lost:
++    * it covers 120 tiles, the first 100 of them the first draw's. The first
++    * heap stays with the recording until it is freed. As the two entries of
++    * one multi-draw, they grow the first heap once to hold both. */
++   o = report(instance, physical,
++              &(struct draw_case){TESS, 100u, 1, 120u, false, false, 1});
++   CHECK(o.red[0] == 120u * TILE_TEXELS && o.heap_B == MIB(32) &&
++         o.peak_B == MIB(48) && !o.loss_reported);
++   o = report(instance, physical,
++              &(struct draw_case){TESS, 100u, 1, 120u, false, true, 1});
++   CHECK(o.red[0] == 120u * TILE_TEXELS && o.heap_B == MIB(32) &&
++         o.peak_B == MIB(32) && !o.loss_reported);
++
++   /* Six indirect draws of 39 patches at level 64, 5.2 MB each, and then one
++    * of 64 patches, 8.5 MB, 39.4 MB together. On the 16 MiB heap the first
++    * three fit and the rest are refused one after another, so the render
++    * pass needs what the three reserved plus every refused size. Neither
++    * the largest refused end nor the refused sizes' sum, 23.9 MB each, is
++    * enough: grown to hold only that, the second submission loses the last
++    * draw again. */
++   o = report(instance, physical,
++              &(struct draw_case){TESS, 39u, 6, 64u, true, false, 2});
++   CHECK(o.red[0] < 64u * TILE_TEXELS && o.red[1] == 64u * TILE_TEXELS &&
++         o.heap_B == MIB(64) && o.loss_reported);
++
++   /* 256 patches at the constant level 1 need a few hundred kilobytes, so
++    * the heap keeps its 16 MiB. So do 500 draws of 64 in one render pass.
++    * The same draws at level 1 through a level the compiler cannot see are
++    * bounded by level 64 and grow the heap to its 128 MiB cap, holding each
++    * size on the way until the recording is freed. */
++   o = report(instance, physical,
++              &(struct draw_case){TESS_LEVEL1, 256u, 1, 0, false, false, 1});
++   CHECK(o.red[0] == full && o.heap_B == MIB(16) && o.peak_B == MIB(16) &&
++         !o.loss_reported);
++   o = report(instance, physical,
++              &(struct draw_case){TESS_LEVEL1, 64u, 500, 0, false, false, 1});
++   CHECK(o.red[0] == 64u * TILE_TEXELS && o.heap_B == MIB(16) &&
++         o.peak_B == MIB(16) && !o.loss_reported);
++   o = report(instance, physical,
++              &(struct draw_case){TESS_DYNAMIC1, 64u, 500, 0, false, false, 1});
++   CHECK(o.red[0] == 64u * TILE_TEXELS && o.heap_B == MIB(128) &&
++         o.peak_B == MIB(16 + 32 + 64 + 128) && !o.loss_reported);
++
++   vkDestroyInstance(instance, NULL);
++   printf("the geometry heap grows for the draws that need it\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_heap_overflow_gpu.c b/src/kosmickrisp/vulkan/tests/test_heap_overflow_gpu.c
+index 587401849fb8378a8d39b01553f487b6367e21d3..02f3a11a5243a1e5ac0f7b484eb5d7469268ef5b 100644
+--- a/src/kosmickrisp/vulkan/tests/test_heap_overflow_gpu.c
++++ b/src/kosmickrisp/vulkan/tests/test_heap_overflow_gpu.c
+@@ -408,6 +408,32 @@ check_wrap(struct context *ctx, const char *name, uint32_t refused_units,
+    printf("heap wrap PASS %s\n", name);
+ }
+ 
++/* The reset that starts a render segment on the heap folds the segment
++ * before it into needed_units, the 16-byte units it reserved plus those it
++ * was refused, zeroes both and keeps the larger need. A sum past 2^32
++ * saturates. */
++struct fold_case {
++   const char *name;
++   uint32_t bottom, size, refused_units, needed_units;
++   uint32_t expected;
++};
++
++static void
++check_fold(struct context *ctx, const struct fold_case *test)
++{
++   struct kk_cmd_buffer *cmd = begin(ctx);
++   struct kk_ptr heap_ptr = heap_claiming(cmd, test->bottom, test->size);
++   struct poly_heap *header = heap_ptr.cpu;
++   header->segment_refused_units = test->refused_units;
++   header->needed_units = test->needed_units;
++   libkk_heap_reset(cmd, kk_grid_1d(1), true, heap_ptr.gpu);
++   submit(ctx);
++
++   CHECK(header->bottom == 0u && header->segment_refused_units == 0u);
++   CHECK(header->needed_units == test->expected);
++   printf("heap fold PASS %s\n", test->name);
++}
++
+ int
+ main(void)
+ {
+@@ -499,6 +525,15 @@ main(void)
+    check_wrap(&ctx, "counts", 0u, 0u);
+    check_wrap(&ctx, "saturates", 0xffffff00u, 0xffffffffu);
+ 
++   const struct fold_case folds[] = {
++      {"reserved-and-refused", 0x100, HEAP_SIZE, 5, 0, 0x10 + 5},
++      {"partial-unit", 0x101, HEAP_SIZE, 0, 0, 0x11},
++      {"keeps-larger-need", 0x100, HEAP_SIZE, 5, 0x100, 0x100},
++      {"saturates", 0xeffffff0u, 0xf0000000u, 0xffffff00u, 0, 0xffffffffu},
++   };
++   for (unsigned i = 0; i < ARRAY_SIZE(folds); i++)
++      check_fold(&ctx, &folds[i]);
++
+    ctx.api->DestroyCommandPool(ctx.device, ctx.pool, NULL);
+    ctx.api->DestroyDevice(ctx.device, NULL);
+    kk_DestroyInstance(instance, NULL);
+diff --git a/src/kosmickrisp/vulkan/tests/test_heap_size_override.c b/src/kosmickrisp/vulkan/tests/test_heap_size_override.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..95a963e10ec7194ca66bf049e734b8e44898072c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_heap_size_override.c
+@@ -0,0 +1,419 @@
++/* SPDX-License-Identifier: MIT */
++
++/* The device heap the emulated stages allocate from is sized by
++ * MESA_KK_HEAP_SIZE_MIB when it is set. The size reaches the GPU allocator as
++ * a 32-bit bound, so only 1 to 4095 MiB can be honoured: a value that wraps
++ * the byte count to zero, one Metal refuses and one past 4 GiB must all fall
++ * back to the default instead of crashing the first draw that needs the heap
++ * or leaving the GPU a bound larger than the heap. Each case draws a triangle
++ * fan, which is unrolled through the heap, on a device of its own. */
++
++#define VK_NO_PROTOTYPES
++#include "kk_bo.h"
++#include "kk_device.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++static const uint32_t vertex_spirv[] =
++#include "statistics_shaders/fullscreen.vert.h"
++   ;
++static const uint32_t fragment_spirv[] =
++#include "alpha_to_coverage_shaders/a2c_red.frag.h"
++   ;
++
++#define EXTENT      32u
++#define DEFAULT_MIB 16u
++
++/* The header the driver writes at the start of the heap: struct poly_heap. */
++struct heap_header {
++   uint64_t base;
++   uint32_t bottom;
++   uint32_t size;
++   uint32_t refusals;
++   uint32_t segment_refused_units;
++   uint32_t needed_units;
++   uint32_t pad;
++};
++
++static const struct {
++   const char *value;
++   uint32_t mib;
++} cases[] = {
++   {NULL, DEFAULT_MIB},
++   {"2", 2u},
++   {"0", DEFAULT_MIB},
++   {"-8", DEFAULT_MIB},
++   /* 2^44 MiB is 2^64 bytes, which wraps to zero. */
++   {"17592186044416", DEFAULT_MIB},
++   /* Far more than Metal will make. */
++   {"1000000", DEFAULT_MIB},
++   /* Past the 32-bit bound. */
++   {"4096", DEFAULT_MIB},
++};
++
++static uint32_t
++draw_fan(VkInstance instance, VkPhysicalDevice physical, uint32_t *heap_size)
++{
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .dynamicRendering = VK_TRUE,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features13,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateShaderModule);
++   LOAD_D(vkDestroyShaderModule);
++   LOAD_D(vkCreatePipelineLayout);
++   LOAD_D(vkDestroyPipelineLayout);
++   LOAD_D(vkCreateGraphicsPipelines);
++   LOAD_D(vkDestroyPipeline);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkMapMemory);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdBeginRendering);
++   LOAD_D(vkCmdEndRendering);
++   LOAD_D(vkCmdBindPipeline);
++   LOAD_D(vkCmdDraw);
++   LOAD_D(vkCmdPipelineBarrier);
++   LOAD_D(vkCmdCopyImageToBuffer);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, 0, 0, &queue);
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++
++   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = {EXTENT, EXTENT, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage =
++         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++   VkMemoryRequirements image_requirements;
++   vkGetImageMemoryRequirements(device, image, &image_requirements);
++   uint32_t image_type = 0u;
++   while (image_type < memory_properties.memoryTypeCount &&
++          !(image_requirements.memoryTypeBits & (1u << image_type)))
++      image_type++;
++   CHECK(image_type < memory_properties.memoryTypeCount);
++   VkMemoryAllocateInfo image_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = image_requirements.size,
++      .memoryTypeIndex = image_type,
++   };
++   VkDeviceMemory image_memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &image_allocate, NULL, &image_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindImageMemory(device, image, image_memory, 0) == VK_SUCCESS);
++   VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = format,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   VkImageView view = VK_NULL_HANDLE;
++   CHECK(vkCreateImageView(device, &view_info, NULL, &view) == VK_SUCCESS);
++
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = EXTENT * EXTENT * 4u,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   VkBuffer buffer = VK_NULL_HANDLE;
++   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
++   VkMemoryRequirements buffer_requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &buffer_requirements);
++   const VkMemoryPropertyFlags host =
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   uint32_t buffer_type = 0u;
++   while (buffer_type < memory_properties.memoryTypeCount &&
++          (!(buffer_requirements.memoryTypeBits & (1u << buffer_type)) ||
++           (memory_properties.memoryTypes[buffer_type].propertyFlags & host) !=
++              host))
++      buffer_type++;
++   CHECK(buffer_type < memory_properties.memoryTypeCount);
++   VkMemoryAllocateInfo buffer_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = buffer_requirements.size,
++      .memoryTypeIndex = buffer_type,
++   };
++   VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &buffer_allocate, NULL, &buffer_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, buffer, buffer_memory, 0) == VK_SUCCESS);
++   uint8_t *pixels = NULL;
++   CHECK(vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0,
++                     (void **)&pixels) == VK_SUCCESS);
++   memset(pixels, 0, (size_t)buffer_info.size);
++
++   VkShaderModuleCreateInfo module_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(vertex_spirv),
++      .pCode = vertex_spirv,
++   };
++   VkShaderModule vertex_module = VK_NULL_HANDLE;
++   CHECK(vkCreateShaderModule(device, &module_info, NULL, &vertex_module) ==
++         VK_SUCCESS);
++   module_info.codeSize = sizeof(fragment_spirv);
++   module_info.pCode = fragment_spirv;
++   VkShaderModule fragment_module = VK_NULL_HANDLE;
++   CHECK(vkCreateShaderModule(device, &module_info, NULL, &fragment_module) ==
++         VK_SUCCESS);
++   VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++   };
++   VkPipelineLayout layout = VK_NULL_HANDLE;
++   CHECK(vkCreatePipelineLayout(device, &layout_info, NULL, &layout) ==
++         VK_SUCCESS);
++   VkPipelineShaderStageCreateInfo stages[2] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .stage = VK_SHADER_STAGE_VERTEX_BIT,
++       .module = vertex_module,
++       .pName = "main"},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
++       .module = fragment_module,
++       .pName = "main"},
++   };
++   VkPipelineVertexInputStateCreateInfo vertex_input = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
++   };
++   /* Metal has no fans, so the driver unrolls this one through the heap. */
++   VkPipelineInputAssemblyStateCreateInfo assembly = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
++   };
++   VkViewport viewport = {0, 0, EXTENT, EXTENT, 0, 1};
++   VkRect2D scissor = {{0, 0}, {EXTENT, EXTENT}};
++   VkPipelineViewportStateCreateInfo viewport_state = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1,
++      .pViewports = &viewport,
++      .scissorCount = 1,
++      .pScissors = &scissor,
++   };
++   VkPipelineRasterizationStateCreateInfo raster = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL,
++      .cullMode = VK_CULL_MODE_NONE,
++      .lineWidth = 1,
++   };
++   VkPipelineMultisampleStateCreateInfo multisample = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
++   };
++   VkPipelineColorBlendAttachmentState blend_attachment = {
++      .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
++   };
++   VkPipelineColorBlendStateCreateInfo blend = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .attachmentCount = 1,
++      .pAttachments = &blend_attachment,
++   };
++   VkPipelineRenderingCreateInfo rendering_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1,
++      .pColorAttachmentFormats = &format,
++   };
++   VkGraphicsPipelineCreateInfo pipeline_info = {
++      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++      .pNext = &rendering_info,
++      .stageCount = 2,
++      .pStages = stages,
++      .pVertexInputState = &vertex_input,
++      .pInputAssemblyState = &assembly,
++      .pViewportState = &viewport_state,
++      .pRasterizationState = &raster,
++      .pMultisampleState = &multisample,
++      .pColorBlendState = &blend,
++      .layout = layout,
++   };
++   VkPipeline pipeline = VK_NULL_HANDLE;
++   CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                   NULL, &pipeline) == VK_SUCCESS);
++
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = 0,
++   };
++   VkCommandPool pool = VK_NULL_HANDLE;
++   CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool) == VK_SUCCESS);
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VkCommandBuffer commands = VK_NULL_HANDLE;
++   CHECK(vkAllocateCommandBuffers(device, &command_info, &commands) ==
++         VK_SUCCESS);
++   VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   CHECK(vkBeginCommandBuffer(commands, &begin) == VK_SUCCESS);
++   VkRenderingAttachmentInfo color_attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++   };
++   VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = scissor,
++      .layerCount = 1,
++      .colorAttachmentCount = 1,
++      .pColorAttachments = &color_attachment,
++   };
++   vkCmdBeginRendering(commands, &rendering);
++   vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++   vkCmdDraw(commands, 3, 1, 0, 0);
++   vkCmdEndRendering(commands);
++   VkImageMemoryBarrier to_transfer = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
++                        &to_transfer);
++   VkBufferImageCopy copy = {
++      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .imageExtent = {EXTENT, EXTENT, 1},
++   };
++   vkCmdCopyImageToBuffer(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                          buffer, 1, &copy);
++   CHECK(vkEndCommandBuffer(commands) == VK_SUCCESS);
++   VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &commands,
++   };
++   CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++   CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++
++   uint32_t red = 0u;
++   for (uint32_t texel = 0u; texel < EXTENT * EXTENT; texel++) {
++      if (pixels[texel * 4u] == 255u && pixels[texel * 4u + 1u] == 0u &&
++          pixels[texel * 4u + 3u] == 255u)
++         red++;
++   }
++
++   /* The draw needed the heap, so it exists, and the bound the GPU allocator
++    * checks against is what was allocated less the header. */
++   struct kk_device *dev = kk_device_from_handle(device);
++   CHECK(dev->heap != NULL);
++   const struct heap_header *header = dev->heap->bo->cpu;
++   CHECK(sizeof(*header) == 32u);
++   *heap_size = header->size + (uint32_t)sizeof(*header);
++   CHECK(dev->heap->bo->size_B >= *heap_size);
++
++   vkDestroyCommandPool(device, pool, NULL);
++   vkDestroyPipeline(device, pipeline, NULL);
++   vkDestroyPipelineLayout(device, layout, NULL);
++   vkDestroyShaderModule(device, fragment_module, NULL);
++   vkDestroyShaderModule(device, vertex_module, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, buffer_memory, NULL);
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, image_memory, NULL);
++   vkDestroyDevice(device, NULL);
++   return red;
++}
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++
++   for (unsigned i = 0u; i < sizeof(cases) / sizeof(cases[0]); i++) {
++      if (cases[i].value != NULL)
++         setenv("MESA_KK_HEAP_SIZE_MIB", cases[i].value, 1);
++      else
++         unsetenv("MESA_KK_HEAP_SIZE_MIB");
++      uint32_t heap_size = 0u;
++      const uint32_t red = draw_fan(instance, physical, &heap_size);
++      fprintf(stderr, "MESA_KK_HEAP_SIZE_MIB=%s: heap %u bytes, %u of %u red\n",
++              cases[i].value ? cases[i].value : "(unset)", heap_size, red,
++              EXTENT * EXTENT);
++      CHECK(heap_size == cases[i].mib * 1024u * 1024u);
++      CHECK(red == EXTENT * EXTENT);
++   }
++
++   vkDestroyInstance(instance, NULL);
++   printf("every heap-size override is bounded\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_tess_bound_gpu.c b/src/kosmickrisp/vulkan/tests/test_tess_bound_gpu.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec0c70d7d21d5a383b0cd1088e3569935dc54d2b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_tess_bound_gpu.c
+@@ -0,0 +1,246 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A direct tessellated draw reserves heap space for the most points and
++ * indices kk_tess_patch_bound() allows each patch, given the largest level
++ * its TCS writes. A patch the tessellator gives more would be refused and
++ * lose its draw, so for every domain, partitioning and point mode, and for
++ * maximum levels from 0.5 to 64, this counts patches with levels up to that
++ * maximum on the GPU and checks none exceeds the bound. Each set mixes the
++ * maximum itself, fractions below it, integers, and the small levels at
++ * which the tessellator special-cases or widens an inner level. */
++#include "kosmickrisp/vulkan/kk_cmd_buffer.h"
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/vulkan/kk_entrypoints.h"
++#include "kosmickrisp/vulkan/kk_tess_bound.h"
++#include "kosmickrisp/libkk/kk_tessellator.h"
++#include "poly/tessellator.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(condition)                                                       \
++   do {                                                                        \
++      if (!(condition)) {                                                      \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,      \
++                 #condition);                                                  \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++
++#define VK_CHECK(expr)                                                         \
++   do {                                                                        \
++      VkResult result_ = (expr);                                               \
++      if (result_ != VK_SUCCESS) {                                             \
++         fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #expr,        \
++                 result_);                                                     \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++
++enum { PATCHES = 4096, STRIDE_EL = 8 };
++
++static const float max_levels[] = {
++   0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f, 7.0f, 8.0f,
++   13.0f, 16.0f, 31.5f, 32.0f, 48.0f, 61.5f, 62.0f, 63.0f, 64.0f,
++};
++
++struct context {
++   VkDevice device;
++   VkQueue queue;
++   VkCommandBuffer command;
++   const struct vk_device_dispatch_table *api;
++};
++
++static uint32_t rng_state = 0x12345678u;
++
++static uint32_t
++rng(void)
++{
++   rng_state = rng_state * 1664525u + 1013904223u;
++   return rng_state >> 8;
++}
++
++/* A level no larger than max: the maximum, a fraction below it, an integer
++ * below it, or one of the small levels the tessellator treats specially. */
++static float
++level(float max)
++{
++   static const float small[] = {0.25f, 1.0f, 1.0001f, 1.5f, 2.0f, 3.0f};
++   switch (rng() % 4) {
++   case 0:
++      return max;
++   case 1:
++      return max * (float)((rng() % 1000) + 1) / 1000.0f;
++   case 2:
++      return MAX2(1.0f, floorf(max * (float)(rng() % 1001) / 1000.0f));
++   default: {
++      const float f = small[rng() % ARRAY_SIZE(small)];
++      return f <= max ? f : max;
++   }
++   }
++}
++
++struct level_set {
++   struct kk_ptr counts, points;
++   float max;
++};
++
++static void
++check(struct context *ctx, enum tess_primitive_mode mode,
++      enum poly_tess_partitioning partitioning, bool points_mode)
++{
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   VK_CHECK(ctx->api->BeginCommandBuffer(ctx->command, &begin));
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(ctx->command);
++
++   struct level_set sets[ARRAY_SIZE(max_levels)];
++   for (unsigned s = 0; s < ARRAY_SIZE(max_levels); s++) {
++      const float max = max_levels[s];
++      struct kk_ptr tcs =
++         kk_pool_alloc(cmd, PATCHES * STRIDE_EL * sizeof(float), 4);
++      sets[s].counts = kk_pool_alloc(cmd, PATCHES * sizeof(uint32_t), 4);
++      sets[s].points = kk_pool_alloc(cmd, PATCHES * sizeof(uint32_t), 4);
++      sets[s].max = max;
++      CHECK(tcs.cpu && sets[s].counts.cpu && sets[s].points.cpu);
++
++      float *factors = tcs.cpu;
++      for (unsigned i = 0; i < PATCHES; i++) {
++         float *f = &factors[i * STRIDE_EL];
++         for (unsigned j = 0; j < STRIDE_EL; j++)
++            f[j] = i == 0 ? max : level(max);
++      }
++
++      const struct poly_tess_params tess = {
++         .coord_allocs = sets[s].points.gpu,
++         .tcs_buffer = tcs.gpu,
++         .counts = sets[s].counts.gpu,
++         .tcs_stride_el = STRIDE_EL,
++         .nr_patches = PATCHES,
++         .partitioning = partitioning,
++         .points_mode = points_mode,
++         .isolines = mode == TESS_PRIMITIVE_ISOLINES,
++         .winding_in_index_buffer = true,
++      };
++      struct kk_ptr p = kk_pool_upload(cmd, &tess, sizeof(tess), 8);
++      CHECK(p.cpu);
++      libkk_tessellate(cmd, kk_grid_1d(PATCHES), true, mode,
++                       POLY_TESS_MODE_COUNT, p.gpu);
++   }
++
++   VK_CHECK(ctx->api->EndCommandBuffer(ctx->command));
++   const VkSubmitInfo info = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &ctx->command,
++   };
++   VK_CHECK(ctx->api->QueueSubmit(ctx->queue, 1, &info, VK_NULL_HANDLE));
++   VK_CHECK(ctx->api->QueueWaitIdle(ctx->queue));
++
++   for (unsigned s = 0; s < ARRAY_SIZE(max_levels); s++) {
++      uint32_t bound_points, bound_indices;
++      kk_tess_patch_bound(mode, sets[s].max, &bound_points, &bound_indices);
++      const uint32_t *counts = sets[s].counts.cpu;
++      const uint32_t *points = sets[s].points.cpu;
++      uint32_t most_points = 0, most_indices = 0;
++      for (unsigned i = 0; i < PATCHES; i++) {
++         most_points = MAX2(most_points, points[i]);
++         most_indices = MAX2(most_indices, counts[i]);
++      }
++      if (most_points > bound_points || most_indices > bound_indices) {
++         fprintf(stderr,
++                 "mode %d partitioning %d points %d max %.4g: %u points "
++                 "and %u indices, bound %u and %u\n",
++                 mode, partitioning, points_mode, sets[s].max, most_points,
++                 most_indices, bound_points, bound_indices);
++         abort();
++      }
++      if (sets[s].max == 64.0f)
++         printf("mode %d partitioning %d points %d: at most %u points and %u "
++                "indices at level 64, bound %u and %u\n",
++                mode, partitioning, points_mode, most_points, most_indices,
++                bound_points, bound_indices);
++   }
++}
++
++int
++main(void)
++{
++   const VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .apiVersion = VK_API_VERSION_1_3,
++   };
++   const VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   VkInstance instance;
++   VK_CHECK(kk_CreateInstance(&instance_info, NULL, &instance));
++   PFN_vkEnumeratePhysicalDevices enumerate =
++      (PFN_vkEnumeratePhysicalDevices)kk_GetInstanceProcAddr(
++         instance, "vkEnumeratePhysicalDevices");
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   VkResult enumerated = enumerate(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++
++   const float priority = 1.0f;
++   const VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   const VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   struct context ctx = {0};
++   VK_CHECK(kk_CreateDevice(physical, &device_info, NULL, &ctx.device));
++   ctx.api = &kk_device_from_handle(ctx.device)->exposed_dispatch_table;
++   ctx.api->GetDeviceQueue(ctx.device, 0, 0, &ctx.queue);
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = 0,
++   };
++   VkCommandPool pool;
++   VK_CHECK(ctx.api->CreateCommandPool(ctx.device, &pool_info, NULL, &pool));
++   const VkCommandBufferAllocateInfo allocation = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VK_CHECK(ctx.api->AllocateCommandBuffers(ctx.device, &allocation,
++                                            &ctx.command));
++
++   const enum tess_primitive_mode modes[] = {
++      TESS_PRIMITIVE_TRIANGLES,
++      TESS_PRIMITIVE_QUADS,
++      TESS_PRIMITIVE_ISOLINES,
++   };
++   const enum poly_tess_partitioning partitionings[] = {
++      POLY_TESS_PARTITIONING_INTEGER,
++      POLY_TESS_PARTITIONING_FRACTIONAL_ODD,
++      POLY_TESS_PARTITIONING_FRACTIONAL_EVEN,
++   };
++   for (unsigned m = 0; m < ARRAY_SIZE(modes); m++) {
++      for (unsigned p = 0; p < ARRAY_SIZE(partitionings); p++) {
++         for (unsigned points = 0; points < 2; points++) {
++            VK_CHECK(ctx.api->ResetCommandPool(ctx.device, pool, 0));
++            check(&ctx, modes[m], partitionings[p], points);
++         }
++      }
++   }
++
++   ctx.api->DestroyCommandPool(ctx.device, pool, NULL);
++   ctx.api->DestroyDevice(ctx.device, NULL);
++   kk_DestroyInstance(instance, NULL);
++   printf("every tessellated patch fits its bound\n");
++   return 0;
++}

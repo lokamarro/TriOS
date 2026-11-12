@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:08:46 +0900
+Subject: [PATCH] um: keep asynchronous host signals off Darwin SME carriers
+
+XNU delivers a signal to a thread in streaming mode without leaving
+it, and the return from the handler loses the upper bits of the Z
+registers. When the Darwin host implements SME for the run, a CPU
+carrier may be running translated streaming code at any moment, so no
+asynchronous signal may reach it.
+
+Carriers therefore block SIGUSR1, the IPI wake signal, except inside
+the idle pselect(), whose mask already unblocks it, and block the
+process-directed SIGINT, SIGTERM, SIGHUP, SIGQUIT and SIGCHLD from the
+moment they start, so the process takes those on a thread that runs no
+guest: the launcher, or a thread of the embedding host.
+
+The wake signal is only an edge. Every other carrier wait polls the
+pending IPIs or does not rely on its EINTR: vhost-user polling retries
+EINTR, futex waits use condition variables and the pre-cooperative
+pause() runs before the carriers exist.
+
+Without SME the masks are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/os-Darwin/smp.c | 42 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/arch/um/os-Darwin/smp.c b/arch/um/os-Darwin/smp.c
+index ccb63c8552d74dd9111197b20604b8035c5181d7..eeac8ec76eea0b72406a3a85cf4b08bf8c38ce9d 100644
+--- a/arch/um/os-Darwin/smp.c
++++ b/arch/um/os-Darwin/smp.c
+@@ -14,6 +14,7 @@
+ #include <os.h>
+ #include <skas.h>
+ #include <smp.h>
++#include "bridge.h"
+ #include "internal.h"
+ 
+ struct cpu_thread_data {
+@@ -490,6 +491,40 @@ int os_send_ipi(int cpu, int vector)
+ 	return pipe_error != 0 ? pipe_error : -error;
+ }
+ 
++/*
++ * XNU delivers a signal to a thread in streaming mode without leaving it, and
++ * the return loses the upper bits of the Z registers, so when the run
++ * implements SME no asynchronous signal may reach a carrier while it can run
++ * translated streaming code.  The IPI wake signal stays blocked on carriers
++ * except inside the idle pselect(), whose mask unblocks it; it is only a wake
++ * edge, and every other carrier wait polls the pending IPIs or does not rely
++ * on its EINTR.  The process-directed signals stay blocked on carriers from
++ * their creation, so the process takes them on a thread that runs no guest:
++ * the launcher, or a thread of the embedding host.
++ */
++static int carriers_block_async_signals(void)
++{
++#ifdef CONFIG_UML_ARM64_SME
++	return darwin_uml_guest_sme_vector_length() != 0;
++#else
++	return 0;
++#endif
++}
++
++static void add_carrier_blocked_signals(sigset_t *set)
++{
++	static const int process_signals[] = {
++		DARWIN_IPI_SIGNAL, SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGCHLD,
++	};
++	unsigned int index;
++
++	if (!carriers_block_async_signals())
++		return;
++	for (index = 0; index < sizeof(process_signals) /
++		     sizeof(process_signals[0]); index++)
++		sigaddset(set, process_signals[index]);
++}
++
+ static void *cpu_carrier(void *argument)
+ {
+ 	struct cpu_thread_data *data = argument;
+@@ -554,6 +589,7 @@ static int start_cpu_carrier(int cpu, int primary, void *stack,
+ 	}
+ 	sigemptyset(&block);
+ 	sigaddset(&block, SIGALRM);
++	add_carrier_blocked_signals(&block);
+ 	error = pthread_sigmask(SIG_BLOCK, &block, &previous);
+ 	if (error == 0) {
+ 		mask_set = 1;
+@@ -662,8 +698,10 @@ void os_init_smp(void)
+ 		panic("Darwin: unable to install IPI handler: %d", errno);
+ 	sigemptyset(&unblock);
+ 	sigaddset(&unblock, DARWIN_IPI_SIGNAL);
+-	if (pthread_sigmask(SIG_UNBLOCK, &unblock, NULL) != 0)
+-		panic("Darwin: unable to unblock IPI wake signal");
++	/* CPU0's carrier runs this; later carriers inherit its mask. */
++	if (pthread_sigmask(carriers_block_async_signals() ? SIG_BLOCK :
++			    SIG_UNBLOCK, &unblock, NULL) != 0)
++		panic("Darwin: unable to set the IPI wake signal mask");
+ 	darwin_set_current_cpu(0);
+ }
+ 

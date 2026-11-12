@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 23:50:05 +0900
+Subject: [PATCH] vrend: copy between the formats of one GL copy view class
+
+glCopyImageSubData moves texel bits, and GL puts every uncompressed
+colour format of the same texel size in one copy view class, so a copy
+between two of them is legal whatever their component types are. vrend
+decided the copy path with util_is_format_compatible(), which answers
+the different question of whether a view may reinterpret one format as
+the other and therefore also demands matching component types. Every
+cross-type copy inside a view class fell through to the blitter, which
+converts the values instead of moving the bits, and the destination
+came back holding the converted numbers.
+
+Keep the view test for what it decides and add the copy view class as
+its own reason to use the copy, so a legal cross-format copy takes the
+path that preserves the bits. Give that reason to the copy caller only:
+the blit caller shares this predicate, and a blit between two formats of
+one view class is a conversion the guest asked for, so moving its bits
+would hand back the source's numbers reinterpreted instead.
+---
+ src/vrend/vrend_formats.c  | 50 +++++++++++++++++++++++++++++++++++++-
+ src/vrend/vrend_renderer.c |  3 ++-
+ src/vrend/vrend_renderer.h |  3 +++
+ 3 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index 670b3a4007cd315321c527eae1060754189a6cad..69ceb82a67917034977cd0ea9062897fa5c59187 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -888,6 +888,35 @@ static bool format_compressed_compressed_copy_compatible(enum virgl_formats src,
+    return false;
+ }
+ 
++/* An uncompressed colour format belongs to the GL copy view class of its
++ * texel size (GL 4.6 table 8.22), so glCopyImageSubData moves the raw bits
++ * between any two of them. Compressed, subsampled and depth or stencil
++ * formats have their own classes and are handled separately.
++ */
++static bool format_is_uncompressed_colour(enum virgl_formats format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++
++   if (util_format_is_depth_or_stencil(format))
++      return false;
++
++   if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN &&
++       desc->layout != UTIL_FORMAT_LAYOUT_OTHER)
++      return false;
++
++   return desc->block.width == 1 && desc->block.height == 1 &&
++          desc->block.depth == 1;
++}
++
++static bool format_is_same_copy_view_class(enum virgl_formats src,
++                                           enum virgl_formats dst)
++{
++   if (!format_is_uncompressed_colour(src) || !format_is_uncompressed_colour(dst))
++      return false;
++
++   return util_format_get_blocksizebits(src) == util_format_get_blocksizebits(dst);
++}
++
+ bool format_is_copy_compatible(enum virgl_formats src, enum virgl_formats dst,
+                                unsigned int flags)
+ {
+@@ -909,9 +938,28 @@ bool format_is_copy_compatible(enum virgl_formats src, enum virgl_formats dst,
+    if (util_format_is_plain(src) && util_format_is_plain(dst))  {
+       const struct util_format_description *src_desc = util_format_description(src);
+       const struct util_format_description *dst_desc = util_format_description(dst);
+-      return util_is_format_compatible(src_desc, dst_desc);
++      if (util_is_format_compatible(src_desc, dst_desc))
++         return true;
+    }
+ 
++   /* util_is_format_compatible() answers whether a view can reinterpret one
++    * format as the other, so it also demands the same component types. A
++    * copy only moves texel bits, and GL's rule for it is the copy view class,
++    * which groups every uncompressed colour format of the same texel size.
++    * Answering the copy question with the view question sends a legal
++    * cross-format copy down a converting blit, which rewrites the values.
++    *
++    * Only a caller that is copying may ask this. A blit between two formats
++    * of one view class is a conversion the guest asked for, and moving its
++    * bits instead would hand back the source's numbers reinterpreted.
++    */
++   if ((flags & VREND_COPY_COMPAT_FLAG_COPY_VIEW_CLASS) &&
++       format_is_same_copy_view_class(src, dst))
++      return true;
++
++   if (util_format_is_plain(src) && util_format_is_plain(dst))
++      return false;
++
+    if (!(flags & VREND_COPY_COMPAT_FLAG_ALLOW_COMPRESSED))
+       return false;
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 1916c2fc77038d0f31675de0cf39bb8223d9b3e4..88f8076b4389004eec8d17423e3b867596366a3a 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -10958,7 +10958,8 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
+       return;
+    }
+ 
+-   comp_flags = VREND_COPY_COMPAT_FLAG_ALLOW_COMPRESSED;
++   comp_flags = VREND_COPY_COMPAT_FLAG_ALLOW_COMPRESSED |
++                VREND_COPY_COMPAT_FLAG_COPY_VIEW_CLASS;
+    if (src_res->egl_image)
+       comp_flags |= VREND_COPY_COMPAT_FLAG_ONE_IS_EGL_IMAGE;
+    if (dst_res->egl_image)
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 8993593a77a7a889b2a301a1b82f3c01f58feb09..32088491c8069f41a6fea56997f47be86a3d54d8 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -595,6 +595,9 @@ bool vrend_format_is_bgra(enum virgl_formats format);
+ 
+ #define VREND_COPY_COMPAT_FLAG_ALLOW_COMPRESSED (1u << 0)
+ #define VREND_COPY_COMPAT_FLAG_ONE_IS_EGL_IMAGE (1u << 1)
++/* The caller is copying texels, not blitting them, so the GL copy view class
++ * decides compatibility. A blit may convert, and must not set this. */
++#define VREND_COPY_COMPAT_FLAG_COPY_VIEW_CLASS (1u << 2)
+ bool format_is_copy_compatible(enum virgl_formats src, enum virgl_formats dst,
+                                unsigned int flags);
+ 

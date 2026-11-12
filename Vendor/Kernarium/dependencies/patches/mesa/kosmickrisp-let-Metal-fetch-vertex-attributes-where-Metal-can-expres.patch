@@ -1,0 +1,2418 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 18:41:01 +0900
+Subject: [PATCH] kosmickrisp: let Metal fetch vertex attributes where Metal
+ can express them
+
+kk_lower_vs_vbo bakes the vertex-input state into the vertex shader: every
+attribute's format, its offset inside its buffer, the buffer's stride and its
+step function become shader code that reads the buffers as UBOs.  That makes
+the shader's MSL a function of state owned by the vertex-input interface
+library, so a pipeline library holding the vertex shader cannot compile it
+until the link, which is the other half of why
+dEQP-VK.pipeline.pipeline_library.graphics_library.misc.other.compare_link_times
+warns.
+
+Metal describes the same fetch with an MTLVertexDescriptor on the
+render-pipeline descriptor and hands the result to the vertex function through
+[[stage_in]].  It has 54 vertex formats, per-attribute offsets, per-buffer
+strides and a per-instance step function, so for most pipelines the descriptor
+says everything kk_lower_vs_vbo used to compile in, and the vertex shader stops
+depending on the vertex-input state entirely.  kk_vertex_input_is_metal_expressible
+is the predicate; what Metal has no form of keeps the lowered path - BGRA
+component order, USCALED and SSCALED, 64-bit and packed formats, and the
+robustBufferAccess and robustnessBufferAccess2 fetch semantics, which Metal's
+descriptor cannot promise.  A vertex stage poly turns into a compute dispatch
+for tessellation or geometry keeps it too: it is not a Metal vertex function,
+so it has neither a [[stage_in]] to fetch through nor a render-pipeline
+descriptor to carry the vertex descriptor.
+
+Two things had to follow the attributes out of the shader.  The vertex buffers
+are now bound as addresses in the argument table rather than read as UBOs, at
+KK_VERTEX_BUFFER_BINDING_BASE onwards, which is why the command buffer's
+argument table now asks for every buffer bind Metal allows it.  And modify_nir_info used to clear inputs_read for
+every vertex shader, on the assumption that attribute fetch always became
+argument-buffer reads; a shader that lets Metal fetch keeps its attributes,
+because they are exactly what the [[stage_in]] parameter and the vertex
+descriptor are built from.  Clearing them left the MSL backend emitting
+in.attribute_N against a parameter it had not declared.
+
+The vertex descriptor is filled at each attribute's Vulkan location, because
+that is the number the MSL backend names it by - both the VertexIn member and
+its [[attribute(n)]] index come from the location.  Compacting the attributes
+the way the shader-lowered path does, which indexes its own descriptor array,
+instead left Metal matching a declared attribute against another one's format,
+or against nothing: "Vertex attribute attribute_5(5) is missing from the vertex
+descriptor".
+
+Metal numbers both ends of that descriptor more narrowly than Vulkan numbers
+its vertex input, so the predicate has to stop where Metal does.  An argument
+table holds at most KK_MAX_ARGUMENT_TABLE_BUFFERS buffer binds - Metal 4's own
+limit, which MTL4ArgumentTableDescriptor and MTLVertexAttributeDescriptor both
+enforce - and three of those carry the root descriptor table, the sampler table
+and the per-draw data, so Metal's fetch can reach KK_MAX_NATIVE_VBUFS bindings.
+MSL numbers an [[attribute(n)]] from zero to thirty, so it can name
+KK_MAX_NATIVE_VERTEX_ATTRIBS locations.  Vulkan advertises 32 of each.  The
+lowered fetch has neither ceiling, because it reads its buffers through the
+root descriptor table and indexes its own attribute array, so a binding or a
+location past Metal's end keeps that path, and maxVertexInputBindings and
+maxVertexInputAttributes stand as advertised.  Sizing the table at
+KK_VERTEX_BUFFER_BINDING_BASE + KK_MAX_VBUFS instead asked for 35 binds, which
+runtime Metal tolerated and MTLDebugDevice rejected outright - "max buffer bind
+count must not be more than 31" - while a draw from the last Vulkan binding
+aborted the process with "buffer index (34) must be < 31" with no validation
+layer at all.
+
+A zero attribute divisor keeps the lowered path.  Vulkan reads the element at
+firstInstance there, not the first element of the buffer, and Metal's constant
+step function always reads the first; firstInstance cannot be folded into the
+bound address either, because an indirect draw keeps it in GPU memory.
+
+The new kosmickrisp_metal_vertex_fetch test draws one fully covered target
+from two bindings at once: an interleaved per-vertex buffer holding float32
+positions, an 8-bit normalized colour and a 16-bit normalized coordinate at
+three different offsets, and a separate per-instance buffer holding a float32
+scale, with two instances covering different halves so an attribute that did
+not advance per instance would show as two identical halves.  Every channel is
+compared against the value the host decoded from the same bytes.  A second
+draw uses a single attribute at location 5 and nothing else, the shape dEQP's
+vertex_input single_attribute cases use, so a descriptor filled at a compacted
+index rather than at the location fails it exactly as Metal reports it.  A
+third draws two instances through a binding whose divisor is zero, which the
+predicate now sends down the lowered path; it is kept because the Metal path
+reached it before, and aborted the process inside MTLVertexDescriptor
+validation.  A fourth and a fifth draw from the last binding and the last
+location Vulkan advertises, both past Metal's ceilings and so on the lowered
+path too, and read the same value back.  Four more link the same vertex stage
+against the
+generated fragment stages KosmicKrisp precompiles for point and line
+rasterization - point and line topologies, and the point and line polygon
+modes - because those are built separately and have to agree with a vertex
+function that takes its attributes through [[stage_in]].  All pass on both
+paths - MESA_KK_DEBUG=no_metal_vertex_fetch forces the lowered one, so
+a suspected fixed-function fetch defect can be bisected without a rebuild.
+
+A one-off benchmark measured the two paths against each other.  It drew
+degenerate triangles into a tiny attachment, so the pass fetched and
+transformed every vertex and shaded no fragment at all, over vertex buffers
+small enough to stay resident - a working set larger than the caches makes
+both paths read the same bytes at the same rate and hides what the fetch
+itself costs.  Best of eight GPU-timed passes, six
+alternating runs of each path on an M1 Ultra: four attributes interleaved
+440.6 us against 453.0 us, the same four in separate buffers 435.9 us
+against 453.5 us, four per-vertex plus one per-instance 439.9 us against
+450.8 us, and eight attributes interleaved 436.6 us against 467.9 us.
+Metal's fetch wins every case, by 2.5% to 4% at four attributes and 7.2%
+at eight, which is the shape to expect when the cost removed is the
+per-attribute address arithmetic and typed load the lowered path emits
+into the shader.  Per vertex that is 0.278 ns against 0.298 ns at eight
+attributes, and 6.82 us against 7.31 us per draw.  So Metal's fetch is
+the default for monolithic pipelines too, not only where it enables a
+fast link.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/bridge/mtl_compiler.h         |   12 +
+ src/kosmickrisp/bridge/mtl_compiler.m         |   36 +
+ src/kosmickrisp/bridge/mtl_types.h            |   66 +
+ src/kosmickrisp/bridge/stubs/mtl_compiler.c   |   14 +
+ src/kosmickrisp/compiler/msl_iomap.c          |   40 +-
+ src/kosmickrisp/compiler/nir_to_msl.c         |    6 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        |   12 +-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |   15 +-
+ src/kosmickrisp/vulkan/kk_debug.c             |    1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |    4 +
+ src/kosmickrisp/vulkan/kk_gpl.h               |    3 +
+ src/kosmickrisp/vulkan/kk_private.h           |   21 +
+ src/kosmickrisp/vulkan/kk_shader.c            |  337 +++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |   20 +
+ src/kosmickrisp/vulkan/meson.build            |   14 +
+ .../metal_vertex_fetch_shaders/fetch.frag     |    7 +
+ .../metal_vertex_fetch_shaders/fetch.frag.h   |   20 +
+ .../metal_vertex_fetch_shaders/fetch.vert     |   18 +
+ .../metal_vertex_fetch_shaders/fetch.vert.h   |   78 ++
+ .../fetch_high_location.vert                  |   15 +
+ .../fetch_high_location.vert.h                |   76 ++
+ .../fetch_single.vert                         |   16 +
+ .../fetch_single.vert.h                       |   76 ++
+ .../metal_vertex_fetch_shaders/generate.sh    |    8 +
+ .../vulkan/tests/test_metal_vertex_fetch.cpp  | 1058 +++++++++++++++++
+ 25 files changed, 1963 insertions(+), 10 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_metal_vertex_fetch.cpp
+
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.h b/src/kosmickrisp/bridge/mtl_compiler.h
+index 6fa72ada40ab02a71647b8fa754657c4a550d318..23238140fcfc5b27fff2ea0409df92e5e50ed5ca 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.h
++++ b/src/kosmickrisp/bridge/mtl_compiler.h
+@@ -50,6 +50,18 @@ void mtl_render_pipeline_descriptor_set_color_attachment_format(
+    mtl_render_pipeline_descriptor *descriptor, uint8_t index,
+    enum mtl_pixel_format format);
+ 
++/* Metal's own vertex fetch.  An attribute names the buffer binding it reads
++ * through, and that binding's layout carries the stride and the step, so the
++ * vertex shader keeps a plain [[stage_in]] argument and stays independent of
++ * the vertex-input state. */
++void mtl_render_pipeline_descriptor_set_vertex_attribute(
++   mtl_render_pipeline_descriptor *descriptor, uint32_t attribute,
++   enum mtl_vertex_format format, uint32_t offset, uint32_t buffer_index);
++
++void mtl_render_pipeline_descriptor_set_vertex_layout(
++   mtl_render_pipeline_descriptor *descriptor, uint32_t buffer_index,
++   uint32_t stride, enum mtl_vertex_step_function step, uint32_t step_rate);
++
+ /* Metal's fixed-function blend for one colour attachment.  A pipeline whose
+  * blend state Metal cannot express keeps kk_lower_fs_blend instead, so the
+  * factors and operations reaching here are always ones Metal has. */
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_compiler.m
+index 6730f8af364c6ca79be47d39b9ddf9e29d6c0d48..def3b7f6a0708a677444b963341c64ba1c0ac709 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -158,6 +158,42 @@
+    }
+ }
+ 
++void
++mtl_render_pipeline_descriptor_set_vertex_attribute(mtl_render_pipeline_descriptor *descriptor,
++                                                    uint32_t attribute,
++                                                    enum mtl_vertex_format format,
++                                                    uint32_t offset,
++                                                    uint32_t buffer_index)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
++      if (desc.vertexDescriptor == nil)
++         desc.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
++      MTLVertexAttributeDescriptor *att = desc.vertexDescriptor.attributes[attribute];
++      att.format = (MTLVertexFormat)format;
++      att.offset = offset;
++      att.bufferIndex = buffer_index;
++   }
++}
++
++void
++mtl_render_pipeline_descriptor_set_vertex_layout(mtl_render_pipeline_descriptor *descriptor,
++                                                 uint32_t buffer_index,
++                                                 uint32_t stride,
++                                                 enum mtl_vertex_step_function step,
++                                                 uint32_t step_rate)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
++      if (desc.vertexDescriptor == nil)
++         desc.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
++      MTLVertexBufferLayoutDescriptor *layout = desc.vertexDescriptor.layouts[buffer_index];
++      layout.stride = stride;
++      layout.stepFunction = (MTLVertexStepFunction)step;
++      layout.stepRate = step_rate;
++   }
++}
++
+ void
+ mtl_render_pipeline_descriptor_set_blend(mtl_render_pipeline_descriptor *descriptor,
+                                          uint8_t index,
+diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
+index 1a4d1bb622d2a789c5ab0b11abe42b11280190ad..2abf93b7d65a1b33b82f7f3f73b6117a349de03f 100644
+--- a/src/kosmickrisp/bridge/mtl_types.h
++++ b/src/kosmickrisp/bridge/mtl_types.h
+@@ -229,6 +229,72 @@ enum mtl_visibility_result_mode {
+    MTL_VISIBILITY_RESULT_MODE_COUNTING = 2,
+ };
+ 
++/* MTLVertexFormat.  Only the formats KosmicKrisp can hand to Metal's own
++ * vertex fetch are listed; a Vulkan format with no entry here keeps
++ * kk_lower_vs_vbo, which reads the attribute out of memory itself. */
++enum mtl_vertex_format {
++   MTL_VERTEX_FORMAT_INVALID = 0,
++   MTL_VERTEX_FORMAT_UCHAR2 = 1,
++   MTL_VERTEX_FORMAT_UCHAR3 = 2,
++   MTL_VERTEX_FORMAT_UCHAR4 = 3,
++   MTL_VERTEX_FORMAT_CHAR2 = 4,
++   MTL_VERTEX_FORMAT_CHAR3 = 5,
++   MTL_VERTEX_FORMAT_CHAR4 = 6,
++   MTL_VERTEX_FORMAT_UCHAR2_NORMALIZED = 7,
++   MTL_VERTEX_FORMAT_UCHAR3_NORMALIZED = 8,
++   MTL_VERTEX_FORMAT_UCHAR4_NORMALIZED = 9,
++   MTL_VERTEX_FORMAT_CHAR2_NORMALIZED = 10,
++   MTL_VERTEX_FORMAT_CHAR3_NORMALIZED = 11,
++   MTL_VERTEX_FORMAT_CHAR4_NORMALIZED = 12,
++   MTL_VERTEX_FORMAT_USHORT2 = 13,
++   MTL_VERTEX_FORMAT_USHORT3 = 14,
++   MTL_VERTEX_FORMAT_USHORT4 = 15,
++   MTL_VERTEX_FORMAT_SHORT2 = 16,
++   MTL_VERTEX_FORMAT_SHORT3 = 17,
++   MTL_VERTEX_FORMAT_SHORT4 = 18,
++   MTL_VERTEX_FORMAT_USHORT2_NORMALIZED = 19,
++   MTL_VERTEX_FORMAT_USHORT3_NORMALIZED = 20,
++   MTL_VERTEX_FORMAT_USHORT4_NORMALIZED = 21,
++   MTL_VERTEX_FORMAT_SHORT2_NORMALIZED = 22,
++   MTL_VERTEX_FORMAT_SHORT3_NORMALIZED = 23,
++   MTL_VERTEX_FORMAT_SHORT4_NORMALIZED = 24,
++   MTL_VERTEX_FORMAT_HALF2 = 25,
++   MTL_VERTEX_FORMAT_HALF3 = 26,
++   MTL_VERTEX_FORMAT_HALF4 = 27,
++   MTL_VERTEX_FORMAT_FLOAT = 28,
++   MTL_VERTEX_FORMAT_FLOAT2 = 29,
++   MTL_VERTEX_FORMAT_FLOAT3 = 30,
++   MTL_VERTEX_FORMAT_FLOAT4 = 31,
++   MTL_VERTEX_FORMAT_INT = 32,
++   MTL_VERTEX_FORMAT_INT2 = 33,
++   MTL_VERTEX_FORMAT_INT3 = 34,
++   MTL_VERTEX_FORMAT_INT4 = 35,
++   MTL_VERTEX_FORMAT_UINT = 36,
++   MTL_VERTEX_FORMAT_UINT2 = 37,
++   MTL_VERTEX_FORMAT_UINT3 = 38,
++   MTL_VERTEX_FORMAT_UINT4 = 39,
++   MTL_VERTEX_FORMAT_INT_1010102_NORMALIZED = 40,
++   MTL_VERTEX_FORMAT_UINT_1010102_NORMALIZED = 41,
++   MTL_VERTEX_FORMAT_UCHAR = 45,
++   MTL_VERTEX_FORMAT_CHAR = 46,
++   MTL_VERTEX_FORMAT_UCHAR_NORMALIZED = 47,
++   MTL_VERTEX_FORMAT_CHAR_NORMALIZED = 48,
++   MTL_VERTEX_FORMAT_USHORT = 49,
++   MTL_VERTEX_FORMAT_SHORT = 50,
++   MTL_VERTEX_FORMAT_USHORT_NORMALIZED = 51,
++   MTL_VERTEX_FORMAT_SHORT_NORMALIZED = 52,
++   MTL_VERTEX_FORMAT_HALF = 53,
++   MTL_VERTEX_FORMAT_FLOAT_RG11B10 = 54,
++   MTL_VERTEX_FORMAT_FLOAT_RGB9E5 = 55,
++};
++
++/* MTLVertexStepFunction */
++enum mtl_vertex_step_function {
++   MTL_VERTEX_STEP_FUNCTION_CONSTANT = 0,
++   MTL_VERTEX_STEP_FUNCTION_PER_VERTEX = 1,
++   MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE = 2,
++};
++
+ /* MTLBlendFactor.  Metal has no equivalent of a Vulkan logic op or of an
+  * advanced blend operation, so a pipeline that asks for either keeps the
+  * shader-lowered blend path instead. */
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_compiler.c b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+index 6dd3cbae16d50812a28eacc4d4fbb4ea2014aed0..debb4d7534a3fb656727cdfce08930c6311c01a7 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -79,6 +79,20 @@ mtl_render_pipeline_descriptor_set_raster_sample_count(
+ {
+ }
+ 
++void
++mtl_render_pipeline_descriptor_set_vertex_attribute(
++   mtl_render_pipeline_descriptor *descriptor, uint32_t attribute,
++   enum mtl_vertex_format format, uint32_t offset, uint32_t buffer_index)
++{
++}
++
++void
++mtl_render_pipeline_descriptor_set_vertex_layout(
++   mtl_render_pipeline_descriptor *descriptor, uint32_t buffer_index,
++   uint32_t stride, enum mtl_vertex_step_function step, uint32_t step_rate)
++{
++}
++
+ void
+ mtl_render_pipeline_descriptor_set_blend(
+    mtl_render_pipeline_descriptor *descriptor, uint8_t index, bool enabled,
+diff --git a/src/kosmickrisp/compiler/msl_iomap.c b/src/kosmickrisp/compiler/msl_iomap.c
+index b3f40aab031d50e5143965b27288234a03f4fe80..01f8997d145686eb1c30118b0a8c57f0dc8ef847 100644
+--- a/src/kosmickrisp/compiler/msl_iomap.c
++++ b/src/kosmickrisp/compiler/msl_iomap.c
+@@ -264,6 +264,33 @@ fs_input_no_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
+    }
+ }
+ 
++/* Generate the struct definition for the vertex shader input argument.  It
++ * exists only while the vertex shader still reads its attributes, which is to
++ * say while KosmicKrisp left the fetch to Metal's own MTLVertexDescriptor;
++ * kk_lower_vs_vbo turns every load_input into a buffer load and leaves
++ * inputs_read empty, and an emulated vertex stage is a compute shader by the
++ * time it reaches here, so neither grows a [[stage_in]] argument.
++ *
++ * Every attribute is declared with four components.  Metal fills the channels
++ * a narrower vertex format does not supply with (0, 0, 0, 1), which is exactly
++ * what Vulkan requires of an attribute the shader reads wider than the format.
++ */
++static void
++vs_input_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
++{
++   P(ctx, "struct VertexIn {\n");
++   ctx->indentlevel++;
++   u_foreach_bit64(location, shader->info.inputs_read) {
++      assert(location >= VERT_ATTRIB_GENERIC0 && "not a Vulkan attribute");
++      const unsigned attribute = location - VERT_ATTRIB_GENERIC0;
++      const char *type = alu_type_to_string(ctx->inputs_info[location].type);
++      P_IND(ctx, "%s4 attribute_%u [[attribute(%u)]];\n", type, attribute,
++            attribute);
++   }
++   ctx->indentlevel--;
++   P(ctx, "};\n");
++}
++
+ /* Generate the struct definition for the fragment shader input argument */
+ static void
+ fs_input_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+@@ -457,6 +484,8 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+ {
+    switch (ctx->shader->info.stage) {
+    case MESA_SHADER_VERTEX:
++      if (shader->info.inputs_read)
++         vs_input_block(shader, ctx);
+       vs_output_block(shader, ctx);
+       break;
+    case MESA_SHADER_FRAGMENT:
+@@ -529,6 +558,10 @@ msl_input_name(struct nir_to_msl_ctx *ctx, unsigned location,
+ {
+    P(ctx, "in.");
+    switch (ctx->shader->info.stage) {
++   case MESA_SHADER_VERTEX:
++      assert(location >= VERT_ATTRIB_GENERIC0 && "not a Vulkan attribute");
++      P(ctx, "attribute_%u", location - VERT_ATTRIB_GENERIC0);
++      break;
+    case MESA_SHADER_FRAGMENT:
+       varying_slot_name(ctx, location, component);
+       break;
+@@ -540,8 +573,11 @@ msl_input_name(struct nir_to_msl_ctx *ctx, unsigned location,
+ uint32_t
+ msl_input_num_components(struct nir_to_msl_ctx *ctx, uint32_t location)
+ {
+-   if (ctx->shader->info.stage == MESA_SHADER_FRAGMENT &&
+-       VARYING_SLOT_INFO[location].scalarized)
++   /* vs_input_block declares every attribute as a four-component vector. */
++   if (ctx->shader->info.stage == MESA_SHADER_VERTEX)
++      return 4;
++   else if (ctx->shader->info.stage == MESA_SHADER_FRAGMENT &&
++            VARYING_SLOT_INFO[location].scalarized)
+       return 1;
+    else
+       return ctx->inputs_info[location].num_components;
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index b09a76d3b6220a88cddf39dbc0ce44978b1d4625..d77537c3ea6bf584640b043f0b0d553d144e35ad 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -217,6 +217,12 @@ static void
+ emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+ {
+    switch (shader->info.stage) {
++   case MESA_SHADER_VERTEX:
++      /* Only while Metal's own vertex descriptor does the fetch; see
++       * vs_input_block. */
++      if (shader->info.inputs_read)
++         P_IND(ctx, "VertexIn in [[stage_in]],\n");
++      break;
+    case MESA_SHADER_FRAGMENT:
+       P_IND(ctx, "FragmentIn in [[stage_in]],\n");
+       break;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index ddd8da4fe0b709afab3950c38f12d55c4b3b8ff4..fcb0582b3f6092b1eeec6b2d258a5e2b47c4a770 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -170,7 +170,17 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+       /* Root at 0, samplers at 1 and per draw data at 2 */
+-      mtl_set_max_buffer_binding_count(desc, 3u);
++      /* Metal caps the table at KK_MAX_ARGUMENT_TABLE_BUFFERS binds, so ask
++       * for exactly that: the three fixed slots and, above them, one slot for
++       * every vertex buffer Metal's own fetch is allowed to read.  A binding
++       * past those keeps the shader-lowered fetch and needs no slot here; see
++       * kk_vertex_input_is_metal_expressible. */
++      static_assert(KK_VERTEX_BUFFER_BINDING_BASE + KK_MAX_NATIVE_VBUFS <=
++                       KK_MAX_ARGUMENT_TABLE_BUFFERS,
++                    "argument table must stay inside Metal's bind limit");
++      static_assert(KK_MAX_NATIVE_VBUFS <= KK_MAX_VBUFS,
++                    "Metal cannot fetch from more bindings than Vulkan has");
++      mtl_set_max_buffer_binding_count(desc, KK_MAX_ARGUMENT_TABLE_BUFFERS);
+       cmd->argument_table = mtl_new_argument_table(dev->mtl_handle, desc);
+       mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
+       mtl_release(desc);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 8509deb688d8ea16d02a4ad7cd6454cf089bc08a..a368cf60c9d750005d83a2efad44e97cc472c576 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1808,8 +1808,20 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+-       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB) {
++       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB ||
++       IS_SHADER_DIRTY(VERTEX)) {
+       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++      if (vs->info.vs.metal_vertex_fetch) {
++         /* Metal's own fetch reads each vertex buffer straight out of the
++          * argument table; the binding offset is already folded into the
++          * address, and the stride, step and attribute offset live in the
++          * pipeline state's vertex descriptor. */
++         u_foreach_bit(b, vs->info.vs.vertex_buffers_used) {
++            mtl_set_address(cmd->argument_table, gfx->vb.addr_range[b].addr,
++                            KK_VERTEX_BUFFER_BINDING_BASE + b);
++         }
++         goto vertex_input_done;
++      }
+       unsigned slot = 0;
+       u_foreach_bit(i, vs->info.vs.attribs_read) {
+          if (dyn->vi->attributes_valid & BITFIELD_BIT(i)) {
+@@ -1826,6 +1838,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+          slot++;
+       }
+       desc->root_dirty = true;
++   vertex_input_done:;
+    }
+ 
+    if (desc->root_dirty)
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 9dd178a198295175aab10f8abc237e06c9fd1c89..65ab042575d453620727cbb71bec861e53f6b329 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -13,6 +13,7 @@ const struct debug_named_value flags[] = {
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
+    {"submit_timing", KK_DEBUG_SUBMIT_TIMING},
+    {"no_metal_blend", KK_DEBUG_NO_METAL_BLEND},
++   {"no_metal_vertex_fetch", KK_DEBUG_NO_METAL_VERTEX_FETCH},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index e5664b76bb857eebe1b7d2bd0d39c02c2d4949bf..cb572c11c52ba8b3ee23e9bb69bd78bd5ad7cd5f 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -19,6 +19,10 @@ enum kk_debug {
+     * suspected fixed-function blend defect can be bisected without a
+     * rebuild. */
+    KK_DEBUG_NO_METAL_BLEND = 1ull << 4,
++   /* Read every vertex attribute out of memory in the vertex shader, even one
++    * Metal's own vertex descriptor could fetch.  The companion of
++    * no_metal_blend, for the same two reasons. */
++   KK_DEBUG_NO_METAL_VERTEX_FETCH = 1ull << 5,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_gpl.h b/src/kosmickrisp/vulkan/kk_gpl.h
+index 9a3f458f98a38ced65e9838be6b35a78f53bfb1c..7fd010454cd4c5495d28e83b31d0d54d8431d967 100644
+--- a/src/kosmickrisp/vulkan/kk_gpl.h
++++ b/src/kosmickrisp/vulkan/kk_gpl.h
+@@ -10,6 +10,9 @@
+ #include "kk_depth_clip.h"
+ #include "kk_logic_op.h"
+ 
++#include "kosmickrisp/bridge/mtl_types.h"
++
++#include "util/format/u_format.h"
+ #include "vk_graphics_state.h"
+ 
+ #include <string.h>
+diff --git a/src/kosmickrisp/vulkan/kk_private.h b/src/kosmickrisp/vulkan/kk_private.h
+index a31eadde4320459375e9f1e68bb5d39ea24d55d3..4e246852333186c87ebaa80e892f09cc0f24c0ae 100644
+--- a/src/kosmickrisp/vulkan/kk_private.h
++++ b/src/kosmickrisp/vulkan/kk_private.h
+@@ -15,6 +15,27 @@
+ 
+ #include <assert.h>
+ 
++/* Argument table slots zero to two carry the root descriptor table, the
++ * sampler table and the per-draw data, so Metal's own vertex fetch reads its
++ * vertex buffers from the slots above them. */
++#define KK_VERTEX_BUFFER_BINDING_BASE    3
++
++/* Metal 4 allows an argument table at most this many buffer binds, and both
++ * MTL4ArgumentTableDescriptor and MTLVertexAttributeDescriptor enforce it. */
++#define KK_MAX_ARGUMENT_TABLE_BUFFERS    31
++
++/* The vertex buffers Metal's own fetch can reach are the table slots left
++ * above the fixed three.  A binding above that keeps the shader-lowered fetch,
++ * which reads its buffers through the root descriptor table and so needs no
++ * bind of its own; maxVertexInputBindings stays what the device advertises. */
++#define KK_MAX_NATIVE_VBUFS                                                    \
++   (KK_MAX_ARGUMENT_TABLE_BUFFERS - KK_VERTEX_BUFFER_BINDING_BASE)
++
++/* MSL numbers an [[attribute(n)]] from zero to thirty, so a vertex input
++ * location above that has no Metal attribute to name it and keeps the
++ * shader-lowered fetch as well. */
++#define KK_MAX_NATIVE_VERTEX_ATTRIBS     31
++
+ #define KK_MAX_SETS                      32
+ #define KK_MAX_PUSH_SIZE                 256
+ #define KK_MAX_DYNAMIC_BUFFERS           64
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 705b897306c5860c3e73b68b1bf25f7ccc1a0ead..6c3a505a5c1b42cec3d2a8959e8ec7775b08f01e 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -369,6 +369,291 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2, byte_strides);
+ }
+ 
++/* Which MTLVertexFormat, if any, fetches this Vulkan vertex format exactly?
++ * Metal's fetch is fixed function, so it has to match Vulkan channel for
++ * channel: a format Metal orders differently (the BGRA ones), scales without
++ * normalizing (USCALED and SSCALED), or does not have at all (64-bit, most
++ * packed layouts) keeps kk_lower_vs_vbo, which reads it out of memory itself.
++ */
++static enum mtl_vertex_format
++kk_vertex_format_to_mtl(enum pipe_format format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++   if (desc == NULL || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
++       desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB)
++      return MTL_VERTEX_FORMAT_INVALID;
++
++   if (!desc->is_array) {
++      /* The two packed layouts Metal fetches, and only in the channel order
++       * and normalization Metal fixes for them. */
++      if (format == PIPE_FORMAT_R10G10B10A2_UNORM)
++         return MTL_VERTEX_FORMAT_UINT_1010102_NORMALIZED;
++      if (format == PIPE_FORMAT_R10G10B10A2_SNORM)
++         return MTL_VERTEX_FORMAT_INT_1010102_NORMALIZED;
++      if (format == PIPE_FORMAT_R11G11B10_FLOAT)
++         return MTL_VERTEX_FORMAT_FLOAT_RG11B10;
++      if (format == PIPE_FORMAT_R9G9B9E5_FLOAT)
++         return MTL_VERTEX_FORMAT_FLOAT_RGB9E5;
++      return MTL_VERTEX_FORMAT_INVALID;
++   }
++
++   /* An array format must also be in RGBA order and uniform across channels. */
++   const unsigned channels = desc->nr_channels;
++   if (channels < 1u || channels > 4u)
++      return MTL_VERTEX_FORMAT_INVALID;
++   for (unsigned i = 0; i < channels; ++i) {
++      if (desc->swizzle[i] != (unsigned char)(PIPE_SWIZZLE_X + i))
++         return MTL_VERTEX_FORMAT_INVALID;
++      if (desc->channel[i].size != desc->channel[0].size ||
++          desc->channel[i].type != desc->channel[0].type ||
++          desc->channel[i].normalized != desc->channel[0].normalized)
++         return MTL_VERTEX_FORMAT_INVALID;
++   }
++
++   const unsigned size = desc->channel[0].size;
++   const bool normalized = desc->channel[0].normalized;
++   const bool pure_integer = util_format_is_pure_integer(format);
++   const unsigned index = channels - 1u;
++
++   switch (desc->channel[0].type) {
++   case UTIL_FORMAT_TYPE_FLOAT: {
++      static const enum mtl_vertex_format half[4] = {
++         MTL_VERTEX_FORMAT_HALF, MTL_VERTEX_FORMAT_HALF2,
++         MTL_VERTEX_FORMAT_HALF3, MTL_VERTEX_FORMAT_HALF4};
++      static const enum mtl_vertex_format single[4] = {
++         MTL_VERTEX_FORMAT_FLOAT, MTL_VERTEX_FORMAT_FLOAT2,
++         MTL_VERTEX_FORMAT_FLOAT3, MTL_VERTEX_FORMAT_FLOAT4};
++      if (size == 16u)
++         return half[index];
++      if (size == 32u)
++         return single[index];
++      return MTL_VERTEX_FORMAT_INVALID; /* 64-bit has no Metal form */
++   }
++   case UTIL_FORMAT_TYPE_UNSIGNED:
++   case UTIL_FORMAT_TYPE_SIGNED: {
++      const bool is_signed = desc->channel[0].type == UTIL_FORMAT_TYPE_SIGNED;
++      /* Neither normalized nor a pure integer is a scaled format, which Metal
++       * has no fetch for. */
++      if (!normalized && !pure_integer)
++         return MTL_VERTEX_FORMAT_INVALID;
++
++      if (size == 8u) {
++         static const enum mtl_vertex_format u[4] = {
++            MTL_VERTEX_FORMAT_UCHAR, MTL_VERTEX_FORMAT_UCHAR2,
++            MTL_VERTEX_FORMAT_UCHAR3, MTL_VERTEX_FORMAT_UCHAR4};
++         static const enum mtl_vertex_format s[4] = {
++            MTL_VERTEX_FORMAT_CHAR, MTL_VERTEX_FORMAT_CHAR2,
++            MTL_VERTEX_FORMAT_CHAR3, MTL_VERTEX_FORMAT_CHAR4};
++         static const enum mtl_vertex_format un[4] = {
++            MTL_VERTEX_FORMAT_UCHAR_NORMALIZED,
++            MTL_VERTEX_FORMAT_UCHAR2_NORMALIZED,
++            MTL_VERTEX_FORMAT_UCHAR3_NORMALIZED,
++            MTL_VERTEX_FORMAT_UCHAR4_NORMALIZED};
++         static const enum mtl_vertex_format sn[4] = {
++            MTL_VERTEX_FORMAT_CHAR_NORMALIZED,
++            MTL_VERTEX_FORMAT_CHAR2_NORMALIZED,
++            MTL_VERTEX_FORMAT_CHAR3_NORMALIZED,
++            MTL_VERTEX_FORMAT_CHAR4_NORMALIZED};
++         return normalized ? (is_signed ? sn[index] : un[index])
++                           : (is_signed ? s[index] : u[index]);
++      }
++      if (size == 16u) {
++         static const enum mtl_vertex_format u[4] = {
++            MTL_VERTEX_FORMAT_USHORT, MTL_VERTEX_FORMAT_USHORT2,
++            MTL_VERTEX_FORMAT_USHORT3, MTL_VERTEX_FORMAT_USHORT4};
++         static const enum mtl_vertex_format s[4] = {
++            MTL_VERTEX_FORMAT_SHORT, MTL_VERTEX_FORMAT_SHORT2,
++            MTL_VERTEX_FORMAT_SHORT3, MTL_VERTEX_FORMAT_SHORT4};
++         static const enum mtl_vertex_format un[4] = {
++            MTL_VERTEX_FORMAT_USHORT_NORMALIZED,
++            MTL_VERTEX_FORMAT_USHORT2_NORMALIZED,
++            MTL_VERTEX_FORMAT_USHORT3_NORMALIZED,
++            MTL_VERTEX_FORMAT_USHORT4_NORMALIZED};
++         static const enum mtl_vertex_format sn[4] = {
++            MTL_VERTEX_FORMAT_SHORT_NORMALIZED,
++            MTL_VERTEX_FORMAT_SHORT2_NORMALIZED,
++            MTL_VERTEX_FORMAT_SHORT3_NORMALIZED,
++            MTL_VERTEX_FORMAT_SHORT4_NORMALIZED};
++         return normalized ? (is_signed ? sn[index] : un[index])
++                           : (is_signed ? s[index] : u[index]);
++      }
++      if (size == 32u && !normalized) {
++         static const enum mtl_vertex_format u[4] = {
++            MTL_VERTEX_FORMAT_UINT, MTL_VERTEX_FORMAT_UINT2,
++            MTL_VERTEX_FORMAT_UINT3, MTL_VERTEX_FORMAT_UINT4};
++         static const enum mtl_vertex_format s[4] = {
++            MTL_VERTEX_FORMAT_INT, MTL_VERTEX_FORMAT_INT2,
++            MTL_VERTEX_FORMAT_INT3, MTL_VERTEX_FORMAT_INT4};
++         return is_signed ? s[index] : u[index];
++      }
++      return MTL_VERTEX_FORMAT_INVALID;
++   }
++   default:
++      return MTL_VERTEX_FORMAT_INVALID;
++   }
++}
++
++/* Can Metal's own vertex fetch stand in for kk_lower_vs_vbo here?  Metal takes
++ * the formats, offsets, strides and step rates on the render-pipeline
++ * descriptor, which leaves the vertex shader a plain [[stage_in]] argument and
++ * so independent of the vertex-input interface library.  It fetches without
++ * bounds checking and without a Vulkan-shaped notion of an out-of-range read,
++ * so a pipeline that asked for robustness keeps the lowered path, and so does
++ * one whose vertex input is dynamic, because Metal bakes the descriptor into
++ * the pipeline state.
++ *
++ * Metal also numbers both ends of that descriptor more narrowly than Vulkan
++ * numbers its vertex input: an argument table holds
++ * KK_MAX_ARGUMENT_TABLE_BUFFERS buffer binds and MSL numbers an
++ * [[attribute(n)]] up to KK_MAX_NATIVE_VERTEX_ATTRIBS - 1.  The lowered fetch
++ * has neither limit, because it reads its buffers through the root descriptor
++ * table and indexes its own attribute array, so a binding or a location past
++ * Metal's end keeps that path and the advertised maxVertexInputBindings and
++ * maxVertexInputAttributes stand. */
++static bool
++kk_vertex_input_is_metal_expressible(
++   const struct vk_graphics_pipeline_state *state,
++   const struct vk_pipeline_robustness_state *rs)
++{
++   if (state == NULL || state->vi == NULL)
++      return false;
++
++   if (KK_DEBUG(NO_METAL_VERTEX_FETCH))
++      return false;
++
++   if (rs == NULL ||
++       rs->vertex_inputs != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED)
++      return false;
++
++   if (KK_DEBUG(FORCE_ROBUSTNESS))
++      return false;
++
++   static const enum mesa_vk_dynamic_graphics_state baked[] = {
++      MESA_VK_DYNAMIC_VI,
++      MESA_VK_DYNAMIC_VI_BINDINGS_VALID,
++      MESA_VK_DYNAMIC_VI_BINDING_STRIDES,
++   };
++   for (uint32_t i = 0; i < ARRAY_SIZE(baked); ++i) {
++      if (BITSET_TEST(state->dynamic, baked[i]))
++         return false;
++   }
++
++   static_assert(KK_MAX_NATIVE_VERTEX_ATTRIBS <= KK_MAX_ATTRIBS,
++                 "Metal cannot name more attributes than Vulkan has");
++
++   u_foreach_bit(i, state->vi->attributes_valid) {
++      const struct vk_vertex_attribute_state *attr = &state->vi->attributes[i];
++      if (!(state->vi->bindings_valid & BITFIELD_BIT(attr->binding)))
++         return false;
++      const struct vk_vertex_binding_state *binding =
++         &state->vi->bindings[attr->binding];
++
++      /* The MSL backend names an attribute after its Vulkan location, and MSL
++       * runs out of [[attribute(n)]] indices before Vulkan runs out of
++       * locations: asking for one past the end fails to compile with
++       * "'attribute' attribute parameter is out of bounds". */
++      if (i >= KK_MAX_NATIVE_VERTEX_ATTRIBS)
++         return false;
++
++      /* Metal's fetch reads the buffer bound at KK_VERTEX_BUFFER_BINDING_BASE
++       * plus the Vulkan binding, and the argument table has no slot there for
++       * a binding past KK_MAX_NATIVE_VBUFS.  Metal rejects the descriptor
++       * outright - "buffer index (34) must be < 31" - rather than clamping. */
++      if (attr->binding >= KK_MAX_NATIVE_VBUFS)
++         return false;
++
++      if (kk_vertex_format_to_mtl(vk_format_to_pipe_format(attr->format)) ==
++          MTL_VERTEX_FORMAT_INVALID)
++         return false;
++
++      /* Vulkan's attribute divisor of zero reads the element at firstInstance,
++       * not the first element of the buffer.  Metal's constant step function
++       * always reads the first, and firstInstance cannot be folded into the
++       * bound address because an indirect draw keeps it in GPU memory. */
++      if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE &&
++          binding->divisor == 0u)
++         return false;
++
++      /* Metal reads a per-vertex layout of stride zero as an error rather than
++       * as the repeated element Vulkan allows. */
++      if (binding->stride == 0u)
++         return false;
++
++      /* The whole attribute has to sit inside the stride, or Metal's fetch
++       * would step outside the element Vulkan describes. */
++      const unsigned size = util_format_get_blocksize(
++         vk_format_to_pipe_format(attr->format));
++      if (attr->offset + size > binding->stride)
++         return false;
++   }
++
++   return true;
++}
++
++/* Describe the vertex fetch to Metal instead of lowering it into the shader.
++ * The shader keeps its load_input intrinsics, so nir_to_msl gives it a
++ * [[stage_in]] argument, and its MSL stops depending on the vertex-input
++ * state - which is the whole point, because that state belongs to a different
++ * pipeline library.
++ *
++ * nir_recompute_io_bases compacts the attributes exactly as kk_lower_vs_vbo
++ * needs it to, and the compacted slot is both the [[attribute(n)]] index the
++ * MSL declares and the index Metal's descriptor is filled at, so the two
++ * cannot drift apart. */
++static void
++kk_gather_metal_vertex_fetch(struct kk_shader *shader, nir_shader *nir,
++                             const struct vk_graphics_pipeline_state *state)
++{
++   assert(!(nir->info.inputs_read & BITFIELD64_MASK(VERT_ATTRIB_GENERIC0)) &&
++          "Fixed-function attributes not used in Vulkan");
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++
++   struct kk_shader_info *info = &shader->info;
++   info->vs.metal_vertex_fetch = true;
++   info->vs.vertex_buffers_used = 0u;
++
++   /* The MSL backend names an attribute after its Vulkan location, both in the
++    * VertexIn struct and at its [[attribute(n)]] index, so the vertex
++    * descriptor has to be filled at that same location.  Compacting the
++    * attributes here - which the shader-lowered path does, because it indexes
++    * its own descriptor array - instead left Metal matching each declared
++    * attribute against another one's format, or against nothing at all:
++    * "attribute_5(5) is missing from the vertex descriptor". */
++   u_foreach_bit(i, state->vi->attributes_valid) {
++      const struct vk_vertex_attribute_state *attr = &state->vi->attributes[i];
++      const struct vk_vertex_binding_state *binding =
++         &state->vi->bindings[attr->binding];
++      const unsigned slot = i;
++
++      info->vs.vertex_attributes[slot].format =
++         kk_vertex_format_to_mtl(vk_format_to_pipe_format(attr->format));
++      info->vs.vertex_attributes[slot].offset = attr->offset;
++      info->vs.vertex_attributes[slot].buffer = attr->binding;
++
++      /* Vulkan's divisor zero means every instance reads the first element,
++       * which is Metal's constant step rather than a rate of zero.  Metal
++       * asserts that a constant step carries a rate of zero, so the rate is
++       * the one field that does not follow the divisor here. */
++      const bool instanced =
++         binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
++      info->vs.vertex_layouts[attr->binding].stride = binding->stride;
++      if (!instanced) {
++         info->vs.vertex_layouts[attr->binding].step =
++            MTL_VERTEX_STEP_FUNCTION_PER_VERTEX;
++         info->vs.vertex_layouts[attr->binding].step_rate = 1u;
++      } else if (binding->divisor == 0u) {
++         info->vs.vertex_layouts[attr->binding].step =
++            MTL_VERTEX_STEP_FUNCTION_CONSTANT;
++         info->vs.vertex_layouts[attr->binding].step_rate = 0u;
++      } else {
++         info->vs.vertex_layouts[attr->binding].step =
++            MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE;
++         info->vs.vertex_layouts[attr->binding].step_rate = binding->divisor;
++      }
++      info->vs.vertex_buffers_used |= BITFIELD_BIT(attr->binding);
++   }
++}
++
+ static nir_def *
+ kk_load_depth_clip_array(nir_builder *b, nir_def *viewport,
+                          unsigned array_offset, unsigned element_size)
+@@ -1316,12 +1601,16 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+ }
+ 
+ static void
+-modify_nir_info(nir_shader *nir)
++modify_nir_info(nir_shader *nir, bool metal_vertex_fetch)
+ {
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    if (nir->info.stage == MESA_SHADER_VERTEX) {
+-      /* Vertex attribute fetch is done in shader through argument buffers. */
+-      nir->info.inputs_read = 0u;
++      /* A shader that fetches its own attributes reads them from argument
++       * buffers and has no vertex input interface left.  One that lets Metal
++       * fetch keeps its attributes: they are what the [[stage_in]] parameter
++       * and the MTLVertexDescriptor are built from. */
++      if (!metal_vertex_fetch)
++         nir->info.inputs_read = 0u;
+    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       /* Some meta shaders like vk-meta-resolve will have depth_layout as NONE
+        * which is not a valid Metal layout */
+@@ -1407,10 +1696,22 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+     * are turned to compute shaders that will be dispatched before the draw
+     * call. Tess evalutaion shaders are turned into vertex shaders. */
+    if (stage == MESA_SHADER_VERTEX) {
++      /* A vertex stage poly turns into a compute dispatch is not a Metal
++       * vertex function: it has no [[stage_in]] to fetch through and no
++       * render-pipeline descriptor to carry an MTLVertexDescriptor, so it
++       * keeps fetching its own attributes. */
++      const bool emulated_vs =
++         nir->info.next_stage == MESA_SHADER_TESS_CTRL || force_sw_vs;
++
+       /* VBO lowering needs to go here otherwise, the linking step removes all
+        * inputs since we read vertex attributes from UBOs. */
+-      kk_lower_vs_vbo(nir, state, robustness, byte_strides);
+-      if (nir->info.next_stage == MESA_SHADER_TESS_CTRL || force_sw_vs) {
++      if (!emulated_vs &&
++          kk_vertex_input_is_metal_expressible(state, robustness)) {
++         kk_gather_metal_vertex_fetch(shader, nir, state);
++      } else {
++         kk_lower_vs_vbo(nir, state, robustness, byte_strides);
++      }
++      if (emulated_vs) {
+          if (line_multiview)
+             NIR_PASS(_, nir, kk_nir_lower_line_multiview,
+                      state->mv->view_mask);
+@@ -1481,7 +1782,8 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+    NIR_PASS(_, nir, kk_nir_lower_poly, pipeline_statistics);
+ 
+    msl_optimize_nir(nir);
+-   modify_nir_info(nir);
++   modify_nir_info(nir, nir->info.stage == MESA_SHADER_VERTEX &&
++                           shader->info.vs.metal_vertex_fetch);
+ 
+    struct nir_to_msl_options translate_options = {
+       .mem_ctx = NULL,
+@@ -4120,6 +4422,29 @@ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+    mtl_render_pipeline_descriptor_set_input_primitive_topology(
+       pipeline_descriptor, vs->info.vs.topology);
+ 
++   /* Metal's own vertex fetch, for a shader that kept its [[stage_in]]
++    * argument.  Attributes are indexed by the compacted shader slot the MSL
++    * declared, layouts by the Vulkan binding the attribute names. */
++   if (vs->info.vs.metal_vertex_fetch) {
++      for (uint32_t i = 0; i < KK_MAX_ATTRIBS; ++i) {
++         if (vs->info.vs.vertex_attributes[i].format ==
++             MTL_VERTEX_FORMAT_INVALID)
++            continue;
++         mtl_render_pipeline_descriptor_set_vertex_attribute(
++            pipeline_descriptor, i, vs->info.vs.vertex_attributes[i].format,
++            vs->info.vs.vertex_attributes[i].offset,
++            KK_VERTEX_BUFFER_BINDING_BASE +
++               vs->info.vs.vertex_attributes[i].buffer);
++      }
++      u_foreach_bit(b, vs->info.vs.vertex_buffers_used) {
++         mtl_render_pipeline_descriptor_set_vertex_layout(
++            pipeline_descriptor, KK_VERTEX_BUFFER_BINDING_BASE + b,
++            vs->info.vs.vertex_layouts[b].stride,
++            vs->info.vs.vertex_layouts[b].step,
++            vs->info.vs.vertex_layouts[b].step_rate);
++      }
++   }
++
+    /* If color attachments are reordered there might be unused / invalid gaps
+     * in the array so need to check them all, not just first
+     * color_attachment_count entries.
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 059399497ea496c802d9ee873b7ad9249bbd9e2a..0b96684ea2019494694cae6be04092fc19fc9055 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -9,6 +9,7 @@
+ #define KK_SHADER_H 1
+ 
+ #include "kk_device_memory.h"
++#include "kk_nir_lower_vbo.h"
+ #include "kk_private.h"
+ #include "kk_raster_variant.h"
+ 
+@@ -122,6 +123,25 @@ struct kk_shader_info {
+             uint8_t write_mask;
+          } stencil_front, stencil_back;
+          uint8_t color_attachment_count;
++         /* Metal's own vertex fetch, used when
++          * kk_vertex_input_is_metal_expressible accepted the pipeline's vertex
++          * input state and the vertex shader therefore kept its load_input
++          * intrinsics and takes a [[stage_in]] argument.  The attributes are
++          * indexed by the compacted shader slot, the layouts by the Vulkan
++          * binding, exactly as the descriptor Metal is handed. */
++         bool metal_vertex_fetch;
++         uint32_t vertex_buffers_used;
++         struct {
++            uint16_t format;
++            uint16_t offset;
++            uint8_t buffer;
++         } vertex_attributes[KK_MAX_ATTRIBS];
++         struct {
++            uint32_t stride;
++            uint32_t step_rate;
++            uint8_t step;
++         } vertex_layouts[KK_MAX_VBUFS];
++
+          /* Metal's own blend state, used when kk_blend_is_metal_expressible
+           * accepted the pipeline's colour blend state and the fragment shader
+           * therefore kept its stores instead of carrying a lowered blend. */
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 6afef36d1bd67a9408ce2f188119edb543875db5..5bda031ed06c824e570e8cc18ddb94d6d0ea7b80 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -661,6 +661,20 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_metal_vertex_fetch',
++      executable(
++        'test_kosmickrisp_metal_vertex_fetch',
++        files('tests/test_metal_vertex_fetch.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_early_sample_mask_count',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e12858af5f32335aad1a506e0675c5da489f3b2
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag
+@@ -0,0 +1,7 @@
++#version 450
++layout(location = 0) in vec4 in_value;
++layout(location = 0) out vec4 out_colour;
++void main()
++{
++   out_colour = in_value;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag.h b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..50544d69c37b4e3889a931f38533262b813a6160
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.frag.h
+@@ -0,0 +1,20 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000b,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00040047,0x0000000b,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000007,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x0000000c,
++0x0000000b,0x0003003e,0x00000009,0x0000000c,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..b47798091faf30d8c64a8b6dda1dc079ba30c68d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert
+@@ -0,0 +1,18 @@
++#version 450
++/* One interleaved per-vertex buffer carrying three different formats, and a
++ * separate per-instance buffer, so one draw exercises float32, 8-bit and
++ * 16-bit normalized fetch, two bindings, and the instance step function. */
++layout(location = 0) in vec2 in_position;
++layout(location = 1) in vec4 in_colour;
++layout(location = 2) in vec2 in_uv;
++layout(location = 3) in float in_scale;
++/* An integer attribute whose Metal vertex format is narrower than the uvec2
++ * the shader declares, which is what dEQP's single_attribute uint cases use. */
++layout(location = 4) in uvec2 in_index;
++layout(location = 0) out vec4 out_value;
++void main()
++{
++   gl_Position =
++      vec4(in_position.x, in_position.y + float(gl_InstanceIndex), 0.0, 1.0);
++   out_value = vec4(in_colour.r, in_uv.x, in_scale, float(in_index.x) / 255.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert.h b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..15da88966e170bb3c3109076dde6c865e50d749a
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch.vert.h
+@@ -0,0 +1,78 @@
++{0x07230203,0x00010600,0x000d000b,0x00000038,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000d000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000012,0x0000001a,
++0x00000023,0x00000025,0x00000028,0x0000002b,
++0x0000002f,0x00030047,0x0000000b,0x00000002,
++0x00050048,0x0000000b,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x0000000b,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x0000000b,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x0000000b,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000012,0x0000001e,0x00000000,
++0x00040047,0x0000001a,0x0000000b,0x0000002b,
++0x00040047,0x00000023,0x0000001e,0x00000000,
++0x00040047,0x00000025,0x0000001e,0x00000001,
++0x00040047,0x00000028,0x0000001e,0x00000002,
++0x00040047,0x0000002b,0x0000001e,0x00000003,
++0x00040047,0x0000002f,0x0000001e,0x00000004,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00030016,0x00000006,0x00000020,
++0x00040017,0x00000007,0x00000006,0x00000004,
++0x00040015,0x00000008,0x00000020,0x00000000,
++0x0004002b,0x00000008,0x00000009,0x00000001,
++0x0004001c,0x0000000a,0x00000006,0x00000009,
++0x0006001e,0x0000000b,0x00000007,0x00000006,
++0x0000000a,0x0000000a,0x00040020,0x0000000c,
++0x00000003,0x0000000b,0x0004003b,0x0000000c,
++0x0000000d,0x00000003,0x00040015,0x0000000e,
++0x00000020,0x00000001,0x0004002b,0x0000000e,
++0x0000000f,0x00000000,0x00040017,0x00000010,
++0x00000006,0x00000002,0x00040020,0x00000011,
++0x00000001,0x00000010,0x0004003b,0x00000011,
++0x00000012,0x00000001,0x0004002b,0x00000008,
++0x00000013,0x00000000,0x00040020,0x00000014,
++0x00000001,0x00000006,0x00040020,0x00000019,
++0x00000001,0x0000000e,0x0004003b,0x00000019,
++0x0000001a,0x00000001,0x0004002b,0x00000006,
++0x0000001e,0x00000000,0x0004002b,0x00000006,
++0x0000001f,0x3f800000,0x00040020,0x00000021,
++0x00000003,0x00000007,0x0004003b,0x00000021,
++0x00000023,0x00000003,0x00040020,0x00000024,
++0x00000001,0x00000007,0x0004003b,0x00000024,
++0x00000025,0x00000001,0x0004003b,0x00000011,
++0x00000028,0x00000001,0x0004003b,0x00000014,
++0x0000002b,0x00000001,0x00040017,0x0000002d,
++0x00000008,0x00000002,0x00040020,0x0000002e,
++0x00000001,0x0000002d,0x0004003b,0x0000002e,
++0x0000002f,0x00000001,0x00040020,0x00000030,
++0x00000001,0x00000008,0x0004002b,0x00000006,
++0x00000037,0x3b808081,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x00050041,0x00000014,0x00000015,
++0x00000012,0x00000013,0x0004003d,0x00000006,
++0x00000016,0x00000015,0x00050041,0x00000014,
++0x00000017,0x00000012,0x00000009,0x0004003d,
++0x00000006,0x00000018,0x00000017,0x0004003d,
++0x0000000e,0x0000001b,0x0000001a,0x0004006f,
++0x00000006,0x0000001c,0x0000001b,0x00050081,
++0x00000006,0x0000001d,0x00000018,0x0000001c,
++0x00070050,0x00000007,0x00000020,0x00000016,
++0x0000001d,0x0000001e,0x0000001f,0x00050041,
++0x00000021,0x00000022,0x0000000d,0x0000000f,
++0x0003003e,0x00000022,0x00000020,0x00050041,
++0x00000014,0x00000026,0x00000025,0x00000013,
++0x0004003d,0x00000006,0x00000027,0x00000026,
++0x00050041,0x00000014,0x00000029,0x00000028,
++0x00000013,0x0004003d,0x00000006,0x0000002a,
++0x00000029,0x0004003d,0x00000006,0x0000002c,
++0x0000002b,0x00050041,0x00000030,0x00000031,
++0x0000002f,0x00000013,0x0004003d,0x00000008,
++0x00000032,0x00000031,0x00040070,0x00000006,
++0x00000033,0x00000032,0x00050085,0x00000006,
++0x00000035,0x00000033,0x00000037,0x00070050,
++0x00000007,0x00000036,0x00000027,0x0000002a,
++0x0000002c,0x00000035,0x0003003e,0x00000023,
++0x00000036,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..31703b3f87860b263c441f6e1b40e23bb654bff2
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert
+@@ -0,0 +1,15 @@
++#version 450
++/* The same single attribute as fetch_single.vert, at the highest location
++ * maxVertexInputAttributes allows.  MSL numbers an [[attribute(n)]] from zero
++ * to thirty, so location 31 has no Metal attribute to name it and the pipeline
++ * has to keep the shader-lowered fetch. */
++layout(location = 31) in uvec2 in_index;
++layout(location = 0) out vec4 out_value;
++void main()
++{
++   const vec2 corner[3] =
++      vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
++   gl_Position = vec4(corner[gl_VertexIndex], 0.0, 1.0);
++   out_value = vec4(float(in_index.x) / 255.0, float(in_index.y) / 255.0, 0.0,
++                    1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert.h b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd6ea9628e1e36290eec6645093321032e8025a0
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_high_location.vert.h
+@@ -0,0 +1,76 @@
++{0x07230203,0x00010600,0x000d000b,0x00000039,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x0000001a,0x00000028,
++0x0000002b,0x00030047,0x0000000b,0x00000002,
++0x00050048,0x0000000b,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x0000000b,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x0000000b,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x0000000b,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x0000001a,0x0000000b,0x0000002a,
++0x00030047,0x0000001d,0x00000018,0x00040047,
++0x00000028,0x0000001e,0x00000000,0x00040047,
++0x0000002b,0x0000001e,0x0000001f,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000004,0x00040015,
++0x00000008,0x00000020,0x00000000,0x0004002b,
++0x00000008,0x00000009,0x00000001,0x0004001c,
++0x0000000a,0x00000006,0x00000009,0x0006001e,
++0x0000000b,0x00000007,0x00000006,0x0000000a,
++0x0000000a,0x00040020,0x0000000c,0x00000003,
++0x0000000b,0x0004003b,0x0000000c,0x0000000d,
++0x00000003,0x00040015,0x0000000e,0x00000020,
++0x00000001,0x0004002b,0x0000000e,0x0000000f,
++0x00000000,0x00040017,0x00000010,0x00000006,
++0x00000002,0x0004002b,0x00000008,0x00000011,
++0x00000003,0x0004001c,0x00000012,0x00000010,
++0x00000011,0x0004002b,0x00000006,0x00000013,
++0xbf800000,0x0005002c,0x00000010,0x00000014,
++0x00000013,0x00000013,0x0004002b,0x00000006,
++0x00000015,0x40400000,0x0005002c,0x00000010,
++0x00000016,0x00000015,0x00000013,0x0005002c,
++0x00000010,0x00000017,0x00000013,0x00000015,
++0x0006002c,0x00000012,0x00000018,0x00000014,
++0x00000016,0x00000017,0x00040020,0x00000019,
++0x00000001,0x0000000e,0x0004003b,0x00000019,
++0x0000001a,0x00000001,0x00040020,0x0000001c,
++0x00000007,0x00000012,0x00040020,0x0000001e,
++0x00000007,0x00000010,0x0004002b,0x00000006,
++0x00000021,0x00000000,0x0004002b,0x00000006,
++0x00000022,0x3f800000,0x00040020,0x00000026,
++0x00000003,0x00000007,0x0004003b,0x00000026,
++0x00000028,0x00000003,0x00040017,0x00000029,
++0x00000008,0x00000002,0x00040020,0x0000002a,
++0x00000001,0x00000029,0x0004003b,0x0000002a,
++0x0000002b,0x00000001,0x0004002b,0x00000008,
++0x0000002c,0x00000000,0x00040020,0x0000002d,
++0x00000001,0x00000008,0x0004002b,0x00000006,
++0x00000038,0x3b808081,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0005003b,0x0000001c,0x0000001d,
++0x00000007,0x00000018,0x0004003d,0x0000000e,
++0x0000001b,0x0000001a,0x00050041,0x0000001e,
++0x0000001f,0x0000001d,0x0000001b,0x0004003d,
++0x00000010,0x00000020,0x0000001f,0x00050051,
++0x00000006,0x00000023,0x00000020,0x00000000,
++0x00050051,0x00000006,0x00000024,0x00000020,
++0x00000001,0x00070050,0x00000007,0x00000025,
++0x00000023,0x00000024,0x00000021,0x00000022,
++0x00050041,0x00000026,0x00000027,0x0000000d,
++0x0000000f,0x0003003e,0x00000027,0x00000025,
++0x00050041,0x0000002d,0x0000002e,0x0000002b,
++0x0000002c,0x0004003d,0x00000008,0x0000002f,
++0x0000002e,0x00040070,0x00000006,0x00000030,
++0x0000002f,0x00050085,0x00000006,0x00000032,
++0x00000030,0x00000038,0x00050041,0x0000002d,
++0x00000033,0x0000002b,0x00000009,0x0004003d,
++0x00000008,0x00000034,0x00000033,0x00040070,
++0x00000006,0x00000035,0x00000034,0x00050085,
++0x00000006,0x00000036,0x00000035,0x00000038,
++0x00070050,0x00000007,0x00000037,0x00000032,
++0x00000036,0x00000021,0x00000022,0x0003003e,
++0x00000028,0x00000037,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..76575497bbfece9a6c206c54556233547420e34b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert
+@@ -0,0 +1,16 @@
++#version 450
++/* One attribute and nothing else, the shape dEQP's vertex_input
++ * single_attribute cases use: the position comes from the vertex index.  Its
++ * location is deliberately not zero, because the MSL backend names an
++ * attribute after its Vulkan location and the vertex descriptor has to be
++ * filled at that same index rather than at a compacted one. */
++layout(location = 5) in uvec2 in_index;
++layout(location = 0) out vec4 out_value;
++void main()
++{
++   const vec2 corner[3] =
++      vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
++   gl_Position = vec4(corner[gl_VertexIndex], 0.0, 1.0);
++   out_value = vec4(float(in_index.x) / 255.0, float(in_index.y) / 255.0, 0.0,
++                    1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert.h b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3978fd743b6c296971ceefd71d8daca8836227e0
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/fetch_single.vert.h
+@@ -0,0 +1,76 @@
++{0x07230203,0x00010600,0x000d000b,0x00000039,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x0000001a,0x00000028,
++0x0000002b,0x00030047,0x0000000b,0x00000002,
++0x00050048,0x0000000b,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x0000000b,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x0000000b,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x0000000b,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x0000001a,0x0000000b,0x0000002a,
++0x00030047,0x0000001d,0x00000018,0x00040047,
++0x00000028,0x0000001e,0x00000000,0x00040047,
++0x0000002b,0x0000001e,0x00000005,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000004,0x00040015,
++0x00000008,0x00000020,0x00000000,0x0004002b,
++0x00000008,0x00000009,0x00000001,0x0004001c,
++0x0000000a,0x00000006,0x00000009,0x0006001e,
++0x0000000b,0x00000007,0x00000006,0x0000000a,
++0x0000000a,0x00040020,0x0000000c,0x00000003,
++0x0000000b,0x0004003b,0x0000000c,0x0000000d,
++0x00000003,0x00040015,0x0000000e,0x00000020,
++0x00000001,0x0004002b,0x0000000e,0x0000000f,
++0x00000000,0x00040017,0x00000010,0x00000006,
++0x00000002,0x0004002b,0x00000008,0x00000011,
++0x00000003,0x0004001c,0x00000012,0x00000010,
++0x00000011,0x0004002b,0x00000006,0x00000013,
++0xbf800000,0x0005002c,0x00000010,0x00000014,
++0x00000013,0x00000013,0x0004002b,0x00000006,
++0x00000015,0x40400000,0x0005002c,0x00000010,
++0x00000016,0x00000015,0x00000013,0x0005002c,
++0x00000010,0x00000017,0x00000013,0x00000015,
++0x0006002c,0x00000012,0x00000018,0x00000014,
++0x00000016,0x00000017,0x00040020,0x00000019,
++0x00000001,0x0000000e,0x0004003b,0x00000019,
++0x0000001a,0x00000001,0x00040020,0x0000001c,
++0x00000007,0x00000012,0x00040020,0x0000001e,
++0x00000007,0x00000010,0x0004002b,0x00000006,
++0x00000021,0x00000000,0x0004002b,0x00000006,
++0x00000022,0x3f800000,0x00040020,0x00000026,
++0x00000003,0x00000007,0x0004003b,0x00000026,
++0x00000028,0x00000003,0x00040017,0x00000029,
++0x00000008,0x00000002,0x00040020,0x0000002a,
++0x00000001,0x00000029,0x0004003b,0x0000002a,
++0x0000002b,0x00000001,0x0004002b,0x00000008,
++0x0000002c,0x00000000,0x00040020,0x0000002d,
++0x00000001,0x00000008,0x0004002b,0x00000006,
++0x00000038,0x3b808081,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0005003b,0x0000001c,0x0000001d,
++0x00000007,0x00000018,0x0004003d,0x0000000e,
++0x0000001b,0x0000001a,0x00050041,0x0000001e,
++0x0000001f,0x0000001d,0x0000001b,0x0004003d,
++0x00000010,0x00000020,0x0000001f,0x00050051,
++0x00000006,0x00000023,0x00000020,0x00000000,
++0x00050051,0x00000006,0x00000024,0x00000020,
++0x00000001,0x00070050,0x00000007,0x00000025,
++0x00000023,0x00000024,0x00000021,0x00000022,
++0x00050041,0x00000026,0x00000027,0x0000000d,
++0x0000000f,0x0003003e,0x00000027,0x00000025,
++0x00050041,0x0000002d,0x0000002e,0x0000002b,
++0x0000002c,0x0004003d,0x00000008,0x0000002f,
++0x0000002e,0x00040070,0x00000006,0x00000030,
++0x0000002f,0x00050085,0x00000006,0x00000032,
++0x00000030,0x00000038,0x00050041,0x0000002d,
++0x00000033,0x0000002b,0x00000009,0x0004003d,
++0x00000008,0x00000034,0x00000033,0x00040070,
++0x00000006,0x00000035,0x00000034,0x00050085,
++0x00000006,0x00000036,0x00000035,0x00000038,
++0x00070050,0x00000007,0x00000037,0x00000032,
++0x00000036,0x00000021,0x00000022,0x0003003e,
++0x00000028,0x00000037,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..cfce2d234e095076c934abe207ce5d9f9502f44d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/metal_vertex_fetch_shaders/generate.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in fetch.vert fetch_single.vert fetch_high_location.vert \
++              fetch.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/test_metal_vertex_fetch.cpp b/src/kosmickrisp/vulkan/tests/test_metal_vertex_fetch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b98a21e9ea1c4528b42df804231032acd64c359
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_metal_vertex_fetch.cpp
+@@ -0,0 +1,1058 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* KosmicKrisp lets Metal fetch vertex attributes through an MTLVertexDescriptor
++ * on the render-pipeline descriptor whenever kk_vertex_input_is_metal_expressible
++ * accepts the state, instead of baking formats, strides and offsets into the
++ * vertex shader with kk_lower_vs_vbo.  That keeps the vertex shader independent
++ * of the vertex-input state, which belongs to a different pipeline library, so
++ * a library can compile it before the link.
++ *
++ * Metal then owns the whole fetch - the format conversion, the attribute's
++ * offset inside its buffer, the buffer's stride and its step function - so this
++ * draws one fully covered target from two bindings at once: an interleaved
++ * per-vertex buffer holding float32 positions, an 8-bit normalized colour and a
++ * 16-bit normalized coordinate and an 8-bit unsigned integer pair at four
++ * different offsets, and a separate
++ * per-instance buffer holding a float32 scale.  Two instances cover different
++ * halves of the target, so a per-instance attribute that did not advance would
++ * show as two identical halves.  Every channel is compared against the value
++ * the host decoded from the same bytes.
++ *
++ * The same vertex stage is then linked against the generated fragment stages
++ * KosmicKrisp precompiles for point and line rasterization, because those are
++ * built separately and have to agree with a vertex function that takes its
++ * attributes through [[stage_in]] rather than reading them itself.
++ *
++ * MESA_KK_DEBUG=no_metal_vertex_fetch forces the shader-lowered path, so the
++ * two can be compared without a rebuild.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "metal_vertex_fetch_shaders/fetch.vert.h"
++   ;
++static const uint32_t vertex_single_spirv[] =
++#include "metal_vertex_fetch_shaders/fetch_single.vert.h"
++   ;
++static const uint32_t vertex_high_location_spirv[] =
++#include "metal_vertex_fetch_shaders/fetch_high_location.vert.h"
++   ;
++static const uint32_t fragment_spirv[] =
++#include "metal_vertex_fetch_shaders/fetch.frag.h"
++   ;
++
++static const uint32_t kExtent = 4u;
++
++/* One interleaved per-vertex record: a float32 position, an 8-bit normalized
++ * colour and a 16-bit normalized coordinate, each at its own offset. */
++struct Vertex {
++   float x;
++   float y;
++   uint8_t colour[4];
++   uint16_t uv[2];
++   uint8_t index[2];
++   uint8_t pad[2];
++};
++static_assert(sizeof(Vertex) == 20, "interleaved stride");
++
++/* Instance 0 covers the upper half of the target and instance 1 the lower one,
++ * because the vertex shader adds the instance index to the clip-space Y. */
++static const float kScale[2] = {0.25f, 1.0f};
++
++static const uint8_t kColour[4] = {153u, 40u, 200u, 64u};
++static const uint16_t kUv[2] = {49151u, 12000u};
++static const uint8_t kIndex[2] = {200u, 7u};
++
++int main()
++{
++   VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   application.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &application;
++
++   VkInstance instance = VK_NULL_HANDLE;
++   {
++      LOAD_I(vkCreateInstance);
++      require(vkCreateInstance(&instance_info, nullptr, &instance) == VK_SUCCESS,
++              "vkCreateInstance");
++   }
++
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++
++   uint32_t device_count = 0;
++   require(vkEnumeratePhysicalDevices(instance, &device_count, nullptr) ==
++              VK_SUCCESS,
++           "vkEnumeratePhysicalDevices");
++   require(device_count > 0, "no physical device");
++   std::vector<VkPhysicalDevice> physical_devices(device_count);
++   require(vkEnumeratePhysicalDevices(instance, &device_count,
++                                      physical_devices.data()) == VK_SUCCESS,
++           "vkEnumeratePhysicalDevices");
++   VkPhysicalDevice physical_device = physical_devices[0];
++
++   VkPhysicalDeviceProperties properties{};
++   vkGetPhysicalDeviceProperties(physical_device, &properties);
++   std::printf("%s\n", properties.deviceName);
++
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count,
++                                            nullptr);
++   std::vector<VkQueueFamilyProperties> families(family_count);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count,
++                                            families.data());
++   uint32_t family = UINT32_MAX;
++   for (uint32_t i = 0; i < family_count; ++i) {
++      if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++         family = i;
++         break;
++      }
++   }
++   require(family != UINT32_MAX, "no graphics queue");
++
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info{
++      VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++   queue_info.queueFamilyIndex = family;
++   queue_info.queueCount = 1;
++   queue_info.pQueuePriorities = &priority;
++
++   VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_features{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
++   divisor_features.vertexAttributeInstanceRateDivisor = VK_TRUE;
++   divisor_features.vertexAttributeInstanceRateZeroDivisor = VK_TRUE;
++   VkPhysicalDeviceVulkan13Features vulkan13{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++   vulkan13.dynamicRendering = VK_TRUE;
++   vulkan13.pNext = &divisor_features;
++   static const char *const device_extensions[] = {
++      VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME};
++   VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++   device_info.pNext = &vulkan13;
++   device_info.queueCreateInfoCount = 1;
++   device_info.pQueueCreateInfos = &queue_info;
++   device_info.enabledExtensionCount = 1;
++   device_info.ppEnabledExtensionNames = device_extensions;
++
++   VkDevice device = VK_NULL_HANDLE;
++   require(vkCreateDevice(physical_device, &device_info, nullptr, &device) ==
++              VK_SUCCESS,
++           "vkCreateDevice");
++
++   {
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdSetBlendConstants);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkCmdBindVertexBuffers);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
++      auto memory_type = [&](uint32_t bits, VkMemoryPropertyFlags want) {
++         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
++            if ((bits & (1u << i)) &&
++                (memory_properties.memoryTypes[i].propertyFlags & want) == want)
++               return i;
++         }
++         require(false, "no memory type");
++         return 0u;
++      };
++
++      /* The interleaved per-vertex buffer: two triangles covering the upper
++       * half of clip space, which the instance index then shifts. */
++      const Vertex vertices[6] = {
++         {-1.0f, -1.0f, {kColour[0], kColour[1], kColour[2], kColour[3]},
++          {kUv[0], kUv[1]},
++          {kIndex[0], kIndex[1]},
++          {0u, 0u}},
++         {1.0f, -1.0f, {kColour[0], kColour[1], kColour[2], kColour[3]},
++          {kUv[0], kUv[1]},
++          {kIndex[0], kIndex[1]},
++          {0u, 0u}},
++         {-1.0f, 0.0f, {kColour[0], kColour[1], kColour[2], kColour[3]},
++          {kUv[0], kUv[1]},
++          {kIndex[0], kIndex[1]},
++          {0u, 0u}},
++         {1.0f, -1.0f, {kColour[0], kColour[1], kColour[2], kColour[3]},
++          {kUv[0], kUv[1]},
++          {kIndex[0], kIndex[1]},
++          {0u, 0u}},
++         {1.0f, 0.0f, {kColour[0], kColour[1], kColour[2], kColour[3]},
++          {kUv[0], kUv[1]},
++          {kIndex[0], kIndex[1]},
++          {0u, 0u}},
++         {-1.0f, 0.0f, {kColour[0], kColour[1], kColour[2], kColour[3]},
++          {kUv[0], kUv[1]},
++          {kIndex[0], kIndex[1]},
++          {0u, 0u}},
++      };
++
++      auto make_buffer = [&](VkDeviceSize size, VkBufferUsageFlags usage,
++                             VkBuffer *buffer, VkDeviceMemory *memory,
++                             void **map) {
++         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++         info.size = size;
++         info.usage = usage;
++         require(vkCreateBuffer(device, &info, nullptr, buffer) == VK_SUCCESS,
++                 "vkCreateBuffer");
++         VkMemoryRequirements requirements{};
++         vkGetBufferMemoryRequirements(device, *buffer, &requirements);
++         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++         allocate.allocationSize = requirements.size;
++         allocate.memoryTypeIndex =
++            memory_type(requirements.memoryTypeBits,
++                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++         require(vkAllocateMemory(device, &allocate, nullptr, memory) ==
++                    VK_SUCCESS,
++                 "vkAllocateMemory");
++         require(vkBindBufferMemory(device, *buffer, *memory, 0) == VK_SUCCESS,
++                 "vkBindBufferMemory");
++         if (map)
++            require(vkMapMemory(device, *memory, 0, size, 0, map) == VK_SUCCESS,
++                    "vkMapMemory");
++      };
++
++      VkBuffer vertex_buffer = VK_NULL_HANDLE;
++      VkDeviceMemory vertex_memory = VK_NULL_HANDLE;
++      void *vertex_map = nullptr;
++      make_buffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                  &vertex_buffer, &vertex_memory, &vertex_map);
++      std::memcpy(vertex_map, vertices, sizeof(vertices));
++
++      VkBuffer instance_buffer = VK_NULL_HANDLE;
++      VkDeviceMemory instance_memory = VK_NULL_HANDLE;
++      void *instance_map = nullptr;
++      make_buffer(sizeof(kScale), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                  &instance_buffer, &instance_memory, &instance_map);
++      std::memcpy(instance_map, kScale, sizeof(kScale));
++
++      VkShaderModuleCreateInfo module_info{
++         VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++      module_info.codeSize = sizeof(vertex_spirv);
++      module_info.pCode = vertex_spirv;
++      VkShaderModule vertex_module = VK_NULL_HANDLE;
++      require(vkCreateShaderModule(device, &module_info, nullptr,
++                                   &vertex_module) == VK_SUCCESS,
++              "vkCreateShaderModule vertex");
++      module_info.codeSize = sizeof(fragment_spirv);
++      module_info.pCode = fragment_spirv;
++      VkShaderModule fragment_module = VK_NULL_HANDLE;
++      require(vkCreateShaderModule(device, &module_info, nullptr,
++                                   &fragment_module) == VK_SUCCESS,
++              "vkCreateShaderModule fragment");
++
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      require(vkCreatePipelineLayout(device, &layout_info, nullptr, &layout) ==
++                 VK_SUCCESS,
++              "vkCreatePipelineLayout");
++
++      VkCommandPoolCreateInfo pool_info{
++         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++      pool_info.queueFamilyIndex = family;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      require(vkCreateCommandPool(device, &pool_info, nullptr, &pool) ==
++                 VK_SUCCESS,
++              "vkCreateCommandPool");
++      VkCommandBufferAllocateInfo command_allocate{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      command_allocate.commandPool = pool;
++      command_allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      command_allocate.commandBufferCount = 1;
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      require(vkAllocateCommandBuffers(device, &command_allocate, &command) ==
++                 VK_SUCCESS,
++              "vkAllocateCommandBuffers");
++      VkQueue queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, family, 0, &queue);
++
++      VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      image_info.imageType = VK_IMAGE_TYPE_2D;
++      image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++      image_info.extent = {kExtent, kExtent, 1u};
++      image_info.mipLevels = 1;
++      image_info.arrayLayers = 1;
++      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      VkImage image = VK_NULL_HANDLE;
++      require(vkCreateImage(device, &image_info, nullptr, &image) == VK_SUCCESS,
++              "vkCreateImage");
++      VkMemoryRequirements image_requirements{};
++      vkGetImageMemoryRequirements(device, image, &image_requirements);
++      VkMemoryAllocateInfo image_allocate{
++         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      image_allocate.allocationSize = image_requirements.size;
++      image_allocate.memoryTypeIndex = memory_type(
++         image_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      VkDeviceMemory image_memory = VK_NULL_HANDLE;
++      require(vkAllocateMemory(device, &image_allocate, nullptr,
++                               &image_memory) == VK_SUCCESS,
++              "vkAllocateMemory image");
++      require(vkBindImageMemory(device, image, image_memory, 0) == VK_SUCCESS,
++              "vkBindImageMemory");
++      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view_info.image = image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++      view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      VkImageView view = VK_NULL_HANDLE;
++      require(vkCreateImageView(device, &view_info, nullptr, &view) ==
++                 VK_SUCCESS,
++              "vkCreateImageView");
++
++      const VkDeviceSize readback_size = kExtent * kExtent * 4u;
++      VkBuffer readback = VK_NULL_HANDLE;
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      void *mapped = nullptr;
++      make_buffer(readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback,
++                  &readback_memory, &mapped);
++
++      VkPipelineShaderStageCreateInfo stages[2]{};
++      stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++      stages[0].module = vertex_module;
++      stages[0].pName = "main";
++      stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++      stages[1].module = fragment_module;
++      stages[1].pName = "main";
++
++      const VkVertexInputBindingDescription bindings[2] = {
++         {0u, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX},
++         {1u, sizeof(float), VK_VERTEX_INPUT_RATE_INSTANCE},
++      };
++      const VkVertexInputAttributeDescription attributes[5] = {
++         {0u, 0u, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, x)},
++         {1u, 0u, VK_FORMAT_R8G8B8A8_UNORM, offsetof(Vertex, colour)},
++         {2u, 0u, VK_FORMAT_R16G16_UNORM, offsetof(Vertex, uv)},
++         {3u, 1u, VK_FORMAT_R32_SFLOAT, 0u},
++         {4u, 0u, VK_FORMAT_R8G8_UINT, offsetof(Vertex, index)},
++      };
++      VkPipelineVertexInputStateCreateInfo vertex_input{
++         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      vertex_input.vertexBindingDescriptionCount = 2;
++      vertex_input.pVertexBindingDescriptions = bindings;
++      vertex_input.vertexAttributeDescriptionCount = 5;
++      vertex_input.pVertexAttributeDescriptions = attributes;
++
++      VkPipelineInputAssemblyStateCreateInfo input_assembly{
++         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++      VkViewport viewport{0.0f, 0.0f, (float)kExtent, (float)kExtent, 0.0f,
++                          1.0f};
++      VkRect2D scissor{{0, 0}, {kExtent, kExtent}};
++      VkPipelineViewportStateCreateInfo viewport_state{
++         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++      viewport_state.viewportCount = 1;
++      viewport_state.pViewports = &viewport;
++      viewport_state.scissorCount = 1;
++      viewport_state.pScissors = &scissor;
++      VkPipelineRasterizationStateCreateInfo rasterization{
++         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      rasterization.polygonMode = VK_POLYGON_MODE_FILL;
++      rasterization.cullMode = VK_CULL_MODE_NONE;
++      rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++      rasterization.lineWidth = 1.0f;
++      VkPipelineMultisampleStateCreateInfo multisample{
++         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++      multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++      VkPipelineColorBlendAttachmentState attachment{};
++      attachment.colorWriteMask =
++         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++      VkPipelineColorBlendStateCreateInfo colour_blend{
++         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++      colour_blend.attachmentCount = 1;
++      colour_blend.pAttachments = &attachment;
++      VkFormat colour_format = VK_FORMAT_R8G8B8A8_UNORM;
++      VkPipelineRenderingCreateInfo rendering{
++         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      rendering.colorAttachmentCount = 1;
++      rendering.pColorAttachmentFormats = &colour_format;
++      VkGraphicsPipelineCreateInfo pipeline_info{
++         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      pipeline_info.pNext = &rendering;
++      pipeline_info.stageCount = 2;
++      pipeline_info.pStages = stages;
++      pipeline_info.pVertexInputState = &vertex_input;
++      pipeline_info.pInputAssemblyState = &input_assembly;
++      pipeline_info.pViewportState = &viewport_state;
++      pipeline_info.pRasterizationState = &rasterization;
++      pipeline_info.pMultisampleState = &multisample;
++      pipeline_info.pColorBlendState = &colour_blend;
++      pipeline_info.layout = layout;
++      VkPipeline pipeline = VK_NULL_HANDLE;
++      require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                        &pipeline_info, nullptr,
++                                        &pipeline) == VK_SUCCESS,
++              "vkCreateGraphicsPipelines");
++
++      VkCommandBufferBeginInfo begin{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++              "vkBeginCommandBuffer");
++      VkImageMemoryBarrier to_colour{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      to_colour.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      to_colour.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      to_colour.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      to_colour.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      to_colour.image = image;
++      to_colour.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                           nullptr, 0, nullptr, 1, &to_colour);
++
++      VkRenderingAttachmentInfo colour{
++         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++      colour.imageView = view;
++      colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      colour.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++      colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      for (uint32_t i = 0; i < 4; ++i)
++         colour.clearValue.color.float32[i] = 0.0f;
++      VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++      rendering_info.renderArea = scissor;
++      rendering_info.layerCount = 1;
++      rendering_info.colorAttachmentCount = 1;
++      rendering_info.pColorAttachments = &colour;
++
++      vkCmdBeginRendering(command, &rendering_info);
++      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++      const VkBuffer vertex_buffers[2] = {vertex_buffer, instance_buffer};
++      const VkDeviceSize offsets[2] = {0u, 0u};
++      vkCmdBindVertexBuffers(command, 0, 2, vertex_buffers, offsets);
++      vkCmdDraw(command, 6, 2, 0, 0);
++      vkCmdEndRendering(command);
++
++      VkImageMemoryBarrier to_source{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      to_source.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      to_source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++      to_source.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      to_source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++      to_source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      to_source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      to_source.image = image;
++      to_source.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      vkCmdPipelineBarrier(command,
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                           nullptr, 1, &to_source);
++      VkBufferImageCopy copy{};
++      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++      copy.imageExtent = {kExtent, kExtent, 1u};
++      vkCmdCopyImageToBuffer(command, image,
++                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
++                             &copy);
++      require(vkEndCommandBuffer(command) == VK_SUCCESS, "vkEndCommandBuffer");
++      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++      submit.commandBufferCount = 1;
++      submit.pCommandBuffers = &command;
++      require(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS,
++              "vkQueueSubmit");
++      require(vkQueueWaitIdle(queue) == VK_SUCCESS, "vkQueueWaitIdle");
++
++      const uint8_t *pixels = static_cast<const uint8_t *>(mapped);
++      int failures = 0;
++      for (uint32_t row = 0; row < kExtent; ++row) {
++         /* Clip space Y runs down the target, so the first instance covers the
++          * top half and the second the bottom one. */
++         const uint32_t instance = row < kExtent / 2u ? 0u : 1u;
++         const float expected[4] = {
++            kColour[0] / 255.0f,
++            kUv[0] / 65535.0f,
++            kScale[instance],
++            kIndex[0] / 255.0f,
++         };
++         for (uint32_t column = 0; column < kExtent; ++column) {
++            const uint8_t *texel = pixels + (row * kExtent + column) * 4u;
++            for (uint32_t c = 0; c < 4; ++c) {
++               const float got = texel[c] / 255.0f;
++               if (std::fabs(got - expected[c]) > 1.5f / 255.0f) {
++                  std::fprintf(stderr,
++                               "row %u column %u channel %u is %.4f, "
++                               "expected %.4f\n",
++                               row, column, c, got, expected[c]);
++                  ++failures;
++               }
++            }
++         }
++      }
++      std::printf("  interleaved float32/unorm8/unorm16/uint8 + per-instance "
++                  "float32   %s\n",
++                  failures == 0 ? "ok" : "WRONG");
++
++      VkShaderModule single_module_kept = VK_NULL_HANDLE;
++      /* A pipeline whose only vertex input is one attribute, the shape dEQP's
++       * vertex_input single_attribute cases use. */
++      {
++         module_info.codeSize = sizeof(vertex_single_spirv);
++         module_info.pCode = vertex_single_spirv;
++         VkShaderModule single_module = VK_NULL_HANDLE;
++         require(vkCreateShaderModule(device, &module_info, nullptr,
++                                      &single_module) == VK_SUCCESS,
++                 "vkCreateShaderModule single");
++
++         const uint8_t single_data[3][4] = {
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {kIndex[0], kIndex[1], 0u, 0u},
++         };
++         VkBuffer single_buffer = VK_NULL_HANDLE;
++         VkDeviceMemory single_memory = VK_NULL_HANDLE;
++         void *single_map = nullptr;
++         make_buffer(sizeof(single_data), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                     &single_buffer, &single_memory, &single_map);
++         std::memcpy(single_map, single_data, sizeof(single_data));
++
++         VkPipelineShaderStageCreateInfo single_stages[2] = {stages[0],
++                                                             stages[1]};
++         single_stages[0].module = single_module;
++         const VkVertexInputBindingDescription single_binding = {
++            0u, 4u, VK_VERTEX_INPUT_RATE_VERTEX};
++         const VkVertexInputAttributeDescription single_attribute = {
++            5u, 0u, VK_FORMAT_R8G8_UINT, 0u};
++         VkPipelineVertexInputStateCreateInfo single_input{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         single_input.vertexBindingDescriptionCount = 1;
++         single_input.pVertexBindingDescriptions = &single_binding;
++         single_input.vertexAttributeDescriptionCount = 1;
++         single_input.pVertexAttributeDescriptions = &single_attribute;
++
++         VkGraphicsPipelineCreateInfo single_info = pipeline_info;
++         single_info.pStages = single_stages;
++         single_info.pVertexInputState = &single_input;
++         VkPipeline single_pipeline = VK_NULL_HANDLE;
++         require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                           &single_info, nullptr,
++                                           &single_pipeline) == VK_SUCCESS,
++                 "vkCreateGraphicsPipelines single");
++
++         require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                 "vkBeginCommandBuffer single");
++         to_colour.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++         to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                              0, nullptr, 0, nullptr, 1, &to_colour);
++         vkCmdBeginRendering(command, &rendering_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                           single_pipeline);
++         const VkDeviceSize single_offset = 0u;
++         vkCmdBindVertexBuffers(command, 0, 1, &single_buffer, &single_offset);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         vkCmdEndRendering(command);
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++         vkCmdCopyImageToBuffer(command, image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &copy);
++         require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                 "vkEndCommandBuffer single");
++         require(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS,
++                 "vkQueueSubmit single");
++         require(vkQueueWaitIdle(queue) == VK_SUCCESS, "vkQueueWaitIdle single");
++
++         const float single_expected[4] = {kIndex[0] / 255.0f,
++                                           kIndex[1] / 255.0f, 0.0f, 1.0f};
++         int single_failures = 0;
++         for (uint32_t p = 0; p < kExtent * kExtent; ++p) {
++            for (uint32_t c = 0; c < 4; ++c) {
++               const float got = pixels[p * 4u + c] / 255.0f;
++               if (std::fabs(got - single_expected[c]) > 1.5f / 255.0f) {
++                  std::fprintf(stderr,
++                               "single: pixel %u channel %u is %.4f, "
++                               "expected %.4f\n",
++                               p, c, got, single_expected[c]);
++                  ++single_failures;
++               }
++            }
++         }
++         std::printf("  single uint8 attribute at location 5              "
++                     "        %s\n",
++                     single_failures == 0 ? "ok" : "WRONG");
++         failures += single_failures;
++
++         vkDestroyPipeline(device, single_pipeline, nullptr);
++         vkDestroyBuffer(device, single_buffer, nullptr);
++         vkFreeMemory(device, single_memory, nullptr);
++         single_module_kept = single_module;
++      }
++
++      /* A zero attribute divisor reads the element at firstInstance, which
++       * Metal's constant step function cannot express, so this pipeline takes
++       * the shader-lowered path.  It is kept here because the Metal path
++       * reached it before the predicate rejected it, aborting the process
++       * inside MTLVertexDescriptor validation. */
++      {
++         const uint8_t divisor_data[2][4] = {
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {9u, 9u, 0u, 0u},
++         };
++         VkBuffer divisor_buffer = VK_NULL_HANDLE;
++         VkDeviceMemory divisor_memory = VK_NULL_HANDLE;
++         void *divisor_map = nullptr;
++         make_buffer(sizeof(divisor_data), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                     &divisor_buffer, &divisor_memory, &divisor_map);
++         std::memcpy(divisor_map, divisor_data, sizeof(divisor_data));
++
++         VkPipelineShaderStageCreateInfo divisor_stages[2] = {stages[0],
++                                                              stages[1]};
++         divisor_stages[0].module = single_module_kept;
++         const VkVertexInputBindingDescription divisor_binding = {
++            0u, 4u, VK_VERTEX_INPUT_RATE_INSTANCE};
++         const VkVertexInputAttributeDescription divisor_attribute = {
++            5u, 0u, VK_FORMAT_R8G8_UINT, 0u};
++         const VkVertexInputBindingDivisorDescriptionEXT zero_divisor = {0u, 0u};
++         VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT};
++         divisor_state.vertexBindingDivisorCount = 1;
++         divisor_state.pVertexBindingDivisors = &zero_divisor;
++         VkPipelineVertexInputStateCreateInfo divisor_input{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         divisor_input.pNext = &divisor_state;
++         divisor_input.vertexBindingDescriptionCount = 1;
++         divisor_input.pVertexBindingDescriptions = &divisor_binding;
++         divisor_input.vertexAttributeDescriptionCount = 1;
++         divisor_input.pVertexAttributeDescriptions = &divisor_attribute;
++
++         VkGraphicsPipelineCreateInfo divisor_info = pipeline_info;
++         divisor_info.pStages = divisor_stages;
++         divisor_info.pVertexInputState = &divisor_input;
++         VkPipeline divisor_pipeline = VK_NULL_HANDLE;
++         require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                           &divisor_info, nullptr,
++                                           &divisor_pipeline) == VK_SUCCESS,
++                 "vkCreateGraphicsPipelines divisor");
++
++         require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                 "vkBeginCommandBuffer divisor");
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                              0, nullptr, 0, nullptr, 1, &to_colour);
++         vkCmdBeginRendering(command, &rendering_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                           divisor_pipeline);
++         const VkDeviceSize divisor_offset = 0u;
++         vkCmdBindVertexBuffers(command, 0, 1, &divisor_buffer,
++                                &divisor_offset);
++         /* Two instances, and both must read element zero. */
++         vkCmdDraw(command, 3, 2, 0, 0);
++         vkCmdEndRendering(command);
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++         vkCmdCopyImageToBuffer(command, image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &copy);
++         require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                 "vkEndCommandBuffer divisor");
++         require(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS,
++                 "vkQueueSubmit divisor");
++         require(vkQueueWaitIdle(queue) == VK_SUCCESS,
++                 "vkQueueWaitIdle divisor");
++
++         const float divisor_expected[4] = {kIndex[0] / 255.0f,
++                                            kIndex[1] / 255.0f, 0.0f, 1.0f};
++         int divisor_failures = 0;
++         for (uint32_t p = 0; p < kExtent * kExtent; ++p) {
++            for (uint32_t c = 0; c < 4; ++c) {
++               const float got = pixels[p * 4u + c] / 255.0f;
++               if (std::fabs(got - divisor_expected[c]) > 1.5f / 255.0f) {
++                  std::fprintf(stderr,
++                               "divisor: pixel %u channel %u is %.4f, "
++                               "expected %.4f\n",
++                               p, c, got, divisor_expected[c]);
++                  ++divisor_failures;
++               }
++            }
++         }
++         std::printf("  zero attribute divisor                            "
++                     "        %s\n",
++                     divisor_failures == 0 ? "ok" : "WRONG");
++         failures += divisor_failures;
++
++         vkDestroyPipeline(device, divisor_pipeline, nullptr);
++         vkDestroyBuffer(device, divisor_buffer, nullptr);
++         vkFreeMemory(device, divisor_memory, nullptr);
++      }
++
++      /* Metal's own fetch reads its vertex buffers out of the command buffer's
++       * argument table, and Metal 4 allows that table at most 31 buffer binds.
++       * Three of them are the root descriptor table, the sampler table and the
++       * per-draw data, so a binding past the slots those leave has nowhere
++       * native to sit and keeps the shader-lowered fetch, which reads its
++       * buffers through the root table and needs no bind of its own.
++       * maxVertexInputBindings therefore stays what the device advertises. */
++      {
++         require(properties.limits.maxVertexInputBindings >= 32u,
++                 "maxVertexInputBindings");
++         const uint32_t last_binding =
++            properties.limits.maxVertexInputBindings - 1u;
++         const uint8_t last_binding_data[3][4] = {
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {kIndex[0], kIndex[1], 0u, 0u},
++         };
++         VkBuffer last_binding_buffer = VK_NULL_HANDLE;
++         VkDeviceMemory last_binding_memory = VK_NULL_HANDLE;
++         void *last_binding_map = nullptr;
++         make_buffer(sizeof(last_binding_data),
++                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &last_binding_buffer,
++                     &last_binding_memory, &last_binding_map);
++         std::memcpy(last_binding_map, last_binding_data,
++                     sizeof(last_binding_data));
++
++         VkPipelineShaderStageCreateInfo last_binding_stages[2] = {stages[0],
++                                                                   stages[1]};
++         last_binding_stages[0].module = single_module_kept;
++         const VkVertexInputBindingDescription last_binding_description = {
++            last_binding, 4u, VK_VERTEX_INPUT_RATE_VERTEX};
++         const VkVertexInputAttributeDescription last_binding_attribute = {
++            5u, last_binding, VK_FORMAT_R8G8_UINT, 0u};
++         VkPipelineVertexInputStateCreateInfo last_binding_input{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         last_binding_input.vertexBindingDescriptionCount = 1;
++         last_binding_input.pVertexBindingDescriptions =
++            &last_binding_description;
++         last_binding_input.vertexAttributeDescriptionCount = 1;
++         last_binding_input.pVertexAttributeDescriptions =
++            &last_binding_attribute;
++
++         VkGraphicsPipelineCreateInfo last_binding_info = pipeline_info;
++         last_binding_info.pStages = last_binding_stages;
++         last_binding_info.pVertexInputState = &last_binding_input;
++         VkPipeline last_binding_pipeline = VK_NULL_HANDLE;
++         require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                           &last_binding_info, nullptr,
++                                           &last_binding_pipeline) ==
++                    VK_SUCCESS,
++                 "vkCreateGraphicsPipelines last binding");
++
++         require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                 "vkBeginCommandBuffer last binding");
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                              0, nullptr, 0, nullptr, 1, &to_colour);
++         vkCmdBeginRendering(command, &rendering_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                           last_binding_pipeline);
++         const VkDeviceSize last_binding_offset = 0u;
++         vkCmdBindVertexBuffers(command, last_binding, 1, &last_binding_buffer,
++                                &last_binding_offset);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         vkCmdEndRendering(command);
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++         vkCmdCopyImageToBuffer(command, image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &copy);
++         require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                 "vkEndCommandBuffer last binding");
++         require(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS,
++                 "vkQueueSubmit last binding");
++         require(vkQueueWaitIdle(queue) == VK_SUCCESS,
++                 "vkQueueWaitIdle last binding");
++
++         const float last_binding_expected[4] = {kIndex[0] / 255.0f,
++                                                 kIndex[1] / 255.0f, 0.0f,
++                                                 1.0f};
++         int last_binding_failures = 0;
++         for (uint32_t p = 0; p < kExtent * kExtent; ++p) {
++            for (uint32_t c = 0; c < 4; ++c) {
++               const float got = pixels[p * 4u + c] / 255.0f;
++               if (std::fabs(got - last_binding_expected[c]) > 1.5f / 255.0f) {
++                  std::fprintf(stderr,
++                               "last binding: pixel %u channel %u is %.4f, "
++                               "expected %.4f\n",
++                               p, c, got, last_binding_expected[c]);
++                  ++last_binding_failures;
++               }
++            }
++         }
++         std::printf("  attribute at the last vertex binding              "
++                     "        %s\n",
++                     last_binding_failures == 0 ? "ok" : "WRONG");
++         failures += last_binding_failures;
++
++         vkDestroyPipeline(device, last_binding_pipeline, nullptr);
++         vkDestroyBuffer(device, last_binding_buffer, nullptr);
++         vkFreeMemory(device, last_binding_memory, nullptr);
++      }
++
++      /* MSL numbers an [[attribute(n)]] from zero to thirty while Vulkan
++       * advertises 32 vertex input attributes, so the last location has no
++       * Metal attribute to name it.  Asking Metal for one made the MSL fail to
++       * compile ("'attribute' attribute parameter is out of bounds: must be
++       * between 0 and 30"), so that location keeps the shader-lowered fetch and
++       * maxVertexInputAttributes stays what the device advertises. */
++      {
++         require(properties.limits.maxVertexInputAttributes >= 32u,
++                 "maxVertexInputAttributes");
++         module_info.codeSize = sizeof(vertex_high_location_spirv);
++         module_info.pCode = vertex_high_location_spirv;
++         VkShaderModule high_location_module = VK_NULL_HANDLE;
++         require(vkCreateShaderModule(device, &module_info, nullptr,
++                                      &high_location_module) == VK_SUCCESS,
++                 "vkCreateShaderModule high location");
++
++         const uint8_t high_location_data[3][4] = {
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {kIndex[0], kIndex[1], 0u, 0u},
++            {kIndex[0], kIndex[1], 0u, 0u},
++         };
++         VkBuffer high_location_buffer = VK_NULL_HANDLE;
++         VkDeviceMemory high_location_memory = VK_NULL_HANDLE;
++         void *high_location_map = nullptr;
++         make_buffer(sizeof(high_location_data),
++                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &high_location_buffer,
++                     &high_location_memory, &high_location_map);
++         std::memcpy(high_location_map, high_location_data,
++                     sizeof(high_location_data));
++
++         VkPipelineShaderStageCreateInfo high_location_stages[2] = {stages[0],
++                                                                    stages[1]};
++         high_location_stages[0].module = high_location_module;
++         const VkVertexInputBindingDescription high_location_binding = {
++            0u, 4u, VK_VERTEX_INPUT_RATE_VERTEX};
++         /* The shader declares this location; see fetch_high_location.vert. */
++         const VkVertexInputAttributeDescription high_location_attribute = {
++            31u, 0u, VK_FORMAT_R8G8_UINT, 0u};
++         VkPipelineVertexInputStateCreateInfo high_location_input{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         high_location_input.vertexBindingDescriptionCount = 1;
++         high_location_input.pVertexBindingDescriptions =
++            &high_location_binding;
++         high_location_input.vertexAttributeDescriptionCount = 1;
++         high_location_input.pVertexAttributeDescriptions =
++            &high_location_attribute;
++
++         VkGraphicsPipelineCreateInfo high_location_info = pipeline_info;
++         high_location_info.pStages = high_location_stages;
++         high_location_info.pVertexInputState = &high_location_input;
++         VkPipeline high_location_pipeline = VK_NULL_HANDLE;
++         require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                           &high_location_info, nullptr,
++                                           &high_location_pipeline) ==
++                    VK_SUCCESS,
++                 "vkCreateGraphicsPipelines high location");
++
++         require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                 "vkBeginCommandBuffer high location");
++         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                              0, nullptr, 0, nullptr, 1, &to_colour);
++         vkCmdBeginRendering(command, &rendering_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                           high_location_pipeline);
++         const VkDeviceSize high_location_offset = 0u;
++         vkCmdBindVertexBuffers(command, 0, 1, &high_location_buffer,
++                                &high_location_offset);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         vkCmdEndRendering(command);
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++         vkCmdCopyImageToBuffer(command, image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &copy);
++         require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                 "vkEndCommandBuffer high location");
++         require(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS,
++                 "vkQueueSubmit high location");
++         require(vkQueueWaitIdle(queue) == VK_SUCCESS,
++                 "vkQueueWaitIdle high location");
++
++         const float high_location_expected[4] = {kIndex[0] / 255.0f,
++                                                  kIndex[1] / 255.0f, 0.0f,
++                                                  1.0f};
++         int high_location_failures = 0;
++         for (uint32_t p = 0; p < kExtent * kExtent; ++p) {
++            for (uint32_t c = 0; c < 4; ++c) {
++               const float got = pixels[p * 4u + c] / 255.0f;
++               if (std::fabs(got - high_location_expected[c]) > 1.5f / 255.0f) {
++                  std::fprintf(stderr,
++                               "high location: pixel %u channel %u is %.4f, "
++                               "expected %.4f\n",
++                               p, c, got, high_location_expected[c]);
++                  ++high_location_failures;
++               }
++            }
++         }
++         std::printf("  attribute at the last vertex input location       "
++                     "        %s\n",
++                     high_location_failures == 0 ? "ok" : "WRONG");
++         failures += high_location_failures;
++
++         vkDestroyPipeline(device, high_location_pipeline, nullptr);
++         vkDestroyShaderModule(device, high_location_module, nullptr);
++         vkDestroyBuffer(device, high_location_buffer, nullptr);
++         vkFreeMemory(device, high_location_memory, nullptr);
++      }
++      /* KosmicKrisp precompiles bounded raster variants for point and line
++       * rasterization, and generates their fragment stages.  Those generated
++       * shaders are linked against the same vertex stage, so they have to
++       * agree with a vertex function that takes its attributes through
++       * [[stage_in]] rather than reading them itself. */
++      {
++         struct RasterCase {
++            const char *name;
++            VkPrimitiveTopology topology;
++            VkPolygonMode polygon_mode;
++         };
++         static const RasterCase raster_cases[] = {
++            {"point list", VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
++             VK_POLYGON_MODE_FILL},
++            {"line list", VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
++             VK_POLYGON_MODE_FILL},
++            {"polygon mode point", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
++             VK_POLYGON_MODE_POINT},
++            {"polygon mode line", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
++             VK_POLYGON_MODE_LINE},
++         };
++         for (const RasterCase &raster : raster_cases) {
++            VkPipelineInputAssemblyStateCreateInfo raster_assembly =
++               input_assembly;
++            raster_assembly.topology = raster.topology;
++            VkPipelineRasterizationStateCreateInfo raster_state = rasterization;
++            raster_state.polygonMode = raster.polygon_mode;
++
++            VkPipelineShaderStageCreateInfo raster_stages[2] = {stages[0],
++                                                                stages[1]};
++            raster_stages[0].module = single_module_kept;
++            const VkVertexInputBindingDescription raster_binding = {
++               0u, 4u, VK_VERTEX_INPUT_RATE_VERTEX};
++            const VkVertexInputAttributeDescription raster_attribute = {
++               5u, 0u, VK_FORMAT_R8G8_UINT, 0u};
++            VkPipelineVertexInputStateCreateInfo raster_input{
++               VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++            raster_input.vertexBindingDescriptionCount = 1;
++            raster_input.pVertexBindingDescriptions = &raster_binding;
++            raster_input.vertexAttributeDescriptionCount = 1;
++            raster_input.pVertexAttributeDescriptions = &raster_attribute;
++
++            VkGraphicsPipelineCreateInfo raster_info = pipeline_info;
++            raster_info.pStages = raster_stages;
++            raster_info.pVertexInputState = &raster_input;
++            raster_info.pInputAssemblyState = &raster_assembly;
++            raster_info.pRasterizationState = &raster_state;
++            VkPipeline raster_pipeline = VK_NULL_HANDLE;
++            const VkResult created = vkCreateGraphicsPipelines(
++               device, VK_NULL_HANDLE, 1, &raster_info, nullptr,
++               &raster_pipeline);
++            if (created != VK_SUCCESS) {
++               std::fprintf(stderr, "%s: vkCreateGraphicsPipelines %d\n",
++                            raster.name, created);
++               std::printf("  raster variant: %-26s WRONG\n", raster.name);
++               ++failures;
++               continue;
++            }
++            std::printf("  raster variant: %-26s ok\n", raster.name);
++            vkDestroyPipeline(device, raster_pipeline, nullptr);
++         }
++      }
++
++      vkDestroyShaderModule(device, single_module_kept, nullptr);
++
++      vkDestroyPipeline(device, pipeline, nullptr);
++      vkDestroyImageView(device, view, nullptr);
++      vkDestroyImage(device, image, nullptr);
++      vkFreeMemory(device, image_memory, nullptr);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      vkDestroyBuffer(device, vertex_buffer, nullptr);
++      vkFreeMemory(device, vertex_memory, nullptr);
++      vkDestroyBuffer(device, instance_buffer, nullptr);
++      vkFreeMemory(device, instance_memory, nullptr);
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyShaderModule(device, fragment_module, nullptr);
++      vkDestroyShaderModule(device, vertex_module, nullptr);
++      vkDestroyDevice(device, nullptr);
++
++      vkDestroyInstance(instance, nullptr);
++      return failures == 0 ? 0 : 1;
++   }
++}

@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 20:33:46 +0900
+Subject: [PATCH] gallium: return NULL for failed threaded buffer maps
+
+A driver buffer_map failure leaves the output transfer untouched, but the
+threaded context annotated it anyway and dereferenced an uninitialized
+pointer. A failed read used to populate a CPU shadow also published the
+uninitialized shadow as valid.
+
+Annotate a transfer only after the driver map succeeded. When populating a
+CPU shadow fails, free and unpublish the shadow, release the driver-thread
+marker, and return NULL so the same context can still map later.
+
+The gallium-threaded-map test drives the production threaded context with a
+minimal driver whose map fails once, covering synchronized, unsynchronized,
+thread-safe, and CPU-shadow paths and the recovery map afterwards.
+---
+ src/gallium/auxiliary/meson.build             |  14 ++
+ .../auxiliary/util/u_threaded_context.c       |  13 +-
+ .../util/u_threaded_context_test.cpp          | 177 ++++++++++++++++++
+ 3 files changed, 202 insertions(+), 2 deletions(-)
+ create mode 100644 src/gallium/auxiliary/util/u_threaded_context_test.cpp
+
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index b9385528911d1e5df6519b05f469c3360505420d..d6730a9715aa550350cce6213287cbc18ea95915 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -562,6 +562,20 @@ if with_tests
+       suite : 'gallium',
+       protocol : 'gtest',
+     )
++
++    test('gallium-threaded-map',
++      executable(
++        'gallium-threaded-map',
++        'util/u_threaded_context_test.cpp',
++        include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
++        link_with : libgallium,
++        dependencies : [idep_gtest, idep_mesautil],
++        override_options : ['cpp_std=c++20'],
++      ),
++      env : ['GALLIUM_THREAD=true'],
++      suite : 'gallium',
++      protocol : 'gtest',
++    )
+   endif
+ endif
+ 
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index 3ac16907116e6ffad2e9da107f799358a2ffb7e9..d498eb6fea9c8c37e75ebe2e24eb41f9e490273b 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -2774,6 +2774,13 @@ tc_buffer_map(struct pipe_context *_pipe,
+ 
+             void *ret = pipe->buffer_map(pipe, tres->latest ? tres->latest : resource,
+                                          0, PIPE_MAP_READ, &box2, &transfer2);
++            if (!ret) {
++               /* A failed read cannot publish an uninitialized CPU shadow. */
++               align_free(tres->cpu_storage);
++               tres->cpu_storage = NULL;
++               tc_clear_driver_thread(tc);
++               return NULL;
++            }
+             memcpy(&((uint8_t*)tres->cpu_storage)[tres->valid_buffer_range.start],
+                    ret,
+                    valid_range_len);
+@@ -2855,8 +2862,10 @@ tc_buffer_map(struct pipe_context *_pipe,
+ 
+    void *ret = pipe->buffer_map(pipe, tres->latest ? tres->latest : resource,
+                                 level, usage, box, transfer);
+-   threaded_transfer(*transfer)->valid_buffer_range = &tres->valid_buffer_range;
+-   threaded_transfer(*transfer)->cpu_storage_mapped = false;
++   if (ret) {
++      threaded_transfer(*transfer)->valid_buffer_range = &tres->valid_buffer_range;
++      threaded_transfer(*transfer)->cpu_storage_mapped = false;
++   }
+ 
+    if (!(usage & TC_TRANSFER_MAP_THREADED_UNSYNC))
+       tc_clear_driver_thread(tc);
+diff --git a/src/gallium/auxiliary/util/u_threaded_context_test.cpp b/src/gallium/auxiliary/util/u_threaded_context_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e138f5d6bd969519551593004050f1aee02d6ad9
+--- /dev/null
++++ b/src/gallium/auxiliary/util/u_threaded_context_test.cpp
+@@ -0,0 +1,177 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "util/box.h"
++#include "util/u_inlines.h"
++#include "util/u_threaded_context.h"
++#include "util/u_upload_mgr.h"
++#include <gtest/gtest.h>
++#include <array>
++#include <cstring>
++#include <type_traits>
++
++static pipe_caps
++map_caps()
++{
++   pipe_caps caps = {};
++   caps.prefer_real_buffer_in_constbuf0 = true;
++   caps.min_map_buffer_alignment = 64;
++   return caps;
++}
++
++struct map_driver {
++   pipe_context base = {};
++   struct threaded_transfer transfer = {};
++   std::array<unsigned char, 64> data = {};
++   unsigned maps = 0;
++   unsigned unmaps = 0;
++   bool fail = true;
++   bool destroyed = false;
++};
++static_assert(std::is_standard_layout_v<map_driver>);
++
++class threaded_map : public ::testing::Test {
++protected:
++   pipe_screen screen = {.caps = map_caps()};
++   map_driver driver;
++   struct threaded_resource resource = {};
++   slab_parent_pool pool = {};
++   pipe_context *pipe = nullptr;
++   struct threaded_context *tc = nullptr;
++
++   void SetUp() override
++   {
++      slab_create_parent(&pool, sizeof(struct threaded_transfer), 16);
++      resource.b.screen = &screen;
++      resource.b.target = PIPE_BUFFER;
++      resource.b.width0 = static_cast<unsigned>(driver.data.size());
++      resource.b.usage = PIPE_USAGE_STAGING;
++      pipe_reference_init(&resource.b.reference, 1);
++      threaded_resource_init(&resource.b, false);
++      util_range_add(&resource.b, &resource.valid_buffer_range, 8, 48);
++      driver.base.screen = &screen;
++      driver.base.buffer_map = [](pipe_context *ctx, pipe_resource *res,
++                                  unsigned level, unsigned usage,
++                                  const pipe_box *box, pipe_transfer **out) -> void * {
++         auto *state = reinterpret_cast<map_driver *>(ctx);
++         ++state->maps;
++         if (state->fail)
++            return nullptr; /* The output transfer is deliberately untouched. */
++         state->transfer = {};
++         state->transfer.b.resource = res;
++         state->transfer.b.level = level;
++         state->transfer.b.usage = static_cast<pipe_map_flags>(usage);
++         state->transfer.b.box = *box;
++         state->transfer.cpu_storage_mapped = true;
++         *out = &state->transfer.b;
++         return state->data.data() + box->x;
++      };
++      driver.base.buffer_unmap = [](pipe_context *ctx, pipe_transfer *transfer) {
++         auto *state = reinterpret_cast<map_driver *>(ctx);
++         EXPECT_EQ(transfer, &state->transfer.b);
++         ++state->unmaps;
++      };
++      driver.base.destroy = [](pipe_context *ctx) {
++         auto *state = reinterpret_cast<map_driver *>(ctx);
++         u_upload_destroy(ctx->stream_uploader);
++         state->destroyed = true;
++      };
++      driver.base.stream_uploader = u_upload_create_default(&driver.base);
++      ASSERT_NE(driver.base.stream_uploader, nullptr);
++      driver.base.const_uploader = driver.base.stream_uploader;
++      pipe = threaded_context_create(&driver.base, &pool, nullptr, nullptr, &tc);
++      ASSERT_NE(pipe, nullptr);
++      ASSERT_NE(pipe, &driver.base);
++      ASSERT_NE(tc, nullptr);
++      for (unsigned i = 0; i < driver.data.size(); ++i)
++         driver.data[i] = i ^ 0xa5;
++   }
++
++   void TearDown() override
++   {
++      if (pipe && pipe != &driver.base)
++         pipe->destroy(pipe);
++      else if (!driver.destroyed && driver.base.stream_uploader)
++         driver.base.destroy(&driver.base);
++      EXPECT_TRUE(driver.destroyed);
++      threaded_resource_deinit(&resource.b);
++      slab_destroy_parent(&pool);
++   }
++
++   void expect_caller_thread_released()
++   {
++#ifndef NDEBUG
++      const thrd_t empty = {};
++      EXPECT_EQ(std::memcmp(&tc->driver_thread, &empty, sizeof(empty)), 0);
++#endif
++   }
++
++   void check_direct_failure(unsigned usage)
++   {
++      pipe_box box;
++      u_box_1d(8, 16, &box);
++      pipe_transfer *transfer = nullptr;
++      EXPECT_EQ(pipe->buffer_map(pipe, &resource.b, 0, usage, &box, &transfer), nullptr);
++      EXPECT_EQ(transfer, nullptr);
++      EXPECT_EQ(driver.maps, 1u);
++      EXPECT_EQ(driver.unmaps, 0u);
++      EXPECT_EQ(resource.cpu_storage, nullptr);
++      expect_caller_thread_released();
++
++      /* The same context and resource must still perform a later valid map. */
++      driver.fail = false;
++      void *mapped = pipe->buffer_map(pipe, &resource.b, 0, usage, &box, &transfer);
++      ASSERT_EQ(mapped, driver.data.data() + 8);
++      ASSERT_EQ(transfer, &driver.transfer.b);
++      EXPECT_EQ(driver.transfer.valid_buffer_range, &resource.valid_buffer_range);
++      EXPECT_FALSE(driver.transfer.cpu_storage_mapped);
++      expect_caller_thread_released();
++      pipe->buffer_unmap(pipe, transfer);
++      EXPECT_EQ(threaded_context_unwrap_sync(pipe), &driver.base);
++      EXPECT_EQ(driver.maps, 2u);
++      EXPECT_EQ(driver.unmaps, 1u);
++   }
++};
++
++TEST_F(threaded_map, synchronized_driver_failure)
++{
++   check_direct_failure(PIPE_MAP_READ);
++}
++
++TEST_F(threaded_map, unsynchronized_driver_failure)
++{
++   check_direct_failure(PIPE_MAP_READ | PIPE_MAP_UNSYNCHRONIZED);
++}
++
++TEST_F(threaded_map, thread_safe_driver_failure)
++{
++   check_direct_failure(PIPE_MAP_WRITE | PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_THREAD_SAFE);
++}
++
++TEST_F(threaded_map, cpu_storage_population_failure)
++{
++   resource.allow_cpu_storage = true;
++   pipe_box box;
++   u_box_1d(8, 16, &box);
++   pipe_transfer *transfer = nullptr;
++   EXPECT_EQ(pipe->buffer_map(pipe, &resource.b, 0, PIPE_MAP_READ, &box, &transfer), nullptr);
++   EXPECT_EQ(transfer, nullptr);
++   EXPECT_EQ(resource.cpu_storage, nullptr);
++   EXPECT_EQ(driver.maps, 1u);
++   EXPECT_EQ(driver.unmaps, 0u);
++   EXPECT_EQ(resource.valid_buffer_range.start, 8u);
++   EXPECT_EQ(resource.valid_buffer_range.end, 48u);
++   expect_caller_thread_released();
++
++   /* Recovery uses the normal direct path, never a partial CPU shadow. */
++   resource.allow_cpu_storage = false;
++   driver.fail = false;
++   ASSERT_EQ(pipe->buffer_map(pipe, &resource.b, 0, PIPE_MAP_READ, &box, &transfer),
++             driver.data.data() + 8);
++   ASSERT_NE(transfer, nullptr);
++   pipe->buffer_unmap(pipe, transfer);
++   EXPECT_EQ(threaded_context_unwrap_sync(pipe), &driver.base);
++   EXPECT_EQ(driver.maps, 2u);
++   EXPECT_EQ(driver.unmaps, 1u);
++}

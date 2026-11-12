@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 07:06:41 +0900
+Subject: [PATCH] vrend: convert a Z24X8 depth by width, not by scale
+
+The guest keeps a Z24X8 texel as a 24-bit depth in the low bits of a
+word; the host reads and writes the same texel as a 32-bit normalised
+depth, so a transfer has to change the value's width. That was done by
+multiplying by 256 through a float, with the depth taken from the top
+24 bits of the word rather than the bottom. Every value therefore lost
+its low eight bits in each direction, and the guest's 0x00ffffff - a
+depth of exactly 1.0 - reached the host as 0xffff0000 and sampled back
+as 0.999985.
+
+Widening an unsigned normalised value is bit replication: 0x00ffffff
+becomes 0xffffffff, and narrowing is a shift that recovers the original
+exactly. Even an exact scale by 256 would not do, because it maps the
+largest 24-bit depth to 0xffffff00 and leaves it one part in 2^24 short
+of 1.0.
+
+The legacy pixel-transfer path keeps its GL_DEPTH_SCALE, which GL
+applies to the normalised value and which has never had the shift.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_renderer.c | 36 ++++++++++++++++++++++--------------
+ 1 file changed, 22 insertions(+), 14 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 88f8076b4389004eec8d17423e3b867596366a3a..2a95dd698b606e98104908c017e9d16cc032c52a 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -9175,19 +9175,29 @@ static void iov_buffer_upload(void *cookie, uint32_t doff, void *src, int len)
+    glBufferSubData(d->target, d->box->x + doff, len, src);
+ }
+ 
+-static void vrend_scale_depth(void *ptr, int size, float scale_val)
++/* The guest keeps a Z24X8 depth in the low 24 bits of a word while the host
++ * reads and writes the same texel as a 32-bit normalised depth. Widening an
++ * unsigned normalised value replicates its bits; it is not a multiply by 256,
++ * which leaves the largest 24-bit depth one part in 2^24 short of 1.0. The
++ * scaled form also read the depth out of the wrong half of the word, so the
++ * low eight bits of every value were lost in each direction.
++ */
++static void vrend_depth_24_to_32(void *ptr, int size)
+ {
+    GLuint *ival = ptr;
+-   const GLfloat myscale = 1.0f / 0xffffff;
+-   int i;
+-   for (i = 0; i < size / 4; i++) {
+-      GLuint value = ival[i];
+-      GLfloat d = ((float)(value >> 8) * myscale) * scale_val;
+-      d = CLAMP(d, 0.0F, 1.0F);
+-      ival[i] = (GLuint)(d / myscale) << 8;
++   for (int i = 0; i < size / 4; i++) {
++      const GLuint d24 = ival[i] & 0xffffff;
++      ival[i] = (d24 << 8) | (d24 >> 16);
+    }
+ }
+ 
++static void vrend_depth_32_to_24(void *ptr, int size)
++{
++   GLuint *ival = ptr;
++   for (int i = 0; i < size / 4; i++)
++      ival[i] = ival[i] >> 8;
++}
++
+ static void read_transfer_data(const struct iovec *iov,
+                                unsigned int num_iovs,
+                                char *data,
+@@ -9741,7 +9751,7 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+             if (!vrend_state.use_core_profile)
+                glPixelTransferf(GL_DEPTH_SCALE, depth_scale);
+             else
+-               vrend_scale_depth(data, send_size, depth_scale);
++               vrend_depth_24_to_32(data, send_size);
+          }
+          if (res->target == GL_TEXTURE_CUBE_MAP) {
+             GLenum ctarget = GL_TEXTURE_CUBE_MAP_POSITIVE_X + info->box->z;
+@@ -10128,7 +10138,7 @@ static int vrend_transfer_send_readpixels(struct vrend_context *ctx,
+       if (!vrend_state.use_core_profile)
+          glPixelTransferf(GL_DEPTH_SCALE, 1.0);
+       else
+-         vrend_scale_depth(data, send_size, depth_scale);
++         vrend_depth_32_to_24(data, send_size);
+    }
+ 
+    if (need_temp) {
+@@ -10724,10 +10734,8 @@ static void vrend_resource_copy_fallback(struct vrend_resource *src_res,
+       /* we get values from the guest as 24-bit scaled integers
+          but we give them to the host GL and it interprets them
+          as 32-bit scaled integers, so we need to scale them here */
+-      if (dst_res->base.format == VIRGL_FORMAT_Z24X8_UNORM) {
+-         float depth_scale = 256.0;
+-         vrend_scale_depth(tptr, total_size, depth_scale);
+-      }
++      if (dst_res->base.format == VIRGL_FORMAT_Z24X8_UNORM)
++         vrend_depth_24_to_32(tptr, total_size);
+ 
+       /* if this is a BGR* resource on GLES, the data needs to be manually swizzled to RGB* before
+        * storing in a texture. Iovec data is assumed to have the original byte-order, namely BGR*,

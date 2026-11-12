@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:28:37 +0900
+Subject: [PATCH] drm/virtio: pace the CRTC with a vblank timer
+
+virtio-gpu has no vertical blank and the driver set up no vblank
+support, so the atomic helpers completed every page flip as it was
+queued: the flip event and the CRTC's out-fence signalled before the
+device had the frame, at whatever rate the compositor committed.
+Android's drm_hwcomposer sleeps until a quarter of a period before the
+vblank it expects its commit to latch at and then commits, so it got a
+present fence that signalled up to a period before the time it asked
+for, which the CTS frame-timeline tests and VK_GOOGLE_display_timing
+measure.
+
+Pace the CRTC the way vkms does: initialise vblank handling for every
+scanout and let the DRM helpers run a timer at the mode's refresh rate.
+A flip event is armed for the next tick, and the timer runs only while
+something holds a vblank reference, so an idle display costs nothing. A
+client that flips faster than the refresh rate is now held to it, since
+the next commit waits for the previous flip event.
+
+The commit tail waits for the commit's own flip event rather than
+counting a vblank, as the default tail does. The default wait warns when
+it sees no vblank within 100 ms, which a loaded host can cause by
+delaying the timer, and the flip event completes on the same tick
+without the warning. No scanout needs either wait, because the host
+copies the frame when the driver flushes the resource and nothing scans
+out the old framebuffer afterwards. A commit must still complete on its
+flip, though: without any wait a blocking commit, a SETCRTC for
+instance, returns before its flip event, and the nonblocking page flip
+that a client queues next is refused with -EBUSY for up to a tick.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/virtio/virtgpu_display.c | 54 ++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index e265a06f2c06ab2b9c79384346cfcf8278bffe3b..7c31ff32787d99f2b4df14bdbe3e9a199ba6f6f3 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -32,6 +32,8 @@
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_vblank.h>
++#include <drm/drm_vblank_helper.h>
+ 
+ #include "virtgpu_drv.h"
+ 
+@@ -55,6 +57,7 @@ static const struct drm_crtc_funcs virtio_gpu_crtc_funcs = {
+ 	.reset                  = drm_atomic_helper_crtc_reset,
+ 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+ 	.atomic_destroy_state   = drm_atomic_helper_crtc_destroy_state,
++	DRM_CRTC_VBLANK_TIMER_FUNCS,
+ };
+ 
+ static const struct drm_framebuffer_funcs virtio_gpu_fb_funcs = {
+@@ -99,6 +102,7 @@ static void virtio_gpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ static void virtio_gpu_crtc_atomic_enable(struct drm_crtc *crtc,
+ 					  struct drm_atomic_state *state)
+ {
++	drm_crtc_vblank_atomic_enable(crtc, state);
+ }
+ 
+ static void virtio_gpu_crtc_atomic_disable(struct drm_crtc *crtc,
+@@ -110,6 +114,8 @@ static void virtio_gpu_crtc_atomic_disable(struct drm_crtc *crtc,
+ 
+ 	virtio_gpu_cmd_set_scanout(vgdev, output->index, 0, 0, 0, 0, 0);
+ 	virtio_gpu_notify(vgdev);
++
++	drm_crtc_vblank_atomic_disable(crtc, state);
+ }
+ 
+ static int virtio_gpu_crtc_atomic_check(struct drm_crtc *crtc,
+@@ -133,6 +139,15 @@ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	 */
+ 	if (drm_atomic_crtc_needs_modeset(crtc_state))
+ 		output->needs_modeset = true;
++
++	/*
++	 * The device has no vertical blank of its own, so the DRM core
++	 * paces the CRTC with a timer at the mode's refresh rate. A page
++	 * flip completes at the next tick rather than as soon as it is
++	 * queued, which is what a compositor that schedules frames against
++	 * the present fence assumes.
++	 */
++	drm_crtc_vblank_atomic_flush(crtc, state);
+ }
+ 
+ static const struct drm_crtc_helper_funcs virtio_gpu_crtc_helper_funcs = {
+@@ -331,6 +346,37 @@ static const struct drm_mode_config_funcs virtio_gpu_mode_funcs = {
+ 	.atomic_commit = drm_atomic_helper_commit,
+ };
+ 
++/*
++ * The default commit tail counts a vblank after it programs the planes and
++ * warns when it sees none within 100 ms. Here the vblank is a timer, which a
++ * loaded host can delay past that without anything being wrong. Wait for the
++ * commit's own flip event instead, which the same timer sends: a commit then
++ * still completes on the next tick, as it does on a device with a real
++ * vertical blank, so a client that queues a flip right after a blocking
++ * commit (a SETCRTC, say) is not refused with -EBUSY for the flip that is
++ * still pending.
++ *
++ * No scanout needs the wait: the host copies the frame when the driver
++ * flushes the resource, so nothing scans out the old framebuffer once the
++ * planes are programmed.
++ */
++static void virtio_gpu_commit_tail(struct drm_atomic_state *state)
++{
++	struct drm_device *dev = state->dev;
++
++	drm_atomic_helper_commit_modeset_disables(dev, state);
++	drm_atomic_helper_commit_planes(dev, state, 0);
++	drm_atomic_helper_commit_modeset_enables(dev, state);
++	drm_atomic_helper_fake_vblank(state);
++	drm_atomic_helper_commit_hw_done(state);
++	drm_atomic_helper_wait_for_flip_done(dev, state);
++	drm_atomic_helper_cleanup_planes(dev, state);
++}
++
++static const struct drm_mode_config_helper_funcs virtio_gpu_mode_helpers = {
++	.atomic_commit_tail = virtio_gpu_commit_tail,
++};
++
+ int virtio_gpu_modeset_init(struct virtio_gpu_device *vgdev)
+ {
+ 	int i, ret;
+@@ -342,8 +388,16 @@ int virtio_gpu_modeset_init(struct virtio_gpu_device *vgdev)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = drm_vblank_init(vgdev->ddev, vgdev->num_scanouts);
++	if (ret)
++		return ret;
++
++	/* The timer starts and stops at no cost, so nothing keeps it running. */
++	vgdev->ddev->vblank_disable_immediate = true;
++
+ 	vgdev->ddev->mode_config.quirk_addfb_prefer_host_byte_order = true;
+ 	vgdev->ddev->mode_config.funcs = &virtio_gpu_mode_funcs;
++	vgdev->ddev->mode_config.helper_private = &virtio_gpu_mode_helpers;
+ 
+ 	/* modes will be validated against the framebuffer size */
+ 	vgdev->ddev->mode_config.min_width = XRES_MIN;

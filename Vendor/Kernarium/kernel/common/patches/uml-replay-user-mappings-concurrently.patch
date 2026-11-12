@@ -1,0 +1,702 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 09:14:08 +0900
+Subject: [PATCH] uml: replay user mappings concurrently
+
+Threads of one process replayed their page-table changes to the Darwin
+software MMU one at a time, behind a sleeping per-mm turnstile taken with
+mmap_read_lock() held. A walk holds it for three or four microseconds and
+a waiter that sleeps pays a wakeup of several hundred, so eight threads
+of a 4 KiB guest that fault on fresh memory spent more time queued than
+running, and their vCPUs idled meanwhile: in one multi-core Geekbench
+Navigation run they waited 28 seconds in total on the turnstile for 2.6 of
+walking. A 4 KiB guest takes four times the faults of a 16 KiB one and
+bounded every x86-64 guest with it.
+
+Four changes, which a 4 KiB guest needs together:
+
+- A fault replayed the faulting page before asking Linux to resolve it,
+  in case the page was only missing from the shadow MMU. That is what a
+  fork or an mprotect() leaves behind, but seven in 388733 demand-paging
+  faults were of that kind. um_tlb_access_granted() samples the PTE
+  without a lock, and only a PTE which already grants the access is
+  replayed first. The answer is a hint: a stale one costs a spurious
+  fault or the replay it would have skipped.
+
+- Walkers of one user mm run together. Nothing in Linux orders them; the
+  host does. batch_begin() records the generation's invalidation epoch,
+  Linux invalidates the host range after it changes a PTE and before it
+  frees the page, every such invalidation advances the epoch, and
+  batch_end() publishes only while it still matches. What two walkers of
+  one page can still do is publish in the wrong order across a change
+  that needs no invalidation, and each of those makes the PTE more
+  permissive, so the stale batch leaves the page absent or less
+  accessible than Linux allows and the next access replays it. The
+  caller's own range joins its snapshot under one lock hold, so a sibling
+  cannot take it and leave the caller to return to an unpublished page.
+  The host walker call remains as the carrier's binding to the
+  generation; a host which still treats it as exclusive serializes the
+  walkers again, which is slower and no less correct.
+
+- A replay is published in batches of 64 pages, which span the ranges of
+  its snapshot, and only a rejected batch is walked again. After a fork, an exec or a flush_tlb_mm() the
+  pending range is the whole mm, and every sibling invalidation rejects
+  whatever batch is open: one batch for all of it started over for as
+  long as a sibling kept unmapping, with no scheduling point on the way.
+  An Android boot held a CPU in current_mm_sync() for 84 seconds, RCU
+  reported the stall and the boot took 621 seconds instead of 182. A
+  batch which was published stays sound when a later one is rejected,
+  because the invalidation that rejects it has already removed what it
+  covers from the host. Between batches no page-table lock, host batch
+  or walker binding is live, so after every batch it fills and every
+  sixteenth it loses the walker services its clock event and its IPIs
+  there and lets the scheduler run. A batch per range was tried first:
+  a fault's snapshot is a handful of single pages, every batch_end()
+  takes the generation's mappings lock exclusively, and eight threads
+  touching fresh memory lost a tenth of their throughput to it.
+
+- A user mm keeps exact pending ranges. They were rounded to the 16 KiB
+  Darwin host page, which is what a kernel mapping is made of, but a user
+  mm runs through the software MMU one Linux page at a time, and every
+  page a 4 KiB guest touched walked and published its three neighbours
+  again. The replay in front of a granted fault still takes the whole
+  16 KiB, because there the neighbours are usually missing as well.
+
+The Darwin enter_turnstile() and exit_turnstile() have no callers left
+and go; init_mm keeps its own serialized walker.
+
+Eight vCPUs, 4 KiB pages, same-session controls, with the host changes
+this needs: first-touch of fresh anonymous memory 593 -> 1490 MiB/s on
+one thread and 325 -> 995 on eight; multi-core File Compression 584 ->
+800, Navigation 997 -> 1444, Background Blur 721 -> 770, HDR 842 -> 896.
+---
+ arch/um/include/asm/pgtable.h      |  29 ++--
+ arch/um/include/asm/tlbflush.h     |   5 +-
+ arch/um/include/shared/skas/skas.h |   1 +
+ arch/um/kernel/skas/mmu_darwin.c   |  28 ----
+ arch/um/kernel/skas/process.c      |  62 ++++---
+ arch/um/kernel/tlb.c               | 260 +++++++++++++++++++++++------
+ arch/um/os-Darwin/skas/process.c   |  14 +-
+ 7 files changed, 285 insertions(+), 114 deletions(-)
+
+diff --git a/arch/um/include/asm/pgtable.h b/arch/um/include/asm/pgtable.h
+index 54b72472a4e34fb4c88ff7aaf61e343a6e707c2a..29228c4941558ab2d4a5153991642c4659552891 100644
+--- a/arch/um/include/asm/pgtable.h
++++ b/arch/um/include/asm/pgtable.h
+@@ -282,26 +282,28 @@ static inline void set_pte(pte_t *pteptr, pte_t pteval)
+ 
+ #define PFN_PTE_SHIFT		PAGE_SHIFT
+ 
+-static inline void um_tlb_mark_sync(struct mm_struct *mm, unsigned long start,
+-				    unsigned long end)
++/* The caller holds mm->context.sync_tlb_lock. */
++static inline void um_tlb_mark_sync_locked(struct mm_struct *mm,
++					   unsigned long start,
++					   unsigned long end)
+ {
+ #ifdef UML_HOST_DARWIN
+ 	struct uml_tlb_sync_range *ranges = mm->context.sync_tlb_ranges;
+ 	unsigned int count;
+ 	unsigned long slot_size = 16UL * 1024;
+-#endif
+ 
+-	guard(spinlock_irqsave)(&mm->context.sync_tlb_lock);
+-
+-#ifdef UML_HOST_DARWIN
+ 	count = mm->context.sync_tlb_range_count;
+ 	/*
+-	 * Darwin commits complete 16 KiB host slots. Keep
+-	 * unrelated slots disjoint instead of expanding one global envelope
++	 * Kernel mappings are Darwin VM, which changes in complete 16 KiB host
++	 * slots.  A user mm runs through the software MMU one Linux page at a
++	 * time, so its ranges stay exact: rounded to a slot, every page a 4 KiB
++	 * guest touches walks and publishes its three neighbours again.  Keep
++	 * unrelated ranges disjoint instead of expanding one global envelope
+ 	 * across per-thread stacks, heaps, and shared libraries.  Ten sibling
+-	 * faults otherwise make one walker replay every PTE in the gaps while
+-	 * all other vCPUs queue behind it.
++	 * faults otherwise make one walker replay every PTE in the gaps.
+ 	 */
++	if (mm != &init_mm)
++		slot_size = PAGE_SIZE;
+ 	start &= ~(slot_size - 1);
+ 	end = ALIGN(end, slot_size);
+ 	if (end <= start)
+@@ -321,6 +323,13 @@ static inline void um_tlb_mark_sync(struct mm_struct *mm, unsigned long start,
+ #endif
+ }
+ 
++static inline void um_tlb_mark_sync(struct mm_struct *mm, unsigned long start,
++				    unsigned long end)
++{
++	guard(spinlock_irqsave)(&mm->context.sync_tlb_lock);
++	um_tlb_mark_sync_locked(mm, start, end);
++}
++
+ #define set_ptes set_ptes
+ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 			    pte_t *ptep, pte_t pte, unsigned int nr)
+diff --git a/arch/um/include/asm/tlbflush.h b/arch/um/include/asm/tlbflush.h
+index d048fa81f9085ec54c5150abca3c53ef49b73efd..bd049ef7a30551999bbafa7b3bfef08932df43d6 100644
+--- a/arch/um/include/asm/tlbflush.h
++++ b/arch/um/include/asm/tlbflush.h
+@@ -34,7 +34,10 @@ extern int um_tlb_sync(struct mm_struct *mm);
+ 
+ #ifdef UML_HOST_DARWIN
+ extern bool um_tlb_sync_pending(struct mm_struct *mm);
+-extern int um_tlb_sync_locked(struct mm_struct *mm);
++extern int um_tlb_sync_locked(struct mm_struct *mm, unsigned long start,
++			      unsigned long end);
++extern bool um_tlb_access_granted(struct mm_struct *mm, unsigned long addr,
++				  bool is_write);
+ extern void darwin_tlb_invalidate_range(struct mm_struct *mm,
+ 					unsigned long start,
+ 					unsigned long end);
+diff --git a/arch/um/include/shared/skas/skas.h b/arch/um/include/shared/skas/skas.h
+index 147a5533909d870606ba4f953d78f29a04374afe..16a9b0f8f228fc0b0bac09d5b77aff057fb1a310 100644
+--- a/arch/um/include/shared/skas/skas.h
++++ b/arch/um/include/shared/skas/skas.h
+@@ -18,6 +18,7 @@ extern unsigned long current_tls(void);
+ extern void current_set_tls(unsigned long tls);
+ extern void current_mm_sync(void);
+ extern void current_mm_force_sync(unsigned long address);
++extern int current_mm_access_granted(unsigned long address, int is_write);
+ extern int current_mm_prefault_host_slot(unsigned long address, int is_write);
+ void initial_jmpbuf_lock(void);
+ void initial_jmpbuf_unlock(void);
+diff --git a/arch/um/kernel/skas/mmu_darwin.c b/arch/um/kernel/skas/mmu_darwin.c
+index 69ce461b08c9e2b37b56cf1405b4ea9f3b6fa710..e770c638bc22feef6238890837e6d3f50bae46f4 100644
+--- a/arch/um/kernel/skas/mmu_darwin.c
++++ b/arch/um/kernel/skas/mmu_darwin.c
+@@ -11,34 +11,6 @@
+ 
+ static atomic_t darwin_mm_generation = ATOMIC_INIT(1);
+ 
+-/* The turnstile must be owned by the guest task, not by the host carrier
+- * thread.  A task can be scheduled out inside this region, so taking only
+- * the host walker mutex lets every other carrier block on it and consume
+- * the very virtual CPUs the holder needs to make progress.  Take the
+- * sleeping guest mutex first, exactly as the Linux host backend does: a
+- * waiter then blocks as a Linux task and releases its virtual CPU, and the
+- * host walker lock behind it is uncontended.
+- */
+-void enter_turnstile(struct mm_id *id) __acquires(turnstile)
+-{
+-	struct mm_context *ctx = container_of(id, struct mm_context, id);
+-
+-	mutex_lock(&ctx->turnstile);
+-	if (darwin_uml_vm_walker_lock(id->darwin_generation) < 0)
+-		panic("Darwin: unable to lock address-space walker %lu",
+-		      id->darwin_generation);
+-}
+-
+-void exit_turnstile(struct mm_id *id) __releases(turnstile)
+-{
+-	struct mm_context *ctx = container_of(id, struct mm_context, id);
+-
+-	if (darwin_uml_vm_walker_unlock(id->darwin_generation) < 0)
+-		panic("Darwin: unable to unlock address-space walker %lu",
+-		      id->darwin_generation);
+-	mutex_unlock(&ctx->turnstile);
+-}
+-
+ void arch_exit_mmap(struct mm_struct *mm)
+ {
+ 	/* exit_mmap() is about to free the physical pages which back this mm.
+diff --git a/arch/um/kernel/skas/process.c b/arch/um/kernel/skas/process.c
+index 5e153236cbc104c5ac60297c9de16773e1a325dd..8cb774915731e131352e9f9e3249ac8422faa293 100644
+--- a/arch/um/kernel/skas/process.c
++++ b/arch/um/kernel/skas/process.c
+@@ -92,49 +92,68 @@ void current_mm_sync(void)
+ 		return;
+ 	mm = current->mm;
+ #ifdef UML_HOST_DARWIN
+-	/* mmap_read_lock() may schedule while a writer owns the VMA tree.  Take it
+-	 * before the per-mm turnstile so a scheduled-out UML task never retains
+-	 * the mutex needed by the sibling selected to run.  Mapping replay itself
+-	 * remains serialized, while guest execution remains fully concurrent.
++	/* Sibling tasks replay their mappings concurrently; see __um_tlb_sync()
++	 * for what keeps that sound.  mmap_read_lock() stabilizes the VMA tree
++	 * for the walk and is the only lock a task can sleep on here.
+ 	 * Most guest exits do not change any PTE.  Check the protected pending
+-	 * range first so those exits do not contend on either shared lock.  A
++	 * range first so those exits do not contend on the shared lock.  A
+ 	 * range queued after this check belongs to an update still in progress;
+ 	 * that updating task synchronizes it before returning to userspace.
+ 	 */
+ 	if (!um_tlb_sync_pending(mm))
+ 		return;
+ 	mmap_read_lock(mm);
+-	enter_turnstile(&mm->context.id);
+-	um_tlb_sync_locked(mm);
+-	exit_turnstile(&mm->context.id);
++	um_tlb_sync_locked(mm, 0, 0);
+ 	mmap_read_unlock(mm);
+ #else
+ 	um_tlb_sync(mm);
+ #endif
+ }
+ 
+-void current_mm_force_sync(unsigned long address)
++static void current_mm_sync_range(unsigned long start, unsigned long end)
+ {
+-	struct mm_struct *mm;
+-	unsigned long page;
++	struct mm_struct *mm = current->mm;
+ 
+-	if (current->mm == NULL)
+-		return;
+-	mm = current->mm;
+-	page = address & PAGE_MASK;
+ #ifdef UML_HOST_DARWIN
+ 	mmap_read_lock(mm);
+-	enter_turnstile(&mm->context.id);
+-	um_tlb_mark_sync(mm, page, page + PAGE_SIZE);
+-	um_tlb_sync_locked(mm);
+-	exit_turnstile(&mm->context.id);
++	um_tlb_sync_locked(mm, start, end);
+ 	mmap_read_unlock(mm);
+ #else
+-	um_tlb_mark_sync(mm, page, page + PAGE_SIZE);
++	um_tlb_mark_sync(mm, start, end);
+ 	um_tlb_sync(mm);
+ #endif
+ }
+ 
++void current_mm_force_sync(unsigned long address)
++{
++	unsigned long start = address & PAGE_MASK;
++	unsigned long end = start + PAGE_SIZE;
++
++	if (current->mm == NULL)
++		return;
++#ifdef UML_HOST_DARWIN
++	/* The caller found mappings which Linux already grants missing from the
++	 * shadow MMU, as they all are after a fork or an mprotect().  Replay
++	 * the neighbours in the same 16 KiB with the addressed page: a 4 KiB
++	 * guest otherwise takes a host fault for each of them in turn.
++	 */
++	start = address & ~(16UL * 1024 - 1);
++	end = start + 16UL * 1024;
++#endif
++	current_mm_sync_range(start, end);
++}
++
++int current_mm_access_granted(unsigned long address, int is_write)
++{
++#ifdef UML_HOST_DARWIN
++	if (current->mm == NULL)
++		return 0;
++	return um_tlb_access_granted(current->mm, address, is_write != 0);
++#else
++	return 0;
++#endif
++}
++
+ int current_mm_prefault_host_slot(unsigned long address, int is_write)
+ {
+ 	if (current->mm == NULL)
+@@ -143,6 +162,7 @@ int current_mm_prefault_host_slot(unsigned long address, int is_write)
+ 	 * granularity. The fault handler has already resolved the addressed page;
+ 	 * synchronize only it so demand paging and MLOCK_ONFAULT remain observable.
+ 	 */
+-	current_mm_force_sync(address);
++	current_mm_sync_range(address & PAGE_MASK,
++			      (address & PAGE_MASK) + PAGE_SIZE);
+ 	return 0;
+ }
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index bcb7a240bb0e14ab55dc6ca27902cc2c23c3bcfb..aeef0bd64b989e85535fce0cdf67cea1de8a9599 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -28,9 +28,33 @@ struct vm_ops {
+ 		    int phys_fd, unsigned long long offset);
+ 	int (*unmap)(struct mm_id *mm_idp,
+ 		     unsigned long virt, unsigned long len);
++#ifdef UML_HOST_DARWIN
++	/* A walk of a user mm ends its host batch after @budget PTEs and leaves
++	 * the address of the next one in @resume.  Zero walks without a bound.
++	 */
++	unsigned int budget;
++	unsigned long resume;
++#endif
+ };
+ 
+ #ifdef UML_HOST_DARWIN
++/*
++ * How many PTEs one host batch of a user mm carries.  The host rejects a batch
++ * when any invalidation of the generation arrives before it ends, and after a
++ * fork or an exec the pending range is the whole address space.  Walked in one
++ * batch, that loses to the first sibling which unmaps, remaps or breaks a
++ * copy-on-write anywhere, and a walk which starts over each time never ends
++ * while they keep at it: binder traffic held a system_server thread here for
++ * 84 seconds, its CPU's timer and the RCU grace-period thread behind it.  A
++ * batch of this size takes tens of microseconds, and a rejected one is walked
++ * again alone.  The walker checkpoints after every batch it fills and after
++ * every sixteenth it loses; a fault's batch is a page or four, and its retry
++ * costs less than the checkpoint would.
++ */
++#define UML_TLB_SYNC_BATCH_PAGES 64U
++#define UML_TLB_SYNC_BATCH_FULL 1
++#define UML_TLB_SYNC_REJECTS_PER_CHECKPOINT 16U
++
+ static spinlock_t *darwin_pte_lockptr(struct mm_struct *mm, pmd_t *pmd)
+ {
+ 	/*
+@@ -313,6 +337,10 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
+ 
+ #ifdef UML_HOST_DARWIN
++		if (!ret && ops->budget != 0 && --ops->budget == 0) {
++			ops->resume = addr + PAGE_SIZE;
++			ret = UML_TLB_SYNC_BATCH_FULL;
++		}
+ 	} while (addr += PAGE_SIZE, ((addr < end) && !ret));
+ #else
+ 		*pte = pte_mkuptodate(*pte);
+@@ -421,15 +449,103 @@ static int update_mm_range(struct mm_struct *mm, struct vm_ops *ops,
+ 	return ret;
+ }
+ 
++#ifdef UML_HOST_DARWIN
++static void darwin_tlb_sync_checkpoint(void)
++{
++	/* No page-table lock, host batch or walker binding is live here, and the
++	 * mmap_read_lock() the walk runs under may be slept on.  A long or a
++	 * contested replay must not keep this CPU's clock event, its pending IPI
++	 * vectors and its RCU quiescent state waiting for the last batch, and
++	 * cond_resched() services all three (see flush_tlb_mm()).
++	 */
++	if (um_get_signals())
++		cond_resched();
++}
++
++/* Replay the snapshot of a user mm in bounded host batches.  A batch spans
++ * ranges, because every batch_end() takes the generation's mappings lock
++ * exclusively and a fault's snapshot is a handful of single pages.
++ */
++static int darwin_replay_user_ranges(struct mm_struct *mm, struct vm_ops *ops,
++				     const struct uml_tlb_sync_range *ranges,
++				     unsigned int count)
++{
++	unsigned long generation = mm->context.id.darwin_generation;
++	unsigned long addr = count ? ranges[0].from : 0;
++	unsigned int index = 0;
++	unsigned int rejected = 0;
++	int ret = 0;
++
++	while (index < count && !ret) {
++		unsigned long batch_addr = addr;
++		unsigned int batch_index = index;
++		bool full = false;
++
++		/* Bind this carrier to the generation for the batch.  A host which
++		 * still treats the binding as exclusive serializes the walkers
++		 * again, which is slower and no less correct; nothing between here
++		 * and the unlock can schedule.
++		 */
++		if (darwin_uml_vm_walker_lock(generation) < 0)
++			panic("Darwin: unable to bind address-space walker %lu",
++			      generation);
++		ret = darwin_uml_vm_batch_begin(generation);
++		if (!ret) {
++			int batch_ret;
++
++			ops->budget = UML_TLB_SYNC_BATCH_PAGES;
++			while (!ret) {
++				ret = update_mm_range(mm, ops, batch_addr,
++						      ranges[batch_index].to);
++				if (ret || ++batch_index == count)
++					break;
++				batch_addr = ranges[batch_index].from;
++			}
++			/* Commit the collected mappings while no PTE lock is held.
++			 * A concurrent synchronous invalidation changes the host
++			 * epoch; batch_end() then asks for this batch again.
++			 */
++			batch_ret = darwin_uml_vm_batch_end();
++			full = ret == UML_TLB_SYNC_BATCH_FULL;
++			if (full)
++				ret = 0;
++			if (!ret)
++				ret = batch_ret;
++		}
++		if (darwin_uml_vm_walker_unlock(generation) < 0)
++			panic("Darwin: unable to release address-space walker %lu",
++			      generation);
++		if (ret == -EAGAIN) {
++			/* Walk the same batch again.  A fault's batch is a page or
++			 * four and costs less than the checkpoint would.
++			 */
++			ret = 0;
++			if (++rejected % UML_TLB_SYNC_REJECTS_PER_CHECKPOINT == 0)
++				darwin_tlb_sync_checkpoint();
++			continue;
++		}
++		if (ret || !full)
++			break;
++		index = batch_index;
++		addr = ops->resume;
++		if (addr >= ranges[index].to && ++index < count)
++			addr = ranges[index].from;
++		darwin_tlb_sync_checkpoint();
++	}
++	return ret;
++}
++#endif
++
+ static int __um_tlb_sync(struct mm_struct *mm,
+-			 bool mmap_lock_held __maybe_unused)
++			 bool mmap_lock_held __maybe_unused,
++			 unsigned long force_start __maybe_unused,
++			 unsigned long force_end __maybe_unused)
+ {
+ 	struct vm_ops ops;
+ 	unsigned long addr;
+ 	unsigned long sync_end;
+ 	int ret = 0;
+ #ifdef UML_HOST_DARWIN
+-	int batch_started = 0;
+ 	int mmap_lock_owned = 0;
+ 	unsigned long flags;
+ 	unsigned int sync_count;
+@@ -439,21 +555,37 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ #endif
+ 
+ #ifdef UML_HOST_DARWIN
+-retry:
+-	batch_started = 0;
+-	mmap_lock_owned = 0;
+ 	/*
+ 	 * set_ptes() records pending work while the fault path still holds the
+ 	 * mmap lock.  Do not retain this spinlock while the walker takes
+ 	 * mmap_read_lock(), which would invert that order and deadlock concurrent
+ 	 * faults in a shared mm.
+ 	 *
+-	 * The per-mm turnstile serializes Darwin user-mm walkers.  Snapshot and
+-	 * clear the range here so set_ptes() can queue later changes independently;
+-	 * the Darwin walker visits every PTE in its snapshot regardless of the
+-	 * _PAGE_NEEDSYNC bit, so a racing update remains visible on the next pass.
++	 * Snapshot and clear the range here so set_ptes() can queue later changes
++	 * independently; the Darwin walker visits every PTE in its snapshot
++	 * regardless of the _PAGE_NEEDSYNC bit, so a racing update remains visible
++	 * on the next pass.  The caller's own range joins the snapshot under the
++	 * same lock hold, so no sibling can take it away and leave this task to
++	 * return to a page that nobody has published yet.
++	 *
++	 * Walkers of one user mm run concurrently.  Nothing here orders them; the
++	 * host does.  Each batch_begin() records the generation's invalidation epoch,
++	 * Linux invalidates the host range after it changes a PTE and before it
++	 * frees the page, every such invalidation advances the epoch, and
++	 * batch_end() publishes only while the epoch still matches.  A walker that
++	 * sampled a PTE before it changed therefore cannot publish it afterwards.
++	 * What two walkers of one page can still do is publish in the wrong order
++	 * across a change that needs no invalidation, and every one of those makes
++	 * the PTE more permissive: the stale batch leaves the page absent or less
++	 * accessible than Linux allows, and the next access faults and replays it.
++	 * Serializing the walkers behind a sleeping per-mm lock instead cost each
++	 * waiter a wakeup a hundred times longer than the walk it waited for.
+ 	 */
+ 	spin_lock_irqsave(&mm->context.sync_tlb_lock, flags);
++	if (force_end > force_start) {
++		um_tlb_mark_sync_locked(mm, force_start, force_end);
++		force_end = force_start;
++	}
+ 	sync_count = mm->context.sync_tlb_range_count;
+ 	if (sync_count == 0) {
+ 		spin_unlock_irqrestore(&mm->context.sync_tlb_lock, flags);
+@@ -475,27 +607,25 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ #ifdef UML_HOST_DARWIN
+ 	/*
+ 	 * macOS/arm64 maps memory in 16 KiB host pages. um_tlb_mark_sync() has
+-	 * already expanded each snapshot to native boundaries: that is one Linux
+-	 * page in the default build and four pages in the 4 KiB fallback.
++	 * already expanded each init_mm snapshot to native boundaries: that is
++	 * one Linux page in the default build and four pages in the 4 KiB
++	 * fallback.  A user mm has no host mapping and keeps exact ranges.
+ 	 */
+-	if (mm != &init_mm) {
+-		/* Stabilize the VMA tree before collecting the host update batch.
++	if (mm != &init_mm && !mmap_lock_held) {
++		/* Stabilize the VMA tree before collecting the host update batches.
+ 		 * The host deliberately defers its execution gate until batch_end(),
+-		 * after this walker has released every PTE lock.
++		 * after the walker has released every PTE lock.
+ 		 */
+-		if (!mmap_lock_held) {
+-			mmap_read_lock(mm);
+-			mmap_lock_owned = 1;
+-		}
+-		ret = darwin_uml_vm_batch_begin(
+-			mm->context.id.darwin_generation);
+-		if (ret)
+-			goto out;
+-		batch_started = 1;
++		mmap_read_lock(mm);
++		mmap_lock_owned = 1;
+ 	}
+ #endif
+ 	ops.mm_idp = &mm->context.id;
+ 	ops.mm = mm;
++#ifdef UML_HOST_DARWIN
++	ops.budget = 0;
++	ops.resume = 0;
++#endif
+ 	if (mm == &init_mm) {
+ 		ops.mmap = kern_map;
+ 		ops.unmap = kern_unmap;
+@@ -504,7 +634,10 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ 		ops.unmap = unmap;
+ 	}
+ #ifdef UML_HOST_DARWIN
+-	for (sync_index = 0; sync_index < sync_count && !ret; ++sync_index) {
++	if (mm != &init_mm)
++		ret = darwin_replay_user_ranges(mm, &ops, sync_ranges, sync_count);
++	for (sync_index = 0;
++	     mm == &init_mm && sync_index < sync_count && !ret; ++sync_index) {
+ 		addr = sync_ranges[sync_index].from;
+ 		sync_end = sync_ranges[sync_index].to;
+ 		ret = update_mm_range(mm, &ops, addr, sync_end);
+@@ -514,18 +647,6 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ #endif
+ 
+ #ifdef UML_HOST_DARWIN
+-out:
+-	/* Commit the collected mappings while no PTE lock is held.  A concurrent
+-	 * synchronous invalidation changes the host epoch; batch_end() then asks
+-	 * us to discard the stale snapshot and retry before returning to guest.
+-	 */
+-	if (batch_started) {
+-		int batch_ret = darwin_uml_vm_batch_end();
+-
+-		if (!ret)
+-			ret = batch_ret;
+-		batch_started = 0;
+-	}
+ 	if (mmap_lock_owned) {
+ 		mmap_read_unlock(mm);
+ 		mmap_lock_owned = 0;
+@@ -542,10 +663,6 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ 			um_tlb_mark_sync(mm, sync_ranges[sync_index].from,
+ 					 sync_ranges[sync_index].to);
+ 	}
+-	if (ret == -EAGAIN) {
+-		ret = 0;
+-		goto retry;
+-	}
+ #else
+ 	mm->context.sync_tlb_range_from = 0;
+ 	mm->context.sync_tlb_range_to = 0;
+@@ -574,7 +691,7 @@ static noinline int um_tlb_sync_init_mm(void)
+ 		goto clear_owner;
+ 	}
+ 	WRITE_ONCE(init_mm_tlb_owner, current);
+-	ret = __um_tlb_sync(&init_mm, false);
++	ret = __um_tlb_sync(&init_mm, false, 0, 0);
+ clear_owner:
+ 	WRITE_ONCE(init_mm_tlb_owner, NULL);
+ 	mutex_unlock(&init_mm.context.turnstile);
+@@ -588,7 +705,7 @@ int um_tlb_sync(struct mm_struct *mm)
+ 	if (unlikely(mm == &init_mm))
+ 		return um_tlb_sync_init_mm();
+ #endif
+-	return __um_tlb_sync(mm, false);
++	return __um_tlb_sync(mm, false, 0, 0);
+ }
+ 
+ #ifdef UML_HOST_DARWIN
+@@ -603,16 +720,61 @@ bool um_tlb_sync_pending(struct mm_struct *mm)
+ 	return pending;
+ }
+ 
+-int um_tlb_sync_locked(struct mm_struct *mm)
++/* Whether the Linux page tables already grant this access, which leaves only
++ * the Darwin shadow mapping to replay.  The answer is a hint sampled without
++ * a lock: a stale "no" costs a spurious Linux fault whose replay then runs as
++ * usual, and a stale "yes" costs the replay this check exists to skip.  UML
++ * selects MMU_GATHER_RCU_TABLE_FREE, so an RCU read section keeps every
++ * page-table level alive.  The walker grants nothing through a PTE that is
++ * not young and no write through one that is not dirty, so neither does this.
++ */
++bool um_tlb_access_granted(struct mm_struct *mm, unsigned long addr,
++			   bool is_write)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *ptep;
++	bool granted = false;
++
++	rcu_read_lock();
++	pgd = pgd_offset(mm, addr);
++	if (!pgd_present(*pgd))
++		goto out;
++	p4d = p4d_offset(pgd, addr);
++	if (!p4d_present(*p4d))
++		goto out;
++	pud = pud_offset(p4d, addr);
++	if (!pud_present(*pud))
++		goto out;
++	pmd = pmd_offset(pud, addr);
++	if (!pmd_present(*pmd))
++		goto out;
++	ptep = pte_offset_map(pmd, addr);
++	if (ptep != NULL) {
++		pte_t value = ptep_get_lockless(ptep);
++
++		granted = pte_present(value) && pte_young(value) &&
++			  (is_write ? pte_write(value) && pte_dirty(value) :
++				      pte_read(value));
++		pte_unmap(ptep);
++	}
++out:
++	rcu_read_unlock();
++	return granted;
++}
++
++/* Replay the pending ranges of a user mm, and [start, end) with them when that
++ * is not empty.  The caller holds mmap_read_lock(), which may schedule and so
++ * stays outside the walk.
++ */
++int um_tlb_sync_locked(struct mm_struct *mm, unsigned long start,
++		       unsigned long end)
+ {
+-	/* Darwin sibling walkers take mmap_lock before their per-mm turnstile.
+-	 * Keeping that order outside the walker is essential: mmap_read_lock()
+-	 * may schedule, and a scheduled-out UML task must never retain a mutex
+-	 * needed by the sibling that was selected to run.
+-	 */
+ 	if (WARN_ON_ONCE(mm == &init_mm))
+ 		return -EINVAL;
+-	return __um_tlb_sync(mm, true);
++	return __um_tlb_sync(mm, true, start, end);
+ }
+ #endif
+ 
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index d0b15a1c077737bfc9c88b7bbadd8fe7132f07b1..7734bb4843add9f185d0d909944e3b91fd6f09c1 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -444,12 +444,16 @@ void userspace(struct uml_pt_regs *registers)
+ 			unsigned long fault = FAULT_ADDRESS(registers->faultinfo);
+ 			int retry;
+ 
+-			/* A valid 4 KiB Linux PTE may still be an unmaterialized
+-			 * quarter of a 16 KiB Darwin VM slot.  Force all four PTEs
+-			 * into the shadow MMU before asking Linux to resolve a real
+-			 * guest page fault.
++			/* A PTE which already grants the access is only missing from
++			 * the shadow MMU: replay it and retry without a Linux fault.
++			 * Anything else is a real guest page fault, which Linux must
++			 * resolve before there is a mapping worth replaying; all but
++			 * a handful in a million demand-paging faults are that kind,
++			 * and the replay in front of each was wasted.
+ 			 */
+-			if (fault >= 4096 && uml_darwin_guest_range(fault, 1)) {
++			if (fault >= 4096 && uml_darwin_guest_range(fault, 1) &&
++			    current_mm_access_granted(fault,
++					FAULT_WRITE(registers->faultinfo))) {
+ 				current_mm_force_sync(fault);
+ 				retry = darwin_uml_vm_retry_fault(fault,
+ 					FAULT_EXECUTE(registers->faultinfo),

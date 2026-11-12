@@ -1,0 +1,455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:01:12 +0900
+Subject: [PATCH] Embedding: raise #AC while RFLAGS.AC is set
+
+x86 raises #AC at CPL 3 for a misaligned access while RFLAGS.AC is set,
+and an embedding host that runs x86 programs exactly needs to know
+when. The floating-point mode an embedder sets now also says whether
+RFLAGS.AC is set, and POPF and IRET leave a context whose mode they
+change, after writing back what they retire.
+
+In that mode every access of two, four or eight bytes checks that its
+address is a multiple of its size, before its translation, and leaves
+with EMBEDDER_EXIT_ALIGNMENT_FAULT when it is not; the instruction has
+changed nothing. A pair checks each operand by its size. The elements
+of a masked vector move, as parts of a wider operand, and of a gather
+check nothing. A new EmbedderAlignmentCheck op checks an operand x86
+checks as a whole: an x87 environment or state image by the width of
+its fields, before FLDENV or FRSTOR probes it, IRET's and POPA's stack
+before the probe of their frame, and the operand of a bit test, which
+the frontend reads as a byte. It also exempts the rest of FXSAVE,
+FXRSTOR, XSAVE, XRSTOR, FNSAVE, FRSTOR, FNSTENV, FLDENV and the indirect
+far transfers. A REP MOVS or STOS is the host's to check.
+---
+ .../Interface/Core/JIT/EmbedderFloat.cpp      |  8 +++-
+ .../Interface/Core/JIT/EmbedderMemory.cpp     | 37 ++++++++++++++++++-
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  1 +
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |  9 +++++
+ .../Source/Interface/Core/JIT/MemoryOps.cpp   | 12 ++++--
+ .../Interface/Core/OpcodeDispatcher.cpp       | 23 ++++++++++++
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  2 +
+ .../Core/OpcodeDispatcher/Vector.cpp          | 11 ++++++
+ .../Interface/Core/OpcodeDispatcher/X87.cpp   |  7 ++++
+ FEXCore/Source/Interface/IR/IR.json           | 14 ++++++-
+ FEXCore/include/FEXCore/Core/CoreState.h      | 11 ++++++
+ 11 files changed, 126 insertions(+), 9 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
+index 3ee847f4e46d1d111ae0a0748496a7317fc31956..2ea8f895a1ec2865e51be398196fa849b380520d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderFloat.cpp
+@@ -516,6 +516,8 @@ DEF_OP(EmbedderFPModeCheck) {
+   LOGMAN_THROW_A_FMT(Embedded(), "EmbedderFPModeCheck outside embedding");
+   auto Site = fextl::make_unique<EmbedderBudgetSite>();
+   Site->GuestRIP = Op->NextRIP;
++  // NextRIP 0: a branch stored its target.
++  Site->RIPInState = Op->NextRIP == 0;
+   Site->ExitReason = Core::EMBEDDER_EXIT_MODE;
+   Site->Unretired = EmbedderUnretired(true);
+   // The mode of the MXCSR the instruction stored: DAZ, FTZ, and the checks
+@@ -551,8 +553,12 @@ DEF_OP(EmbedderFPModeCheck) {
+   neg(i32, TMP3, TMP3);
+   lsr(i32, TMP3, TMP3, 31);
+   orr(i32, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 4);
++  // ALIGNMENT, RFLAGS.AC.
++  ldrb(TMP3.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.flags) + FEXCore::X86State::RFLAG_AC_LOC);
++  orr(i32, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 5);
+   const auto Expected = CTX->EmbedderFPMode & (Core::EMBEDDER_FP_MODE_DAZ | Core::EMBEDDER_FP_MODE_FTZ | Core::EMBEDDER_FP_MODE_CHECK_SPECIAL |
+-                                               Core::EMBEDDER_FP_MODE_CHECK_ALL | Core::EMBEDDER_FP_MODE_X87);
++                                               Core::EMBEDDER_FP_MODE_CHECK_ALL | Core::EMBEDDER_FP_MODE_X87 |
++                                               Core::EMBEDDER_FP_MODE_ALIGNMENT);
+   if (Expected != 0) {
+     eor(ARMEmitter::Size::i32Bit, TMP2, TMP2, Expected);
+   }
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+index b4f282dd4a99c2856a18936217a4be0e708d86ff..8fa607a4c13b9ffcbcc855f712664bb10e7e710b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+@@ -45,6 +45,13 @@ ARMEmitter::Register Arm64JITCore::EmbedderTranslate(ARMEmitter::Register Addres
+   LOGMAN_THROW_A_FMT(Address != TMP1 && Address != TMP2 && Address != TMP3, "Translation temporaries would clobber the address");
+   LOGMAN_THROW_A_FMT(Size > 0 && Size <= 64, "Unexpected access size {}", Size);
+ 
++  // x86 checks a gather's elements and a wider operand's parts by the
++  // instruction's own rules.
++  if ((Flags & (Core::EMBEDDER_ACCESS_GATHER | Core::EMBEDDER_ACCESS_COMMIT | Core::EMBEDDER_ACCESS_PART)) == 0) {
++    EmbedderAlignmentCheck(Address, Size);
++  }
++  Flags &= ~Core::EMBEDDER_ACCESS_PART;
++
+   auto Site = fextl::make_unique<EmbedderColdSite>();
+   Site->Address = Address;
+   Site->Info = Size | Flags | (static_cast<uint64_t>(EmbedderUnretired(false)) << Core::EMBEDDER_ACCESS_UNRETIRED_SHIFT);
+@@ -84,6 +91,30 @@ ARMEmitter::Register Arm64JITCore::EmbedderTranslate(ARMEmitter::Register Addres
+   return TMP1;
+ }
+ 
++void Arm64JITCore::EmbedderAlignmentCheck(ARMEmitter::Register Address, uint32_t Alignment) {
++  if ((CTX->EmbedderFPMode & Core::EMBEDDER_FP_MODE_ALIGNMENT) == 0 || EmbedderAlignmentExemptRIP == EmbedderCurrentRIP ||
++      (Alignment != 2 && Alignment != 4 && Alignment != 8)) {
++    return;
++  }
++  LOGMAN_THROW_A_FMT(Address != TMP2, "The alignment check would clobber the address");
++  auto Site = fextl::make_unique<EmbedderBudgetSite>();
++  Site->GuestRIP = EmbedderCurrentRIP;
++  Site->ExitReason = Core::EMBEDDER_EXIT_ALIGNMENT_FAULT;
++  Site->Unretired = EmbedderUnretired(false);
++  and_(ARMEmitter::Size::i64Bit, TMP2, Address, Alignment - 1);
++  cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP2, &Site->Entry);
++  EmbedderBudgetSites.push_back(std::move(Site));
++}
++
++DEF_OP(EmbedderAlignmentCheck) {
++  const auto Op = IROp->C<IR::IROp_EmbedderAlignmentCheck>();
++  LOGMAN_THROW_A_FMT(Embedded(), "EmbedderAlignmentCheck outside embedding");
++  EmbedderAlignmentCheck(GetReg(Op->Addr), Op->Alignment);
++  if (Op->Exempt) {
++    EmbedderAlignmentExemptRIP = EmbedderCurrentRIP;
++  }
++}
++
+ DEF_OP(EmbedderProbe) {
+   const auto Op = IROp->C<IR::IROp_EmbedderProbe>();
+   const auto Addr = GetReg(Op->Addr);
+@@ -174,8 +205,10 @@ void Arm64JITCore::EmitEmbedderColdSites() {
+     // compiled again with far branches.
+     BindOrRestart(&Site->Entry);
+     EmitEmbedderUnretired(Site->Unretired);
+-    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Site->GuestRIP);
+-    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++    if (!Site->RIPInState) {
++      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Site->GuestRIP);
++      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++    }
+     if (Site->FaultData) {
+       LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Site->FaultData);
+       str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index cd3c256a7eb74aaefe88d89fe8106edc2a994f7a..862cfbf4af6a8c116d6aa083fa94ba00b0724704 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -975,6 +975,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   EmbedderLoopSites.clear();
+   EmbedderFPSites.clear();
+   EmbedderCurrentRIP = Entry;
++  EmbedderAlignmentExemptRIP = ~uint64_t {0};
+   // A unit that runs no instruction still costs one, so a dispatch always
+   // ends; 4095 bounds the cost to an immediate, above any unit's length.
+   EmbedderBlockInstructions = std::clamp<uint32_t>(IR->GetHeader()->NumHostInstructions, 1, 4095);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index e25ba3bbec86673de076de92d38f0c41ac052b4d..56d14de3b1cf44cac3a2282e403e40dcf0077042 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -145,6 +145,8 @@ private:
+     uint64_t FaultData {};
+     // Instructions of the unit the exit leaves unretired.
+     uint32_t Unretired {};
++    // The instruction stored the RIP to report: GuestRIP is unused.
++    bool RIPInState {};
+   };
+   fextl::vector<fextl::unique_ptr<EmbedderBudgetSite>> EmbedderBudgetSites;
+   // A backward branch spends budget and leaves the dispatch when the budget is
+@@ -200,6 +202,13 @@ private:
+   // The next instruction's RIP, from the running instruction's
+   // EmbedderX87Wait, where its EmbedderX87Commit ops leave.
+   uint64_t EmbedderX87NextRIP {};
++  // The instruction an exempting EmbedderAlignmentCheck began, whose own
++  // accesses check no alignment.
++  uint64_t EmbedderAlignmentExemptRIP {};
++  // While RFLAGS.AC is set, leaves with EMBEDDER_EXIT_ALIGNMENT_FAULT unless
++  // Address (not TMP2) is a multiple of Alignment, a power of two from 2 to
++  // 8; any other Alignment checks nothing. No NZCV writes.
++  void EmbedderAlignmentCheck(ARMEmitter::Register Address, uint32_t Alignment);
+   // The instructions the unit runs from its entry to its end, which its entry
+   // charges the budget for, and their offsets from the entry in order.
+   uint32_t EmbedderBlockInstructions {};
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index 82560621dc675f1280d874b82e7f5b3da4a6f8b8..ebc570f5fc630aabbc6ab298ce05f3a2314cdd8b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -754,7 +754,9 @@ DEF_OP(LoadMemPair) {
+       add(ARMEmitter::Size::i64Bit, TMP4, Addr, TMP4);
+       Addr = TMP4;
+     }
+-    Addr = EmbedderTranslate(Addr, 2 * IR::OpSizeToSize(IROp->Size), 0);
++    // Two operands, each checked by its own size.
++    EmbedderAlignmentCheck(Addr, IR::OpSizeToSize(IROp->Size));
++    Addr = EmbedderTranslate(Addr, 2 * IR::OpSizeToSize(IROp->Size), Core::EMBEDDER_ACCESS_PART);
+     PairOffset = 0;
+   }
+ 
+@@ -935,7 +937,8 @@ DEF_OP(VLoadVectorMasked) {
+       default: LOGMAN_MSG_A_FMT("Unhandled masked element size: {}", ElementSize); break;
+       }
+       (void)tbz(TMP2, IR::OpSizeAsBits(ElementSize) - 1, &Skip);
+-      const auto Host = EmbedderTranslate(TMP4, ElementBytes, 0);
++      // An element of a masked 16- or 32-byte operand.
++      const auto Host = EmbedderTranslate(TMP4, ElementBytes, Core::EMBEDDER_ACCESS_PART);
+       switch (ElementSize) {
+       case IR::OpSize::i32Bit: ld1<ARMEmitter::SubRegSize::i32Bit>(VTMP1.Q(), i, Host); break;
+       case IR::OpSize::i64Bit: ld1<ARMEmitter::SubRegSize::i64Bit>(VTMP1.Q(), i, Host); break;
+@@ -1076,7 +1079,7 @@ DEF_OP(VStoreVectorMasked) {
+         default: break;
+         }
+       };
+-      StoreLane(EmbedderTranslate(TMP4, ElementBytes, Core::EMBEDDER_ACCESS_WRITE, StoreLane));
++      StoreLane(EmbedderTranslate(TMP4, ElementBytes, Core::EMBEDDER_ACCESS_WRITE | Core::EMBEDDER_ACCESS_PART, StoreLane));
+       (void)Bind(&Skip);
+       if (i + 1 != NumElements) {
+         add(ARMEmitter::Size::i64Bit, TMP4, TMP4, ElementBytes);
+@@ -1987,7 +1990,8 @@ DEF_OP(StoreMemPair) {
+       add(ARMEmitter::Size::i64Bit, TMP4, Addr, TMP4);
+       EA = TMP4;
+     }
+-    EmitStorePair(EmbedderTranslate(EA, 2 * IR::OpSizeToSize(OpSize), Core::EMBEDDER_ACCESS_WRITE, EmitStorePair));
++    EmbedderAlignmentCheck(EA, IR::OpSizeToSize(OpSize));
++    EmitStorePair(EmbedderTranslate(EA, 2 * IR::OpSizeToSize(OpSize), Core::EMBEDDER_ACCESS_WRITE | Core::EMBEDDER_ACCESS_PART, EmitStorePair));
+     return;
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 6ab0ab8d0546a92bc80fce6cc50652f541d492e4..10919e0e094b61df9c804bfce9af6cbdf830de8c 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -176,6 +176,8 @@ void OpDispatchBuilder::IRETOp(OpcodeArgs) {
+   const uint32_t Loaded = (UserLoadableFlags | (1U << X86State::RFLAG_RF_LOC)) & (GPRSize == OpSize::i16Bit ? 0xffffU : ~0U);
+ 
+   Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
++  // The stack wants its own width, before the frame is read.
++  EmbedderAlignmentCheck(SP, Is64BitMode ? 8 : 4, false);
+   if (CTX->Embedded) {
+     // The whole frame is read before CS or the flags are loaded from it.
+     _EmbedderProbe(SP, IR::OpSizeToSize(GPRSize) * (Is64BitMode ? 5 : 3));
+@@ -206,6 +208,14 @@ void OpDispatchBuilder::IRETOp(OpcodeArgs) {
+     StoreGPRRegister(X86State::REG_RSP, SP);
+   }
+ 
++  if (CTX->Embedded) {
++    // RFLAGS.AC may have changed the mode. An exit retires the
++    // instruction, so its registers and flags are written first, and
++    // reports the RIP stored.
++    FlushRegisterCache();
++    _StoreContextGPR(OpSize::i64Bit, NewRIP, offsetof(FEXCore::Core::CPUState, rip));
++    _EmbedderFPModeCheck(0);
++  }
+   ExitFunction(NewRIP);
+   BlockSetRIP = true;
+ }
+@@ -490,6 +500,7 @@ void OpDispatchBuilder::POPAOp(OpcodeArgs) {
+   const auto Size = OpSizeFromSrc(Op);
+ 
+   Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
++  EmbedderAlignmentCheck(SP, IR::OpSizeToSize(Size), false);
+   if (CTX->Embedded) {
+     // The whole frame is read before any register is loaded from it.
+     _EmbedderProbe(SP, 8 * IR::OpSizeToSize(Size));
+@@ -997,6 +1008,8 @@ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
+   // This uses ModRM to determine its location
+   // No way to use this effectively in multiblock
+   Ref Src = MakeSegmentAddress(Op, Op->Dest);
++  // As in the gadget engine, a far transfer checks no alignment.
++  EmbedderAlignmentCheck(Src, 1, true);
+   AddressMode SrcCS = {.Base = Src, .Offset = static_cast<int64_t>(IR::OpSizeToSize(SrcSize)), .AddrSize = OpSize::i64Bit};
+   auto RIPOffset = _LoadMemGPRAutoTSO(SrcSize, Src, OpSize::i8Bit);
+   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
+@@ -1018,6 +1031,7 @@ void OpDispatchBuilder::CALLFARIndirectOp(OpcodeArgs) {
+   BlockSetRIP = true;
+ 
+   Ref Src = MakeSegmentAddress(Op, Op->Dest);
++  EmbedderAlignmentCheck(Src, 1, true);
+   AddressMode SrcCS = {.Base = Src, .Offset = static_cast<int64_t>(IR::OpSizeToSize(SrcSize)), .AddrSize = OpSize::i64Bit};
+   auto RIPOffset = _LoadMemGPRAutoTSO(SrcSize, Src, OpSize::i8Bit);
+   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
+@@ -2680,6 +2694,9 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
+   } else {
+     // Load the address to the memory location
+     Ref Dest = MakeSegmentAddress(Op, Op->Dest);
++    // The byte accessed below is in an operand of Size bits, at Dest plus a
++    // multiple of its size, which x86 checks.
++    EmbedderAlignmentCheck(Dest, Size / 8, false);
+     // Get the bit selection from the src
+     auto BitSelect = Src.Bfe(0, 3);
+ 
+@@ -3969,6 +3986,12 @@ void OpDispatchBuilder::POPFOp(OpcodeArgs) {
+   // loads only the low half.
+   const uint32_t Loaded = Size == OpSize::i16Bit ? (UserLoadableFlags & 0xffffU) : UserLoadableFlags;
+   SetPackedRFLAG(false, Src, Loaded);
++  if (CTX->Embedded) {
++    // RFLAGS.AC may have changed the mode. An exit retires the
++    // instruction, so its stack pointer and flags are written first.
++    FlushRegisterCache();
++    EmbedderFPModeCheck(Op);
++  }
+ 
+   auto NewRIP = GetRelocatedPC(Op);
+   ExitFunction(NewRIP, BranchHint::CheckTF);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index ab6c86226698aef204e4a1d3d2cea450c8bbc5d1..a76b20a3c5215eddba5268fe0dc859dbd0510dce 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1517,6 +1517,8 @@ private:
+   // reads them.
+   void EmbedderFPExceptions(Core::EmbedderFPKind Kind, IR::OpSize ElementSize, uint32_t Lanes, Ref Source1, Ref Source2 = nullptr,
+                             uint32_t Imm = 0, uint32_t Flags = 0);
++  // Embedded, while RFLAGS.AC is set: an EmbedderAlignmentCheck op.
++  void EmbedderAlignmentCheck(Ref Addr, uint32_t Alignment, bool Exempt);
+   // Embedded, while the x87 control word unmasks an exception: x87 checks.
+   bool EmbedderX87Checks() const;
+   // With x87 checks, EmbedderX87Commit(Mask).
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index d5739f308148154e35992cb40f65b849daa1e3e0..023010280b29c70b089579a9f1f12ff888f0de9c 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -776,6 +776,12 @@ void OpDispatchBuilder::EmbedderFPModeCheck(OpcodeArgs) {
+   }
+ }
+ 
++void OpDispatchBuilder::EmbedderAlignmentCheck(Ref Addr, uint32_t Alignment, bool Exempt) {
++  if (CTX->Embedded && (CTX->EmbedderFPMode & Core::EMBEDDER_FP_MODE_ALIGNMENT) != 0) {
++    _EmbedderAlignmentCheck(Addr, Alignment, Exempt);
++  }
++}
++
+ Ref OpDispatchBuilder::EmbedderFPResult(Ref Result, uint32_t Descriptor, Ref Source1, Ref Source2, Ref Source3) {
+   if (!EmbedderFPChecks(static_cast<Core::EmbedderFPKind>(Descriptor & 0xFF))) {
+     return Result;
+@@ -3154,6 +3160,8 @@ void OpDispatchBuilder::AVXVFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
+ 
+ void OpDispatchBuilder::FXSaveOp(OpcodeArgs) {
+   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
++  // x86 does not check an extended-state image under RFLAGS.AC.
++  EmbedderAlignmentCheck(Mem, 1, true);
+ 
+   SaveX87State(Op, Mem);
+   SaveSSEState(Mem);
+@@ -3172,6 +3180,7 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
+   // NOTE: Mask should be EAX and EDX concatenated, but we only need to test
+   //       for features that are in the lower 32 bits, so EAX only is sufficient.
+   const auto OpSize = GetGPROpSize();
++  EmbedderAlignmentCheck(XSaveBase(Op), 1, true);
+ 
+   const auto StoreIfFlagSet = [this, OpSize](uint32_t BitIndex, auto fn, uint32_t FieldSize = 1) {
+     Ref Mask = LoadGPRRegister(X86State::REG_RAX);
+@@ -3353,6 +3362,7 @@ Ref OpDispatchBuilder::GetMXCSR() {
+ 
+ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
+   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
++  EmbedderAlignmentCheck(Mem, 1, true);
+   if (CTX->Embedded) {
+     // The whole area is read before any of it is loaded.
+     _EmbedderProbe(Mem, 512);
+@@ -3368,6 +3378,7 @@ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
+ 
+ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+   const auto OpSize = GetGPROpSize();
++  EmbedderAlignmentCheck(XSaveBase(Op), 1, true);
+   if (CTX->Embedded) {
+     // The whole area, through the AVX state, is read before any of it is
+     // loaded.
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 41a7d584103898432fd2019f3f7cf63e585acac9..455541df9e09a14081834ff081e00ee8c5bac61e 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -384,6 +384,8 @@ void OpDispatchBuilder::X87FNSTENV(OpcodeArgs) {
+   const auto Size = OpSizeFromSrc(Op);
+   Ref Mem = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+   Mem = AppendSegmentOffset(Mem, Op->Flags);
++  // The image wants the alignment of its fields.
++  EmbedderAlignmentCheck(Mem, IR::OpSizeToSize(Size), true);
+ 
+   {
+     auto FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
+@@ -451,6 +453,7 @@ void OpDispatchBuilder::X87LDENV(OpcodeArgs) {
+   const auto Size = OpSizeFromSrc(Op);
+   Ref Mem = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
+   Mem = AppendSegmentOffset(Mem, Op->Flags);
++  EmbedderAlignmentCheck(Mem, IR::OpSizeToSize(Size), true);
+   if (CTX->Embedded) {
+     // The whole environment is read before any of it is loaded.
+     _EmbedderProbe(Mem, Size == OpSize::i16Bit ? 14 : 28);
+@@ -494,6 +497,9 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
+   // 4 bytes : data pointer selector
+   const auto Size = OpSizeFromDst(Op);
+   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
++  // The image wants the alignment of its environment's fields; its
++  // registers, ten bytes each, are part of it.
++  EmbedderAlignmentCheck(Mem, IR::OpSizeToSize(Size), true);
+   Ref Top = GetX87Top();
+   {
+     auto FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
+@@ -560,6 +566,7 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
+   _StackForceSlow();
+   const auto Size = OpSizeFromSrc(Op);
+   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
++  EmbedderAlignmentCheck(Mem, IR::OpSizeToSize(Size), true);
+   if (CTX->Embedded) {
+     // The whole image is read before any of it is loaded.
+     _EmbedderProbe(Mem, Size == OpSize::i16Bit ? 94 : 108);
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index a3bcbff046f35edc41c388259c5df37afef5803e..21cb0906b534decc97240ab1dd0cb99fd7dcd6e0 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -713,8 +713,9 @@
+       },
+       "EmbedderFPModeCheck u64:$NextRIP": {
+         "Desc": ["Embedded only: leaves the dispatch at NextRIP with EMBEDDER_EXIT_MODE when the",
+-                 "floating-point mode the state's MXCSR implies is not the one the context translates",
+-                 "for. Ends an instruction that loads MXCSR."
++                 "floating-point mode the state's MXCSR, x87 control word and RFLAGS.AC imply is not the",
++                 "one the context translates for. Ends an instruction that loads any of them. A branch",
++                 "stores its target as RIP and passes NextRIP 0."
+                 ],
+         "HasSideEffects": true
+       },
+@@ -736,6 +737,15 @@
+         "HasSideEffects": true
+       },
+ 
++      "EmbedderAlignmentCheck GPR:$Addr, u8:$Alignment, i1:$Exempt": {
++        "Desc": ["Embedded, while the context's mode has EMBEDDER_FP_MODE_ALIGNMENT: leaves the",
++                 "dispatch with EMBEDDER_EXIT_ALIGNMENT_FAULT unless Addr is a multiple of Alignment,",
++                 "for an instruction whose operand x86 checks as a whole, such as an x87 environment",
++                 "image. Exempt, the instruction's own accesses check nothing after it."
++                ],
++        "HasSideEffects": true
++      },
++
+       "EmbedderProbe GPR:$Addr, u32:$Size": {
+         "Desc": ["Embedded only: faults as a load of the Size bytes at Addr would, without loading.",
+                  "An instruction that loads its operand in parts, such as FXRSTOR, probes the whole",
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 10d3172eb0226b5021dc1b4530e20578c1bd0d29..e4b2acca7e62d8c1325a2d892042a0ac0175687e 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -381,6 +381,9 @@ enum EmbedderExitReason : uint32_t {
+   // retired having changed only the status word, as x86 does, and RIP names
+   // the next instruction.
+   EMBEDDER_EXIT_X87_EXCEPTION = 11,
++  // An access the alignment check found misaligned while RFLAGS.AC is set:
++  // RIP names the instruction, which has done nothing, and x86 raises #AC.
++  EMBEDDER_EXIT_ALIGNMENT_FAULT = 12,
+ };
+ 
+ // Access info passed to the TLB-miss stub.
+@@ -401,6 +404,9 @@ constexpr uint64_t EMBEDDER_ACCESS_COMMIT = 1ULL << 12;
+ // before the faulting one, as x86 does, which the backend's loop does not
+ // keep in the guest state.
+ constexpr uint64_t EMBEDDER_ACCESS_GATHER = 1ULL << 13;
++// A part of a wider operand, which the alignment check does not hold to its
++// own size. The backend's own; the host ignores it.
++constexpr uint64_t EMBEDDER_ACCESS_PART = 1ULL << 14;
+ // Bits 32 and up: the instructions a fault at this access leaves unretired
+ // of those its unit charged the budget for.
+ constexpr uint32_t EMBEDDER_ACCESS_UNRETIRED_SHIFT = 32;
+@@ -429,6 +435,11 @@ constexpr uint32_t EMBEDDER_FP_MODE_CHECK_ALL = 1U << 3;
+ // instruction starts with EmbedderX87Wait, and an x87 instruction that
+ // raises an unmasked exception commits only what x86 commits.
+ constexpr uint32_t EMBEDDER_FP_MODE_X87 = 1U << 4;
++// RFLAGS.AC is set: an access of two, four or eight bytes checks that its
++// address is a multiple of its size, and leaves with
++// EMBEDDER_EXIT_ALIGNMENT_FAULT when it is not. POPF and IRET leave a context
++// whose mode they change.
++constexpr uint32_t EMBEDDER_FP_MODE_ALIGNMENT = 1U << 5;
+ // The x86 operation an EmbedderFPCheck op checks, of the instruction (or
+ // 128-bit part of one) whose result it takes.
+ enum EmbedderFPKind : uint8_t {

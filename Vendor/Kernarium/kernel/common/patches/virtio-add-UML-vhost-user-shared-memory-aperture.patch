@@ -1,0 +1,1044 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 08:02:37 +0900
+Subject: [PATCH] virtio: add UML vhost-user shared-memory aperture
+
+---
+ arch/um/drivers/vhost_user.h          |  36 ++-
+ arch/um/drivers/virtio_uml.c          | 334 ++++++++++++++++++++++++--
+ arch/um/include/shared/mem.h          |  22 ++
+ arch/um/kernel/physmem.c              | 249 +++++++++++++++++++
+ arch/um/kernel/um_arch.c              |  20 +-
+ drivers/gpu/drm/virtio/virtgpu_vram.c |  16 +-
+ 6 files changed, 653 insertions(+), 24 deletions(-)
+
+diff --git a/arch/um/drivers/vhost_user.h b/arch/um/drivers/vhost_user.h
+index fcfa3b7e021bae961cd76d830929b03b70ac5562..841ae6d730c2c35c815462d3a6c251f5ef140bf8 100644
+--- a/arch/um/drivers/vhost_user.h
++++ b/arch/um/drivers/vhost_user.h
+@@ -15,6 +15,7 @@
+ #define VHOST_USER_PROTOCOL_F_SLAVE_REQ			5
+ #define VHOST_USER_PROTOCOL_F_CONFIG			9
+ #define VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS	14
++#define VHOST_USER_PROTOCOL_F_SHMEM_MAP			22
+ /* Vring state index masks */
+ #define VHOST_USER_VRING_INDEX_MASK	0xff
+ #define VHOST_USER_VRING_POLL_MASK	BIT(8)
+@@ -23,12 +24,19 @@
+ #define VHOST_USER_VERSION		1
+ /* Supported transport features */
+ #define VHOST_USER_SUPPORTED_F		BIT_ULL(VHOST_USER_F_PROTOCOL_FEATURES)
++#ifdef UML_HOST_DARWIN
++#define VHOST_USER_SUPPORTED_SHMEM_F \
++	BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM_MAP)
++#else
++#define VHOST_USER_SUPPORTED_SHMEM_F	0
++#endif
+ /* Supported protocol features */
+ #define VHOST_USER_SUPPORTED_PROTOCOL_F	(BIT_ULL(VHOST_USER_PROTOCOL_F_MQ) | \
+ 					 BIT_ULL(VHOST_USER_PROTOCOL_F_REPLY_ACK) | \
+ 					 BIT_ULL(VHOST_USER_PROTOCOL_F_SLAVE_REQ) | \
+ 					 BIT_ULL(VHOST_USER_PROTOCOL_F_CONFIG) | \
+-					 BIT_ULL(VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS))
++					 BIT_ULL(VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS) | \
++					 VHOST_USER_SUPPORTED_SHMEM_F)
+ 
+ enum vhost_user_request {
+ 	VHOST_USER_GET_FEATURES = 1,
+@@ -57,6 +65,7 @@ enum vhost_user_request {
+ 	VHOST_USER_GET_CONFIG = 24,
+ 	VHOST_USER_SET_CONFIG = 25,
+ 	VHOST_USER_VRING_KICK = 35,
++	VHOST_USER_GET_SHMEM_CONFIG = 44,
+ };
+ 
+ enum vhost_user_slave_request {
+@@ -64,6 +73,8 @@ enum vhost_user_slave_request {
+ 	VHOST_USER_SLAVE_CONFIG_CHANGE_MSG = 2,
+ 	VHOST_USER_SLAVE_VRING_HOST_NOTIFIER_MSG = 3,
+ 	VHOST_USER_SLAVE_VRING_CALL = 4,
++	VHOST_USER_SLAVE_SHMEM_MAP = 9,
++	VHOST_USER_SLAVE_SHMEM_UNMAP = 10,
+ };
+ 
+ struct vhost_user_header {
+@@ -107,12 +118,35 @@ struct vhost_user_mem_regions {
+ 	struct vhost_user_mem_region regions[2]; /* Currently supporting 2 */
+ } __packed;
+ 
++#define VHOST_USER_MAX_SHMEM_REGIONS	256
++
++struct vhost_user_shmem_config {
++	u32 num_regions;
++	u32 padding;
++	u64 region_sizes[VHOST_USER_MAX_SHMEM_REGIONS];
++} __packed;
++
++struct vhost_user_mmap {
++	u8 shmid;
++	u8 padding[7];
++	u64 fd_offset;
++	u64 shm_offset;
++	u64 len;
++	u64 flags;
++} __packed;
++
++#define VHOST_USER_SHMEM_MAP_RO	0
++#define VHOST_USER_SHMEM_MAP_RW	1
++#define VHOST_USER_SHMEM_REGION_HOST_VISIBLE	1
++
+ union vhost_user_payload {
+ 	u64 integer;
+ 	struct vhost_user_config config;
+ 	struct vhost_user_vring_state vring_state;
+ 	struct vhost_user_vring_addr vring_addr;
+ 	struct vhost_user_mem_regions mem_regions;
++	struct vhost_user_shmem_config shmem_config;
++	struct vhost_user_mmap mmap;
+ };
+ 
+ struct vhost_user_msg {
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index 7b1c3c69b5c396c1def9c8f703dab0d569237138..a4eb1ce101ab427c58a14bc1568deb1452def089 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -22,9 +22,11 @@
+  */
+ #include <linux/module.h>
+ #include <linux/dma-mapping.h>
++#include <linux/irq_work.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/virtio.h>
+ #include <linux/virtio_config.h>
+ #include <linux/virtio_ring.h>
+@@ -33,6 +35,7 @@
+ #include <shared/as-layout.h>
+ #include <irq_kern.h>
+ #include <init.h>
++#include <mem.h>
+ #include <os.h>
+ #include "vhost_user.h"
+ 
+@@ -54,18 +57,26 @@ struct virtio_uml_device {
+ 	struct virtio_uml_platform_data *pdata;
+ 
+ 	raw_spinlock_t sock_lock;
++	raw_spinlock_t req_lock;
+ 	int sock, req_fd, irq;
+ 	u64 features;
+ 	u64 protocol_features;
+ 	u64 max_vqs;
++	struct virtio_shm_region shmem_region;
+ 	u8 status;
+ 	u8 registered:1;
+ 	u8 suspended:1;
+ 	u8 no_vq_suspend:1;
++	u8 has_shmem_region:1;
+ 
+-	u8 config_changed_irq:1;
++	/* Recorded under req_lock, taken and cleared by vu_req_interrupt() */
++	bool config_changed_irq;
+ 	uint64_t vq_irq_vq_map;
+ 	int recv_rc;
++#ifdef UML_HOST_DARWIN
++	/* Delivers what a reply wait recorded while serving backend requests */
++	struct irq_work req_irq_work;
++#endif
+ };
+ 
+ struct virtio_uml_vq_info {
+@@ -76,6 +87,9 @@ struct virtio_uml_vq_info {
+ 
+ #define vu_err(vu_dev, ...)	dev_err(&(vu_dev)->pdev->dev, ##__VA_ARGS__)
+ 
++static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
++				       struct time_travel_event *ev);
++
+ /* Vhost-user protocol */
+ 
+ static int full_sendmsg_fds(int fd, const void *buf, unsigned int len,
+@@ -173,13 +187,61 @@ static void vhost_user_check_reset(struct virtio_uml_device *vu_dev,
+ 	schedule_work(&pdata->conn_broken_wk);
+ }
+ 
++#ifdef UML_HOST_DARWIN
++/*
++ * Wait for the backend to answer on the main socket, serving its requests
++ * meanwhile. Darwin delivers the backend-request socket through an ordinary
++ * SIGIO IRQ, which only CPU 0 polls. A backend may send a request that needs
++ * a reply, such as a config change or a SHMEM_MAP, and wait for that reply
++ * before it reads its next frontend message. A frontend that waited on the
++ * main socket alone, for a GET_CONFIG answer or an acknowledgement, would
++ * then leave both channels blocked, and a CPU 0 blocked in that read could
++ * never take the IRQ that answers. Serving a request here only records its
++ * Virtio interrupt and replies on the request socket; it sends nothing on the
++ * main socket. The recorded interrupts are delivered from interrupt context
++ * once this CPU can take interrupts again.
++ */
++static int vhost_user_wait_resp(struct virtio_uml_device *vu_dev)
++{
++	while (vu_dev->req_fd >= 0) {
++		const int poll_fds[] = { vu_dev->req_fd, vu_dev->sock };
++		int ready;
++
++		do {
++			ready = os_poll(ARRAY_SIZE(poll_fds), poll_fds);
++		} while (ready == -EINTR);
++		if (ready < 0)
++			return ready;
++		if (ready == 1)
++			break;
++
++		vu_req_read_message(vu_dev, NULL);
++		if (vu_dev->recv_rc)
++			return vu_dev->recv_rc;
++		/*
++		 * A descriptor edge is reported only while unread data remains,
++		 * so the request IRQ will not run for what this wait has read.
++		 */
++		if (READ_ONCE(vu_dev->vq_irq_vq_map) ||
++		    READ_ONCE(vu_dev->config_changed_irq))
++			irq_work_queue(&vu_dev->req_irq_work);
++	}
++	return 0;
++}
++#endif
++
+ static int vhost_user_recv_resp(struct virtio_uml_device *vu_dev,
+ 				struct vhost_user_msg *msg,
+ 				size_t max_payload_size)
+ {
+-	int rc = vhost_user_recv(vu_dev, vu_dev->sock, msg,
+-				 max_payload_size, true);
++	int rc = 0;
+ 
++#ifdef UML_HOST_DARWIN
++	rc = vhost_user_wait_resp(vu_dev);
++#endif
++	if (!rc)
++		rc = vhost_user_recv(vu_dev, vu_dev->sock, msg,
++				     max_payload_size, true);
+ 	if (rc) {
+ 		vhost_user_check_reset(vu_dev, rc);
+ 		return rc;
+@@ -208,19 +270,57 @@ static int vhost_user_recv_u64(struct virtio_uml_device *vu_dev,
+ 
+ static int vhost_user_recv_req(struct virtio_uml_device *vu_dev,
+ 			       struct vhost_user_msg *msg,
+-			       size_t max_payload_size)
++			       size_t max_payload_size, int fds[2])
+ {
+-	int rc = vhost_user_recv(vu_dev, vu_dev->req_fd, msg,
+-				 max_payload_size, false);
++	ssize_t header_size;
++	size_t payload_size;
++	int rc;
++
++	fds[0] = -1;
++	fds[1] = -1;
++	do {
++		header_size = os_rcv_fd_msg(vu_dev->req_fd, fds, 2, msg,
++					    sizeof(msg->header));
++	} while (header_size == -EINTR);
++	if (header_size < 0)
++		return header_size;
++	if (!header_size)
++		return -ECONNRESET;
++	if (header_size < (ssize_t)sizeof(msg->header)) {
++		rc = full_read(vu_dev->req_fd,
++			       (u8 *)msg + header_size,
++			       (int)(sizeof(msg->header) -
++				     (size_t)header_size), false);
++		if (rc)
++			goto error_close_fds;
++	}
++
++	payload_size = msg->header.size;
++	if (payload_size > max_payload_size) {
++		rc = -EPROTO;
++		goto error_close_fds;
++	}
++	rc = full_read(vu_dev->req_fd, &msg->payload, payload_size, false);
+ 
+ 	if (rc)
+-		return rc;
++		goto error_close_fds;
+ 
+ 	if ((msg->header.flags & ~VHOST_USER_FLAG_NEED_REPLY) !=
+-			VHOST_USER_VERSION)
+-		return -EPROTO;
++			VHOST_USER_VERSION) {
++		rc = -EPROTO;
++		goto error_close_fds;
++	}
+ 
+ 	return 0;
++
++error_close_fds:
++	if (fds[0] >= 0)
++		os_close_file(fds[0]);
++	if (fds[1] >= 0)
++		os_close_file(fds[1]);
++	fds[0] = -1;
++	fds[1] = -1;
++	return rc;
+ }
+ 
+ static int vhost_user_send(struct virtio_uml_device *vu_dev,
+@@ -354,6 +454,45 @@ static int vhost_user_get_queue_num(struct virtio_uml_device *vu_dev,
+ 	return vhost_user_recv_u64(vu_dev, queue_num);
+ }
+ 
++#ifdef UML_HOST_DARWIN
++static int vhost_user_get_shmem_config(struct virtio_uml_device *vu_dev)
++{
++	struct vhost_user_msg msg;
++	unsigned long long phys;
++	unsigned long long size;
++	int rc;
++	int i;
++
++	rc = vhost_user_send_no_payload(vu_dev, true,
++					 VHOST_USER_GET_SHMEM_CONFIG);
++	if (rc)
++		return rc;
++	rc = vhost_user_recv_resp(vu_dev, &msg,
++				  sizeof(msg.payload.shmem_config));
++	if (rc)
++		return rc;
++	if (msg.header.request != VHOST_USER_GET_SHMEM_CONFIG ||
++	    msg.header.size != sizeof(msg.payload.shmem_config) ||
++	    msg.payload.shmem_config.num_regions != 1 ||
++	    msg.payload.shmem_config.padding != 0 ||
++	    msg.payload.shmem_config.region_sizes[0] != 0)
++		return -EPROTO;
++	for (i = 2; i < VHOST_USER_MAX_SHMEM_REGIONS; i++) {
++		if (msg.payload.shmem_config.region_sizes[i])
++			return -EPROTO;
++	}
++
++	rc = uml_vhost_user_shmem_claim(
++		vu_dev, msg.payload.shmem_config.region_sizes[1], &phys, &size);
++	if (rc)
++		return rc;
++	vu_dev->shmem_region.addr = phys;
++	vu_dev->shmem_region.len = size;
++	vu_dev->has_shmem_region = true;
++	return 0;
++}
++#endif
++
+ static void vhost_user_reply(struct virtio_uml_device *vu_dev,
+ 			     struct vhost_user_msg *msg, int response)
+ {
+@@ -376,22 +515,24 @@ static void vhost_user_reply(struct virtio_uml_device *vu_dev,
+ 		       rc, size);
+ }
+ 
+-static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+-				       struct time_travel_event *ev)
++static irqreturn_t __vu_req_read_message(struct virtio_uml_device *vu_dev,
++					 struct time_travel_event *ev)
+ {
+ 	struct virtqueue *vq;
+-	int response = 1;
+ 	struct {
+ 		struct vhost_user_msg msg;
+ 		u8 extra_payload[512];
+ 	} msg;
++	int fds[2];
+ 	int rc;
+ 	irqreturn_t irq_rc = IRQ_NONE;
+ 
+ 	while (1) {
++		int response = 1;
++
+ 		rc = vhost_user_recv_req(vu_dev, &msg.msg,
+ 					 sizeof(msg.msg.payload) +
+-					 sizeof(msg.extra_payload));
++					 sizeof(msg.extra_payload), fds);
+ 		if (rc)
+ 			break;
+ 
+@@ -409,6 +550,54 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 				}
+ 			}
+ 			break;
++#ifdef UML_HOST_DARWIN
++		case VHOST_USER_SLAVE_SHMEM_MAP:
++			if (!(vu_dev->protocol_features &
++			      BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM_MAP)) ||
++			    msg.msg.header.size != sizeof(msg.msg.payload.mmap) ||
++			    msg.msg.payload.mmap.shmid !=
++				VHOST_USER_SHMEM_REGION_HOST_VISIBLE ||
++			    memchr_inv(msg.msg.payload.mmap.padding, 0,
++				       sizeof(msg.msg.payload.mmap.padding)) ||
++			    msg.msg.payload.mmap.flags != VHOST_USER_SHMEM_MAP_RW ||
++			    fds[0] < 0 || fds[1] >= 0)
++				break;
++			rc = uml_vhost_user_shmem_map(
++				vu_dev, fds[0], msg.msg.payload.mmap.fd_offset,
++				msg.msg.payload.mmap.shm_offset,
++				msg.msg.payload.mmap.len,
++				msg.msg.payload.mmap.flags);
++			if (rc) {
++				vu_err(vu_dev,
++				       "shared-memory map rejected: %d\n", rc);
++				break;
++			}
++			fds[0] = -1;
++			response = 0;
++			break;
++		case VHOST_USER_SLAVE_SHMEM_UNMAP:
++			if (!(vu_dev->protocol_features &
++			      BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM_MAP)) ||
++			    msg.msg.header.size != sizeof(msg.msg.payload.mmap) ||
++			    msg.msg.payload.mmap.shmid !=
++				VHOST_USER_SHMEM_REGION_HOST_VISIBLE ||
++			    memchr_inv(msg.msg.payload.mmap.padding, 0,
++				       sizeof(msg.msg.payload.mmap.padding)) ||
++			    msg.msg.payload.mmap.fd_offset != 0 ||
++			    msg.msg.payload.mmap.flags != VHOST_USER_SHMEM_MAP_RO ||
++			    fds[0] >= 0 || fds[1] >= 0)
++				break;
++			rc = uml_vhost_user_shmem_unmap(
++				vu_dev, msg.msg.payload.mmap.shm_offset,
++				msg.msg.payload.mmap.len);
++			if (rc) {
++				vu_err(vu_dev,
++				       "shared-memory unmap rejected: %d\n", rc);
++				break;
++			}
++			response = 0;
++			break;
++#endif
+ 		case VHOST_USER_SLAVE_IOTLB_MSG:
+ 			/* not supported - VIRTIO_F_ACCESS_PLATFORM */
+ 		case VHOST_USER_SLAVE_VRING_HOST_NOTIFIER_MSG:
+@@ -418,6 +607,11 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 			       msg.msg.header.request);
+ 		}
+ 
++		if (fds[0] >= 0)
++			os_close_file(fds[0]);
++		if (fds[1] >= 0)
++			os_close_file(fds[1]);
++
+ 		if (ev && !vu_dev->suspended)
+ 			time_travel_add_irq_event(ev);
+ 
+@@ -430,10 +624,31 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 	return irq_rc;
+ }
+ 
++static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
++				       struct time_travel_event *ev)
++{
++	unsigned long flags;
++	irqreturn_t result;
++
++	/*
++	 * Darwin can drain this stream synchronously from the main-socket
++	 * reply wait while another vCPU receives its ordinary request-fd IRQ.
++	 * Serialize the complete framed read and reply so the two consumers
++	 * cannot split a header and payload or consume one another's reply.
++	 */
++	raw_spin_lock_irqsave(&vu_dev->req_lock, flags);
++	result = __vu_req_read_message(vu_dev, ev);
++	raw_spin_unlock_irqrestore(&vu_dev->req_lock, flags);
++	return result;
++}
++
+ static irqreturn_t vu_req_interrupt(int irq, void *data)
+ {
+ 	struct virtio_uml_device *vu_dev = data;
+ 	irqreturn_t ret = IRQ_HANDLED;
++	bool config_changed;
++	unsigned long flags;
++	uint64_t vq_map;
+ 
+ #ifdef UML_HOST_DARWIN
+ 	/*
+@@ -448,22 +663,47 @@ static irqreturn_t vu_req_interrupt(int irq, void *data)
+ 
+ 	if (vu_dev->recv_rc) {
+ 		vhost_user_check_reset(vu_dev, vu_dev->recv_rc);
+-	} else if (vu_dev->vq_irq_vq_map) {
++		return ret;
++	}
++	/*
++	 * Deliver everything recorded. A request another reader drained leaves
++	 * no descriptor edge behind, so nothing would deliver a remainder.
++	 * That reader records under req_lock on another CPU, so take and clear
++	 * the records under it too; a record made afterwards stays for the
++	 * next delivery. Deliver unlocked: a callback may send a request,
++	 * whose reply wait takes req_lock.
++	 */
++	raw_spin_lock_irqsave(&vu_dev->req_lock, flags);
++	vq_map = vu_dev->vq_irq_vq_map;
++	vu_dev->vq_irq_vq_map = 0;
++	config_changed = vu_dev->config_changed_irq;
++	vu_dev->config_changed_irq = false;
++	raw_spin_unlock_irqrestore(&vu_dev->req_lock, flags);
++
++	if (vq_map) {
+ 		struct virtqueue *vq;
+ 
+ 		virtio_device_for_each_vq((&vu_dev->vdev), vq) {
+-			if (vu_dev->vq_irq_vq_map & BIT_ULL(vq->index))
++			if (vq_map & BIT_ULL(vq->index))
+ 				vring_interrupt(0 /* ignored */, vq);
+ 		}
+-		vu_dev->vq_irq_vq_map = 0;
+-	} else if (vu_dev->config_changed_irq) {
+-		virtio_config_changed(&vu_dev->vdev);
+-		vu_dev->config_changed_irq = false;
+ 	}
++	if (config_changed)
++		virtio_config_changed(&vu_dev->vdev);
+ 
+ 	return ret;
+ }
+ 
++#ifdef UML_HOST_DARWIN
++static void vu_req_irq_work(struct irq_work *work)
++{
++	struct virtio_uml_device *vu_dev =
++		container_of(work, struct virtio_uml_device, req_irq_work);
++
++	vu_req_interrupt(vu_dev->irq, vu_dev);
++}
++#endif
++
+ #ifndef UML_HOST_DARWIN
+ static void vu_req_interrupt_comm_handler(int irq, int fd, void *data,
+ 					  struct time_travel_event *ev)
+@@ -508,6 +748,7 @@ static int vhost_user_init_slave_req(struct virtio_uml_device *vu_dev)
+ 	um_free_irq(vu_dev->irq, vu_dev);
+ err_close:
+ 	os_close_file(req_fds[0]);
++	vu_dev->req_fd = -1;
+ out:
+ 	/* Close unused write end of request fds */
+ 	os_close_file(req_fds[1]);
+@@ -530,6 +771,15 @@ static int vhost_user_init(struct virtio_uml_device *vu_dev)
+ 		if (rc)
+ 			return rc;
+ 		vu_dev->protocol_features &= VHOST_USER_SUPPORTED_PROTOCOL_F;
++		if ((vu_dev->protocol_features &
++		     BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM_MAP)) &&
++		    (vu_dev->protocol_features &
++		     (BIT_ULL(VHOST_USER_PROTOCOL_F_SLAVE_REQ) |
++		      BIT_ULL(VHOST_USER_PROTOCOL_F_REPLY_ACK))) !=
++			(BIT_ULL(VHOST_USER_PROTOCOL_F_SLAVE_REQ) |
++			 BIT_ULL(VHOST_USER_PROTOCOL_F_REPLY_ACK)))
++			vu_dev->protocol_features &=
++				~BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM_MAP);
+ 		rc = vhost_user_set_protocol_features(vu_dev,
+ 				vu_dev->protocol_features);
+ 		if (rc)
+@@ -543,6 +793,15 @@ static int vhost_user_init(struct virtio_uml_device *vu_dev)
+ 			return rc;
+ 	}
+ 
++#ifdef UML_HOST_DARWIN
++	if (vu_dev->protocol_features &
++			BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM_MAP)) {
++		rc = vhost_user_get_shmem_config(vu_dev);
++		if (rc)
++			return rc;
++	}
++#endif
++
+ 	if (vu_dev->protocol_features &
+ 			BIT_ULL(VHOST_USER_PROTOCOL_F_MQ)) {
+ 		rc = vhost_user_get_queue_num(vu_dev, &vu_dev->max_vqs);
+@@ -881,6 +1140,9 @@ static void vu_reset(struct virtio_device *vdev)
+ {
+ 	struct virtio_uml_device *vu_dev = to_virtio_uml_device(vdev);
+ 
++#ifdef UML_HOST_DARWIN
++	uml_vhost_user_shmem_reset(vu_dev);
++#endif
+ 	vu_dev->status = 0;
+ }
+ 
+@@ -1124,6 +1386,18 @@ static const char *vu_bus_name(struct virtio_device *vdev)
+ 	return vu_dev->pdev->name;
+ }
+ 
++static bool vu_get_shm_region(struct virtio_device *vdev,
++			      struct virtio_shm_region *region, u8 id)
++{
++	struct virtio_uml_device *vu_dev = to_virtio_uml_device(vdev);
++
++	if (!region || !vu_dev->has_shmem_region ||
++	    id != VHOST_USER_SHMEM_REGION_HOST_VISIBLE)
++		return false;
++	*region = vu_dev->shmem_region;
++	return true;
++}
++
+ static const struct virtio_config_ops virtio_uml_config_ops = {
+ 	.get = vu_get,
+ 	.set = vu_set,
+@@ -1135,6 +1409,7 @@ static const struct virtio_config_ops virtio_uml_config_ops = {
+ 	.get_features = vu_get_features,
+ 	.finalize_features = vu_finalize_features,
+ 	.bus_name = vu_bus_name,
++	.get_shm_region = vu_get_shm_region,
+ };
+ 
+ static void virtio_uml_release_dev(struct device *d)
+@@ -1145,6 +1420,11 @@ static void virtio_uml_release_dev(struct device *d)
+ 
+ 	time_travel_propagate_time();
+ 
++#ifdef UML_HOST_DARWIN
++	irq_work_sync(&vu_dev->req_irq_work);
++	uml_vhost_user_shmem_release(vu_dev);
++#endif
++
+ 	/* might not have been opened due to not negotiating the feature */
+ 	if (vu_dev->req_fd >= 0) {
+ 		um_free_irq(vu_dev->irq, vu_dev);
+@@ -1177,6 +1457,10 @@ static void vu_of_conn_broken(struct work_struct *wk)
+ 
+ 	vu_dev = platform_get_drvdata(pdata->pdev);
+ 
++#ifdef UML_HOST_DARWIN
++	uml_vhost_user_shmem_release(vu_dev);
++	vu_dev->has_shmem_region = false;
++#endif
+ 	virtio_break_device(&vu_dev->vdev);
+ 
+ 	/*
+@@ -1263,6 +1547,10 @@ static int virtio_uml_probe(struct platform_device *pdev)
+ 	vu_dev->sock = rc;
+ 
+ 	raw_spin_lock_init(&vu_dev->sock_lock);
++	raw_spin_lock_init(&vu_dev->req_lock);
++#ifdef UML_HOST_DARWIN
++	init_irq_work(&vu_dev->req_irq_work, vu_req_irq_work);
++#endif
+ 
+ 	rc = vhost_user_init(vu_dev);
+ 	if (rc)
+@@ -1281,6 +1569,14 @@ static int virtio_uml_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ error_init:
++#ifdef UML_HOST_DARWIN
++	irq_work_sync(&vu_dev->req_irq_work);
++	uml_vhost_user_shmem_release(vu_dev);
++#endif
++	if (vu_dev->req_fd >= 0) {
++		um_free_irq(vu_dev->irq, vu_dev);
++		os_close_file(vu_dev->req_fd);
++	}
+ 	os_close_file(vu_dev->sock);
+ error_free:
+ 	kfree(vu_dev);
+diff --git a/arch/um/include/shared/mem.h b/arch/um/include/shared/mem.h
+index 98aacd54410801551d3b887e1181a9e7b0f7429f..952b871ea04bf65e28379adcbe3788cd5f67cc1e 100644
+--- a/arch/um/include/shared/mem.h
++++ b/arch/um/include/shared/mem.h
+@@ -8,6 +8,28 @@
+ 
+ extern int phys_mapping(unsigned long phys, unsigned long long *offset_out);
+ 
++#ifdef UML_HOST_DARWIN
++#define UML_VHOST_USER_SHMEM_ALIGNMENT	(16ULL * 1024ULL)
++#define UML_VHOST_USER_SHMEM_SIZE	(1024ULL * 1024ULL * 1024ULL)
++#define UML_VHOST_USER_SHMEM_RESERVATION_SIZE \
++	(UML_VHOST_USER_SHMEM_SIZE + 2 * UML_VHOST_USER_SHMEM_ALIGNMENT)
++
++void uml_vhost_user_shmem_reserve(void);
++int uml_vhost_user_shmem_claim(void *owner, unsigned long long size,
++			       unsigned long long *phys_out,
++			       unsigned long long *size_out);
++int uml_vhost_user_shmem_map(void *owner, int fd,
++			     unsigned long long fd_offset,
++			     unsigned long long shm_offset,
++			     unsigned long long length,
++			     unsigned long long flags);
++int uml_vhost_user_shmem_unmap(void *owner,
++			       unsigned long long shm_offset,
++			       unsigned long long length);
++void uml_vhost_user_shmem_reset(void *owner);
++void uml_vhost_user_shmem_release(void *owner);
++#endif
++
+ extern unsigned long uml_physmem;
+ static inline unsigned long uml_to_phys(void *virt)
+ {
+diff --git a/arch/um/kernel/physmem.c b/arch/um/kernel/physmem.c
+index af02b5f9911d343b3089f40aea3d6d595b47f7f4..e739fa5ab8f956ab8802ee7a759eb2134a03be4b 100644
+--- a/arch/um/kernel/physmem.c
++++ b/arch/um/kernel/physmem.c
+@@ -7,6 +7,7 @@
+ #include <linux/memblock.h>
+ #include <linux/mm.h>
+ #include <linux/pfn.h>
++#include <linux/spinlock.h>
+ #include <asm/page.h>
+ #include <asm/sections.h>
+ #include <as-layout.h>
+@@ -18,6 +19,250 @@
+ 
+ static int physmem_fd = -1;
+ 
++#ifdef UML_HOST_DARWIN
++#define UML_VHOST_USER_SHMEM_MAX_MAPS \
++	(UML_VHOST_USER_SHMEM_SIZE / UML_VHOST_USER_SHMEM_ALIGNMENT)
++#define UML_VHOST_USER_SHMEM_MAP_RW	1
++
++struct uml_vhost_user_shmem_mapping {
++	void *owner;
++	unsigned long long fd_offset;
++	unsigned long long shm_offset;
++	unsigned long long length;
++	int fd;
++	bool mapped;
++};
++
++static DEFINE_RAW_SPINLOCK(uml_vhost_user_shmem_lock);
++static struct uml_vhost_user_shmem_mapping
++	uml_vhost_user_shmem_mappings[UML_VHOST_USER_SHMEM_MAX_MAPS];
++/* Zero means free; otherwise the page names its mapping's first page plus one. */
++static unsigned int uml_vhost_user_shmem_pages[UML_VHOST_USER_SHMEM_MAX_MAPS];
++static void *uml_vhost_user_shmem_owner;
++static unsigned long uml_vhost_user_shmem_phys;
++static bool uml_vhost_user_shmem_reserved;
++static bool uml_vhost_user_shmem_revoking;
++
++void uml_vhost_user_shmem_reserve(void)
++{
++	if (uml_vhost_user_shmem_reserved)
++		return;
++
++	/* One leading alignment gap and one trailing guard bound the aperture. */
++	iomem_size += UML_VHOST_USER_SHMEM_RESERVATION_SIZE;
++	uml_vhost_user_shmem_reserved = true;
++}
++
++int uml_vhost_user_shmem_claim(void *owner, unsigned long long size,
++			       unsigned long long *phys_out,
++			       unsigned long long *size_out)
++{
++	unsigned long flags;
++	unsigned long virt;
++	int ret = 0;
++
++	if (!owner || !phys_out || !size_out ||
++	    !uml_vhost_user_shmem_reserved || size != UML_VHOST_USER_SHMEM_SIZE)
++		return -EINVAL;
++
++	virt = ALIGN(high_physmem + PAGE_SIZE,
++		     UML_VHOST_USER_SHMEM_ALIGNMENT);
++	if (virt < high_physmem || virt > end_iomem ||
++	    end_iomem - virt < UML_VHOST_USER_SHMEM_SIZE)
++		return -ERANGE;
++
++	raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, flags);
++	if (uml_vhost_user_shmem_revoking ||
++	    (uml_vhost_user_shmem_owner &&
++	     uml_vhost_user_shmem_owner != owner)) {
++		ret = -EBUSY;
++	} else {
++		uml_vhost_user_shmem_owner = owner;
++		uml_vhost_user_shmem_phys = __pa(virt);
++		*phys_out = uml_vhost_user_shmem_phys;
++		*size_out = UML_VHOST_USER_SHMEM_SIZE;
++	}
++	raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++	return ret;
++}
++
++int uml_vhost_user_shmem_map(void *owner, int fd,
++			     unsigned long long fd_offset,
++			     unsigned long long shm_offset,
++			     unsigned long long length,
++			     unsigned long long flags)
++{
++	struct uml_stat stat;
++	struct uml_vhost_user_shmem_mapping *mapping;
++	unsigned long irq_flags;
++	unsigned int first, count, i;
++	int ret = 0;
++
++	if (!owner || fd < 0 || !length ||
++	    flags != UML_VHOST_USER_SHMEM_MAP_RW ||
++	    ((fd_offset | shm_offset | length) &
++	     (UML_VHOST_USER_SHMEM_ALIGNMENT - 1)))
++		return -EINVAL;
++	if (fd_offset > U64_MAX - length || shm_offset > U64_MAX - length ||
++	    shm_offset + length > UML_VHOST_USER_SHMEM_SIZE)
++		return -ERANGE;
++	if (os_stat_fd(fd, &stat) || fd_offset + length > stat.ust_size)
++		return -EINVAL;
++	first = shm_offset / UML_VHOST_USER_SHMEM_ALIGNMENT;
++	count = length / UML_VHOST_USER_SHMEM_ALIGNMENT;
++
++	raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, irq_flags);
++	if (uml_vhost_user_shmem_owner != owner) {
++		ret = -EPERM;
++		goto out_unlock;
++	}
++	if (uml_vhost_user_shmem_revoking) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++	for (i = first; i < first + count; i++) {
++		if (uml_vhost_user_shmem_pages[i]) {
++			ret = -EEXIST;
++			goto out_unlock;
++		}
++	}
++	mapping = &uml_vhost_user_shmem_mappings[first];
++	*mapping = (struct uml_vhost_user_shmem_mapping) {
++		.owner = owner,
++		.fd_offset = fd_offset,
++		.shm_offset = shm_offset,
++		.length = length,
++		.fd = fd,
++		.mapped = true,
++	};
++	for (i = first; i < first + count; i++)
++		uml_vhost_user_shmem_pages[i] = first + 1;
++
++out_unlock:
++	raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, irq_flags);
++	return ret;
++}
++
++int uml_vhost_user_shmem_unmap(void *owner,
++			       unsigned long long shm_offset,
++			       unsigned long long length)
++{
++	struct uml_vhost_user_shmem_mapping *mapping;
++	unsigned long flags;
++	unsigned int first, count, i;
++	int fd = -1;
++
++	if (!owner || !length ||
++	    ((shm_offset | length) & (UML_VHOST_USER_SHMEM_ALIGNMENT - 1)) ||
++	    shm_offset > U64_MAX - length ||
++	    shm_offset + length > UML_VHOST_USER_SHMEM_SIZE)
++		return -EINVAL;
++	first = shm_offset / UML_VHOST_USER_SHMEM_ALIGNMENT;
++	count = length / UML_VHOST_USER_SHMEM_ALIGNMENT;
++
++	raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, flags);
++	if (uml_vhost_user_shmem_owner != owner || uml_vhost_user_shmem_revoking)
++		goto out_unlock;
++	mapping = &uml_vhost_user_shmem_mappings[first];
++	if (!mapping->mapped || mapping->owner != owner ||
++	    mapping->shm_offset != shm_offset || mapping->length != length)
++		goto out_unlock;
++	fd = mapping->fd;
++	for (i = first; i < first + count; i++)
++		uml_vhost_user_shmem_pages[i] = 0;
++	*mapping = (struct uml_vhost_user_shmem_mapping) {};
++
++out_unlock:
++	raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++	if (fd < 0)
++		return -ENOENT;
++	os_close_file(fd);
++	return 0;
++}
++
++static void uml_vhost_user_shmem_revoke(void *owner, bool release)
++{
++	int fds[64];
++	unsigned long flags;
++	unsigned int first, i, count;
++
++	raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, flags);
++	if (uml_vhost_user_shmem_owner != owner) {
++		raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++		return;
++	}
++	if (release)
++		uml_vhost_user_shmem_owner = NULL;
++	if (uml_vhost_user_shmem_revoking) {
++		raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++		return;
++	}
++	uml_vhost_user_shmem_revoking = true;
++	memset(uml_vhost_user_shmem_pages, 0, sizeof(uml_vhost_user_shmem_pages));
++	raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++
++	/* Keep the stack bounded and close host descriptors outside the raw lock. */
++	for (first = 0; first < UML_VHOST_USER_SHMEM_MAX_MAPS;
++	     first += ARRAY_SIZE(fds)) {
++		count = 0;
++		raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, flags);
++		for (i = first; i < first + ARRAY_SIZE(fds) &&
++		     i < UML_VHOST_USER_SHMEM_MAX_MAPS; i++) {
++			struct uml_vhost_user_shmem_mapping *mapping =
++				&uml_vhost_user_shmem_mappings[i];
++
++			if (!mapping->mapped || mapping->owner != owner)
++				continue;
++			fds[count++] = mapping->fd;
++			*mapping = (struct uml_vhost_user_shmem_mapping) {};
++		}
++		raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++		for (i = 0; i < count; i++)
++			os_close_file(fds[i]);
++	}
++	raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, flags);
++	uml_vhost_user_shmem_revoking = false;
++	raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++}
++
++void uml_vhost_user_shmem_reset(void *owner)
++{
++	uml_vhost_user_shmem_revoke(owner, false);
++}
++
++void uml_vhost_user_shmem_release(void *owner)
++{
++	uml_vhost_user_shmem_revoke(owner, true);
++}
++
++static int uml_vhost_user_shmem_phys_mapping(
++	unsigned long phys, unsigned long long *offset_out)
++{
++	struct uml_vhost_user_shmem_mapping *mapping;
++	unsigned long long offset;
++	unsigned long flags;
++	unsigned int index;
++	int fd = -1;
++
++	raw_spin_lock_irqsave(&uml_vhost_user_shmem_lock, flags);
++	if (uml_vhost_user_shmem_revoking || phys < uml_vhost_user_shmem_phys)
++		goto out_unlock;
++	offset = phys - uml_vhost_user_shmem_phys;
++	if (offset >= UML_VHOST_USER_SHMEM_SIZE)
++		goto out_unlock;
++	index = uml_vhost_user_shmem_pages[offset / UML_VHOST_USER_SHMEM_ALIGNMENT];
++	if (!index)
++		goto out_unlock;
++	mapping = &uml_vhost_user_shmem_mappings[index - 1];
++	fd = mapping->fd;
++	*offset_out = mapping->fd_offset + offset - mapping->shm_offset;
++
++out_unlock:
++	raw_spin_unlock_irqrestore(&uml_vhost_user_shmem_lock, flags);
++	return fd;
++}
++#endif
++
+ /* Changed during early boot */
+ unsigned long high_physmem;
+ EXPORT_SYMBOL(high_physmem);
+@@ -117,6 +362,10 @@ int phys_mapping(unsigned long phys, unsigned long long *offset_out)
+ 			}
+ 			region = region->next;
+ 		}
++#ifdef UML_HOST_DARWIN
++		if (fd < 0)
++			fd = uml_vhost_user_shmem_phys_mapping(phys, offset_out);
++#endif
+ 	}
+ 
+ 	return fd;
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+index 8fc2974ed990740df90e8dfdc5ecebc60cb19526..175767459fda9ac776b9395ff5fc3a29b0d86226 100644
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -31,6 +31,7 @@
+ #include <init.h>
+ #include <kern.h>
+ #include <kern_util.h>
++#include <mem.h>
+ #include <mem_user.h>
+ #include <os.h>
+ #include <skas.h>
+@@ -331,7 +332,16 @@ static unsigned long __init darwin_native_auxiliary_size(
+ 	 */
+ 	if (size > UML_DARWIN_NATIVE_AUXILIARY_MAXIMUM)
+ 		size = UML_DARWIN_NATIVE_AUXILIARY_MAXIMUM;
+-	return size;
++	/*
++	 * The shared-memory aperture is a fixed guest-physical reservation, not
++	 * part of the RAM-scaled vmalloc allowance, so it is added after that
++	 * cap instead of competing with it.
++	 */
++	if (size > ULONG_MAX - UML_VHOST_USER_SHMEM_RESERVATION_SIZE -
++		STUB_SIZE)
++		return ULONG_MAX;
++	return PAGE_ALIGN(size + UML_VHOST_USER_SHMEM_RESERVATION_SIZE +
++		STUB_SIZE);
+ }
+ #endif
+ 
+@@ -452,6 +462,14 @@ int __init linux_main(int argc, char **argv, char **envp)
+ 
+ 	setup_machinename(init_utsname()->machine);
+ 
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Reserve a bounded, guarded GPA aperture for negotiated vhost-user
++	 * shared-memory regions. It consumes address space, not guest RAM.
++	 */
++	uml_vhost_user_shmem_reserve();
++#endif
++
+ 	physmem_size = (physmem_size + PAGE_SIZE - 1) & PAGE_MASK;
+ 	iomem_size = (iomem_size + PAGE_SIZE - 1) & PAGE_MASK;
+ 
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vram.c b/drivers/gpu/drm/virtio/virtgpu_vram.c
+index f955779d5ea0ea115ed0c5b9d06072fc006aa521..e8a9d6d62e4c245897b72ce1fc3b251db2b1cc19 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vram.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vram.c
+@@ -2,6 +2,9 @@
+ #include "virtgpu_drv.h"
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/sizes.h>
++
++#define VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT	SZ_16K
+ 
+ static void virtio_gpu_vram_free(struct drm_gem_object *obj)
+ {
+@@ -153,8 +156,10 @@ static int virtio_gpu_vram_map(struct virtio_gpu_object *bo)
+ 		return -EINVAL;
+ 
+ 	spin_lock(&vgdev->host_visible_lock);
+-	ret = drm_mm_insert_node(&vgdev->host_visible_mm, &vram->vram_node,
+-				 bo->base.base.size);
++	ret = drm_mm_insert_node_generic(&vgdev->host_visible_mm,
++				 &vram->vram_node, bo->base.base.size,
++				 VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT, 0,
++				 DRM_MM_INSERT_BEST);
+ 	spin_unlock(&vgdev->host_visible_lock);
+ 
+ 	if (ret)
+@@ -193,6 +198,10 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
+ 	struct virtio_gpu_object_vram *vram;
+ 	int ret;
+ 
++	if (!params->size ||
++	    params->size > ULONG_MAX - (VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT - 1))
++		return -EINVAL;
++
+ 	vram = kzalloc(sizeof(*vram), GFP_KERNEL);
+ 	if (!vram)
+ 		return -ENOMEM;
+@@ -200,7 +209,8 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
+ 	obj = &vram->base.base.base;
+ 	obj->funcs = &virtio_gpu_vram_funcs;
+ 
+-	params->size = PAGE_ALIGN(params->size);
++	params->size = ALIGN(params->size,
++			     VIRTIO_GPU_HOST_VISIBLE_ALIGNMENT);
+ 	drm_gem_private_object_init(vgdev->ddev, obj, params->size);
+ 
+ 	/* Create fake offset */

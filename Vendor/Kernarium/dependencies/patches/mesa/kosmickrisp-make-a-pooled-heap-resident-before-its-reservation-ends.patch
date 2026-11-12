@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 02:12:39 +0900
+Subject: [PATCH] kosmickrisp: make a pooled heap resident before its
+ reservation ends
+
+A pooled device reserves the size of every heap before Metal makes it
+and releases the reservation once the host's pool counts the heap. The
+pool counts what the GPU holds for the process by the larger of two
+readings: Metal's allocation counter and the process's graphics
+footprint, the ledger the system limits the process by. Metal counts a
+heap from its creation, but the footprint counts its pages only once
+they are resident, and the device's residency set makes them resident
+only at the device's next submission. The footprint also holds storage
+Metal's counter omits, such as command storage, so it usually leads the
+counter, and a heap made under that lead moved neither reading the pool
+goes by. A burst of allocations with no submission between them, such
+as a guest creating textures back to back, was admitted against a usage
+that did not move, and once the next submission made the heaps resident
+the process held more than the pool's limit, by as much as the lead.
+
+A pooled device now makes each heap it creates resident, through a
+residency set of the heap's own, before the reservation ends, so both
+readings count the heap from then on. The device's own storage is made
+resident too, so the pool sees it from its creation. The next
+submission would have made every heap resident anyway, so this moves
+the cost of committing the pages rather than adding to it; a device
+without a pool is unchanged.
+
+tests/test_device_memory_pool.c checks that the footprint has counted
+each heap by the time its reservation is released, before any work is
+submitted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/bridge/mtl_heap.h             |  1 +
+ src/kosmickrisp/bridge/mtl_heap.m             | 24 +++++++++++
+ src/kosmickrisp/bridge/stubs/mtl_heap.c       |  5 +++
+ src/kosmickrisp/vulkan/kk_bo.c                | 12 ++++++
+ .../vulkan/tests/test_device_memory_pool.c    | 43 +++++++++++++++++--
+ 5 files changed, 81 insertions(+), 4 deletions(-)
+
+diff --git a/src/kosmickrisp/bridge/mtl_heap.h b/src/kosmickrisp/bridge/mtl_heap.h
+index fd34ac4ac5b1153dfb0ce8f738087c82fb9e73f3..345d0514435dd516aafd7849f4fe6233897f17b5 100644
+--- a/src/kosmickrisp/bridge/mtl_heap.h
++++ b/src/kosmickrisp/bridge/mtl_heap.h
+@@ -20,6 +20,7 @@ mtl_heap *mtl_new_heap(mtl_device *device, uint64_t size,
+ 
+ /* Utils */
+ uint64_t mtl_heap_get_size(mtl_heap *heap);
++void mtl_heap_make_resident(mtl_device *device, mtl_heap *heap);
+ 
+ /* Allocation from heap */
+ mtl_buffer *mtl_new_buffer_with_length(mtl_heap *heap, uint64_t size_B,
+diff --git a/src/kosmickrisp/bridge/mtl_heap.m b/src/kosmickrisp/bridge/mtl_heap.m
+index c658c0253ec30f9667bbb6f3c668bdfddd442df3..a5212dacf2ff415388502d51b580b0db7bbc18d9 100644
+--- a/src/kosmickrisp/bridge/mtl_heap.m
++++ b/src/kosmickrisp/bridge/mtl_heap.m
+@@ -11,6 +11,7 @@
+ #include "kk_image_layout.h"
+ 
+ #include <Metal/MTLHeap.h>
++#include <Metal/MTLResidencySet.h>
+ 
+ /* Creation */
+ mtl_heap *
+@@ -38,6 +39,29 @@
+    }
+ }
+ 
++/* Commits the heap's pages now, through a residency set of its own, rather
++ * than at the first submission of a queue whose set holds it. The pages stay
++ * once the set ends its residency; only their eviction becomes possible. */
++void
++mtl_heap_make_resident(mtl_device *device, mtl_heap *heap)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      MTLResidencySetDescriptor *descriptor =
++         [[[MTLResidencySetDescriptor alloc] init] autorelease];
++      NSError *error = nil;
++      id<MTLResidencySet> set =
++         [dev newResidencySetWithDescriptor:descriptor error:&error];
++      if (set == nil)
++         return;
++      [set addAllocation:(id<MTLHeap>)heap];
++      [set commit];
++      [set requestResidency];
++      [set endResidency];
++      [set release];
++   }
++}
++
+ static MTLTextureDescriptor *
+ mtl_new_texture_descriptor(const struct kk_image_layout *layout)
+ {
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_heap.c b/src/kosmickrisp/bridge/stubs/mtl_heap.c
+index de916c4d76c11d24af9781f9922c0c7223dfa130..53cf2e58e0a529823d846a0a34d94848991571b0 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_heap.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_heap.c
+@@ -21,6 +21,11 @@ mtl_heap_get_size(mtl_heap *heap)
+    return 0u;
+ }
+ 
++void
++mtl_heap_make_resident(mtl_device *device, mtl_heap *heap)
++{
++}
++
+ /* Allocation from heap */
+ mtl_buffer *
+ mtl_new_buffer_with_length(mtl_heap *heap, uint64_t size_B, uint64_t offset_B)
+diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
+index 5cb334fbd59bc3d22fe00f809e0af53897d015b8..a62d01c717055e5766f0f332592d20c3f809e13d 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.c
++++ b/src/kosmickrisp/vulkan/kk_bo.c
+@@ -72,6 +72,18 @@ kk_alloc_bo_internal(struct kk_device *dev, struct vk_object_base *log_obj,
+ 
+    kk_device_add_heap_to_residency_set(dev, handle);
+ 
++   /* Metal counts a heap from its creation, but the process's graphics
++    * footprint counts its pages only once they are resident, which the
++    * device's residency set makes them at the device's next submission. A
++    * pool that reads both and goes by the larger misses a heap made while the
++    * footprint leads Metal's count, so allocations made with no submission
++    * between them could together pass its limit. A pooled device makes every
++    * heap resident here, before its reservation ends, so both readings count
++    * it from then on; its next submission would have made it resident
++    * anyway. */
++   if (kk_device_pooled(dev))
++      mtl_heap_make_resident(dev->mtl_handle, handle);
++
+    *bo_out = bo;
+    if (reserved)
+       kk_device_pool_release(dev, size_B);
+diff --git a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+index 2eb8fe7ac47d99507a639525c22a1e1139d0d49e..679e608c78d767ba4cb6d715e8d910a88099c950 100644
+--- a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
++++ b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
+@@ -5,12 +5,14 @@
+  * the devices a Venus guest and the host's OpenGL driver create then share it
+  * without either chaining anything.  An allocation the pool cannot hold fails
+  * with VK_ERROR_OUT_OF_DEVICE_MEMORY and allocates nothing; the reservation of
+- * one that succeeds is returned once Metal counts the heap, so a pool that
+- * counts what its devices hold sees every byte once.
++ * one that succeeds is returned once both Metal and the process's graphics
++ * footprint count the heap, so a pool that counts what its devices hold by
++ * either reading sees every byte once.
+  *
+  * The pool here counts what the test allocated, and refuses what would take
+  * that and the reservations under way past its limit.  The test checks the
+- * limit, the balance of reservations and releases, that a refusal charges
++ * limit, that the footprint has counted a heap when its reservation is
++ * returned, the balance of reservations and releases, that a refusal charges
+  * nothing and leaves the device usable, that clearing the pool, or stating one
+  * with a callback missing, frees the devices of any bound, and that a pool a
+  * device names itself is charged instead of the process's. */
+@@ -18,6 +20,7 @@
+ #define VK_NO_PROTOTYPES
+ #include <vulkan/vulkan_core.h>
+ 
++#include <mach/mach.h>
+ #include <pthread.h>
+ #include <stdatomic.h>
+ #include <stdio.h>
+@@ -38,8 +41,29 @@ struct pool {
+    /* When not UINT64_MAX, the headroom the pool reports, whatever it holds:
+     * the ledger a pool counts by can lag behind what was freed. */
+    _Atomic VkDeviceSize headroom_override_B;
++   /* While set, each release checks that the graphics footprint grew by the
++    * reservation since it was admitted, and counts the releases where it
++    * did not. */
++   bool check_footprint;
++   int64_t footprint_at_reserve_B;
++   unsigned uncounted;
+ };
+ 
++/* The process's graphics footprint, the ledger the system counts a process's
++ * GPU memory by. */
++static int64_t
++graphics_footprint_B(void)
++{
++   task_vm_info_data_t info = {0};
++   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
++   if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info,
++                 &count) != KERN_SUCCESS ||
++       count < TASK_VM_INFO_COUNT)
++      return -1;
++   return info.ledger_tag_graphics_footprint +
++          info.ledger_tag_graphics_footprint_compressed;
++}
++
+ static VkDeviceSize
+ charge_B(VkDeviceSize size)
+ {
+@@ -57,6 +81,8 @@ pool_reserve(void *data, VkDeviceSize size)
+       return VK_FALSE;
+    }
+    pool->reserved_B += charge_B(size);
++   if (pool->check_footprint)
++      pool->footprint_at_reserve_B = graphics_footprint_B();
+    return VK_TRUE;
+ }
+ 
+@@ -65,6 +91,10 @@ pool_release(void *data, VkDeviceSize size)
+ {
+    struct pool *pool = data;
+    CHECK(pool->reserved_B >= charge_B(size));
++   if (pool->check_footprint &&
++       graphics_footprint_B() - pool->footprint_at_reserve_B <
++          (int64_t)charge_B(size))
++      pool->uncounted++;
+    pool->reserved_B -= charge_B(size);
+    pool->releases++;
+ }
+@@ -171,11 +201,16 @@ main(void)
+       kk_test_memory_type(&t, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const uint32_t host_type = kk_test_memory_type(&t, ~0u, KK_TEST_HOST_MEMORY);
+ 
+-   /* What fits is admitted, and its reservation is returned. */
++   /* What fits is admitted, and its reservation is returned once the
++    * footprint counts the heap as well as Metal: no work has been submitted
++    * that would make the heaps resident. */
+    VkDeviceMemory memory[3] = {0}, extra = VK_NULL_HANDLE;
++   process.check_footprint = graphics_footprint_B() >= 0;
+    for (unsigned i = 0; i < 3; i++)
+       CHECK(allocate(&t, device_type, MIB(32), &memory[i], &process) ==
+             VK_SUCCESS);
++   CHECK(process.uncounted == 0u);
++   process.check_footprint = false;
+    CHECK(process.live_B == MIB(96));
+    CHECK(process.reserved_B == 0u);
+    CHECK(process.reserves >= 3u && process.reserves == process.releases);

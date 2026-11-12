@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:10:52 +0900
+Subject: [PATCH] venus: keep the ring awake while a driver notify still covers
+ it
+
+The driver announces commands to an idle ring with a notify, and sends
+at most one per idle timeout: Mesa throttles by the same
+VN_RING_IDLE_TIMEOUT_NS it passes as idleTimeout, counts that notify as
+covering every command it submits in the interval, and never notifies
+again while it waits for the ring. The ring cleared pending_notify at
+every idle transition, so a notify that arrived while it was busy was
+dropped. When the ring had already read the notified command on its own,
+a later command inside the driver's interval that found the ring idle was
+never announced; the ring slept on it and the driver waited until it
+aborted. A Vulkan CTS image-format family hung that way in 3 of 15 runs
+on a Darwin host.
+
+The ring now never sleeps while a notify the driver counts as
+outstanding may still cover a later command. It takes a notify under the
+ring mutex, both when it wakes and at an idle transition, instead of
+discarding it; a taken notify keeps it awake for twice the idle timeout,
+the driver's interval plus the same again as margin for the two clocks.
+A notify that arrives while the ring works stays pending for the next
+transition.
+
+The tail load after setting the idle bit is now sequentially consistent.
+The driver stores the tail and then loads the status; the ring sets the
+idle bit and then loads the tail. Each must see the other's store, and
+an acquire load (LDAPR after LDSETAL on arm64) may be satisfied before
+the idle bit is visible.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_ring.c | 69 ++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 60 insertions(+), 9 deletions(-)
+
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 26446485cbd480ec71f71e899695bd19c071977f..1911c07c931aa7e7ce5e690ee2edf631ed0bb3c8 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -75,6 +75,43 @@ vkr_ring_load_tail(const struct vkr_ring *ring)
+    return atomic_load_explicit(ring->control.tail, memory_order_acquire);
+ }
+ 
++static uint32_t
++vkr_ring_load_tail_after_idle(const struct vkr_ring *ring)
++{
++   /* The driver stores the tail and then loads the status, and the ring sets
++    * the idle bit and then loads the tail: each side must see the other's
++    * store, or the driver skips the notify while the ring goes to sleep on a
++    * command it never read. That needs both loads sequentially consistent. An
++    * acquire load may be satisfied before the idle bit is visible (LDAPR after
++    * LDSETAL on arm64), so this one is not an acquire load.
++    */
++   return atomic_load_explicit(ring->control.tail, memory_order_seq_cst);
++}
++
++static uint64_t
++vkr_ring_notify_window(const struct vkr_ring *ring)
++{
++   /* The driver sends at most one notify per idle timeout -- Mesa throttles
++    * by the VN_RING_IDLE_TIMEOUT_NS it also passes as idleTimeout -- and
++    * counts that notify as covering every command it submits within the
++    * interval, measured on its own clock from its decision to notify. The
++    * ring therefore stays awake for twice the idle timeout after it takes a
++    * notify: one interval for the driver's window, which began before the
++    * notify reached the ring, and one of margin for the two clocks.
++    */
++   return ring->idle_timeout * 2;
++}
++
++static bool
++vkr_ring_take_notify(struct vkr_ring *ring)
++{
++   mtx_lock(&ring->mutex);
++   const bool notified = ring->pending_notify;
++   ring->pending_notify = false;
++   mtx_unlock(&ring->mutex);
++   return notified;
++}
++
+ static void
+ vkr_ring_unset_status_bits(struct vkr_ring *ring, uint32_t mask)
+ {
+@@ -264,17 +301,27 @@ vkr_ring_thread(void *arg)
+ #endif
+    }
+ 
+-   uint64_t last_submit = vkr_ring_now();
++   /* The ring never sleeps while a notify the driver counts as outstanding
++    * may still cover a later command: a taken notify keeps it awake for the
++    * notify window, and one that arrives while it is busy is taken at the
++    * next idle transition rather than discarded there.
++    */
++   uint64_t idle_deadline = vkr_ring_now() + ring->idle_timeout;
+    uint32_t relax_iter = 0;
+    int ret = 0;
+    while (ring->started) {
+       bool wait = false;
+-      if (vkr_ring_now() >= last_submit + ring->idle_timeout) {
+-         ring->pending_notify = false;
+-         vkr_ring_set_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
+-         wait = ring->buffer.cur == vkr_ring_load_tail(ring);
+-         if (!wait)
+-            vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
++      const uint64_t now = vkr_ring_now();
++      if (now >= idle_deadline) {
++         if (vkr_ring_take_notify(ring)) {
++            idle_deadline = now + vkr_ring_notify_window(ring);
++            relax_iter = 0;
++         } else {
++            vkr_ring_set_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
++            wait = ring->buffer.cur == vkr_ring_load_tail_after_idle(ring);
++            if (!wait)
++               vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
++         }
+       }
+ 
+       if (wait) {
+@@ -289,13 +336,17 @@ vkr_ring_thread(void *arg)
+                goto out;
+             }
+          }
++         /* The notify that woke the ring is taken here; one that arrives
++          * after this point is left pending for the next idle transition.
++          */
++         ring->pending_notify = false;
+          vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
+          mtx_unlock(&ring->mutex);
+ 
+          if (!ring->started)
+             break;
+ 
+-         last_submit = vkr_ring_now();
++         idle_deadline = vkr_ring_now() + vkr_ring_notify_window(ring);
+          relax_iter = 0;
+       }
+ 
+@@ -316,7 +367,7 @@ vkr_ring_thread(void *arg)
+             break;
+          }
+ 
+-         last_submit = vkr_ring_now();
++         idle_deadline = MAX2(idle_deadline, vkr_ring_now() + ring->idle_timeout);
+          relax_iter = 0;
+       } else {
+          /* Get the active wait_ring seqno first to ensure ordering. */

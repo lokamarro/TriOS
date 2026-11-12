@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:37:10 +0900
+Subject: [PATCH] kosmickrisp: report the host memory a device imports
+
+Metal counts a no-copy buffer in MTLDevice.currentAllocatedSize at its
+full size, whatever backs it, file or anonymous pages alike. A device
+makes one for every VkDeviceMemory imported from a host pointer: the
+shared-memory segments the renderer maps for a guest's host-visible
+allocations, and the pinned pages behind a guest's coherent buffers. The
+pool charges memory a device makes for the GPU and not these, so a host
+that reads Metal's counter for its pool sees memory it only lent, and on
+iOS memory that sits outside the footprint the system limits the process
+by.
+
+kk_imported_host_memory_bytes(), exported by the driver library, is the
+sum of the host-pointer imports the process's devices hold now. It is
+raised once the Metal buffer exists and lowered before it is released,
+so it never exceeds what Metal counts and an import is never counted
+twice. A host subtracts it from Metal's counter to get the memory it
+made.
+
+test_imported_host_memory imports two regions, checks the count after
+each import and each free, that Metal's counter rose by at least the
+import and the count never passes the rise, and that an allocation the
+device makes itself leaves the count alone.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_device_memory.c     |   9 ++
+ src/kosmickrisp/vulkan/kk_device_memory.h     |   4 +
+ .../vulkan/kk_device_memory_pool.c            |  25 ++++
+ .../vulkan/kk_device_memory_pool.h            |   9 ++
+ src/kosmickrisp/vulkan/meson.build            |   2 +
+ .../vulkan/tests/test_imported_host_memory.m  | 130 ++++++++++++++++++
+ 6 files changed, 179 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_imported_host_memory.m
+
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index b75375dce7d3b90125dcfc5abaa482bce07dee11..d2c61b38446fba7081421308416afa7305300b36 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -138,6 +138,12 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
+          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
+          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
++         /* Metal counts the buffer in the device's allocation at its full
++          * size; the import is the host's memory, not one the pool charges. */
++         if (mem->bo->map) {
++            mem->imported_host_B = mem->bo->size_B;
++            kk_imported_host_memory_add(mem->imported_host_B);
++         }
+       }
+ 
+       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+@@ -187,6 +193,9 @@ kk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
+                              mem->bo->gpu, mem->bo->size_B,
+                              VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+ 
++   /* Before the buffer goes, so Metal never counts an import this does not. */
++   if (mem->imported_host_B)
++      kk_imported_host_memory_sub(mem->imported_host_B);
+    kk_destroy_bo(dev, mem->bo);
+ 
+    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.h b/src/kosmickrisp/vulkan/kk_device_memory.h
+index 3fd99f4e63b214972052d56e84208a4607c63e0b..24b2cc021c39c04f8d3d0f5143bc36bda157c7d7 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory.h
+@@ -22,6 +22,10 @@ struct kk_device_memory {
+    struct kk_bo *bo;
+    void *map;
+    struct list_head address_space_link;
++   /* The bytes of host memory this allocation imports by pointer and the
++    * process-wide count includes (kk_imported_host_memory_bytes()), else
++    * zero. */
++   uint64_t imported_host_B;
+ };
+ 
+ struct kk_device_address {
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.c b/src/kosmickrisp/vulkan/kk_device_memory_pool.c
+index 4235d84f22579f0b61c2dc35eb75cf091699c993..3d0a9095d622cdc67ef400923e15ad256984bcb7 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.c
+@@ -97,3 +97,28 @@ kk_device_pool_headroom(const struct kk_device *dev)
+    simple_mtx_unlock(&kk_process_pool_mutex);
+    return headroom;
+ }
++
++/* Host memory the process's devices import by pointer. Metal counts a
++ * no-copy buffer at its full size, whatever backs it, so the figure lets a
++ * host tell the memory it made for the GPU from memory it only lent. It is
++ * kept to the byte under Metal's own count: raised once the buffer exists,
++ * lowered before the buffer goes, so it never exceeds what Metal holds. */
++static uint64_t kk_imported_host_memory_B;
++
++void
++kk_imported_host_memory_add(uint64_t bytes)
++{
++   p_atomic_add(&kk_imported_host_memory_B, bytes);
++}
++
++void
++kk_imported_host_memory_sub(uint64_t bytes)
++{
++   p_atomic_add(&kk_imported_host_memory_B, -bytes);
++}
++
++PUBLIC uint64_t
++kk_imported_host_memory_bytes(void)
++{
++   return p_atomic_read(&kk_imported_host_memory_B);
++}
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+index 98314ff2379420c0b1776186e08225edb7f7f46a..d2f90139e898f7e8645462889f6c760ed91ab6be 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -88,6 +88,15 @@ void kk_set_device_memory_pool(const VkDeviceMemoryPoolCreateInfoKK *pPool);
+  * a queue's or the pool's, so any thread may call it. */
+ uint64_t kk_release_cached_memory(void);
+ 
++/* The bytes of host memory the process's devices hold by import: memory that
++ * exists already and a device maps by its address
++ * (VkImportMemoryHostPointerInfoEXT). Metal counts such a buffer in the
++ * device's allocation at its full size, as it counts a heap the device made,
++ * but no pool charges it, so a host that wants only the memory it makes for
++ * the GPU subtracts this from Metal's counter. Exported by the driver
++ * library. */
++uint64_t kk_imported_host_memory_bytes(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index fa2af0b0d7cce746d6af30ca06f56ba835dc2982..8115891beabed10c20187f64cf37d6ab9398c63a 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -482,6 +482,8 @@ if with_tests
+        [kk_metal_frameworks], ['-Wno-unused-function']],
+       ['command_allocator_budget', ['test_command_allocator_budget.c'], 60,
+        [], []],
++      ['imported_host_memory', ['test_imported_host_memory.m'], 60,
++       [kk_metal_frameworks], []],
+       ['command_buffer_consolidation', ['test_command_buffer_consolidation.c'],
+        60, [], []],
+       ['raster_discard', ['test_raster_discard.cpp', 'raster_discard_state.c'],
+diff --git a/src/kosmickrisp/vulkan/tests/test_imported_host_memory.m b/src/kosmickrisp/vulkan/tests/test_imported_host_memory.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..edcb6025eeb271e454bda910af1bcebe5be3894c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_imported_host_memory.m
+@@ -0,0 +1,130 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A device maps host memory it is lent (VkImportMemoryHostPointerInfoEXT) as
++ * a no-copy Metal buffer, and Metal counts such a buffer in the device's
++ * allocation at its full size, whatever backs it. A host that charges only the
++ * memory it makes for the GPU has to tell the two apart, so the driver counts
++ * its imports: kk_imported_host_memory_bytes() rises by the size of each
++ * import once the buffer exists, falls when the memory is freed, and never
++ * exceeds what Metal holds. An allocation the device makes itself leaves it
++ * alone. */
++
++#define VK_NO_PROTOTYPES
++#include <Metal/Metal.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "kosmickrisp/vulkan/kk_device_memory_pool.h"
++#include "kk_test.h"
++
++#define MIB(n) ((VkDeviceSize)(n) << 20)
++
++static VkResult
++import(const struct kk_test_device *t, void *pointer, VkDeviceSize size,
++       VkDeviceMemory *memory)
++{
++   PFN_vkGetMemoryHostPointerPropertiesEXT get_properties =
++      (PFN_vkGetMemoryHostPointerPropertiesEXT)kk_test_device_proc(
++         t, "vkGetMemoryHostPointerPropertiesEXT");
++   VkMemoryHostPointerPropertiesEXT properties = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
++   VK_CHECK(get_properties(
++      t->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++      pointer, &properties));
++   CHECK(properties.memoryTypeBits != 0u);
++
++   VkImportMemoryHostPointerInfoEXT host = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++      .pHostPointer = pointer,
++   };
++   VkMemoryAllocateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &host,
++      .allocationSize = size,
++      .memoryTypeIndex = (uint32_t)__builtin_ctz(properties.memoryTypeBits),
++   };
++   PFN_vkAllocateMemory allocate_memory =
++      (PFN_vkAllocateMemory)kk_test_device_proc(t, "vkAllocateMemory");
++   return allocate_memory(t->device, &info, NULL, memory);
++}
++
++static void
++release(const struct kk_test_device *t, VkDeviceMemory memory)
++{
++   PFN_vkFreeMemory free_memory =
++      (PFN_vkFreeMemory)kk_test_device_proc(t, "vkFreeMemory");
++   free_memory(t->device, memory, NULL);
++}
++
++static void *
++lend(VkDeviceSize size)
++{
++   void *pointer = mmap(NULL, size, PROT_READ | PROT_WRITE,
++                        MAP_ANON | MAP_PRIVATE, -1, 0);
++   CHECK(pointer != MAP_FAILED);
++   return pointer;
++}
++
++int
++main(void)
++{
++   @autoreleasepool {
++      id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
++      CHECK(metal != nil);
++
++      struct kk_test_device t;
++      kk_test_create_instance(&t, NULL);
++      const char *extensions[] = {
++         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
++      kk_test_create_device(&t, NULL, NULL, 1, extensions);
++
++      const uint64_t counted = kk_imported_host_memory_bytes();
++      const uint64_t held = metal.currentAllocatedSize;
++
++      void *first_pages = lend(MIB(8));
++      void *second_pages = lend(MIB(2));
++      VkDeviceMemory first = VK_NULL_HANDLE, second = VK_NULL_HANDLE;
++      CHECK(import(&t, first_pages, MIB(8), &first) == VK_SUCCESS);
++      CHECK(kk_imported_host_memory_bytes() == counted + MIB(8));
++      /* Metal counts the import, which is why the driver does: the count
++       * is part of what Metal holds. */
++      const uint64_t held_with_first = metal.currentAllocatedSize;
++      CHECK(held_with_first >= held + MIB(8));
++      CHECK(kk_imported_host_memory_bytes() - counted <=
++            held_with_first - held);
++
++      CHECK(import(&t, second_pages, MIB(2), &second) == VK_SUCCESS);
++      CHECK(kk_imported_host_memory_bytes() == counted + MIB(10));
++
++      /* Memory the device makes for itself is not an import. */
++      PFN_vkAllocateMemory allocate_memory =
++         (PFN_vkAllocateMemory)kk_test_device_proc(&t, "vkAllocateMemory");
++      VkMemoryAllocateInfo own_info = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++         .allocationSize = MIB(4),
++         .memoryTypeIndex = kk_test_memory_type(
++            &t, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++      };
++      VkDeviceMemory own = VK_NULL_HANDLE;
++      CHECK(allocate_memory(t.device, &own_info, NULL, &own) == VK_SUCCESS);
++      CHECK(kk_imported_host_memory_bytes() == counted + MIB(10));
++
++      release(&t, own);
++      CHECK(kk_imported_host_memory_bytes() == counted + MIB(10));
++      release(&t, first);
++      CHECK(kk_imported_host_memory_bytes() == counted + MIB(2));
++      release(&t, second);
++      CHECK(kk_imported_host_memory_bytes() == counted);
++
++      munmap(first_pages, MIB(8));
++      munmap(second_pages, MIB(2));
++      kk_test_destroy(&t);
++      CHECK(kk_imported_host_memory_bytes() == counted);
++   }
++   printf("a device counts the host memory it imports\n");
++   return 0;
++}

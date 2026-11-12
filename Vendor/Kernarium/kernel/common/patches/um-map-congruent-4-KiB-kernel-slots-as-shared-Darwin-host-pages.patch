@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:58:06 +0900
+Subject: [PATCH] um: map congruent 4 KiB kernel slots as shared Darwin host
+ pages
+
+With 4 KiB pages on a 16 KiB host every init_mm slot got a private
+shadow whose quarters were copied from guest RAM, so a vmalloc or vmap
+alias was incoherent with the user mappings, linear map and devices
+that reach the same frames. Map a slot whose four PTEs name one aligned
+host page of a single backing as one shared host page instead, and
+unmap an empty slot in one call. Ask vmalloc for groups of four pages so
+that its areas are congruent.
+
+Implement flush_kernel_vmap_range() and invalidate_kernel_vmap_range()
+for the slots that remain private, as Linux does for a virtually indexed
+cache. Callers that share a vmap with another alias, such as XFS, dm,
+the DMA-BUF heaps and the BPF ring buffer, already bracket their
+accesses with them.
+
+Implement flush_cache_vunmap() the same way: it writes a range's private
+slots back to their frames before Linux clears the range's PTEs, so the
+stores of a vm_map_ram() alias, such as EROFS's LZ4 output into page
+cache folios, reach the frames before anything reads or frees them.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/include/asm/cacheflush.h |  14 +++
+ arch/um/include/asm/vmalloc.h    |  14 +++
+ arch/um/kernel/tlb.c             | 166 +++++++++++++++++++++++++++++--
+ 3 files changed, 187 insertions(+), 7 deletions(-)
+
+diff --git a/arch/um/include/asm/cacheflush.h b/arch/um/include/asm/cacheflush.h
+index b301339bed275270cf4c99b751eac7c594d86955..31deab0b5c24a55cd6baf6a253f418fc98db3ed0 100644
+--- a/arch/um/include/asm/cacheflush.h
++++ b/arch/um/include/asm/cacheflush.h
+@@ -3,7 +3,9 @@
+ 
+ #include <asm/tlbflush.h>
+ #define flush_cache_vmap flush_tlb_kernel_range
++#ifndef UML_HOST_DARWIN
+ #define flush_cache_vunmap flush_tlb_kernel_range
++#endif
+ 
+ #ifdef UML_HOST_DARWIN
+ struct mm_struct;
+@@ -23,6 +25,18 @@ extern void darwin_flush_icache_remote_user_range(struct mm_struct *mm,
+ 						  unsigned long len);
+ #define flush_icache_user_page darwin_flush_icache_user_page
+ #define flush_icache_remote_user_range darwin_flush_icache_remote_user_range
++
++/*
++ * With 4 KiB pages on a 16 KiB host, a kernel alias whose host page does not
++ * map one aligned group of four consecutive frames is a private copy, and
++ * behaves like a virtually indexed cache line toward the other aliases of
++ * its frames. See arch_vmap_group_order().
++ */
++#define ARCH_IMPLEMENTS_FLUSH_KERNEL_VMAP_RANGE 1
++extern void flush_kernel_vmap_range(void *vaddr, int size);
++extern void invalidate_kernel_vmap_range(void *vaddr, int size);
++extern void flush_cache_vunmap(unsigned long start, unsigned long end);
++#define flush_cache_vunmap flush_cache_vunmap
+ #endif
+ 
+ #include <asm-generic/cacheflush.h>
+diff --git a/arch/um/include/asm/vmalloc.h b/arch/um/include/asm/vmalloc.h
+index 9a7b9ed9373370ed8e421004f39fb65e26feec1e..d366f2f28fd61c7b42456abc1a63dd0dd7cd2244 100644
+--- a/arch/um/include/asm/vmalloc.h
++++ b/arch/um/include/asm/vmalloc.h
+@@ -1,4 +1,18 @@
+ #ifndef _ASM_UM_VMALLOC_H
+ #define _ASM_UM_VMALLOC_H
+ 
++#ifdef UML_HOST_DARWIN
++/*
++ * A 16 KiB Darwin host page backs four 4 KiB guest pages. The host maps a
++ * kernel slot as one shared page only when it covers one aligned group of
++ * four consecutive frames; any other slot gets a private copy that other
++ * aliases of its frames do not see.
++ */
++#define arch_vmap_group_order arch_vmap_group_order
++static inline unsigned int arch_vmap_group_order(void)
++{
++	return 2;
++}
++#endif
++
+ #endif /* _ASM_UM_VMALLOC_H */
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index c1c5e43b6ad05f4aba9a8136a0184843f6f59f3b..518cd56f2c254bc5e66527256eead5f85fb21282 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -9,6 +9,7 @@
+ #include <linux/string.h>
+ 
+ #include <asm/tlbflush.h>
++#include <asm/cacheflush.h>
+ #include <asm/mmu_context.h>
+ #include <as-layout.h>
+ #include <mem_user.h>
+@@ -136,12 +137,8 @@ static_assert(DARWIN_HOST_PAGE_SIZE == 4 * PAGE_SIZE);
+ static_assert(PTRS_PER_PTE % 4 == 0);
+ static_assert(PMD_SIZE % DARWIN_HOST_PAGE_SIZE == 0);
+ 
+-static int darwin_map_init_mm_pte(struct vm_ops *ops,
+-				  unsigned long addr, pte_t pteval)
++static int darwin_init_mm_pte_prot(pte_t pteval)
+ {
+-	unsigned long phys = pte_val(pteval) & PAGE_MASK;
+-	__u64 offset;
+-	int fd = phys_mapping(phys, &offset);
+ 	int r = pte_read(pteval);
+ 	int w = pte_write(pteval);
+ 	int x = pte_exec(pteval);
+@@ -156,8 +153,59 @@ static int darwin_map_init_mm_pte(struct vm_ops *ops,
+ 	prot = (r ? UM_PROT_READ : 0) |
+ 	       (w ? UM_PROT_WRITE : 0) |
+ 	       (x ? UM_PROT_EXEC : 0);
+-	prot = darwin_guest_protection(&init_mm, prot, x, 0);
+-	return ops->mmap(ops->mm_idp, addr, PAGE_SIZE, prot, fd, offset);
++	return darwin_guest_protection(&init_mm, prot, x, 0);
++}
++
++static int darwin_map_init_mm_pte(struct vm_ops *ops,
++				  unsigned long addr, pte_t pteval)
++{
++	unsigned long phys = pte_val(pteval) & PAGE_MASK;
++	__u64 offset;
++	int fd = phys_mapping(phys, &offset);
++
++	return ops->mmap(ops->mm_idp, addr, PAGE_SIZE,
++			 darwin_init_mm_pte_prot(pteval), fd, offset);
++}
++
++/*
++ * A slot is congruent when its four PTEs map four consecutive frames of one
++ * backing, starting at a 16 KiB boundary of that backing, with one accessible
++ * protection. The host then maps the slot as one shared host page: the same
++ * memory the linear map, user mappings and devices reach, with no private
++ * copy to keep in step. pte_read() is false for every kernel PTE, which lacks
++ * _PAGE_USER, but a present kernel page is always readable.
++ */
++static bool darwin_init_mm_slot_congruent(const pte_t *snapshots, int *fd_out,
++					  __u64 *offset_out, int *prot_out)
++{
++	unsigned long phys = pte_val(snapshots[0]) & PAGE_MASK;
++	__u64 offset;
++	__u64 last_offset;
++	unsigned int index;
++	int prot;
++	int fd;
++
++	if (!pte_present(snapshots[0]) ||
++	    (phys & (DARWIN_HOST_PAGE_SIZE - 1)))
++		return false;
++	prot = darwin_init_mm_pte_prot(snapshots[0]);
++	if (!(prot & (UM_PROT_READ | UM_PROT_WRITE)))
++		return false;
++	for (index = 1; index < 4; ++index)
++		if (!pte_present(snapshots[index]) ||
++		    (pte_val(snapshots[index]) & PAGE_MASK) !=
++			    phys + index * PAGE_SIZE ||
++		    darwin_init_mm_pte_prot(snapshots[index]) != prot)
++			return false;
++	fd = phys_mapping(phys, &offset);
++	if (fd < 0 || (offset & (DARWIN_HOST_PAGE_SIZE - 1)) ||
++	    phys_mapping(phys + 3 * PAGE_SIZE, &last_offset) != fd ||
++	    last_offset != offset + 3 * PAGE_SIZE)
++		return false;
++	*fd_out = fd;
++	*offset_out = offset;
++	*prot_out = prot;
++	return true;
+ }
+ 
+ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+@@ -168,7 +216,10 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 	pte_t *pte;
+ 	spinlock_t *ptl;
+ 	unsigned int index;
++	__u64 offset;
++	int prot;
+ 	int ret;
++	int fd;
+ 
+ 	if (WARN_ON_ONCE(ops->mm != &init_mm ||
+ 			 (addr & (DARWIN_HOST_PAGE_SIZE - 1))))
+@@ -190,6 +241,21 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 		snapshots[index] = ptep_get(pte + index);
+ 	spin_unlock(ptl);
+ 
++	/* A congruent slot needs no shadow: map it as one shared host page.
++	 * The host publishes the dirty quarters of a shadow it replaces, and
++	 * stores that reach that shadow meanwhile wait for the shared page.
++	 * Kernel aliases stay data-only, as the shadows they replace were.
++	 */
++	if (darwin_init_mm_slot_congruent(snapshots, &fd, &offset, &prot))
++		return os_map_memory((void *)addr, fd, offset,
++				     DARWIN_HOST_PAGE_SIZE, 1,
++				     prot & UM_PROT_WRITE, 0);
++	for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
++		if (pte_present(snapshots[index]))
++			break;
++	if (index == ARRAY_SIZE(snapshots))
++		return ops->unmap(ops->mm_idp, addr, DARWIN_HOST_PAGE_SIZE);
++
+ 	/* Flush every dirty quarter in the existing 16 KiB shadow before a newly
+ 	 * present quarter is loaded from the same backing. This call never removes
+ 	 * a mapping; an error leaves the whole slot unapplied for retry.
+@@ -222,6 +288,92 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 	return 0;
+ }
+ 
++/*
++ * Linux's kernel-alias cache maintenance for a host-private slot. Callers
++ * that share a vmalloc or vmap alias with another alias of the same frames
++ * (a user mapping, the linear map, a device) bracket their accesses with
++ * these, as on a virtually indexed cache. A congruent slot is the shared
++ * memory itself and needs neither.
++ */
++static bool darwin_kernel_slot_private(unsigned long slot)
++{
++	pte_t snapshots[4];
++	unsigned int index;
++	__u64 offset;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++	int prot;
++	int fd;
++
++	pgd = pgd_offset_k(slot);
++	if (pgd_none(*pgd))
++		return false;
++	p4d = p4d_offset(pgd, slot);
++	if (p4d_none(*p4d))
++		return false;
++	pud = pud_offset(p4d, slot);
++	if (pud_none(*pud))
++		return false;
++	pmd = pmd_offset(pud, slot);
++	if (pmd_none(*pmd))
++		return false;
++	pte = pte_offset_kernel(pmd, slot);
++	for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
++		snapshots[index] = ptep_get(pte + index);
++	return !darwin_init_mm_slot_congruent(snapshots, &fd, &offset, &prot);
++}
++
++static void darwin_flush_private_slots(unsigned long start,
++				       unsigned long end)
++{
++	unsigned long slot = start & ~(DARWIN_HOST_PAGE_SIZE - 1);
++
++	for (; slot < end; slot += DARWIN_HOST_PAGE_SIZE)
++		if (darwin_kernel_slot_private(slot))
++			WARN_ON_ONCE(os_drop_memory((void *)slot,
++						    DARWIN_HOST_PAGE_SIZE));
++}
++
++void flush_kernel_vmap_range(void *vaddr, int size)
++{
++	if (size <= 0 || !is_vmalloc_or_module_addr(vaddr))
++		return;
++	darwin_flush_private_slots((unsigned long)vaddr,
++				   (unsigned long)vaddr + size);
++}
++EXPORT_SYMBOL(flush_kernel_vmap_range);
++
++void invalidate_kernel_vmap_range(void *vaddr, int size)
++{
++	unsigned long page = (unsigned long)vaddr & PAGE_MASK;
++	unsigned long end = (unsigned long)vaddr + size;
++
++	if (size <= 0 || !is_vmalloc_or_module_addr(vaddr))
++		return;
++	for (; page < end; page += PAGE_SIZE)
++		if (darwin_kernel_slot_private(page &
++					       ~(DARWIN_HOST_PAGE_SIZE - 1)))
++			WARN_ON_ONCE(darwin_uml_vm_sync_from_backing(page));
++}
++EXPORT_SYMBOL(invalidate_kernel_vmap_range);
++
++/*
++ * Linux calls this before it clears the PTEs of a vmalloc, vmap or
++ * vm_map_ram range, as a virtually indexed cache needs: the frames may be
++ * read through the linear map, or freed, as soon as it returns. Write the
++ * range's private slots back to their frames here. Leaving their stores to
++ * the host unmap of a later purge would show stale frames meanwhile and
++ * then publish the stores over frames that may have been reused.
++ */
++void flush_cache_vunmap(unsigned long start, unsigned long end)
++{
++	darwin_flush_private_slots(start, end);
++	flush_tlb_kernel_range(start, end);
++}
++
+ static noinline int update_init_mm_pte_range(pmd_t *pmd,
+ 					      unsigned long addr,
+ 					      unsigned long end,

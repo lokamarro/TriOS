@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:46:22 +0900
+Subject: [PATCH] um: submit Darwin UBD requests without allocating memory
+
+ubd_queue_rq() allocated each request's io_thread_req, with one
+descriptor per segment, by kmalloc(GFP_ATOMIC): up to 3 KiB from
+kmalloc-4k for a 64-segment write. Writeback under memory pressure
+could find the atomic reserve empty, and the page allocator then
+printed a page allocation failure with a call trace from the flusher.
+The request was only requeued: BLK_STS_RESOURCE dispatched it again,
+after up to 3 ms, and no I/O failed. But every such dip printed the
+trace, and a disk that needs memory to write back dirty pages works
+against the reclaim that is waiting for it. Upstream allocates the
+same way.
+
+blk-mq already allocates per-request driver data with each request.
+On Darwin, make the io_thread_req that data (the tag set's cmd_size),
+and let the work item walk the request's segments itself, one
+descriptor on its stack at a time, with the COW mapping each segment
+had before. Submission now allocates nothing and cannot fail, and the
+COW bitmap, which queue_rq() updated without the lock a Linux host
+takes, is updated only on the ordered workqueue that runs the I/O.
+
+Each preallocated request grows by 96 bytes, 128 once aligned: 24 KiB
+for a disk's 64 driver and 128 mq-deadline requests, where a request
+in flight held up to 3 KiB of slab before.
+---
+ arch/um/drivers/ubd_kern.c | 142 +++++++++++++++++++++++++------------
+ 1 file changed, 98 insertions(+), 44 deletions(-)
+
+diff --git a/arch/um/drivers/ubd_kern.c b/arch/um/drivers/ubd_kern.c
+index 06ae0c2ebea91933977bee070049853a689a39f6..5d75377ba0d3d3e0164702c1c06ffcc24132a257 100644
+--- a/arch/um/drivers/ubd_kern.c
++++ b/arch/um/drivers/ubd_kern.c
+@@ -59,6 +59,11 @@ struct io_desc {
+ 	unsigned long bitmap_words[2];
+ };
+ 
++/*
++ * On Darwin an io_thread_req is the data blk-mq allocates with each request
++ * (the tag set's cmd_size) and holds no descriptors: its work item runs the
++ * request's segments one at a time.
++ */
+ struct io_thread_req {
+ 	struct request *req;
+ 	bool direct;
+@@ -464,7 +469,9 @@ static void ubd_end_request(struct io_thread_req *io_req)
+ 			blk_queue_disable_write_zeroes(io_req->req->q);
+ 	}
+ 	blk_mq_end_request(io_req->req, io_req->error);
++#ifndef UML_HOST_DARWIN
+ 	kfree(io_req);
++#endif
+ }
+ 
+ static irqreturn_t ubd_intr(int irq, void *dev)
+@@ -922,6 +929,9 @@ static int ubd_add(int n, char **error_out)
+ 	ubd_dev->tag_set.numa_node = NUMA_NO_NODE;
+ 	ubd_dev->tag_set.driver_data = ubd_dev;
+ 	ubd_dev->tag_set.nr_hw_queues = 1;
++#ifdef UML_HOST_DARWIN
++	ubd_dev->tag_set.cmd_size = sizeof(struct io_thread_req);
++#endif
+ 
+ 	err = blk_mq_alloc_tag_set(&ubd_dev->tag_set);
+ 	if (err)
+@@ -1260,6 +1270,92 @@ static void cowify_req(struct io_thread_req *req, struct io_desc *segment,
+ 	}
+ }
+ 
++static void ubd_init_req(struct ubd *dev, struct io_thread_req *io_req,
++			 struct request *req)
++{
++	io_req->req = req;
++	io_req->direct = !dev->cow.file;
++	if (dev->cow.file)
++		io_req->fds[0] = dev->cow.fd;
++	else
++		io_req->fds[0] = dev->fd;
++	io_req->error = 0;
++	io_req->sectorsize = SECTOR_SIZE;
++	io_req->fds[1] = dev->fd;
++	io_req->offset = (u64) blk_rq_pos(req) << SECTOR_SHIFT;
++	io_req->offsets[0] = 0;
++	io_req->offsets[1] = dev->cow.data_offset;
++}
++
++#ifdef UML_HOST_DARWIN
++/* Run one segment through a descriptor of its own, as do_io() expects it. */
++static void darwin_ubd_do_segment(struct ubd *dev, struct io_thread_req *io_req,
++				  char *buffer, unsigned long length,
++				  unsigned long byte_offset)
++{
++	struct io_desc desc = {
++		.buffer = buffer,
++		.length = length,
++		.sector_mask = 0,
++		.cow_offset = -1,
++	};
++
++	if (dev->cow.file)
++		cowify_req(io_req, &desc, byte_offset, dev->cow.bitmap,
++			   dev->cow.bitmap_offset, dev->cow.bitmap_len);
++	do_io(io_req, &desc);
++}
++
++static void darwin_ubd_work(struct work_struct *work)
++{
++	struct io_thread_req *io_req =
++		container_of(work, struct io_thread_req, work);
++	struct request *req = io_req->req;
++	struct ubd *dev = req->q->queuedata;
++	unsigned long byte_offset = io_req->offset;
++	struct req_iterator iter;
++	struct bio_vec bvec;
++
++	switch (req_op(req)) {
++	case REQ_OP_FLUSH:
++		do_io(io_req, NULL);
++		break;
++	case REQ_OP_DISCARD:
++	case REQ_OP_WRITE_ZEROES:
++		darwin_ubd_do_segment(dev, io_req, NULL, blk_rq_bytes(req),
++				      byte_offset);
++		break;
++	default:
++		rq_for_each_segment(bvec, req, iter) {
++			darwin_ubd_do_segment(dev, io_req, bvec_virt(&bvec),
++					      bvec.bv_len, byte_offset);
++			if (io_req->error)
++				goto out;
++			byte_offset += bvec.bv_len;
++		}
++	}
++out:
++	ubd_end_request(io_req);
++}
++
++static int ubd_submit_request(struct ubd *dev, struct request *req)
++{
++	struct io_thread_req *io_req = blk_mq_rq_to_pdu(req);
++
++	/*
++	 * blk-mq allocated io_req with the request, and the work item walks
++	 * the request's segments itself, so submission allocates nothing and
++	 * never fails.  Host I/O still runs inside the UML process, but
++	 * completion has to be deferred until after queue_rq() returns.
++	 * Completing synchronously here re-enters blk-mq dispatch while it
++	 * still owns the request.
++	 */
++	ubd_init_req(dev, io_req, req);
++	INIT_WORK(&io_req->work, darwin_ubd_work);
++	queue_work(darwin_ubd_wq, &io_req->work);
++	return 0;
++}
++#else
+ static void ubd_map_req(struct ubd *dev, struct io_thread_req *io_req,
+ 			struct request *req)
+ {
+@@ -1305,18 +1401,7 @@ static struct io_thread_req *ubd_alloc_req(struct ubd *dev, struct request *req,
+ 	if (!io_req)
+ 		return NULL;
+ 
+-	io_req->req = req;
+-	io_req->direct = !dev->cow.file;
+-	if (dev->cow.file)
+-		io_req->fds[0] = dev->cow.fd;
+-	else
+-		io_req->fds[0] = dev->fd;
+-	io_req->error = 0;
+-	io_req->sectorsize = SECTOR_SIZE;
+-	io_req->fds[1] = dev->fd;
+-	io_req->offset = (u64) blk_rq_pos(req) << SECTOR_SHIFT;
+-	io_req->offsets[0] = 0;
+-	io_req->offsets[1] = dev->cow.data_offset;
++	ubd_init_req(dev, io_req, req);
+ 
+ 	for (i = 0 ; i < desc_cnt; i++) {
+ 		io_req->io_desc[i].sector_mask = 0;
+@@ -1326,29 +1411,11 @@ static struct io_thread_req *ubd_alloc_req(struct ubd *dev, struct request *req,
+ 	return io_req;
+ }
+ 
+-#ifdef UML_HOST_DARWIN
+-static void darwin_ubd_work(struct work_struct *work)
+-{
+-	struct io_thread_req *io_req =
+-		container_of(work, struct io_thread_req, work);
+-	int i;
+-
+-	if (io_req->desc_cnt == 0)
+-		do_io(io_req, NULL);
+-	else
+-		for (i = 0; i < io_req->desc_cnt && !io_req->error; i++)
+-			do_io(io_req, &io_req->io_desc[i]);
+-	ubd_end_request(io_req);
+-}
+-#endif
+-
+ static int ubd_submit_request(struct ubd *dev, struct request *req)
+ {
+ 	int segs = 0;
+ 	struct io_thread_req *io_req;
+-#ifndef UML_HOST_DARWIN
+ 	int ret;
+-#endif
+ 	enum req_op op = req_op(req);
+ 
+ 	if (op == REQ_OP_FLUSH)
+@@ -1366,19 +1433,6 @@ static int ubd_submit_request(struct ubd *dev, struct request *req)
+ 	if (segs)
+ 		ubd_map_req(dev, io_req, req);
+ 
+-#ifdef UML_HOST_DARWIN
+-	/*
+-	 * Host I/O still runs inside the UML process, but completion has to be
+-	 * deferred until after queue_rq() returns.  Completing synchronously here
+-	 * re-enters blk-mq dispatch while it still owns the request.
+-	 */
+-	INIT_WORK(&io_req->work, darwin_ubd_work);
+-	if (!queue_work(darwin_ubd_wq, &io_req->work)) {
+-		kfree(io_req);
+-		return -EIO;
+-	}
+-	return sizeof(io_req);
+-#else
+ 	ret = os_write_file(thread_fd, &io_req, sizeof(io_req));
+ 	if (ret != sizeof(io_req)) {
+ 		if (ret != -EAGAIN)
+@@ -1386,8 +1440,8 @@ static int ubd_submit_request(struct ubd *dev, struct request *req)
+ 		kfree(io_req);
+ 	}
+ 	return ret;
+-#endif
+ }
++#endif
+ 
+ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 				 const struct blk_mq_queue_data *bd)

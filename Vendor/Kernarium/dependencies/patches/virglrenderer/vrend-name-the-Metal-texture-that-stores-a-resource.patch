@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 02:04:17 +0900
+Subject: [PATCH] vrend: name the Metal texture that stores a resource
+
+A virtio-gpu host on Apple presents a Venus scanout by sampling the
+Metal texture the renderer rendered into, but every vrend resource -
+a classic 3D resource, or a blob a Virgl context created, which is what
+Android's allocator hands its compositor - is read back through
+glReadPixels and uploaded again on every frame, because the renderer
+names no native object for it.
+
+The host GL driver is zink, and zink now answers a MESA_GLINTEROP
+export with the Metal texture behind a GL texture. Ask it from
+virgl_renderer_resource_get_info_ext(), which already carries a native
+handle and its type for the D3D11 textures a Windows host shares, and
+report the texture as VIRGL_NATIVE_HANDLE_METAL_TEXTURE. Only a plain,
+single-sample, single-layer 2D texture is offered; anything else keeps
+the readback. The handle is borrowed and valid while the resource keeps
+its storage, so a presenter asks for it with each frame instead of
+holding on to it. The resource's Y_0_TOP flag in the same reply tells
+it which way up the rows are.
+
+A texture that shadows a shared-memory segment is refreshed from the
+segment before every GL read, since another context may have written
+the segment since. A presenter reading it is one more such read, and
+one that happens on a queue GL does not order against, so the refresh
+is completed before the texture is handed out.
+
+The lookup runs in context 0, as host-initiated transfers do.
+
+The export's layouts come from GL/mesa_glinterop.h and
+GL/zink_interop_public.h, which the host Mesa installs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/virglrenderer.c          | 13 +++++++++
+ src/vrend/vrend_renderer.c   | 36 ++++++++++++++++++++++++
+ src/vrend/vrend_renderer.h   |  5 ++++
+ src/vrend/vrend_winsys_egl.c | 53 ++++++++++++++++++++++++++++++++++++
+ src/vrend/vrend_winsys_egl.h |  6 ++++
+ 5 files changed, 113 insertions(+)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index f6b570dbcccfaba5bc963e4b43c94aeaedae6e43..4a4b28791803a38f358d88f499f6caba779e7ef2 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -598,6 +598,19 @@ int virgl_renderer_resource_get_info_ext(int res_handle,
+    info_ext->version = VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION;
+ 
+ #ifdef ENABLE_VREND
++#ifdef ENABLE_METAL
++   /* On an Apple host a GL texture is stored in a Metal texture, which a
++    * presenter can sample instead of reading the resource back. */
++   struct virgl_resource *res = virgl_resource_lookup(res_handle);
++   void *metal_texture = NULL;
++   if (res && res->pipe_resource &&
++       vrend_renderer_resource_metal_texture(res->pipe_resource,
++                                             &metal_texture) == 0) {
++      info_ext->native_handle = metal_texture;
++      info_ext->native_type = VIRGL_NATIVE_HANDLE_METAL_TEXTURE;
++   }
++#endif
++
+    if (state.winsys_initialized) {
+       return vrend_winsys_get_attrs_for_texture(info_ext->base.tex_id,
+                                                 info_ext->base.virgl_format,
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index e054b58333fb818ca4c80be53ba7bfbacd9c245b..79d420d61a0c3240e78998fbf18b2f43aa310c30 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -14026,6 +14026,42 @@ vrend_renderer_resource_d3d11_texture2d(struct pipe_resource *pres, void **d3d_t
+ #endif
+ }
+ 
++int
++vrend_renderer_resource_metal_texture(struct pipe_resource *pres, void **texture)
++{
++#ifdef ENABLE_METAL
++   struct vrend_resource *res = (struct vrend_resource *)pres;
++
++   *texture = NULL;
++   /* A presenter samples one plain 2D image; anything else is read back. */
++   if (!has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE) ||
++       res->target != GL_TEXTURE_2D || res->base.nr_samples > 1 ||
++       res->base.array_size > 1)
++      return EINVAL;
++
++   if (!vrend_hw_switch_context(vrend_state.ctx0, true))
++      return EINVAL;
++
++   /* A texture that shadows a shared-memory segment is refreshed from the
++    * segment before every GL read, because another context may have written
++    * the segment since (see vrend_resource_sync_shm_import()); a presenter
++    * reading it is one more such read. The refresh is GL work the presenter's
++    * own queue cannot see, so it has to have completed before the texture is
++    * handed out. */
++   if (res->shm_import_map && !res->shm_import_image) {
++      vrend_resource_sync_shm_import(res);
++      glFinish();
++   }
++
++   *texture = virgl_egl_texture_metal_object(egl, res->target, res->gl_id);
++   return *texture ? 0 : ENOTSUP;
++#else
++   (void)pres;
++   *texture = NULL;
++   return ENOTSUP;
++#endif
++}
++
+ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+                                 uint32_t *max_size)
+ {
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 726ffc2e0ad49a57f458c1d79972fdabebe59781..d6465e1f4ba53d2671151aecf6e647f66bb330a9 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -681,6 +681,11 @@ struct vrend_video_context *vrend_context_get_video_ctx(struct vrend_context *ct
+ int
+ vrend_renderer_resource_d3d11_texture2d(struct pipe_resource *res, void **handle);
+ 
++/* The MTLTexture that stores a texture resource, borrowed for as long as the
++ * resource keeps its storage, or ENOTSUP/EINVAL where there is none. */
++int
++vrend_renderer_resource_metal_texture(struct pipe_resource *res, void **texture);
++
+ int
+ vrend_renderer_pipe_resource_get_layout(struct vrend_context *ctx,
+                                         uint32_t out_res_id, uint32_t res_id);
+diff --git a/src/vrend/vrend_winsys_egl.c b/src/vrend/vrend_winsys_egl.c
+index 06ecba50f1b24f40c30513b7cc283de60c8b647b..7efb9592d04f2213f50868ed828af67c9a54798b 100644
+--- a/src/vrend/vrend_winsys_egl.c
++++ b/src/vrend/vrend_winsys_egl.c
+@@ -55,6 +55,10 @@
+ #include "vrend_winsys_gbm.h"
+ #endif
+ #include "virgl_util.h"
++#ifdef ENABLE_METAL
++#include <GL/mesa_glinterop.h>
++#include <GL/zink_interop_public.h>
++#endif
+ 
+ #define EGL_KHR_SURFACELESS_CONTEXT            BIT(0)
+ #define EGL_KHR_CREATE_CONTEXT                 BIT(1)
+@@ -70,6 +74,7 @@
+ #define EGL_EXT_DEVICE_QUERY                   BIT(11)
+ #define EGL_EXT_PLATFORM_DEVICE                BIT(12)
+ #define EGL_MESA_IMAGE_HOST_POINTER            BIT(13)
++#define EGL_MESA_GL_INTEROP                    BIT(14)
+ 
+ static const struct {
+    uint32_t bit;
+@@ -88,6 +93,7 @@ static const struct {
+    { EGL_EXT_DEVICE_QUERY, "EGL_EXT_device_query" },
+    { EGL_EXT_PLATFORM_DEVICE, "EGL_EXT_platform_device" },
+    { EGL_MESA_IMAGE_HOST_POINTER, "EGL_MESA_image_host_pointer" },
++   { EGL_MESA_GL_INTEROP, "EGL_MESA_gl_interop" },
+ };
+ 
+ struct egl_funcs {
+@@ -973,6 +979,53 @@ void virgl_egl_host_pointer_image_destroy(struct virgl_egl *egl, void *image)
+    eglDestroyImageKHR(egl->egl_display, image);
+ }
+ 
++#ifdef ENABLE_METAL
++/* The Metal texture that stores a GL texture, or NULL where the driver has
++ * none to give. It is borrowed: it lives as long as the GL texture keeps its
++ * current storage. The texture is looked up in the current context's share
++ * group. */
++void *virgl_egl_texture_metal_object(struct virgl_egl *egl,
++                                     uint32_t target,
++                                     uint32_t texture)
++{
++   static PFNMESAGLINTEROPEGLEXPORTOBJECTPROC export_object;
++
++   if (!egl || !has_bit(egl->extension_bits, EGL_MESA_GL_INTEROP))
++      return NULL;
++   if (!export_object) {
++      export_object = (PFNMESAGLINTEROPEGLEXPORTOBJECTPROC)
++         eglGetProcAddress("eglGLInteropExportObjectMESA");
++      if (!export_object)
++         return NULL;
++   }
++
++   EGLContext context = eglGetCurrentContext();
++   if (context == EGL_NO_CONTEXT)
++      return NULL;
++
++   struct zink_interop_metal_texture metal = { 0 };
++   struct mesa_glinterop_export_in in = {
++      .version = 2,
++      .target = target,
++      .obj = texture,
++      .access = MESA_GLINTEROP_ACCESS_READ_ONLY,
++      .out_driver_data_size = sizeof(metal),
++      .out_driver_data = &metal,
++   };
++   /* Version 1 ends at out_driver_data_written, the last field read here. */
++   struct mesa_glinterop_export_out out = {
++      .version = 1,
++      .dmabuf_fd = -1,
++   };
++   int result = export_object(egl->egl_display, context, &in, &out);
++   if (result != MESA_GLINTEROP_SUCCESS ||
++       out.out_driver_data_written < sizeof(metal) ||
++       metal.version < 1)
++      return NULL;
++   return metal.texture;
++}
++#endif
++
+ bool virgl_egl_supports_fences(struct virgl_egl *egl)
+ {
+    return (egl && has_bit(egl->extension_bits, EGL_KHR_FENCE_SYNC_ANDROID));
+diff --git a/src/vrend/vrend_winsys_egl.h b/src/vrend/vrend_winsys_egl.h
+index 907ccee87bd5c156346c534e555712d83dd70def..e51745c46fc874e9b02aeb6cd34670c9ee1826db 100644
+--- a/src/vrend/vrend_winsys_egl.h
++++ b/src/vrend/vrend_winsys_egl.h
+@@ -97,6 +97,12 @@ void *virgl_egl_image_from_host_pointer(struct virgl_egl *egl,
+                                         uint32_t offset);
+ void virgl_egl_host_pointer_image_destroy(struct virgl_egl *egl, void *image);
+ 
++#ifdef ENABLE_METAL
++void *virgl_egl_texture_metal_object(struct virgl_egl *egl,
++                                     uint32_t target,
++                                     uint32_t texture);
++#endif
++
+ bool virgl_egl_supports_fences(struct virgl_egl *egl);
+ EGLSyncKHR virgl_egl_fence_create(struct virgl_egl *egl);
+ void virgl_egl_fence_destroy(struct virgl_egl *egl, EGLSyncKHR fence);

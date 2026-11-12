@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 17:49:05 +0900
+Subject: [PATCH] vrend: write a sampler's texture unit once, not on every bind
+
+The unit a sampler uniform is bound to follows from the program's own sampler
+mask: it is decided when the program is linked and is the same for every draw
+that program makes. The draw path wrote it again on every dirty sampler view,
+which is a default-uniform update between two draws.
+
+On this host stack that is the most expensive thing a draw can do. Measured in
+the guest, 2048 draws per frame that change nothing cost 2.6 us each; 512 draws
+that each rebind a texture cost 1.8 ms each, and a sample of the host shows the
+time in a new Metal render command encoder per draw, because the update ends
+the render pass. The control stack pays 20 us for the same bind.
+
+Keep the unit each location already holds and write it only when it changes.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_renderer.c | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index eab47ccf447bf0cb3fd7f1675cae9aeb4c597948..ecc009fa146f9c7c525f41f501df1f211009e980 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -490,6 +490,8 @@ struct vrend_linked_shader_program {
+ 
+    // compact arrays of uniform locations for each set bit in samplers_used_mask
+    GLuint *sampler_locs[PIPE_SHADER_TYPES];
++   // the texture unit each of those locations already holds, or -1
++   GLint *sampler_units[PIPE_SHADER_TYPES];
+    // ignore elements corresponding to unset bits of shadow_samp_mask
+    GLuint *shadow_samp_mask_locs[PIPE_SHADER_TYPES];
+    GLuint *shadow_samp_add_locs[PIPE_SHADER_TYPES];
+@@ -1678,6 +1680,14 @@ static int bind_sampler_locs(struct vrend_linked_shader_program *sprog,
+    if (sinfo->samplers_used_mask) {
+       unsigned nsamp = util_bitcount(sinfo->samplers_used_mask);
+       sprog->sampler_locs[shader_type] = calloc(nsamp, sizeof(GLuint));
++      free(sprog->sampler_units[shader_type]);
++      sprog->sampler_units[shader_type] = malloc(nsamp * sizeof(GLint));
++      if (sprog->sampler_units[shader_type]) {
++         /* A link resets every default uniform, so nothing is known to hold
++          * its texture unit until the draw path writes it. */
++         for (unsigned s = 0; s < nsamp; ++s)
++            sprog->sampler_units[shader_type][s] = -1;
++      }
+       if (sinfo->shadow_samp_mask) {
+          sprog->shadow_samp_mask_locs[shader_type] = calloc(nsamp, sizeof(GLuint));
+          sprog->shadow_samp_add_locs[shader_type] = calloc(nsamp, sizeof(GLuint));
+@@ -1713,6 +1723,8 @@ static int bind_sampler_locs(struct vrend_linked_shader_program *sprog,
+       }
+    } else {
+       sprog->sampler_locs[shader_type] = NULL;
++      free(sprog->sampler_units[shader_type]);
++      sprog->sampler_units[shader_type] = NULL;
+       sprog->shadow_samp_mask_locs[shader_type] = NULL;
+       sprog->shadow_samp_add_locs[shader_type] = NULL;
+       assert(!sinfo->shadow_samp_mask);
+@@ -2304,6 +2316,7 @@ static void vrend_destroy_program(struct vrend_linked_shader_program *ent)
+             ent->ss[i]->last_pipeline_id = 0xffffffff;
+       }
+       free(ent->sampler_locs[i]);
++      free(ent->sampler_units[i]);
+       free(ent->shadow_samp_mask_locs[i]);
+       free(ent->shadow_samp_add_locs[i]);
+       free(ent->img_locs[i]);
+@@ -5312,8 +5325,22 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+       struct vrend_sampler_view *tview = shader_view->views[i];
+ 
+       if ((dirty & (1 << i)) && tview) {
++         GLint *units = sprog->sampler_units[shader_type];
++
+          glActiveTexture(GL_TEXTURE0 + next_sampler_id);
+-         glUniform1i(sprog->sampler_locs[shader_type][sampler_index], next_sampler_id);
++         /* The unit a sampler is bound to follows from the program's own
++          * sampler mask, so it is the same for every draw the program makes,
++          * while the view bound to it changes constantly. Writing it again on
++          * every bind is a default-uniform update, and a default-uniform
++          * update between two draws costs the host GL stack a render-pass
++          * restart: measured at 1.8 ms per bind on Zink over KosmicKrisp
++          * against 2.6 us for a draw that changes nothing. Write it once. */
++         if (!units || units[sampler_index] != (GLint)next_sampler_id) {
++            glUniform1i(sprog->sampler_locs[shader_type][sampler_index],
++                        next_sampler_id);
++            if (units)
++               units[sampler_index] = (GLint)next_sampler_id;
++         }
+ 
+          if (sprog->shadow_samp_mask[shader_type] & (1 << i)) {
+             struct vrend_texture *tex = (struct vrend_texture *)tview->texture;

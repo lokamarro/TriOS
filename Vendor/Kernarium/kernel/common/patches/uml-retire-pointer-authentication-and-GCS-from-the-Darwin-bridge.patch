@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 02:41:23 +0900
+Subject: [PATCH] uml: retire pointer authentication and GCS from the Darwin
+ bridge
+
+The Darwin host no longer implements FEAT_PAuth, FEAT_GCS, FEAT_MTE or
+FEAT_CPA: their non-hint instructions are UNDEFINED and their hints are
+NOPs, as on a CPU without them. Nothing reads the five pointer-
+authentication key slots in the guest registers any more, and the host
+never reports a guarded-control-stack fault.
+
+Retire both from the bridge, as ABI 15. Event 6 stays unassigned. The
+x86_64-userspace slice kept its i386 TLS descriptors in the first three
+key slots, so the guest registers now carry exactly those three as
+compat_tls, still at offset 336, and exec still clears them.
+---
+ arch/arm64/um/shared/sysdep/ptrace.h        |  9 +++---
+ arch/um/kernel/exec.c                       |  4 +--
+ arch/um/os-Darwin/skas/process.c            | 31 ++-------------------
+ arch/um/os-Darwin/uml_darwin_abi.h          | 16 ++++++-----
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |  4 +--
+ 5 files changed, 21 insertions(+), 43 deletions(-)
+
+diff --git a/arch/arm64/um/shared/sysdep/ptrace.h b/arch/arm64/um/shared/sysdep/ptrace.h
+index 96411d0ddfcca84189277aae487f91fa7c687787..83096ca4112793252c70c677913a0d7ae505aad5 100644
+--- a/arch/arm64/um/shared/sysdep/ptrace.h
++++ b/arch/arm64/um/shared/sysdep/ptrace.h
+@@ -63,11 +63,12 @@ struct uml_pt_regs {
+ 	unsigned long fpmr;
+ 	unsigned long svcr;
+ 	/*
+-	 * Five guest-owned 128-bit pointer-authentication keys.  Each pair is
+-	 * { low, high }.  They are task state rather than host-vCPU state and
+-	 * therefore precede the flexible floating-point register tail.
++	 * The i386 TLS descriptors of an x86_64-userspace kernel's compat task,
++	 * one struct user_desc per pair; every other task leaves them zero.
++	 * They are task state rather than host-vCPU state and therefore precede
++	 * the flexible floating-point register tail.
+ 	 */
+-	unsigned long pointer_auth_keys[5][2];
++	unsigned long compat_tls[3][2];
+ 	unsigned long fp[];
+ };
+ 
+diff --git a/arch/um/kernel/exec.c b/arch/um/kernel/exec.c
+index d0f443c195f30b51bd8e011b1dbab1e8b32eaa88..3ebfd69039436852e72bb82bbc3245888de7f758 100644
+--- a/arch/um/kernel/exec.c
++++ b/arch/um/kernel/exec.c
+@@ -32,8 +32,8 @@ void flush_thread(void)
+ 	 */
+ 	current_pt_regs()->regs.fpmr = 0;
+ 	current_pt_regs()->regs.svcr = 0;
+-	memset(current_pt_regs()->regs.pointer_auth_keys, 0,
+-	       sizeof(current_pt_regs()->regs.pointer_auth_keys));
++	memset(current_pt_regs()->regs.compat_tls, 0,
++	       sizeof(current_pt_regs()->regs.compat_tls));
+ #endif
+ }
+ 
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 96cde66a5811c2b7e86a868e9b0c2b63e8bb7a63..176920b9e90363d7f48a7b74910f6972ec4d96f1 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -34,9 +34,9 @@ _Static_assert(offsetof(struct uml_pt_regs, syscall) ==
+ _Static_assert(offsetof(struct uml_pt_regs, fpmr) ==
+ 	      DARWIN_UML_ABI_GUEST_REGISTERS_FPMR_OFFSET,
+ 	       "fpmr ABI offset drift");
+-_Static_assert(offsetof(struct uml_pt_regs, pointer_auth_keys) ==
+-	      DARWIN_UML_ABI_GUEST_REGISTERS_POINTER_AUTH_KEYS_OFFSET,
+-	       "pointer-auth ABI offset drift");
++_Static_assert(offsetof(struct uml_pt_regs, compat_tls) ==
++	      DARWIN_UML_ABI_GUEST_REGISTERS_COMPAT_TLS_OFFSET,
++	       "compat TLS ABI offset drift");
+ _Static_assert(offsetof(struct uml_pt_regs, fp) ==
+ 	      DARWIN_UML_ABI_GUEST_REGISTERS_SIZE,
+ 	       "uml_pt_regs ABI prefix size drift");
+@@ -51,9 +51,6 @@ _Static_assert(UML_ARM64_FAULT_PAGE == DARWIN_UML_FAULT_PAGE,
+ 
+ /* relay_signal consumes Linux signal numbers, not Darwin SIGBUS (10). */
+ #define DARWIN_GUEST_SIGBUS 7
+-/* Linux asm-generic/siginfo.h ABI value.  This host-side file includes
+- * Darwin's signal.h, where the guest-only SEGV_CPERR name is unavailable. */
+-#define DARWIN_GUEST_SEGV_CPERR 10
+ /* Linux asm-generic/siginfo.h values differ from Darwin's floating-point
+  * si_code values, so keep the guest ABI numbers explicit at this boundary. */
+ #define DARWIN_GUEST_FPE_FLTDIV 3
+@@ -559,28 +556,6 @@ void userspace(struct uml_pt_regs *registers)
+ 			registers->is_user = 0;
+ 			break;
+ 		}
+-		case DARWIN_UML_EVENT_GCS_FAULT:
+-		{
+-			siginfo_t signal_info = { 0 };
+-
+-			/* Match native arm64: guarded-control-stack exceptions report
+-			 * the faulting instruction address as SEGV_CPERR, not as an
+-			 * ordinary page fault or an undefined instruction. */
+-			registers->faultinfo.error_code = 0;
+-			registers->faultinfo.cr2 = UPT_IP(registers);
+-			registers->faultinfo.trap_no = 0;
+-			signal_info.si_signo = SIGSEGV;
+-			signal_info.si_errno = 0;
+-			signal_info.si_code = DARWIN_GUEST_SEGV_CPERR;
+-			signal_info.si_addr = (void *)UPT_IP(registers);
+-			registers->is_user = 1;
+-			block_signals_trace();
+-			relay_signal(SIGSEGV, (struct siginfo *)&signal_info,
+-				     registers, NULL);
+-			unblock_signals_trace();
+-			registers->is_user = 0;
+-			break;
+-		}
+ 		case DARWIN_UML_EVENT_BREAKPOINT:
+ 		{
+ 			siginfo_t signal_info = { 0 };
+diff --git a/arch/um/os-Darwin/uml_darwin_abi.h b/arch/um/os-Darwin/uml_darwin_abi.h
+index f6e861ad286af192f6f360a13dc97122c934a980..38192336884c5922ef6db1ce80afa607cda3c431 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi.h
++++ b/arch/um/os-Darwin/uml_darwin_abi.h
+@@ -32,7 +32,7 @@ typedef unsigned long long darwin_uml_abi_u64;
+ 
+ enum {
+ 	DARWIN_UML_VECTOR_REGISTER_COUNT = 32,
+-	DARWIN_UML_POINTER_AUTH_KEY_COUNT = 5,
++	DARWIN_UML_COMPAT_TLS_COUNT = 3,
+ };
+ 
+ enum darwin_uml_guest_event {
+@@ -41,7 +41,7 @@ enum darwin_uml_guest_event {
+ 	DARWIN_UML_EVENT_INTERRUPT = 3,
+ 	DARWIN_UML_EVENT_ILLEGAL_INSTRUCTION = 4,
+ 	DARWIN_UML_EVENT_BREAKPOINT = 5,
+-	DARWIN_UML_EVENT_GCS_FAULT = 6,
++	/* 6 was the guarded-control-stack fault of the removed FEAT_GCS. */
+ 	DARWIN_UML_EVENT_FLOATING_POINT_TRAP = 7,
+ 	DARWIN_UML_EVENT_PC_ALIGNMENT = 8,
+ 	DARWIN_UML_EVENT_STOP = 9,
+@@ -98,7 +98,9 @@ struct darwin_uml_guest_registers {
+ 	darwin_uml_abi_s32 padding;
+ 	darwin_uml_abi_u64 fpmr;
+ 	darwin_uml_abi_u64 svcr;
+-	darwin_uml_abi_u64 pointer_auth_keys[DARWIN_UML_POINTER_AUTH_KEY_COUNT][2];
++	/* The i386 TLS descriptors of an x86_64-userspace kernel's compat
++	 * task, one struct user_desc each; zero for every other task. */
++	darwin_uml_abi_u64 compat_tls[DARWIN_UML_COMPAT_TLS_COUNT][2];
+ };
+ 
+ struct darwin_uml_guest_fp_registers {
+@@ -114,8 +116,8 @@ struct darwin_uml_guest_fp_registers {
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_FAULT_OFFSET 280U
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_SYSCALL_OFFSET 304U
+ #define DARWIN_UML_ABI_GUEST_REGISTERS_FPMR_OFFSET 320U
+-#define DARWIN_UML_ABI_GUEST_REGISTERS_POINTER_AUTH_KEYS_OFFSET 336U
+-#define DARWIN_UML_ABI_GUEST_REGISTERS_SIZE 416U
++#define DARWIN_UML_ABI_GUEST_REGISTERS_COMPAT_TLS_OFFSET 336U
++#define DARWIN_UML_ABI_GUEST_REGISTERS_SIZE 384U
+ #define DARWIN_UML_ABI_GUEST_FP_REGISTERS_SIZE 528U
+ 
+ #if defined(__cplusplus)
+@@ -136,8 +138,8 @@ static_assert(offsetof(struct darwin_uml_guest_registers, syscall) ==
+ 		DARWIN_UML_ABI_GUEST_REGISTERS_SYSCALL_OFFSET);
+ static_assert(offsetof(struct darwin_uml_guest_registers, fpmr) ==
+ 		DARWIN_UML_ABI_GUEST_REGISTERS_FPMR_OFFSET);
+-static_assert(offsetof(struct darwin_uml_guest_registers, pointer_auth_keys) ==
+-		DARWIN_UML_ABI_GUEST_REGISTERS_POINTER_AUTH_KEYS_OFFSET);
++static_assert(offsetof(struct darwin_uml_guest_registers, compat_tls) ==
++		DARWIN_UML_ABI_GUEST_REGISTERS_COMPAT_TLS_OFFSET);
+ static_assert(sizeof(struct darwin_uml_guest_registers) ==
+ 		DARWIN_UML_ABI_GUEST_REGISTERS_SIZE);
+ static_assert(sizeof(struct darwin_uml_faultinfo) == 24U);
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index d15a17bed197fbdf354ca06108e425d5dd9c0911..38855e4935929907bb5a23c20c4567b9b5259e31 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 14U
+-#define DARWIN_UML_ABI_FINGERPRINT 0x2d9c2e7a4f3ee428ULL
++#define DARWIN_UML_ABI_VERSION 15U
++#define DARWIN_UML_ABI_FINGERPRINT 0xb4c4fd7b247daffeULL
+ 
+ #endif

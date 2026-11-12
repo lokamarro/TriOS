@@ -1,0 +1,562 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 05:59:33 +0900
+Subject: [PATCH] kosmickrisp: support dynamic logic operations
+
+---
+ src/compiler/nir/nir_lower_blend.c           |  78 +++++++++--
+ src/compiler/nir/nir_lower_blend.h           |  12 ++
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h       |   2 +-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c         |  19 ++-
+ src/kosmickrisp/vulkan/kk_gpl.h              |   6 +
+ src/kosmickrisp/vulkan/kk_logic_op.h         |  42 ++++++
+ src/kosmickrisp/vulkan/kk_physical_device.c  |   2 +-
+ src/kosmickrisp/vulkan/kk_shader.c           |  22 ++-
+ src/kosmickrisp/vulkan/meson.build           |  18 +++
+ src/kosmickrisp/vulkan/tests/test_logic_op.c | 134 +++++++++++++++++++
+ 10 files changed, 320 insertions(+), 15 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_logic_op.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_logic_op.c
+
+diff --git a/src/compiler/nir/nir_lower_blend.c b/src/compiler/nir/nir_lower_blend.c
+index 726503fdfa99b37bbf644b5905dfde863205ebfb..5e06beda42c242e8eaaf5cc6419c7616f1340833 100644
+--- a/src/compiler/nir/nir_lower_blend.c
++++ b/src/compiler/nir/nir_lower_blend.c
+@@ -256,9 +256,41 @@ nir_logicop_func(
+    UNREACHABLE("Invalid logciop function");
+ }
+ 
+-nir_def *
+-nir_color_logicop(nir_builder *b, nir_def *src, nir_def *dst,
+-                  enum pipe_logicop func, enum pipe_format format)
++/* Gallium logic-op values encode the four-row Boolean truth table directly:
++ * bit 2 * src + dst is the result for that pair of input bits.  Expand those
++ * four scalar bits to integer masks and select every bit in parallel.  This
++ * keeps a runtime-selected operation branch-free and implements all 16
++ * operations without shader variants.
++ */
++static nir_def *
++nir_logicop_func_dynamic(nir_builder *b, nir_def *func, nir_def *src,
++                         nir_def *dst, nir_def *bitmask)
++{
++   func = nir_u2u32(b, func);
++
++   nir_def *not_src = nir_ixor(b, src, bitmask);
++   nir_def *not_dst = nir_ixor(b, dst, bitmask);
++   nir_def *terms[4] = {
++      nir_iand(b, not_src, not_dst),
++      nir_iand(b, not_src, dst),
++      nir_iand(b, src, not_dst),
++      nir_iand(b, src, dst),
++   };
++
++   nir_def *result = nir_imm_zero(b, src->num_components, src->bit_size);
++   for (unsigned i = 0; i < ARRAY_SIZE(terms); i++) {
++      nir_def *enabled = nir_iand_imm(b, nir_ushr_imm(b, func, i), 1);
++      nir_def *mask = nir_ineg(b, enabled);
++      result = nir_ior(b, result, nir_iand(b, terms[i], mask));
++   }
++
++   return result;
++}
++
++static nir_def *
++nir_color_logicop_impl(nir_builder *b, nir_def *src, nir_def *dst,
++                       enum pipe_logicop static_func, nir_def *dynamic_func,
++                       enum pipe_format format)
+ {
+    unsigned bit_size = src->bit_size;
+    const struct util_format_description *format_desc =
+@@ -274,9 +306,9 @@ nir_color_logicop(nir_builder *b, nir_def *src, nir_def *dst,
+     */
+    if (util_format_is_float(format) || util_format_is_srgb(format))
+       return src;
+-   else if (func == PIPE_LOGICOP_COPY)
++   else if (dynamic_func == NULL && static_func == PIPE_LOGICOP_COPY)
+       return src;
+-   else if (func == PIPE_LOGICOP_NOOP)
++   else if (dynamic_func == NULL && static_func == PIPE_LOGICOP_NOOP)
+       return dst;
+ 
+    nir_alu_type type =
+@@ -308,8 +340,11 @@ nir_color_logicop(nir_builder *b, nir_def *src, nir_def *dst,
+    for (int i = 0; i < 4; ++i)
+       mask[i] = nir_const_value_for_uint(BITFIELD_MASK(bits[i]), 32);
+ 
+-   nir_def *out = nir_logicop_func(b, func, src, dst,
+-                                   nir_build_imm(b, 4, 32, mask));
++   nir_def *bitmask = nir_build_imm(b, 4, 32, mask);
++   nir_def *out = dynamic_func != NULL
++                     ? nir_logicop_func_dynamic(b, dynamic_func, src, dst,
++                                                bitmask)
++                     : nir_logicop_func(b, static_func, src, dst, bitmask);
+ 
+    if (util_format_is_unorm(format)) {
+       out = nir_format_unorm_to_float(b, out, bits);
+@@ -327,6 +362,21 @@ nir_color_logicop(nir_builder *b, nir_def *src, nir_def *dst,
+    return out;
+ }
+ 
++nir_def *
++nir_color_logicop(nir_builder *b, nir_def *src, nir_def *dst,
++                  enum pipe_logicop func, enum pipe_format format)
++{
++   return nir_color_logicop_impl(b, src, dst, func, NULL, format);
++}
++
++nir_def *
++nir_color_logicop_dynamic(nir_builder *b, nir_def *src, nir_def *dst,
++                          nir_def *func, enum pipe_format format)
++{
++   return nir_color_logicop_impl(b, src, dst, PIPE_LOGICOP_CLEAR, func,
++                                 format);
++}
++
+ static bool
+ channel_exists(const struct util_format_description *desc, unsigned i)
+ {
+@@ -1049,8 +1099,11 @@ nir_lower_blend_instr(nir_builder *b, nir_intrinsic_instr *store, void *data)
+    }
+ 
+    /* Don't bother copying the destination to the source for disabled RTs */
++   const bool dynamic_logicop =
++      options->load_dynamic_logicop_func != NULL;
+    if (options->rt[rt].colormask == 0 ||
+-       (options->logicop_enable && logicop_func == PIPE_LOGICOP_NOOP)) {
++       (options->logicop_enable && !dynamic_logicop &&
++        logicop_func == PIPE_LOGICOP_NOOP)) {
+ 
+       nir_instr_remove(&store->instr);
+       return true;
+@@ -1098,7 +1151,14 @@ nir_lower_blend_instr(nir_builder *b, nir_intrinsic_instr *store, void *data)
+    nir_def *blended = src;
+ 
+    if (options->logicop_enable) {
+-      blended = nir_color_logicop(b, src, dst, options->logicop_func, format);
++      if (dynamic_logicop && !util_format_is_float(format) &&
++          !util_format_is_srgb(format)) {
++         nir_def *func = options->load_dynamic_logicop_func(
++            b, options->dynamic_logicop_data);
++         blended = nir_color_logicop_dynamic(b, src, dst, func, format);
++      } else {
++         blended = nir_color_logicop(b, src, dst, logicop_func, format);
++      }
+    } else if (options->rt[rt].advanced_blend) {
+       blended = nir_blend_advanced(b, options, rt, src, dst);
+    } else if (!util_format_is_pure_integer(format) &&
+diff --git a/src/compiler/nir/nir_lower_blend.h b/src/compiler/nir/nir_lower_blend.h
+index bc979a79efc9b84e92ece4e5b43ee1ec0796902b..245d3b9dcb07fd04650864a95189e13191c009b5 100644
+--- a/src/compiler/nir/nir_lower_blend.h
++++ b/src/compiler/nir/nir_lower_blend.h
+@@ -61,6 +61,14 @@ typedef struct {
+    bool logicop_enable;
+    enum pipe_logicop logicop_func;
+ 
++   /* Optional runtime logic operation.  The callback must return a scalar
++    * pipe_logicop value and may emit driver-specific state loads at the
++    * builder cursor.  Static users leave this NULL and retain the fully
++    * constant-folded logic-op path.
++    */
++   nir_def *(*load_dynamic_logicop_func)(nir_builder *b, void *data);
++   void *dynamic_logicop_data;
++
+    /* If set, will use load_blend_const_color_{r,g,b,a}_float instead of
+     * load_blend_const_color_rgba */
+    bool scalar_blend_const;
+@@ -70,6 +78,10 @@ nir_def *
+ nir_color_logicop(nir_builder *b, nir_def *src, nir_def *dst,
+                   enum pipe_logicop func, enum pipe_format format);
+ 
++nir_def *
++nir_color_logicop_dynamic(nir_builder *b, nir_def *src, nir_def *dst,
++                          nir_def *func, enum pipe_format format);
++
+ nir_def *
+ nir_color_blend(nir_builder *b, nir_def *src0, nir_def *src1, nir_def *dst,
+                 const nir_lower_blend_rt *rt, bool scalar_blend_const);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index fcef60698ec9162be7f09be7ae3982127c30e11b..b21a4963f24a71e4133536562de5ce0fb1151eb1 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -43,7 +43,7 @@ struct kk_root_descriptor_table {
+          float clip_z_coeff;
+          struct kk_depth_clip_transform depth_clip_transforms[KK_MAX_VIEWPORTS];
+          struct kk_depth_clamp_range depth_clamp_ranges[KK_MAX_VIEWPORTS];
+-         uint32_t manual_depth_clamp_enable;
++         uint32_t fragment_dynamic_state;
+       } draw;
+       struct {
+          uint32_t base_group[3];
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index d19a71481a69dd871702e96c42c939d0f7b1d8e0..d8e99b3a5bc1d29e4576c45d5656a71feb94d618 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -14,6 +14,7 @@
+ #include "kk_depth_clip.h"
+ #include "kk_format.h"
+ #include "kk_image_view.h"
++#include "kk_logic_op.h"
+ #include "kk_query_pool.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+@@ -25,6 +26,7 @@
+ #include "poly/geometry.h"
+ #include "poly/tessellator.h"
+ 
++#include "vulkan/runtime/vk_blend.h"
+ #include "vulkan/runtime/vk_render_pass.h"
+ #include "vulkan/util/vk_format.h"
+ 
+@@ -1512,8 +1514,13 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+          desc->root.draw.depth_clamp_ranges[i] =
+             kk_depth_clamp_range(min_depth, max_depth);
+       }
+-      desc->root.draw.manual_depth_clamp_enable =
+-         kk_manual_depth_clamp_enable(&dyn->rs);
++      if (kk_manual_depth_clamp_enable(&dyn->rs)) {
++         desc->root.draw.fragment_dynamic_state |=
++            KK_FRAGMENT_DYNAMIC_DEPTH_CLAMP_ENABLE;
++      } else {
++         desc->root.draw.fragment_dynamic_state &=
++            ~KK_FRAGMENT_DYNAMIC_DEPTH_CLAMP_ENABLE;
++      }
+       desc->root_dirty = true;
+    }
+ 
+@@ -1557,6 +1564,14 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       desc->root_dirty = true;
+    }
+ 
++   if (IS_DIRTY(CB_LOGIC_OP)) {
++      desc->root.draw.fragment_dynamic_state =
++         kk_fragment_dynamic_state_set_logic_op(
++            desc->root.draw.fragment_dynamic_state,
++            vk_logic_op_to_pipe(dyn->cb.logic_op));
++      desc->root_dirty = true;
++   }
++
+    if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+        IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB) {
+       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+diff --git a/src/kosmickrisp/vulkan/kk_gpl.h b/src/kosmickrisp/vulkan/kk_gpl.h
+index 6ffdd35f9b902675129f89b523e89eb18e4726d0..de3e4d7158ce0e569afd1c490d3d632c150a483a 100644
+--- a/src/kosmickrisp/vulkan/kk_gpl.h
++++ b/src/kosmickrisp/vulkan/kk_gpl.h
+@@ -7,6 +7,7 @@
+ #define KK_GPL_H
+ 
+ #include "kk_depth_clip.h"
++#include "kk_logic_op.h"
+ 
+ #include "vk_graphics_state.h"
+ 
+@@ -68,6 +69,7 @@ struct kk_fs_key {
+    bool sample_shading_enable;
+    bool alpha_to_coverage_enable;
+    bool alpha_to_one_enable;
++   bool dynamic_logic_op;
+    enum kk_fragment_depth_clamp_mode depth_clamp_mode;
+ };
+ 
+@@ -90,6 +92,10 @@ kk_populate_fs_key(struct kk_fs_key *key,
+    if (state->cb)
+       key->color_blend = *(state->cb);
+ 
++   key->dynamic_logic_op = kk_logic_op_is_dynamic(state);
++   if (key->dynamic_logic_op)
++      key->color_blend.logic_op = 0;
++
+    if (state->ms) {
+       key->rasterization_samples = state->ms->rasterization_samples;
+       key->static_sample_mask = state->ms->sample_mask;
+diff --git a/src/kosmickrisp/vulkan/kk_logic_op.h b/src/kosmickrisp/vulkan/kk_logic_op.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3b85e7f09becb7312ff056380725810efd0e5a7
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_logic_op.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_LOGIC_OP_H
++#define KK_LOGIC_OP_H 1
++
++#include "vk_graphics_state.h"
++
++/* Keep fragment shader runtime state in the existing four-byte root slot so
++ * the root descriptor ABI, including every following push/descriptor offset,
++ * remains unchanged for the precompiled device library.
++ */
++#define KK_FRAGMENT_DYNAMIC_DEPTH_CLAMP_ENABLE BITFIELD_BIT(0)
++#define KK_FRAGMENT_DYNAMIC_LOGIC_OP_SHIFT     1
++#define KK_FRAGMENT_DYNAMIC_LOGIC_OP_MASK \
++   (0xfu << KK_FRAGMENT_DYNAMIC_LOGIC_OP_SHIFT)
++
++static inline bool
++kk_logic_op_is_dynamic(const struct vk_graphics_pipeline_state *state)
++{
++   return state->cb && state->cb->logic_op_enable &&
++          BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP);
++}
++
++static inline uint32_t
++kk_fragment_dynamic_state_set_logic_op(uint32_t state, uint32_t logic_op)
++{
++   return (state & ~KK_FRAGMENT_DYNAMIC_LOGIC_OP_MASK) |
++          ((logic_op << KK_FRAGMENT_DYNAMIC_LOGIC_OP_SHIFT) &
++           KK_FRAGMENT_DYNAMIC_LOGIC_OP_MASK);
++}
++
++static inline uint32_t
++kk_fragment_dynamic_state_logic_op(uint32_t state)
++{
++   return (state & KK_FRAGMENT_DYNAMIC_LOGIC_OP_MASK) >>
++          KK_FRAGMENT_DYNAMIC_LOGIC_OP_SHIFT;
++}
++
++#endif
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 64a69a57e7c23abe5d9215ec419f101ac483d157..7e4a984f44ce2e8bc82a921d86b58cdaed039232 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -322,7 +322,7 @@ kk_get_device_features(
+       .dynamicRendering = true,
+       .extendedDynamicState = true,
+       .extendedDynamicState2 = true,
+-      .extendedDynamicState2LogicOp = false,
++      .extendedDynamicState2LogicOp = true,
+       .extendedDynamicState2PatchControlPoints = true,
+       .graphicsPipelineLibrary = true,
+       .inlineUniformBlock = true,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index f64d59bfe1a3a13987cb5267b57384a7ea5419e0..098851ad6006b139ef206974a1c336333b9f40e7 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -13,6 +13,7 @@
+ #include "kk_device.h"
+ #include "kk_format.h"
+ #include "kk_gpl.h"
++#include "kk_logic_op.h"
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_physical_device.h"
+ #include "kk_sampler.h"
+@@ -365,15 +366,30 @@ kk_load_depth_clamp_range(nir_builder *b, nir_def *viewport)
+ }
+ 
+ static nir_def *
+-kk_load_manual_depth_clamp_enable(nir_builder *b)
++kk_load_fragment_dynamic_state(nir_builder *b)
+ {
+    return kk_nir_load_root(
+       b, 1, 32,
+       nir_imm_int(b, offsetof(struct kk_root_descriptor_table,
+-                              draw.manual_depth_clamp_enable)),
++                              draw.fragment_dynamic_state)),
+       4);
+ }
+ 
++static nir_def *
++kk_load_manual_depth_clamp_enable(nir_builder *b)
++{
++   return nir_iand_imm(b, kk_load_fragment_dynamic_state(b),
++                       KK_FRAGMENT_DYNAMIC_DEPTH_CLAMP_ENABLE);
++}
++
++static nir_def *
++kk_load_dynamic_logic_op(nir_builder *b, UNUSED void *data)
++{
++   nir_def *state = kk_load_fragment_dynamic_state(b);
++   return nir_iand_imm(
++      b, nir_ushr_imm(b, state, KK_FRAGMENT_DYNAMIC_LOGIC_OP_SHIFT), 0xfu);
++}
++
+ static bool
+ kk_nir_lower_depth_clip_position(nir_shader *nir)
+ {
+@@ -530,6 +546,8 @@ kk_lower_fs_blend(nir_shader *nir,
+       .scalar_blend_const = false,
+       .logicop_enable = state->cb->logic_op_enable,
+       .logicop_func = vk_logic_op_to_pipe(state->cb->logic_op),
++      .load_dynamic_logicop_func =
++         kk_logic_op_is_dynamic(state) ? kk_load_dynamic_logic_op : NULL,
+    };
+ 
+    static_assert(ARRAY_SIZE(opts.rt) == 8, "max RTs out of sync");
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 9e6ccb694f501ecd17b1ea87faed332ac2e11368..af6c3db8d90ca2ff36848f8f65a68389ff37cff2 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -83,6 +83,7 @@ kk_files = files(
+   'kk_format.h',
+   'kk_format.c',
+   'kk_gpl.h',
++  'kk_logic_op.h',
+   'kk_image_layout.h',
+   'kk_image_layout.c',
+   'kk_image_view.h',
+@@ -308,6 +309,23 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_logic_op',
++    executable(
++      'test_kosmickrisp_logic_op',
++      files(
++        'tests/test_logic_op.c',
++        '../../vulkan/runtime/vk_blend.c',
++      ),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_vulkan_runtime_headers,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_rgb32_texel_format',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_logic_op.c b/src/kosmickrisp/vulkan/tests/test_logic_op.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1de26ed282a1d0aa8a9680d553c6c6b525c499b4
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_logic_op.c
+@@ -0,0 +1,134 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kosmickrisp/vulkan/kk_logic_op.h"
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "compiler/nir/nir_lower_blend.h"
++#include "vulkan/runtime/vk_blend.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition)                                                     \
++   do {                                                                      \
++      if (!(condition)) {                                                    \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,   \
++                 #condition);                                                \
++         abort();                                                            \
++      }                                                                      \
++   } while (0)
++
++static uint32_t
++reference_logic_op(uint32_t op, uint32_t src, uint32_t dst)
++{
++   uint32_t result = 0;
++   for (unsigned bit = 0; bit < 8; bit++) {
++      const unsigned inputs = (((src >> bit) & 1u) << 1) |
++                              ((dst >> bit) & 1u);
++      result |= ((op >> inputs) & 1u) << bit;
++   }
++   return result;
++}
++
++static void
++check_dynamic_nir_truth_table(void)
++{
++   static const nir_shader_compiler_options options = {0};
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &options, "dynamic logic-op test");
++
++   const uint32_t src_values[4] = {0x00, 0x0f, 0x55, 0xa6};
++   const uint32_t dst_values[4] = {0xff, 0x33, 0xaa, 0x69};
++   nir_def *src = nir_imm_ivec4(&b, src_values[0], src_values[1],
++                                src_values[2], src_values[3]);
++   nir_def *dst = nir_imm_ivec4(&b, dst_values[0], dst_values[1],
++                                dst_values[2], dst_values[3]);
++
++   nir_intrinsic_instr *uses[16];
++   for (unsigned op = 0; op < ARRAY_SIZE(uses); op++) {
++      nir_def *result = nir_color_logicop_dynamic(
++         &b, src, dst, nir_imm_int(&b, op), PIPE_FORMAT_R8G8B8A8_UINT);
++      uses[op] = nir_use(&b, result);
++   }
++
++   CHECK(nir_opt_constant_folding(b.shader));
++   nir_validate_shader(b.shader, "after dynamic logic-op folding");
++
++   for (unsigned op = 0; op < ARRAY_SIZE(uses); op++) {
++      nir_def *result = uses[op]->src[0].ssa;
++      CHECK(nir_def_is_const(result));
++      const nir_const_value *value = nir_def_as_load_const(result)->value;
++      for (unsigned channel = 0; channel < 4; channel++) {
++         CHECK(value[channel].u32 ==
++               reference_logic_op(op, src_values[channel],
++                                  dst_values[channel]));
++      }
++   }
++
++   ralloc_free(b.shader);
++}
++
++static void
++check_vulkan_mapping_and_root_packing(void)
++{
++   static const uint8_t expected_pipe_op[] = {
++      [VK_LOGIC_OP_CLEAR] = PIPE_LOGICOP_CLEAR,
++      [VK_LOGIC_OP_AND] = PIPE_LOGICOP_AND,
++      [VK_LOGIC_OP_AND_REVERSE] = PIPE_LOGICOP_AND_REVERSE,
++      [VK_LOGIC_OP_COPY] = PIPE_LOGICOP_COPY,
++      [VK_LOGIC_OP_AND_INVERTED] = PIPE_LOGICOP_AND_INVERTED,
++      [VK_LOGIC_OP_NO_OP] = PIPE_LOGICOP_NOOP,
++      [VK_LOGIC_OP_XOR] = PIPE_LOGICOP_XOR,
++      [VK_LOGIC_OP_OR] = PIPE_LOGICOP_OR,
++      [VK_LOGIC_OP_NOR] = PIPE_LOGICOP_NOR,
++      [VK_LOGIC_OP_EQUIVALENT] = PIPE_LOGICOP_EQUIV,
++      [VK_LOGIC_OP_INVERT] = PIPE_LOGICOP_INVERT,
++      [VK_LOGIC_OP_OR_REVERSE] = PIPE_LOGICOP_OR_REVERSE,
++      [VK_LOGIC_OP_COPY_INVERTED] = PIPE_LOGICOP_COPY_INVERTED,
++      [VK_LOGIC_OP_OR_INVERTED] = PIPE_LOGICOP_OR_INVERTED,
++      [VK_LOGIC_OP_NAND] = PIPE_LOGICOP_NAND,
++      [VK_LOGIC_OP_SET] = PIPE_LOGICOP_SET,
++   };
++
++   for (unsigned vk_op = 0; vk_op < ARRAY_SIZE(expected_pipe_op); vk_op++) {
++      const uint32_t pipe_op = vk_logic_op_to_pipe((VkLogicOp)vk_op);
++      CHECK(pipe_op == expected_pipe_op[vk_op]);
++
++      const uint32_t original = 0xa5a50001u;
++      const uint32_t packed =
++         kk_fragment_dynamic_state_set_logic_op(original, pipe_op);
++      CHECK(kk_fragment_dynamic_state_logic_op(packed) == pipe_op);
++      CHECK((packed & ~KK_FRAGMENT_DYNAMIC_LOGIC_OP_MASK) ==
++            (original & ~KK_FRAGMENT_DYNAMIC_LOGIC_OP_MASK));
++   }
++
++}
++
++static void
++check_pipeline_selection(void)
++{
++   struct vk_color_blend_state cb = {.logic_op_enable = true};
++   struct vk_graphics_pipeline_state state = {.cb = &cb};
++
++   CHECK(!kk_logic_op_is_dynamic(&state));
++   BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP);
++   CHECK(kk_logic_op_is_dynamic(&state));
++
++   cb.logic_op_enable = false;
++   CHECK(!kk_logic_op_is_dynamic(&state));
++   state.cb = NULL;
++   CHECK(!kk_logic_op_is_dynamic(&state));
++}
++
++int
++main(void)
++{
++   check_dynamic_nir_truth_table();
++   check_vulkan_mapping_and_root_packing();
++   check_pipeline_selection();
++   return 0;
++}

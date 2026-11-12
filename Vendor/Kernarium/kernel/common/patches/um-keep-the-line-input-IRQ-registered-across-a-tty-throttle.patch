@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 23:27:39 +0900
+Subject: [PATCH] um: keep the line input IRQ registered across a tty throttle
+
+line_throttle() deactivates the input channel, which removes its
+descriptor from the host event set and clears the read registration.
+Nothing registers it again: commit 940b241d9050 ("um: Remove obsolete
+reenable_XX calls") dropped the reactivation from line_unthrottle(),
+which now drains the channel once and stops. n_tty throttles once 3968
+bytes are unread, so a single larger burst to a serial line or the
+console leaves its input dead for good.
+
+Only record the throttle. While throttled, chan_interrupt() still fills
+the flip buffer up to its memory limit and leaves the rest in the host
+channel, the delayed retry does nothing, and line_unthrottle() drains
+the backlog directly, which an edge-triggered descriptor requires.
+Returning early from chan_interrupt() instead would push backpressure
+into the host channel at the line-discipline limit. deactivate_chan()
+has no other caller and goes.
+
+Drain a line's input from one caller at a time.  The input IRQ,
+line_unthrottle() and the retry work all call chan_interrupt(), from any
+CPU, and the IRQ can interrupt a drain on its own CPU.  With the input IRQ
+registered while throttled, an unthrottle drain on the reader's CPU
+overlaps an IRQ drain elsewhere, and the two split and reorder the input
+they read into a flip buffer that takes one producer at a time.  The first
+caller now drains; a concurrent caller only records that input may be
+waiting, and the drainer reads again until no record is left.
+---
+ arch/um/drivers/chan.h      |  1 -
+ arch/um/drivers/chan_kern.c | 39 ++++++++++++++++++++++++++++++-------
+ arch/um/drivers/line.c      |  8 +++++++-
+ arch/um/drivers/line.h      |  2 ++
+ 4 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/arch/um/drivers/chan.h b/arch/um/drivers/chan.h
+index 5a61db512ffbf40fc889b0acfe8d1aed3ad99409..7296ee02a34415e318c4c89afea55859adf50c07 100644
+--- a/arch/um/drivers/chan.h
++++ b/arch/um/drivers/chan.h
+@@ -36,7 +36,6 @@ extern int write_chan(struct chan *chan, const u8 *buf, size_t len,
+ extern int console_write_chan(struct chan *chan, const char *buf, 
+ 			      int len);
+ extern int console_open_chan(struct line *line, struct console *co);
+-extern void deactivate_chan(struct chan *chan, int irq);
+ extern void chan_enable_winch(struct chan *chan, struct tty_port *port);
+ extern int enable_chan(struct line *line);
+ extern void close_chan(struct line *line);
+diff --git a/arch/um/drivers/chan_kern.c b/arch/um/drivers/chan_kern.c
+index 26442db7d60895c53392c6c73be203862118488c..be683af0648c2416789af63b00b86c38ed522e77 100644
+--- a/arch/um/drivers/chan_kern.c
++++ b/arch/um/drivers/chan_kern.c
+@@ -281,12 +281,6 @@ void close_chan(struct line *line)
+ 	}
+ }
+ 
+-void deactivate_chan(struct chan *chan, int irq)
+-{
+-	if (chan && chan->enabled)
+-		deactivate_fd(chan->fd_in, irq);
+-}
+-
+ int write_chan(struct chan *chan, const u8 *buf, size_t len, int write_irq)
+ {
+ 	int n, ret = 0;
+@@ -575,7 +569,7 @@ int parse_chan_pair(char *str, struct line *line, int device,
+ 	return 0;
+ }
+ 
+-void chan_interrupt(struct line *line, int irq)
++static void drain_chan(struct line *line)
+ {
+ 	struct tty_port *port = &line->port;
+ 	struct chan *chan = line->chan_in;
+@@ -608,3 +602,34 @@ void chan_interrupt(struct line *line, int irq)
+  out:
+ 	tty_flip_buffer_push(port);
+ }
++
++#define LINE_INPUT_DRAINING 0
++#define LINE_INPUT_PENDING 1
++
++/*
++ * The input IRQ, line_unthrottle() and the retry work all drain the input
++ * channel, from any CPU, and the IRQ can also interrupt a drain on its own
++ * CPU. The flip buffer takes one producer at a time, and two drains would
++ * also split and reorder the input they read. So the first caller drains,
++ * and a caller that finds a drain in progress only records that more input
++ * may be waiting. The drainer reads again until no record is left, then
++ * checks once more after it lets go. The host descriptor is edge-triggered,
++ * so an IRQ's record can be the only notice of new input; it is never lost.
++ */
++void chan_interrupt(struct line *line, int irq)
++{
++	set_bit(LINE_INPUT_PENDING, &line->input_state);
++	/*
++	 * Pairs with the barrier after the drainer lets go: either the drainer
++	 * sees this record, or this caller sees that the drain has ended.
++	 */
++	smp_mb__after_atomic();
++	while (!test_and_set_bit_lock(LINE_INPUT_DRAINING, &line->input_state)) {
++		while (test_and_clear_bit(LINE_INPUT_PENDING, &line->input_state))
++			drain_chan(line);
++		clear_bit_unlock(LINE_INPUT_DRAINING, &line->input_state);
++		smp_mb__after_atomic();
++		if (!test_bit(LINE_INPUT_PENDING, &line->input_state))
++			break;
++	}
++}
+diff --git a/arch/um/drivers/line.c b/arch/um/drivers/line.c
+index 43d8959cc746fb39e0fc3391b8db4d0f3d07724f..7936f500e0b29c99724b47f759d9d745abc5f3c9 100644
+--- a/arch/um/drivers/line.c
++++ b/arch/um/drivers/line.c
+@@ -215,7 +215,13 @@ void line_throttle(struct tty_struct *tty)
+ {
+ 	struct line *line = tty->driver_data;
+ 
+-	deactivate_chan(line->chan_in, line->read_irq);
++	/*
++	 * Only record the throttle. Deactivating the input descriptor would
++	 * remove it from the host event set, and nothing adds it back, so
++	 * input would stop for good. While throttled, chan_interrupt() fills
++	 * the flip buffer only up to its memory limit, the delayed retry does
++	 * nothing, and line_unthrottle() drains what the host still holds.
++	 */
+ 	line->throttled = 1;
+ }
+ 
+diff --git a/arch/um/drivers/line.h b/arch/um/drivers/line.h
+index e8bd6f3dfb507771e1d7f9e89252904e14240199..899b54b5d48cc917677ffc34d970dc89d9701d88 100644
+--- a/arch/um/drivers/line.h
++++ b/arch/um/drivers/line.h
+@@ -42,6 +42,8 @@ struct line {
+ 	/*This lock is actually, mostly, local to*/
+ 	spinlock_t lock;
+ 	int throttled;
++	/* LINE_INPUT_* bits: chan_interrupt() drains from one caller at a time */
++	unsigned long input_state;
+ 	/* Yes, this is a real circular buffer.
+ 	 * XXX: And this should become a struct kfifo!
+ 	 *

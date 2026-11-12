@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 02:04:06 +0900
+Subject: [PATCH] zink: hand a GL texture's Metal texture to a GL interop
+ caller
+
+On an Apple host a GL texture zink creates is stored in a Metal texture:
+the Vulkan driver backs every VkImage with one. A process that presents
+such a texture with Metal - a virtio-gpu host scanning out what a guest
+rendered - today has to read the pixels back through GL and upload them
+again, because nothing hands it the texture itself, and a dma-buf, the
+usual way out of GL, does not exist on this platform.
+
+MESA_GLINTEROP already has the shape for it. A driver may answer an
+export with driver-specific data instead of a dma-buf; the d3d12 driver
+hands out its ID3D12Resource that way. Zink now does the same where the
+Vulkan driver implements VK_EXT_metal_objects: an export whose caller
+offers room for a struct zink_interop_metal_texture receives the
+texture's id<MTLTexture>, and no dma-buf is attempted. A caller that
+offers no room keeps the ordinary handle export.
+
+The texture is borrowed. It stays valid while the GL object keeps its
+storage, which zink may replace when a resource needs a usage it was not
+created with, so a caller asks again rather than caching it.
+VK_EXT_metal_objects lets a driver refuse the export of an image that
+did not declare it at creation, so every image zink creates on such a
+device chains VkExportMetalObjectCreateInfoEXT for its texture.
+
+The struct is installed as GL/zink_interop_public.h, and
+GL/mesa_glinterop.h, which upstream leaves uninstalled, is installed
+with EGL or GLX, so a caller compiles the export against both headers
+instead of copying their layouts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/meson.build                           |  6 ++
+ src/gallium/drivers/zink/meson.build          |  3 +
+ src/gallium/drivers/zink/zink_device_info.py  |  5 ++
+ .../drivers/zink/zink_interop_public.h        | 38 +++++++++++
+ src/gallium/drivers/zink/zink_resource.c      | 65 +++++++++++++++++++
+ 5 files changed, 117 insertions(+)
+ create mode 100644 src/gallium/drivers/zink/zink_interop_public.h
+
+diff --git a/include/meson.build b/include/meson.build
+index 397d4b424d9d6e4a100576981ce232928acee51f..6af163b44d2e2ba6912c6bfa500c324235fc879d 100644
+--- a/include/meson.build
++++ b/include/meson.build
+@@ -82,6 +82,12 @@ if with_dri
+   install_headers('GL/internal/dri_interface.h', subdir : 'GL/internal')
+ endif
+ 
++# The MESA_GLINTEROP entry points are exported by EGL and GLX; a caller built
++# against this installation takes their ABI from here rather than a copy.
++if with_egl or with_glx != 'disabled'
++  install_headers('GL/mesa_glinterop.h', subdir : 'GL')
++endif
++
+ opencl_headers = files(
+   'CL/cl.h',
+   'CL/cl_d3d10.h',
+diff --git a/src/gallium/drivers/zink/meson.build b/src/gallium/drivers/zink/meson.build
+index e42275e80c979ea2c2d60959fdd0f790b16d8df6..11fd8efd2f144fbcf6bd0df7b60ad6bc0e432983 100644
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -103,6 +103,9 @@ endif
+ 
+ subdir('nir_to_spirv')
+ 
++# The driver data of a MESA_GLINTEROP export, beside GL/mesa_glinterop.h.
++install_headers('zink_interop_public.h', subdir : 'GL')
++
+ libzink = static_library(
+   'zink',
+   [files_libzink, zink_device_info, zink_instance, zink_nir_algebraic_c, vk_dispatch_table, spirv_info_h],
+diff --git a/src/gallium/drivers/zink/zink_device_info.py b/src/gallium/drivers/zink/zink_device_info.py
+index 4a6a1c416dc496fc94fab3ab9e86a7c3e7022bdd..8ac654a0d68d8948321e7c32a42dfeeece49e0b3 100644
+--- a/src/gallium/drivers/zink/zink_device_info.py
++++ b/src/gallium/drivers/zink/zink_device_info.py
+@@ -109,6 +109,7 @@ EXTENSIONS = [
+               alias="bda",
+               features=True),
+     Extension("VK_EXT_external_memory_host", alias="ext_host_mem", properties=True),
++    Extension("VK_EXT_metal_objects", guard=True),
+     Extension("VK_EXT_queue_family_foreign"),
+     Extension("VK_KHR_swapchain_mutable_format"),
+     Extension("VK_KHR_incremental_present"),
+@@ -420,6 +421,10 @@ header_code = """
+ #include <vulkan/vulkan_win32.h>
+ #endif
+ 
++#ifdef VK_USE_PLATFORM_METAL_EXT
++#include <vulkan/vulkan_metal.h>
++#endif
++
+ struct zink_screen;
+ 
+ struct zink_device_info {
+diff --git a/src/gallium/drivers/zink/zink_interop_public.h b/src/gallium/drivers/zink/zink_interop_public.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6eb378dd54a748d0a773b193641072ecc4de3272
+--- /dev/null
++++ b/src/gallium/drivers/zink/zink_interop_public.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 2026 Yi Xie
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef ZINK_INTEROP_PUBLIC_H
++#define ZINK_INTEROP_PUBLIC_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define ZINK_INTEROP_METAL_TEXTURE_VERSION 1
++
++/*
++ * The driver data zink writes for a MESA_GLINTEROP texture export on a
++ * Vulkan driver that implements VK_EXT_metal_objects, when the caller offers
++ * room for it through mesa_glinterop_export_in::out_driver_data. No dma-buf
++ * is exported alongside it.
++ *
++ * texture is the id<MTLTexture> that stores the object's first plane. It is
++ * not retained for the caller: it stays valid while the GL object keeps its
++ * current storage, so a caller that holds it longer retains it itself and
++ * asks again after anything that may have given the object new storage.
++ */
++struct zink_interop_metal_texture {
++   uint32_t version;
++   uint32_t reserved;
++   void *texture;
++};
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index f15ab731833411f38069fd55cdb73831f8bf5e3e..ff498778379705fda0032a475ef0c24fe8889e09 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -32,6 +32,7 @@
+ #include "zink_screen.h"
+ #include "zink_surface.h"
+ #include "zink_kopper.h"
++#include "zink_interop_public.h"
+ 
+ #ifdef VK_USE_PLATFORM_METAL_EXT
+ #include "QuartzCore/CAMetalLayer.h"
+@@ -1761,6 +1762,19 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
+       obj->plane_strides[alloc_info->whandle->plane] = alloc_info->whandle->stride;
+    }
+ 
++#ifdef VK_EXT_metal_objects
++   /* A GL interop caller may ask for the Metal texture behind this image
++    * (see zink_interop_export_object()); the extension lets a driver refuse
++    * that export for an image that did not ask for it at creation. */
++   VkExportMetalObjectCreateInfoEXT metal_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .pNext = ici.pNext,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
++   };
++   if (screen->info.have_EXT_metal_objects)
++      ici.pNext = &metal_export;
++#endif
++
+    VkResult result = VKSCR(CreateImage)(screen->dev, &ici, NULL, &obj->image);
+    if (result != VK_SUCCESS) {
+       mesa_loge("ZINK: vkCreateImage failed (%s)", vk_Result_to_str(result));
+@@ -3679,6 +3693,53 @@ static const struct u_transfer_vtbl transfer_vtbl = {
+    .get_stencil           = zink_resource_get_separate_stencil,
+ };
+ 
++#ifdef VK_EXT_metal_objects
++/* A GL texture's storage on an Apple host is a Metal texture, and a process
++ * that presents it with Metal needs that object rather than a copy of its
++ * pixels. MESA_GLINTEROP carries it as driver data (the d3d12 driver hands
++ * out its ID3D12Resource the same way), so a caller that offers room for a
++ * zink_interop_metal_texture receives the texture instead of a dma-buf,
++ * which this platform does not have. Any other caller is left to the
++ * ordinary handle export.
++ */
++static uint32_t
++zink_interop_export_object(struct pipe_screen *pscreen,
++                           struct pipe_resource *pres,
++                           uint32_t in_data_size,
++                           void *data,
++                           bool *need_export_dmabuf)
++{
++   struct zink_screen *screen = zink_screen(pscreen);
++   struct zink_resource *res = zink_resource(pres);
++   struct zink_interop_metal_texture *info = data;
++
++   /* A display target has no image until it acquires one, and an auxiliary
++    * plane never has its own. */
++   if (!info || in_data_size < sizeof(*info) || pres->target == PIPE_BUFFER ||
++       !res->obj->image || util_format_get_num_planes(pres->format) != 1)
++      return 0;
++
++   VkExportMetalTextureInfoEXT texture = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
++      .image = res->obj->image,
++      .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
++   };
++   VkExportMetalObjectsInfoEXT objects = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
++      .pNext = &texture,
++   };
++   VKSCR(ExportMetalObjectsEXT)(screen->dev, &objects);
++   if (!texture.mtlTexture)
++      return 0;
++
++   info->version = ZINK_INTEROP_METAL_TEXTURE_VERSION;
++   info->reserved = 0;
++   info->texture = (void *)texture.mtlTexture;
++   *need_export_dmabuf = false;
++   return sizeof(*info);
++}
++#endif
++
+ bool
+ zink_screen_resource_init(struct pipe_screen *pscreen)
+ {
+@@ -3700,6 +3761,10 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
+    if (screen->info.have_EXT_external_memory_host) {
+       pscreen->resource_from_user_memory = zink_resource_from_user_memory;
+    }
++#ifdef VK_EXT_metal_objects
++   if (screen->info.have_EXT_metal_objects)
++      pscreen->interop_export_object = zink_interop_export_object;
++#endif
+    if (screen->instance_info->have_KHR_external_memory_capabilities) {
+       pscreen->memobj_create_from_handle = zink_memobj_create_from_handle;
+       pscreen->memobj_destroy = zink_memobj_destroy;

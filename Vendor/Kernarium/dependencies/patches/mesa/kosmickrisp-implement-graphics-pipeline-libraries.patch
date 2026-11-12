@@ -1,0 +1,1241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 03:49:11 +0900
+Subject: [PATCH] kosmickrisp: implement graphics pipeline libraries
+
+---
+ src/kosmickrisp/vulkan/kk_device.c            |   9 +-
+ src/kosmickrisp/vulkan/kk_device.h            |   6 +
+ src/kosmickrisp/vulkan/kk_gpl.h               | 114 ++++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   8 +-
+ src/kosmickrisp/vulkan/kk_shader.c            | 490 +++++++++++++++---
+ src/kosmickrisp/vulkan/kk_shader.h            |   4 +
+ src/kosmickrisp/vulkan/meson.build            |  11 +
+ src/kosmickrisp/vulkan/tests/test_gpl_state.c | 168 ++++++
+ src/vulkan/runtime/vk_pipeline.c              |  45 ++
+ src/vulkan/runtime/vk_shader.h                |  35 ++
+ 10 files changed, 813 insertions(+), 77 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_gpl.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_gpl_state.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 8361e4f53dc63a913b17923ce1c85b4e445c6953..a7e752317e629beb401313bcb3b24122c00be89b 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -311,11 +311,15 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (dev->mtl_compiler_handle == NULL)
+       goto fail_init;
+ 
++   result = kk_linked_graphics_pipeline_cache_init(dev);
++   if (result != VK_SUCCESS)
++      goto fail_compiler;
++
+    /* We need to initialize the device residency set before any bo is created. */
+    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
+    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
+    if (dev->residency_set.handle == NULL)
+-      goto fail_compiler;
++      goto fail_linked_pipeline_cache;
+ 
+    if (pCreateInfo->queueCreateInfoCount > 0) {
+       result =
+@@ -360,6 +364,8 @@ fail_mem_cache:
+ fail_vab_memory:
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
++fail_linked_pipeline_cache:
++   kk_linked_graphics_pipeline_cache_finish(dev);
+ fail_compiler:
+    kk_release_compiler(dev);
+ fail_init:
+@@ -402,6 +408,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+ 
++   kk_linked_graphics_pipeline_cache_finish(dev);
+    kk_release_compiler(dev);
+ 
+    vk_device_finish(&dev->vk);
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index cb6aa034525d6e73ca67adfb5751be8bdc6b04bd..d00c2a4d39777eabfbe2d846c47078661261c5a4 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -94,6 +94,10 @@ struct kk_device {
+ 
+    struct kk_precompiled_cache precompiled_cache;
+ 
++   /* Complete native pipelines assembled from reusable GPL subsets. */
++   struct hash_table *linked_graphics_pipelines;
++   simple_mtx_t linked_graphics_pipelines_lock;
++
+    bool has_queue;
+    struct kk_queue queue;
+ 
+@@ -119,6 +123,8 @@ VkResult kk_device_init_meta(struct kk_device *dev);
+ void kk_device_finish_meta(struct kk_device *dev);
+ VkResult kk_device_init_lib(struct kk_device *dev);
+ void kk_device_finish_lib(struct kk_device *dev);
++VkResult kk_linked_graphics_pipeline_cache_init(struct kk_device *dev);
++void kk_linked_graphics_pipeline_cache_finish(struct kk_device *dev);
+ void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
+ void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
+                                               mtl_heap *heap);
+diff --git a/src/kosmickrisp/vulkan/kk_gpl.h b/src/kosmickrisp/vulkan/kk_gpl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ffdd35f9b902675129f89b523e89eb18e4726d0
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_gpl.h
+@@ -0,0 +1,114 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_GPL_H
++#define KK_GPL_H
++
++#include "kk_depth_clip.h"
++
++#include "vk_graphics_state.h"
++
++#include <string.h>
++
++static inline bool
++kk_graphics_state_is_complete(const struct vk_graphics_pipeline_state *state)
++{
++   if (state == NULL || state->rs == NULL || state->mv == NULL ||
++       state->rp == NULL)
++      return false;
++
++   if ((state->shader_stages & VK_SHADER_STAGE_VERTEX_BIT) &&
++       (state->vi == NULL || state->ia == NULL))
++      return false;
++
++   /* A statically-discarded pipeline has no fragment shader or fragment
++    * output interface.  Otherwise the complete render-pass attachment state
++    * arrives only after the fragment-output library has been linked.
++    */
++   if (state->rs->rasterizer_discard_enable &&
++       !BITSET_TEST(state->dynamic,
++                    MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE))
++      return true;
++
++   return vk_render_pass_state_has_attachment_info(state->rp);
++}
++
++static inline bool
++kk_graphics_state_has_static_depth_stencil(
++   const struct vk_graphics_pipeline_state *state)
++{
++   if (!state->ds)
++      return false;
++
++   return !(
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE) |
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_WRITE_ENABLE) |
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_COMPARE_OP) |
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_TEST_ENABLE) |
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_OP) |
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_COMPARE_MASK) |
++      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_WRITE_MASK));
++}
++
++/* Fragment-output identity of a graphics pipeline.  A linked pipeline library
++ * is cached device-wide under this key, so it must describe every attachment
++ * the compiled Metal pipeline and its depth-stencil state are built from.
++ */
++struct kk_fs_key {
++   VkFormat color_formats[MESA_VK_MAX_COLOR_ATTACHMENTS];
++   VkFormat depth_attachment_format;
++   VkFormat stencil_attachment_format;
++   struct vk_color_blend_state color_blend;
++   struct vk_depth_stencil_state ds;
++   uint32_t rasterization_samples;
++   uint16_t static_sample_mask;
++   uint8_t color_attachment_count;
++   bool sample_shading_enable;
++   bool alpha_to_coverage_enable;
++   bool alpha_to_one_enable;
++   enum kk_fragment_depth_clamp_mode depth_clamp_mode;
++};
++
++static inline void
++kk_populate_fs_key(struct kk_fs_key *key,
++                   const struct vk_graphics_pipeline_state *state)
++{
++   memset(key, 0, sizeof(*key));
++
++   /* Required since we [de]serialize blend, and render target swizzle for
++    * non-native formats */
++   memcpy(key->color_formats, state->rp->color_attachment_formats,
++          sizeof(key->color_formats));
++   key->color_attachment_count = state->rp->color_attachment_count;
++
++   if (kk_graphics_state_has_static_depth_stencil(state))
++      key->ds = *(state->ds);
++
++   /* Blend state gets [de]serialized, so we need to hash it */
++   if (state->cb)
++      key->color_blend = *(state->cb);
++
++   if (state->ms) {
++      key->rasterization_samples = state->ms->rasterization_samples;
++      key->static_sample_mask = state->ms->sample_mask;
++      key->sample_shading_enable = state->ms->sample_shading_enable;
++      key->alpha_to_coverage_enable = state->ms->alpha_to_coverage_enable;
++      key->alpha_to_one_enable = state->ms->alpha_to_one_enable;
++   }
++
++   /* Both depth/stencil attachment formats belong to the identity, exactly as
++    * the colour attachment formats do.  Depth writes are removed without a
++    * depth attachment, and the Metal depth-stencil state carries stencil
++    * descriptors only when a stencil attachment is bound, so a key that
++    * recorded only "some depth attachment exists" let one compilation serve
++    * both a depth-only and a depth+stencil render pass; whichever was
++    * compiled first then decided whether the other wrote stencil at all.
++    */
++   key->depth_attachment_format = state->rp->depth_attachment_format;
++   key->stencil_attachment_format = state->rp->stencil_attachment_format;
++   key->depth_clamp_mode = kk_fragment_depth_clamp_mode(state);
++}
++
++#endif /* KK_GPL_H */
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 37ee3d63009edb8bb3ad76699950e228d67d0ad0..09fcec3df77d8b2610d4c72299b3ed0efcecc99b 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -143,6 +143,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .KHR_maintenance8 = true,
+       .KHR_maintenance9 = true,
+       .KHR_maintenance10 = true,
++      .KHR_pipeline_library = true,
+       .KHR_robustness2 = true,
+       .KHR_shader_fma = true,
+       .KHR_shader_maximal_reconvergence = true,
+@@ -172,6 +173,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_dynamic_rendering_unused_attachments = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_metal = true,
++      .EXT_graphics_pipeline_library = true,
+       .EXT_external_memory_host = true,
+       .EXT_metal_objects = true,
+       .EXT_hdr_metadata = true,
+@@ -321,6 +323,7 @@ kk_get_device_features(
+       .extendedDynamicState2 = true,
+       .extendedDynamicState2LogicOp = false,
+       .extendedDynamicState2PatchControlPoints = true,
++      .graphicsPipelineLibrary = true,
+       .inlineUniformBlock = true,
+       .maintenance4 = true,
+       .pipelineCreationCacheControl = true,
+@@ -767,7 +770,10 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
+       .minImportedHostPointerAlignment = os_page_size,
+ 
+       /* VK_EXT_graphics_pipeline_library */
+-      .graphicsPipelineLibraryFastLinking = true,
++      /* Native Metal specialization still measures in milliseconds, not in
++       * the command-recording latency class required by this property.
++       */
++      .graphicsPipelineLibraryFastLinking = false,
+       .graphicsPipelineLibraryIndependentInterpolationDecoration = true,
+ 
+       /* VK_KHR_line_rasterization */
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 30f3e79e3ed19f91608d9813eaa8625a2af45867..f64d59bfe1a3a13987cb5267b57384a7ea5419e0 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -12,6 +12,7 @@
+ #include "kk_descriptor_set_layout.h"
+ #include "kk_device.h"
+ #include "kk_format.h"
++#include "kk_gpl.h"
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_physical_device.h"
+ #include "kk_sampler.h"
+@@ -24,6 +25,7 @@
+ #include "nir_builtin_builder.h"
+ #include "nir_control_flow.h"
+ #include "nir_lower_blend.h"
++#include "nir_serialize.h"
+ #include "nir_xfb_info.h"
+ 
+ #include "poly/cl/libpoly.h"
+@@ -97,22 +99,6 @@ kk_preprocess_nir(UNUSED struct vk_physical_device *vk_pdev, nir_shader *nir,
+    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
+ }
+ 
+-static bool
+-has_static_depth_stencil_state(const struct vk_graphics_pipeline_state *state)
+-{
+-   if (!state->ds)
+-      return false;
+-
+-   return !(
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE) |
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_WRITE_ENABLE) |
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_COMPARE_OP) |
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_TEST_ENABLE) |
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_OP) |
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_COMPARE_MASK) |
+-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_WRITE_MASK));
+-}
+-
+ struct kk_vs_key {
+    bool is_points;
+    bool polygon_point_emulation;
+@@ -171,46 +157,6 @@ kk_populate_vs_key(struct kk_vs_key *key,
+    key->vi = *state->vi;
+ }
+ 
+-struct kk_fs_key {
+-   VkFormat color_formats[MESA_VK_MAX_COLOR_ATTACHMENTS];
+-   struct vk_color_blend_state color_blend;
+-   struct vk_depth_stencil_state ds;
+-   uint32_t rasterization_samples;
+-   uint16_t static_sample_mask;
+-   bool sample_shading_enable;
+-   bool has_depth;
+-   enum kk_fragment_depth_clamp_mode depth_clamp_mode;
+-};
+-
+-static void
+-kk_populate_fs_key(struct kk_fs_key *key,
+-                   const struct vk_graphics_pipeline_state *state)
+-{
+-   memset(key, 0, sizeof(*key));
+-
+-   /* Required since we [de]serialize blend, and render target swizzle for
+-    * non-native formats */
+-   memcpy(key->color_formats, state->rp->color_attachment_formats,
+-          sizeof(key->color_formats));
+-
+-   if (has_static_depth_stencil_state(state))
+-      key->ds = *(state->ds);
+-
+-   /* Blend state gets [de]serialized, so we need to hash it */
+-   if (state->cb)
+-      key->color_blend = *(state->cb);
+-
+-   if (state->ms) {
+-      key->rasterization_samples = state->ms->rasterization_samples;
+-      key->static_sample_mask = state->ms->sample_mask;
+-      key->sample_shading_enable = state->ms->sample_shading_enable;
+-   }
+-
+-   /* Depth writes are removed unless there's an actual attachment */
+-   key->has_depth = state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
+-   key->depth_clamp_mode = kk_fragment_depth_clamp_mode(state);
+-}
+-
+ static void
+ kk_hash_graphics_state(struct vk_physical_device *device,
+                        const struct vk_graphics_pipeline_state *state,
+@@ -220,6 +166,16 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+    struct mesa_blake3 blake3_ctx;
+    _mesa_blake3_init(&blake3_ctx);
+ 
++   const bool complete = kk_graphics_state_is_complete(state);
++   _mesa_blake3_update(&blake3_ctx, &complete, sizeof(complete));
++
++   /* Incomplete GPL subsets retain preprocessed NIR.  Their state is stored
++    * and merged by the common pipeline implementation, and cannot be safely
++    * dereferenced while generating the deferred shader cache key.
++    */
++   if (!complete)
++      goto done;
++
+    if (stages & VK_SHADER_STAGE_VERTEX_BIT) {
+       struct kk_vs_key key;
+       kk_populate_vs_key(&key, state);
+@@ -235,6 +191,7 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+                           sizeof(state->mv->view_mask));
+    }
+ 
++done:
+    _mesa_blake3_update(&blake3_ctx, &enabled_features->nullDescriptor,
+                        sizeof(enabled_features->nullDescriptor));
+ 
+@@ -909,6 +866,9 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+ {
+    struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
+ 
++   if (shader->info.deferred)
++      blob_finish(&shader->deferred_nir);
++
+    struct kk_pipeline_handles *pipe = &shader->pipeline;
+ 
+    if (shader->info.stage == MESA_SHADER_COMPUTE) {
+@@ -1961,7 +1921,7 @@ gather_graphics_pipeline_create_info(
+       info->vs.view_mask = state->mv->view_mask;
+    }
+ 
+-   info->vs.has_ds = has_static_depth_stencil_state(state);
++   info->vs.has_ds = kk_graphics_state_has_static_depth_stencil(state);
+    if (info->vs.has_ds)
+       kk_gather_ds_info(state->ds, has_depth, has_stencil, info);
+ 
+@@ -2298,12 +2258,62 @@ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+ }
+ 
+ static VkResult
+-kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+-                   struct vk_shader_compile_info *infos,
+-                   const struct vk_graphics_pipeline_state *state,
+-                   const struct vk_features *enabled_features,
+-                   const VkAllocationCallbacks *pAllocator,
+-                   struct vk_shader **shaders_out)
++kk_defer_graphics_shaders(struct kk_device *dev, uint32_t shader_count,
++                          struct vk_shader_compile_info *infos,
++                          const VkAllocationCallbacks *pAllocator,
++                          struct vk_shader **shaders_out)
++{
++   memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
++
++   uint32_t shader_index = 0;
++   for (; shader_index < shader_count; shader_index++) {
++      struct vk_shader_compile_info *compile = &infos[shader_index];
++      struct kk_shader *shader = vk_shader_zalloc(
++         &dev->vk, &kk_shader_ops, compile->stage, pAllocator,
++         sizeof(*shader));
++      if (shader == NULL)
++         break;
++
++      shader->info.stage = compile->stage;
++      shader->info.deferred = true;
++      shader->deferred_robustness = *compile->robustness;
++      blob_init(&shader->deferred_nir);
++      nir_serialize(&shader->deferred_nir, compile->nir, false);
++      ralloc_free(compile->nir);
++      compile->nir = NULL;
++
++      if (shader->deferred_nir.out_of_memory) {
++         kk_shader_destroy(&dev->vk, shader, pAllocator);
++         break;
++      }
++
++      shaders_out[shader_index] = &shader->vk;
++   }
++
++   if (shader_index == shader_count)
++      return VK_SUCCESS;
++
++   for (uint32_t i = shader_index; i < shader_count; i++) {
++      ralloc_free(infos[i].nir);
++      infos[i].nir = NULL;
++   }
++
++   for (uint32_t i = 0; i < shader_index; i++) {
++      kk_shader_destroy(&dev->vk,
++                        container_of(shaders_out[i], struct kk_shader, vk),
++                        pAllocator);
++   }
++   memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
++   return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++}
++
++static VkResult
++kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
++                        struct vk_shader_compile_info *infos,
++                        const struct vk_graphics_pipeline_state *state,
++                        const struct vk_features *enabled_features,
++                        const VkAllocationCallbacks *pAllocator,
++                        struct vk_shader **shaders_out)
+ {
+    VkResult result = VK_SUCCESS;
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+@@ -2388,8 +2398,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+          NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+    }
+ 
+-   /* Since we don't support GPL nor shader objects and Metal render pipelines
+-    * require both vertex and fragment, we may need to provide a pass-through
++   /* Metal render pipelines require both vertex and fragment stages.  Complete
++    * pipelines, including final GPL links, may therefore need a pass-through
+     * fragment. */
+    uint32_t total_shaders = shader_count;
+    if (state && infos[shader_count - 1u].stage != MESA_SHADER_FRAGMENT) {
+@@ -2618,10 +2628,9 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+              sizeof(pre_gs->msl_data[MESA_SHADER_COMPUTE]));
+    }
+ 
+-   /* Compile pipeline:
+-    * 1. Compute pipeline
+-    * 2. Graphics with all stages (since we don't support GPL nor shader
+-    * objects for now). This will be addressed later.
++   /* Compile compute directly.  Graphics stages are complete here: GPL
++    * libraries defer this call until the common runtime has linked all state
++    * and shader subsets.
+     */
+    if (shaders[0]->vk.stage == MESA_SHADER_COMPUTE) {
+       struct kk_shader *s = shaders[0];
+@@ -2666,6 +2675,283 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    return result;
+ }
+ 
++static VkResult
++kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
++                   struct vk_shader_compile_info *infos,
++                   const struct vk_graphics_pipeline_state *state,
++                   const struct vk_features *enabled_features,
++                   const VkAllocationCallbacks *pAllocator,
++                   struct vk_shader **shaders_out)
++{
++   struct kk_device *dev = container_of(device, struct kk_device, vk);
++
++   /* A pipeline library's stages keep their NIR until the final link. */
++   if (shader_count > 0 && infos[0].stage != MESA_SHADER_COMPUTE &&
++       infos[0].defer_graphics_pipeline_link) {
++      return kk_defer_graphics_shaders(dev, shader_count, infos, pAllocator,
++                                       shaders_out);
++   }
++
++   return kk_compile_shaders_impl(device, shader_count, infos, state,
++                                  enabled_features, pAllocator, shaders_out);
++}
++
++/* The compile infos of a deferred graphics chain, one stage per entry in
++ * pipeline order, from the NIR each stage retained.  On failure every NIR
++ * already deserialized is freed. */
++static VkResult
++kk_deserialize_deferred_graphics_shaders(
++   struct kk_device *dev, uint32_t count, const mesa_shader_stage *stages,
++   const struct vk_pipeline_robustness_state *const *robustness,
++   const struct blob *const *nir, uint32_t set_layout_count,
++   struct vk_descriptor_set_layout *const *set_layouts,
++   struct vk_shader_compile_info *infos)
++{
++   for (uint32_t i = 0; i < count; i++) {
++      const nir_shader_compiler_options *nir_options =
++         kk_get_nir_options(dev->vk.physical, stages[i], robustness[i]);
++      struct blob_reader reader;
++      blob_reader_init(&reader, nir[i]->data, nir[i]->size);
++      nir_shader *shader = nir_deserialize(NULL, nir_options, &reader);
++      if (shader == NULL || reader.overrun) {
++         ralloc_free(shader);
++         for (uint32_t j = 0; j < i; j++)
++            ralloc_free(infos[j].nir);
++         return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
++      }
++
++      VkShaderStageFlags next_stage = 0;
++      if (stages[i] != MESA_SHADER_FRAGMENT) {
++         next_stage = i + 1 < count ? mesa_to_vk_shader_stage(stages[i + 1])
++                                    : VK_SHADER_STAGE_FRAGMENT_BIT;
++      }
++
++      infos[i] = (struct vk_shader_compile_info) {
++         .stage = stages[i],
++         .flags = count > 1 ? VK_SHADER_CREATE_LINK_STAGE_BIT_EXT : 0,
++         .next_stage_mask = next_stage,
++         .nir = shader,
++         .robustness = robustness[i],
++         .set_layout_count = set_layout_count,
++         .set_layouts = set_layouts,
++      };
++   }
++
++   return VK_SUCCESS;
++}
++
++struct kk_linked_graphics_pipeline {
++   blake3_hash key;
++   struct kk_shader *shaders[MESA_SHADER_STAGES];
++};
++
++static void
++kk_free_linked_graphics_pipeline(
++   struct vk_device *vk_dev, void *linked_data,
++   const VkAllocationCallbacks *pAllocator)
++{
++   struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
++   struct kk_linked_graphics_pipeline *linked = linked_data;
++
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      if (linked->shaders[stage] != NULL)
++         kk_shader_destroy(vk_dev, linked->shaders[stage], pAllocator);
++   }
++
++   vk_free2(&dev->vk.alloc, pAllocator, linked);
++}
++
++static uint32_t
++kk_linked_graphics_pipeline_hash(const void *key)
++{
++   return _mesa_hash_data(key, sizeof(blake3_hash));
++}
++
++static bool
++kk_linked_graphics_pipeline_equal(const void *a, const void *b)
++{
++   return memcmp(a, b, sizeof(blake3_hash)) == 0;
++}
++
++VkResult
++kk_linked_graphics_pipeline_cache_init(struct kk_device *dev)
++{
++   dev->linked_graphics_pipelines = _mesa_hash_table_create(
++      NULL, kk_linked_graphics_pipeline_hash,
++      kk_linked_graphics_pipeline_equal);
++   if (dev->linked_graphics_pipelines == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   simple_mtx_init(&dev->linked_graphics_pipelines_lock, mtx_plain);
++   return VK_SUCCESS;
++}
++
++void
++kk_linked_graphics_pipeline_cache_finish(struct kk_device *dev)
++{
++   hash_table_foreach(dev->linked_graphics_pipelines, entry) {
++      kk_free_linked_graphics_pipeline(&dev->vk, entry->data,
++                                       &dev->vk.alloc);
++   }
++   _mesa_hash_table_destroy(dev->linked_graphics_pipelines, NULL);
++   dev->linked_graphics_pipelines = NULL;
++   simple_mtx_destroy(&dev->linked_graphics_pipelines_lock);
++}
++
++static void
++kk_linked_graphics_pipeline_key(
++   struct vk_device *vk_dev, uint32_t shader_count,
++   struct vk_shader *const *shaders,
++   const struct vk_graphics_pipeline_state *state, blake3_hash key)
++{
++   struct mesa_blake3 hash;
++   _mesa_blake3_init(&hash);
++
++   VkShaderStageFlags stages = 0;
++   for (uint32_t i = 0; i < shader_count; i++) {
++      _mesa_blake3_update(&hash, &shaders[i]->stage,
++                          sizeof(shaders[i]->stage));
++      _mesa_blake3_update(&hash, shaders[i]->pipeline.cache_key,
++                          sizeof(shaders[i]->pipeline.cache_key));
++      stages |= mesa_to_vk_shader_stage(shaders[i]->stage);
++   }
++
++   blake3_hash state_key;
++   kk_hash_graphics_state(vk_dev->physical, state, &vk_dev->enabled_features,
++                          stages, state_key);
++   _mesa_blake3_update(&hash, state_key, sizeof(state_key));
++   _mesa_blake3_update(&hash, state->dynamic, sizeof(state->dynamic));
++   _mesa_blake3_update(&hash, &state->pipeline_flags,
++                       sizeof(state->pipeline_flags));
++
++   if (state->ia != NULL) {
++      _mesa_blake3_update(&hash, &state->ia->primitive_topology,
++                          sizeof(state->ia->primitive_topology));
++   }
++   if (state->cal != NULL)
++      _mesa_blake3_update(&hash, state->cal, sizeof(*state->cal));
++
++   _mesa_blake3_final(&hash, key);
++}
++
++static void
++kk_destroy_linked_graphics_pipeline(
++   UNUSED struct vk_device *vk_dev, UNUSED void *linked_data,
++   UNUSED const VkAllocationCallbacks *pAllocator)
++{
++   /* Entries remain reusable until device destruction. */
++}
++
++static VkResult
++kk_link_graphics_pipeline(
++   struct vk_device *vk_dev, VkPipelineCreateFlags2KHR pipeline_flags,
++   uint32_t shader_count, struct vk_shader *const *vk_shaders,
++   const struct vk_graphics_pipeline_state *state, uint32_t set_layout_count,
++   struct vk_descriptor_set_layout *const *set_layouts,
++   UNUSED const VkAllocationCallbacks *pAllocator, void **linked_data_out)
++{
++   struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
++   *linked_data_out = NULL;
++
++   bool has_deferred = false;
++   for (uint32_t i = 0; i < shader_count; i++) {
++      struct kk_shader *shader =
++         container_of(vk_shaders[i], struct kk_shader, vk);
++      has_deferred |= shader->info.deferred;
++   }
++
++   /* Monolithic pipelines and complete libraries already own their native
++    * Metal pipeline in the vertex shader.
++    */
++   if (!has_deferred)
++      return VK_SUCCESS;
++
++   blake3_hash key;
++   kk_linked_graphics_pipeline_key(vk_dev, shader_count, vk_shaders, state,
++                                   key);
++
++   simple_mtx_lock(&dev->linked_graphics_pipelines_lock);
++   struct hash_entry *cached =
++      _mesa_hash_table_search(dev->linked_graphics_pipelines, key);
++   if (cached != NULL) {
++      *linked_data_out = cached->data;
++      simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++      return VK_SUCCESS;
++   }
++   simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++
++   if (pipeline_flags &
++       VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
++      return VK_PIPELINE_COMPILE_REQUIRED;
++
++   struct vk_shader_compile_info infos[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] =
++      {0};
++   struct vk_shader *compiled[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] = {0};
++
++   mesa_shader_stage stages[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++   const struct vk_pipeline_robustness_state
++      *robustness[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++   const struct blob *nir[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++   for (uint32_t i = 0; i < shader_count; i++) {
++      const struct kk_shader *shader =
++         container_of(vk_shaders[i], struct kk_shader, vk);
++      if (!shader->info.deferred)
++         return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
++
++      stages[i] = shader->info.stage;
++      robustness[i] = &shader->deferred_robustness;
++      nir[i] = &shader->deferred_nir;
++   }
++
++   VkResult result = kk_deserialize_deferred_graphics_shaders(
++      dev, shader_count, stages, robustness, nir, set_layout_count,
++      set_layouts, infos);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = kk_compile_shaders_impl(
++      vk_dev, shader_count, infos, state, &vk_dev->enabled_features,
++      &dev->vk.alloc, compiled);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct kk_linked_graphics_pipeline *linked =
++      vk_zalloc(&dev->vk.alloc, sizeof(*linked), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (linked == NULL) {
++      for (uint32_t i = 0; i < shader_count; i++) {
++         kk_shader_destroy(vk_dev,
++                           container_of(compiled[i], struct kk_shader, vk),
++                           &dev->vk.alloc);
++      }
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   memcpy(linked->key, key, sizeof(linked->key));
++
++   for (uint32_t i = 0; i < shader_count; i++) {
++      struct kk_shader *shader =
++         container_of(compiled[i], struct kk_shader, vk);
++      linked->shaders[shader->info.stage] = shader;
++   }
++
++   simple_mtx_lock(&dev->linked_graphics_pipelines_lock);
++   cached = _mesa_hash_table_search(dev->linked_graphics_pipelines, key);
++   if (cached == NULL) {
++      _mesa_hash_table_insert(dev->linked_graphics_pipelines, linked->key,
++                              linked);
++      *linked_data_out = linked;
++   } else {
++      *linked_data_out = cached->data;
++   }
++   simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++
++   if (cached != NULL)
++      kk_free_linked_graphics_pipeline(vk_dev, linked, &dev->vk.alloc);
++
++   return VK_SUCCESS;
++}
++
+ static void
+ kk_msl_data_serialize(const struct msl_compile_data *data, struct blob *blob)
+ {
+@@ -2691,6 +2977,15 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+    struct kk_shader *shader = container_of(vk_shader, struct kk_shader, vk);
+ 
+    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
++   if (shader->info.deferred) {
++      blob_write_bytes(blob, &shader->deferred_robustness,
++                       sizeof(shader->deferred_robustness));
++      blob_write_uint64(blob, shader->deferred_nir.size);
++      blob_write_bytes(blob, shader->deferred_nir.data,
++                       shader->deferred_nir.size);
++      return !blob->out_of_memory;
++   }
++
+    kk_msl_serialize(shader, shader->info.stage, blob);
+    if (shader->info.stage == MESA_SHADER_VERTEX) {
+       u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
+@@ -2759,12 +3054,39 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+    if (shader == NULL)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   VkResult result = kk_msl_deserialize(blob, info.stage, shader);
++   VkResult result;
++   shader->info = info;
++
++   if (info.deferred) {
++      blob_copy_bytes(blob, &shader->deferred_robustness,
++                      sizeof(shader->deferred_robustness));
++      const uint64_t nir_size = blob_read_uint64(blob);
++      if (blob->overrun || nir_size > SIZE_MAX) {
++         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
++         goto fail;
++      }
++
++      const void *nir_data = blob_read_bytes(blob, nir_size);
++      if (blob->overrun) {
++         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
++         goto fail;
++      }
++
++      blob_init(&shader->deferred_nir);
++      blob_write_bytes(&shader->deferred_nir, nir_data, nir_size);
++      if (shader->deferred_nir.out_of_memory) {
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto fail;
++      }
++
++      *shader_out = &shader->vk;
++      return VK_SUCCESS;
++   }
++
++   result = kk_msl_deserialize(blob, info.stage, shader);
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+-   shader->info = info;
+-
+    if (shader->info.stage == MESA_SHADER_VERTEX) {
+       u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
+          result = kk_msl_deserialize(blob, stage, shader);
+@@ -2856,6 +3178,21 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
+    cmd->state.gfx.pipeline_sample_count = shader->info.vs.sample_count;
+ }
+ 
++static void
++kk_cmd_bind_linked_graphics_pipeline(struct vk_command_buffer *cmd_buffer,
++                                     void *linked_data)
++{
++   struct kk_cmd_buffer *cmd =
++      container_of(cmd_buffer, struct kk_cmd_buffer, vk);
++   struct kk_linked_graphics_pipeline *linked = linked_data;
++
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      if (linked->shaders[stage] != NULL) {
++         kk_cmd_bind_graphics_shader(cmd, stage, linked->shaders[stage]);
++      }
++   }
++}
++
+ static void
+ kk_cmd_bind_shaders(struct vk_command_buffer *cmd_buffer, uint32_t stage_count,
+                     const mesa_shader_stage *stages,
+@@ -2927,9 +3264,12 @@ const struct vk_device_shader_ops kk_device_shader_ops = {
+    .get_spirv_options = kk_get_spirv_options,
+    .preprocess_nir = kk_preprocess_nir,
+    .hash_state = kk_hash_graphics_state,
+-   .compile =
+-      kk_compile_shaders, /* This will only generate the MSL string we need
+-                             to use for actual library generation */
++   .compile = kk_compile_shaders,
++   .link_graphics_pipeline = kk_link_graphics_pipeline,
++   .destroy_linked_graphics_pipeline =
++      kk_destroy_linked_graphics_pipeline,
++   .cmd_bind_linked_graphics_pipeline =
++      kk_cmd_bind_linked_graphics_pipeline,
+    .deserialize = kk_deserialize_shader,
+    .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
+    .cmd_bind_shaders = kk_cmd_bind_shaders,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index c3db6c67894eced6b1ac299b77006f39d03624e2..7e187015d14c1cc66ca824f4685ebcde07599ca8 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -14,6 +14,7 @@
+ #include "kosmickrisp/bridge/mtl_format.h"
+ 
+ #include "vk_pipeline_cache.h"
++#include "vk_pipeline.h"
+ 
+ #include "vk_shader.h"
+ 
+@@ -58,6 +59,7 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
+ struct kk_shader_info {
+    mesa_shader_stage stage;
+    bool uses_per_draw_data;
++   bool deferred;
+ 
+    /* Required for fragment shader cull distance discards. */
+    uint8_t num_cull_distances;
+@@ -165,6 +167,8 @@ struct kk_shader {
+    /* struct kk_attachment_variant, owned by this shader. */
+    struct util_dynarray attachment_variants;
+    struct kk_shader_info info;
++   struct vk_pipeline_robustness_state deferred_robustness;
++   struct blob deferred_nir;
+    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+    struct msl_compile_data transform_feedback_pre_gs_msl;
+    struct msl_compile_data geometry_main_msl;
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 100493cf8f178ca73da9e7e1a57bd4077bb17ad1..4beaefd360be24573eca96462ce7f282af267530 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -81,6 +81,7 @@ kk_files = files(
+   'kk_event.c',
+   'kk_format.h',
+   'kk_format.c',
++  'kk_gpl.h',
+   'kk_image_layout.h',
+   'kk_image_layout.c',
+   'kk_image_view.h',
+@@ -284,6 +285,16 @@ if with_tests
+     ),
+     suite : ['kosmickrisp'],
+   )
++  test(
++    'kosmickrisp_gpl_state',
++    executable(
++      'test_kosmickrisp_gpl_state',
++      files('tests/test_gpl_state.c'),
++      include_directories : [inc_include, inc_src],
++      dependencies : [idep_vulkan_runtime_headers],
++    ),
++    suite : ['kosmickrisp'],
++  )
+ 
+   test(
+     'kosmickrisp_rgb32_texel_format',
+diff --git a/src/kosmickrisp/vulkan/tests/test_gpl_state.c b/src/kosmickrisp/vulkan/tests/test_gpl_state.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c99a9547cd68774ecd33f577d83499cbb511c807
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_gpl_state.c
+@@ -0,0 +1,168 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kosmickrisp/vulkan/kk_gpl.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++static void
++require(bool condition)
++{
++   if (!condition)
++      abort();
++}
++
++/* Two render passes may share one linked pipeline library only when their
++ * fragment-output keys are identical.
++ */
++static bool
++same_fragment_output(struct vk_graphics_pipeline_state *state,
++                     struct vk_render_pass_state *rp, VkFormat depth_a,
++                     VkFormat stencil_a, VkFormat depth_b, VkFormat stencil_b)
++{
++   struct kk_fs_key a, b;
++
++   rp->depth_attachment_format = depth_a;
++   rp->stencil_attachment_format = stencil_a;
++   kk_populate_fs_key(&a, state);
++
++   rp->depth_attachment_format = depth_b;
++   rp->stencil_attachment_format = stencil_b;
++   kk_populate_fs_key(&b, state);
++
++   return memcmp(&a, &b, sizeof(a)) == 0;
++}
++
++static void
++check_fragment_output_key(void)
++{
++   struct vk_rasterization_state rs = {0};
++   struct vk_multiview_state mv = {0};
++   struct vk_multisample_state ms = {
++      .rasterization_samples = VK_SAMPLE_COUNT_4_BIT,
++      .sample_mask = 0xffff,
++   };
++   /* The application state a multisampled depth/stencil pipeline sets is the
++    * same whichever aspects its render pass actually carries, so only the
++    * attachment formats can tell the two pipelines apart.
++    */
++   struct vk_depth_stencil_state ds = {
++      .depth =
++         {
++            .test_enable = true,
++            .write_enable = true,
++            .compare_op = VK_COMPARE_OP_LESS,
++         },
++      .stencil =
++         {
++            .test_enable = true,
++            .front = {.op = {.pass = VK_STENCIL_OP_REPLACE},
++                      .write_mask = 0xff},
++            .back = {.op = {.pass = VK_STENCIL_OP_REPLACE},
++                     .write_mask = 0xff},
++         },
++   };
++   struct vk_render_pass_state rp = {
++      .attachments = MESA_VK_RP_ATTACHMENT_COLOR_0_BIT |
++                     MESA_VK_RP_ATTACHMENT_DEPTH_BIT |
++                     MESA_VK_RP_ATTACHMENT_STENCIL_BIT,
++      .color_attachment_count = 1,
++      .color_attachment_formats = {VK_FORMAT_R8G8B8A8_UNORM},
++   };
++   struct vk_graphics_pipeline_state state = {
++      .shader_stages = VK_SHADER_STAGE_VERTEX_BIT |
++                       VK_SHADER_STAGE_FRAGMENT_BIT,
++      .rs = &rs,
++      .mv = &mv,
++      .ms = &ms,
++      .ds = &ds,
++      .rp = &rp,
++   };
++
++   /* A depth-only pass compiles a depth-stencil state with no stencil
++    * descriptor at all, so it must never serve a depth+stencil pass: the
++    * shared pipeline would silently stop writing stencil.
++    */
++   require(!same_fragment_output(&state, &rp, VK_FORMAT_D16_UNORM,
++                                 VK_FORMAT_UNDEFINED,
++                                 VK_FORMAT_D32_SFLOAT_S8_UINT,
++                                 VK_FORMAT_D32_SFLOAT_S8_UINT));
++   require(!same_fragment_output(&state, &rp, VK_FORMAT_D32_SFLOAT,
++                                 VK_FORMAT_UNDEFINED,
++                                 VK_FORMAT_D32_SFLOAT_S8_UINT,
++                                 VK_FORMAT_D32_SFLOAT_S8_UINT));
++
++   /* A stencil-only pass is likewise distinct from one with no depth/stencil
++    * attachment, and the concrete depth format is part of the identity.
++    */
++   require(!same_fragment_output(&state, &rp, VK_FORMAT_UNDEFINED,
++                                 VK_FORMAT_S8_UINT, VK_FORMAT_UNDEFINED,
++                                 VK_FORMAT_UNDEFINED));
++   require(!same_fragment_output(&state, &rp, VK_FORMAT_D16_UNORM,
++                                 VK_FORMAT_UNDEFINED, VK_FORMAT_D32_SFLOAT,
++                                 VK_FORMAT_UNDEFINED));
++
++   /* Equal render passes still share one compilation. */
++   require(same_fragment_output(&state, &rp, VK_FORMAT_D32_SFLOAT_S8_UINT,
++                                VK_FORMAT_D32_SFLOAT_S8_UINT,
++                                VK_FORMAT_D32_SFLOAT_S8_UINT,
++                                VK_FORMAT_D32_SFLOAT_S8_UINT));
++
++   /* The rest of the fragment-output identity is still keyed. */
++   rp.depth_attachment_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
++   rp.stencil_attachment_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
++   struct kk_fs_key four_samples, two_samples;
++   kk_populate_fs_key(&four_samples, &state);
++   ms.rasterization_samples = VK_SAMPLE_COUNT_2_BIT;
++   kk_populate_fs_key(&two_samples, &state);
++   require(memcmp(&four_samples, &two_samples, sizeof(four_samples)) != 0);
++}
++
++int
++main(void)
++{
++   struct vk_vertex_input_state vi = {0};
++   struct vk_input_assembly_state ia = {0};
++   struct vk_rasterization_state rs = {0};
++   struct vk_multiview_state mv = {0};
++   struct vk_render_pass_state rp = {
++      .attachments = MESA_VK_RP_ATTACHMENT_INFO_INVALID,
++   };
++   struct vk_graphics_pipeline_state state = {
++      .shader_stages = VK_SHADER_STAGE_VERTEX_BIT |
++                       VK_SHADER_STAGE_FRAGMENT_BIT,
++      .vi = &vi,
++      .ia = &ia,
++      .rs = &rs,
++      .mv = &mv,
++      .rp = &rp,
++   };
++
++   /* Pre-raster and fragment-shader libraries only carry incomplete render
++    * pass state and therefore retain preprocessed NIR for the final link.
++    */
++   require(!kk_graphics_state_is_complete(&state));
++
++   rp.attachments = MESA_VK_RP_ATTACHMENT_COLOR_0_BIT;
++   require(kk_graphics_state_is_complete(&state));
++
++   state.vi = NULL;
++   require(!kk_graphics_state_is_complete(&state));
++   state.vi = &vi;
++
++   /* Static rasterizer discard completes without a fragment-output subset. */
++   rp.attachments = MESA_VK_RP_ATTACHMENT_INFO_INVALID;
++   rs.rasterizer_discard_enable = true;
++   require(kk_graphics_state_is_complete(&state));
++
++   BITSET_SET(state.dynamic,
++              MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE);
++   require(!kk_graphics_state_is_complete(&state));
++
++   check_fragment_output_key();
++
++   return 0;
++}
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 4c06e7db9067394192dd44f554a95f1c161e0855..6b51eb64d5c29ae461a4011c86024d48490cc526 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -1143,6 +1143,9 @@ struct vk_graphics_pipeline {
+ 
+    uint32_t stage_count;
+    struct vk_pipeline_stage stages[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++
++   /* Optional native state spanning more than one shader library. */
++   void *linked_data;
+ };
+ 
+ static void
+@@ -1153,6 +1156,13 @@ vk_graphics_pipeline_destroy(struct vk_device *device,
+    struct vk_graphics_pipeline *gfx_pipeline =
+       container_of(pipeline, struct vk_graphics_pipeline, base);
+ 
++   const struct vk_device_shader_ops *ops = device->shader_ops;
++   if (gfx_pipeline->linked_data != NULL) {
++      assert(ops->destroy_linked_graphics_pipeline != NULL);
++      ops->destroy_linked_graphics_pipeline(device, gfx_pipeline->linked_data,
++                                             pAllocator);
++   }
++
+    for (uint32_t i = 0; i < gfx_pipeline->stage_count; i++)
+       vk_pipeline_stage_finish(device, &gfx_pipeline->stages[i]);
+ 
+@@ -1239,6 +1249,12 @@ vk_graphics_pipeline_cmd_bind(struct vk_command_buffer *cmd_buffer,
+    }
+    ops->cmd_bind_shaders(cmd_buffer, stage_count, stages, shaders);
+ 
++   if (gfx_pipeline != NULL && gfx_pipeline->linked_data != NULL) {
++      assert(ops->cmd_bind_linked_graphics_pipeline != NULL);
++      ops->cmd_bind_linked_graphics_pipeline(cmd_buffer,
++                                             gfx_pipeline->linked_data);
++   }
++
+    if (gfx_pipeline != NULL) {
+       cmd_buffer->pipeline_shader_stages |= vk_stages;
+       ops->cmd_set_dynamic_graphics_state(cmd_buffer,
+@@ -1307,6 +1323,7 @@ struct vk_graphics_pipeline_compile_info {
+ 
+    bool retain_precomp;
+    bool optimize;
++   bool defer_graphics_pipeline_link;
+ 
+    uint32_t part_count;
+    uint32_t partition[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES + 1];
+@@ -1509,6 +1526,15 @@ vk_get_graphics_pipeline_compile_info(struct vk_graphics_pipeline_compile_info *
+       (libs_info == NULL ||
+        (pipeline_flags & VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT));
+ 
++   /* A library has no complete executable pipeline to link yet.  A fast-link
++    * final pipeline may also combine imported library shaders with stages
++    * supplied directly in this create info.  Drivers with a final-link hook
++    * need both kinds of shader to retain the same deferred representation.
++    */
++   info->defer_graphics_pipeline_link =
++      (pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
++      (libs_info != NULL && !info->optimize);
++
+    /* Partition the shaders. Whenever pipelines are used,
+     * vertex/geometry/fragment stages are always specified together, so should
+     * always be linked. That doesn't break the fast link since the relevant
+@@ -1570,6 +1596,10 @@ vk_get_graphics_pipeline_compile_info(struct vk_graphics_pipeline_compile_info *
+ 
+       _mesa_blake3_init(&blake3_ctx);
+ 
++      _mesa_blake3_update(&blake3_ctx,
++                          &info->defer_graphics_pipeline_link,
++                          sizeof(info->defer_graphics_pipeline_link));
++
+       for (uint32_t i = info->partition[p]; i < info->partition[p + 1]; i++) {
+          const struct vk_pipeline_stage *stage = &info->stages[i];
+ 
+@@ -1814,6 +1844,8 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
+ 
+          infos[i] = (struct vk_shader_compile_info) {
+             .stage = stage->stage,
++            .defer_graphics_pipeline_link =
++               compile_info->defer_graphics_pipeline_link,
+             .flags = shader_flags,
+             .next_stage_mask = next_stage,
+             .nir = nir,
+@@ -2154,6 +2186,19 @@ vk_create_graphics_pipeline(struct vk_device *device,
+          goto fail_stages;
+    }
+ 
++   if (!is_library && device->shader_ops->link_graphics_pipeline != NULL) {
++      struct vk_shader *shaders[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++      for (uint32_t i = 0; i < compile_info.stage_count; i++)
++         shaders[i] = compile_info.stages[i].shader;
++
++      result = device->shader_ops->link_graphics_pipeline(
++         device, pipeline_flags, compile_info.stage_count, shaders,
++         compile_info.state, compile_info.set_layout_count,
++         compile_info.set_layouts, pAllocator, &pipeline->linked_data);
++      if (result != VK_SUCCESS)
++         goto fail_stages;
++   }
++
+    /* Keep a reference on the set layouts */
+    pipeline->set_layout_count = compile_info.set_layout_count;
+    for (uint32_t i = 0; i < compile_info.set_layout_count; i++) {
+diff --git a/src/vulkan/runtime/vk_shader.h b/src/vulkan/runtime/vk_shader.h
+index 4e0d4dc84f3ec43554154874eb6802de92fc9141..688f28beb37afce6fef33a04b8468d374d4e98c6 100644
+--- a/src/vulkan/runtime/vk_shader.h
++++ b/src/vulkan/runtime/vk_shader.h
+@@ -76,6 +76,8 @@ int vk_shader_cmp_rt_stages(mesa_shader_stage a, mesa_shader_stage b);
+ 
+ struct vk_shader_compile_info {
+    mesa_shader_stage stage;
++   /* Defer native graphics linking until the complete pipeline is available. */
++   bool defer_graphics_pipeline_link;
+    VkShaderCreateFlagsEXT flags;
+    /* RT flags only includes :
+     *    - VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_BUILT_IN_PRIMITIVES_BIT_KHR
+@@ -302,6 +304,39 @@ struct vk_device_shader_ops {
+                        const VkAllocationCallbacks* pAllocator,
+                        struct vk_shader **shaders_out);
+ 
++   /** Link driver-private graphics pipeline state
++    *
++    * This optional callback is invoked for complete graphics pipelines after
++    * all shader stages and graphics state have been assembled.  It is useful
++    * for APIs where the native pipeline object spans multiple Vulkan shader
++    * objects and therefore cannot be owned by any one pipeline library.
++    *
++    * The returned object is owned by the common graphics pipeline.  The
++    * shaders and state remain valid for the lifetime of the callback, while
++    * the common pipeline itself retains the shader objects afterwards.
++    */
++   VkResult (*link_graphics_pipeline)(
++      struct vk_device *device,
++      VkPipelineCreateFlags2KHR pipeline_flags,
++      uint32_t shader_count,
++      struct vk_shader *const *shaders,
++      const struct vk_graphics_pipeline_state *state,
++      uint32_t set_layout_count,
++      struct vk_descriptor_set_layout *const *set_layouts,
++      const VkAllocationCallbacks *pAllocator,
++      void **linked_data_out);
++
++   /** Destroy an object returned by link_graphics_pipeline(). */
++   void (*destroy_linked_graphics_pipeline)(
++      struct vk_device *device,
++      void *linked_data,
++      const VkAllocationCallbacks *pAllocator);
++
++   /** Bind driver-private state returned by link_graphics_pipeline(). */
++   void (*cmd_bind_linked_graphics_pipeline)(
++      struct vk_command_buffer *cmd_buffer,
++      void *linked_data);
++
+    /** Create a vk_shader from a binary blob */
+    VkResult (*deserialize)(struct vk_device *device,
+                            struct blob_reader *blob,

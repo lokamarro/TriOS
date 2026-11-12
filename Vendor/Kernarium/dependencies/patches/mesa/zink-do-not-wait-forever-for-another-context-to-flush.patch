@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 15:37:29 +0900
+Subject: [PATCH] zink: do not wait forever for another context to flush
+
+A read map that finds the resource's last write recorded on a batch state
+belonging to a different context waits for that batch to be submitted, and
+`zink_batch_usage_unflushed_wait()` does that with an unbounded `cnd_wait()`.
+The wait is only ever satisfied by whichever thread drives the other context.
+That holds for an application with one thread per context; it does not hold for
+a single-threaded multi-context user, and virglrenderer is one: it serves every
+guest GL context, and its own ctx0 transfer context, from the thread that is
+executing the map. No other thread exists to submit the batch, so the wait
+never ends.
+
+On this host that deadlock is fatal to the whole guest, not just to the frame.
+The emulator's scanout CPU fallback reads the scanout resource through
+`virgl_renderer_transfer_read_iov(res, ctx_id = 0)`, which runs `glReadPixels`
+on ctx0 while the frame was rendered by a guest context. `zink_image_map()`
+reaches the "force multi-context sync" wait, the vhost-user GPU thread parks in
+`cnd_wait()` forever, the guest vCPU that kicked that virtqueue parks in
+`vhost_user_recv_ack()` with local interrupts masked, and that CPU never takes
+another timer tick: the guest reports an RCU stall every 63 seconds until it is
+killed. Five such wedges are recorded in the OpenGL/GLES conformance campaigns
+of 2026-09-14 and 2026-09-15, each one costing the run it was in.
+
+Bound the wait. A flush that is on its way lands in microseconds, so ten
+seconds without one means no thread is coming; report it and continue. Every
+expiry is reported, because the read that follows misses that context's last
+write.
+Giving up returns false, the same answer the existing `trywait` path returns,
+so the caller skips only the batch wait it asked for. Re-check the flag around
+`cnd_timedwait()` as well: the previous single `cnd_wait()` also returned on a
+spurious wakeup.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_batch.c | 46 +++++++++++++++++++++++++--
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index 846ae0a748f5981974093ae599f44e87d4cfe06a..81e9a063ae3e0922ad2f7a898980997d8c6dd788 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -8,6 +8,8 @@
+ #include "zink_screen.h"
+ #include "zink_surface.h"
+ 
++#include "util/timespec.h"
++
+ #ifdef VK_USE_PLATFORM_METAL_EXT
+ #include "QuartzCore/CAMetalLayer.h"
+ #endif
+@@ -1213,6 +1215,33 @@ zink_batch_usage_check_completion(struct zink_context *ctx, const struct zink_ba
+    return zink_check_batch_completion(ctx, u->usage);
+ }
+ 
++/* A batch that a *different* context left unflushed is submitted by whoever
++ * drives that context, and the wait below assumes that is another thread.  A
++ * single-threaded multi-context user -- a virtio-gpu renderer that serves every
++ * guest context, plus its own transfer context, from one thread -- has no other
++ * thread to do it, so the wait can never be satisfied and it takes the calling
++ * thread with it.  Put a generous deadline on the wait instead: a flush that is
++ * on its way lands in microseconds, so an expiry means none is coming.  Giving
++ * up costs the caller the ordering it asked for; blocking costs the process.
++ * Every expiry is reported, because the caller then reads the resource without
++ * that context's last write.
++ */
++#define ZINK_UNFLUSHED_WAIT_NS (10ull * 1000 * 1000 * 1000)
++
++static void
++unflushed_wait_expired(const struct zink_batch_usage *u)
++{
++   /* An unflushed batch has no id yet -- submit_queue assigns it -- so name
++    * the batch by the submission it is waiting to become.
++    */
++   mesa_logw("zink: submission %u of another context stayed unflushed for %u "
++             "seconds; continuing without it, so this read misses its writes "
++             "(a single-threaded multi-context caller cannot flush it from "
++             "here)",
++             u->submit_count + 1u,
++             (unsigned)(ZINK_UNFLUSHED_WAIT_NS / 1000000000ull));
++}
++
+ bool
+ zink_batch_usage_unflushed_wait(struct zink_context *ctx, struct zink_batch_usage *u, unsigned submit_count, bool trywait)
+ {
+@@ -1231,8 +1260,21 @@ zink_batch_usage_unflushed_wait(struct zink_context *ctx, struct zink_batch_usag
+          if (trywait) {
+             struct timespec ts = {0, 10000};
+             cnd_timedwait(&u->flush, &u->mtx, &ts);
+-         } else if (u->unflushed)
+-            cnd_wait(&u->flush, &u->mtx);
++         } else {
++            struct timespec now, deadline;
++
++            timespec_get(&now, TIME_UTC);
++            /* Ten seconds from now cannot overflow a 64-bit time_t. */
++            ASSERTED bool overflow =
++               timespec_add_nsec(&deadline, &now, ZINK_UNFLUSHED_WAIT_NS);
++            assert(!overflow);
++            while (zink_batch_usage_is_unflushed(u)) {
++               if (cnd_timedwait(&u->flush, &u->mtx, &deadline) != thrd_success) {
++                  unflushed_wait_expired(u);
++                  break;
++               }
++            }
++         }
+          mtx_unlock(&u->mtx);
+       }
+    }

@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:40:14 +0900
+Subject: [PATCH] xfrm: allow one SPI on several destinations behind a Kconfig
+ option
+
+Linux 6.17 made an SPI unique per protocol for the whole network
+namespace (94f39804d891 "xfrm: Duplicate SPI Handling", CVE-2025-39797),
+and 6.18 carries it with its follow-up cd8ae32e4e46 "xfrm:
+xfrm_alloc_spi shouldn't use 0 as SPI". Before, it was unique per
+destination address, protocol and mark.
+
+Android's IPsec contract is the older one. The platform's IKE daemon, and
+IpSecManagerTunnelTest's getRandomSpi(), reserve one SPI for the local and
+the remote outer address of a tunnel: the first allocation picks a value
+and the second asks for the same value on the other destination. With the
+stricter check the second XFRM_MSG_ALLOCSPI fails ENOENT ("Error netlink
+message"), so every one of the 67 tunnel tests fails in its setup. The
+Android common kernel android17-6.18 reverts both commits for that reason
+(4661ae54 and e6e95923, Bug 439335971); an upstream RFC that would scope
+the check to inbound SAs by XFRMA_SA_DIR is not merged, and netd sets no
+direction on its allocation.
+
+The reverts live behind the new CONFIG_XFRM_SPI_PER_DESTINATION, default
+n, which only the Android configuration fragment sets. With it off the
+allocator is upstream's, byte for byte, so Linux guests keep the stricter
+SPI handling; with it on, xfrm_alloc_spi() is the Android common kernel's
+and xfrm_state_lookup_spi_proto() is not built.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ net/xfrm/Kconfig      | 23 +++++++++++++++++++++++
+ net/xfrm/xfrm_state.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/net/xfrm/Kconfig b/net/xfrm/Kconfig
+index f0157702718ff630d0eb055b899b4589a8e43b6d..26bc4ffcf38144c84364973c810d60da7e09f673 100644
+--- a/net/xfrm/Kconfig
++++ b/net/xfrm/Kconfig
+@@ -79,6 +79,29 @@ config XFRM_STATISTICS
+ 
+ 	  If unsure, say N.
+ 
++config XFRM_SPI_PER_DESTINATION
++	bool "Allow one SPI on several destination addresses"
++	depends on XFRM
++	help
++	  Make an SPI unique per destination address, protocol and mark, as
++	  it was before Linux 6.17, so that one SPI value may be reserved for
++	  two destination addresses. Linux 6.17 made it unique per protocol
++	  for the whole network namespace, whatever the destination
++	  (commit 94f39804d891, which closed CVE-2025-39797), and refuses the
++	  second reservation.
++
++	  Android's IKE daemon and the platform's IPsec tunnel tests reserve
++	  one SPI for the local and the remote outer address of a tunnel, so
++	  the Android common kernel reverts that change and the commit that
++	  followed it (cd8ae32e4e46, which stops xfrm_alloc_spi() from
++	  returning 0). With this option the allocator is the Android common
++	  kernel's, as it was before 6.17: it looks an SPI up and then
++	  inserts it under separate locks, which 94f39804d891 had joined, so
++	  two concurrent allocations of one SPI for one destination can both
++	  succeed.
++
++	  If unsure, say N.
++
+ # This option selects XFRM_ALGO along with the AH authentication algorithms that
+ # RFC 8221 lists as MUST be implemented.
+ config XFRM_AH
+diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
+index f0dd25bdd5d090ccdf4a93361904697a7b18401e..fa0beab9f3c138e4a37c76ab84d43078928da64f 100644
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -1710,6 +1710,7 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
+ }
+ EXPORT_SYMBOL(xfrm_state_lookup_byspi);
+ 
++#ifndef CONFIG_XFRM_SPI_PER_DESTINATION
+ static struct xfrm_state *xfrm_state_lookup_spi_proto(struct net *net, __be32 spi, u8 proto)
+ {
+ 	struct xfrm_state *x;
+@@ -1729,6 +1730,7 @@ static struct xfrm_state *xfrm_state_lookup_spi_proto(struct net *net, __be32 sp
+ 	rcu_read_unlock();
+ 	return NULL;
+ }
++#endif
+ 
+ static void __xfrm_state_insert(struct xfrm_state *x)
+ {
+@@ -2593,7 +2595,13 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+ 	unsigned int h;
+ 	struct xfrm_state *x0;
+ 	int err = -ENOENT;
++#ifdef CONFIG_XFRM_SPI_PER_DESTINATION
++	__be32 minspi = htonl(low);
++	__be32 maxspi = htonl(high);
++	u32 mark = x->mark.v & x->mark.m;
++#else
+ 	u32 range = high - low + 1;
++#endif
+ 	__be32 newspi = 0;
+ 
+ 	spin_lock_bh(&x->lock);
+@@ -2608,6 +2616,40 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+ 
+ 	err = -ENOENT;
+ 
++#ifdef CONFIG_XFRM_SPI_PER_DESTINATION
++	if (minspi == maxspi) {
++		x0 = xfrm_state_lookup(net, mark, &x->id.daddr, minspi, x->id.proto, x->props.family);
++		if (x0) {
++			NL_SET_ERR_MSG(extack, "Requested SPI is already in use");
++			xfrm_state_put(x0);
++			goto unlock;
++		}
++		newspi = minspi;
++	} else {
++		u32 spi = 0;
++		for (h = 0; h < high-low+1; h++) {
++			spi = get_random_u32_inclusive(low, high);
++			x0 = xfrm_state_lookup(net, mark, &x->id.daddr, htonl(spi), x->id.proto, x->props.family);
++			if (x0 == NULL) {
++				newspi = htonl(spi);
++				break;
++			}
++			xfrm_state_put(x0);
++		}
++	}
++	if (newspi) {
++		spin_lock_bh(&net->xfrm.xfrm_state_lock);
++		x->id.spi = newspi;
++		h = xfrm_spi_hash(net, &x->id.daddr, x->id.spi, x->id.proto, x->props.family);
++		XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h,
++				  x->xso.type);
++		spin_unlock_bh(&net->xfrm.xfrm_state_lock);
++
++		err = 0;
++	} else {
++		NL_SET_ERR_MSG(extack, "No SPI available in the requested range");
++	}
++#else
+ 	for (h = 0; h < range; h++) {
+ 		u32 spi = (low == high) ? low : get_random_u32_inclusive(low, high);
+ 		if (spi == 0)
+@@ -2639,6 +2681,7 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+ 
+ 	if (err)
+ 		NL_SET_ERR_MSG(extack, "No SPI available in the requested range");
++#endif
+ 
+ unlock:
+ 	spin_unlock_bh(&x->lock);

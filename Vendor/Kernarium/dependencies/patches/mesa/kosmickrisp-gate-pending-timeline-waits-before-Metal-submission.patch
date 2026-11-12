@@ -1,0 +1,1819 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 9 Sep 2026 05:25:04 +0900
+Subject: [PATCH] kosmickrisp: gate pending timeline waits before Metal
+ submission
+
+Use on-demand common submission for unsatisfied timeline waits so Metal cannot retire a native event wait before the host signals it. Move reusable binary payloads correctly and stop the worker before device resource destruction.
+
+Answer VK_SYNC_WAIT_PENDING with whether a signal operation has been submitted rather than whether it completed. Track the highest value already signalled on the CPU or enqueued on the queue's Metal timeline, and treat a binary semaphore wait as pending because its signal must have been submitted first. Otherwise the common runtime reads every unfinished dependency as unsubmitted: it turns the assisted submission worker on for the life of the device and blocks the caller of vkQueueSubmit, which on a virtualized device is the thread that must deliver the release the worker is waiting for.
+
+The queue publishes that value just before it enqueues the signal, not after. Every later submission to the device's one queue runs after this one, so nothing can order native work behind the value before the signal is in place, and nothing may touch the sync once the signal is enqueued: Metal can deliver it at once, and whoever sees it delivered may destroy the fence or semaphore straight away, as vkQueueWaitIdle does with its own.
+
+In a threaded queue a binary payload moves when the worker reaches the wait, not inside vkQueueSubmit. The signal that payload waits for may still be queued ahead of the wait, and the worker unwraps it against whatever payload the semaphore holds when it runs, so a move made at once handed that signal the fresh payload and left the wait on a point nothing signals until Metal abandoned the native wait seconds later.
+
+Keep absolute CPU wait deadlines while observing device loss, wake queue drains when submission fails, and allow lost-device cleanup of pending submissions. Cover delayed host signals, mixed binary waits with every signalled stage bounded to a second, loss during waits and drain, a binary wait queued behind a host-gated batch, and submission that outruns a long GPU dependency.
+
+Once the worker runs, a resubmitted command buffer is recorded again on it, while the application may be recording another buffer from the same command pool: Vulkan asks it to synchronize the pool only against its own recording, and vkQueueSubmit is not one of those commands. Both recordings take upload BOs from the pool's free list and give them back, so the list and its count are now guarded by a pool mutex. kosmickrisp_command_pool_threads records from one pool on both threads with the worker forced on; without the mutex the list lost its count or crashed within a run.
+---
+ src/kosmickrisp/vulkan/kk_cmd_pool.c          |  10 +-
+ src/kosmickrisp/vulkan/kk_cmd_pool.h          |   9 +
+ src/kosmickrisp/vulkan/kk_device.c            |  18 +-
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   2 +
+ src/kosmickrisp/vulkan/kk_queue.c             |  12 +-
+ src/kosmickrisp/vulkan/kk_sync.c              | 203 +++++++++-
+ src/kosmickrisp/vulkan/kk_sync.h              |  20 +
+ src/kosmickrisp/vulkan/meson.build            |  98 +++++
+ .../vulkan/tests/test_command_pool_threads.c  | 207 ++++++++++
+ .../vulkan/tests/test_timeline_host_wait.cpp  | 364 +++++++++++++++++
+ .../tests/test_timeline_pending_wait.cpp      | 372 ++++++++++++++++++
+ .../vulkan/tests/test_timeline_wait_loss.c    | 182 +++++++++
+ src/vulkan/runtime/vk_queue.c                 |  25 +-
+ 13 files changed, 1488 insertions(+), 34 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_command_pool_threads.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_timeline_host_wait.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_timeline_pending_wait.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_timeline_wait_loss.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_pool.c b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+index e505acdf6e537df2696af29175c119482401bbfe..eba1f8d6aa08ad965775fef2332f0ed45f4d23bb 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_pool.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+@@ -45,24 +45,28 @@ kk_cmd_bo_destroy(struct kk_cmd_pool *pool, struct kk_cmd_bo *bo)
+ static void
+ kk_cmd_pool_destroy_bos(struct kk_cmd_pool *pool)
+ {
++   simple_mtx_lock(&pool->bo_mutex);
+    list_for_each_entry_safe(struct kk_cmd_bo, bo, &pool->free_bos, link)
+       kk_cmd_bo_destroy(pool, bo);
+ 
+    list_inithead(&pool->free_bos);
+    pool->num_free_bos = 0;
++   simple_mtx_unlock(&pool->bo_mutex);
+ }
+ 
+ VkResult
+ kk_cmd_pool_alloc_bo(struct kk_cmd_pool *pool, struct kk_cmd_bo **bo_out)
+ {
+    struct kk_cmd_bo *bo = NULL;
++   simple_mtx_lock(&pool->bo_mutex);
+    if (!list_is_empty(&pool->free_bos)) {
+       bo = list_first_entry(&pool->free_bos, struct kk_cmd_bo, link);
+       pool->num_free_bos--;
++      list_del(&bo->link);
+    }
++   simple_mtx_unlock(&pool->bo_mutex);
+ 
+    if (bo) {
+-      list_del(&bo->link);
+       *bo_out = bo;
+       return VK_SUCCESS;
+    }
+@@ -73,6 +77,7 @@ kk_cmd_pool_alloc_bo(struct kk_cmd_pool *pool, struct kk_cmd_bo **bo_out)
+ void
+ kk_cmd_pool_free_bo_list(struct kk_cmd_pool *pool, struct list_head *bos)
+ {
++   simple_mtx_lock(&pool->bo_mutex);
+    list_for_each_entry_safe(struct kk_cmd_bo, bo, bos, link) {
+       list_del(&bo->link);
+       if (pool->num_free_bos >= KK_CMD_POOL_BO_MAX) {
+@@ -82,6 +87,7 @@ kk_cmd_pool_free_bo_list(struct kk_cmd_pool *pool, struct list_head *bos)
+          pool->num_free_bos++;
+       }
+    }
++   simple_mtx_unlock(&pool->bo_mutex);
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -105,6 +111,7 @@ kk_CreateCommandPool(VkDevice _device,
+       return result;
+    }
+ 
++   simple_mtx_init(&pool->bo_mutex, mtx_plain);
+    list_inithead(&pool->free_bos);
+    pool->num_free_bos = 0;
+ 
+@@ -125,6 +132,7 @@ kk_DestroyCommandPool(VkDevice _device, VkCommandPool commandPool,
+ 
+    vk_command_pool_finish(&pool->vk);
+    kk_cmd_pool_destroy_bos(pool);
++   simple_mtx_destroy(&pool->bo_mutex);
+    vk_free2(&device->vk.alloc, pAllocator, pool);
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_pool.h b/src/kosmickrisp/vulkan/kk_cmd_pool.h
+index e24e5a24693354b5dac6770ccf2e2aa91f1b26e8..46542b5f80a0d4490eb8c5f406d0f06636e68e5b 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_pool.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_pool.h
+@@ -12,6 +12,8 @@
+ 
+ #include "vk_command_pool.h"
+ 
++#include "util/simple_mtx.h"
++
+ #define KK_CMD_BO_SIZE     (1024 * 128)
+ #define KK_CMD_POOL_BO_MAX 32
+ 
+@@ -26,6 +28,13 @@ struct kk_cmd_bo {
+ struct kk_cmd_pool {
+    struct vk_command_pool vk;
+ 
++   /* Guards free_bos and num_free_bos. The application synchronizes a pool
++    * only against its own recording, but a resubmitted command buffer is
++    * recorded again on the queue's submit thread, which takes and returns
++    * upload BOs while the application records another buffer from the pool.
++    */
++   simple_mtx_t bo_mutex;
++
+    /** List of kk_cmd_bo */
+    struct list_head free_bos;
+    uint32_t num_free_bos;
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 2624f423ab94c68003c1523716539c1a3a958e79..9fc9b511a30ed945122bb8c598ffe791db3071c7 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -366,6 +366,13 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_alloc;
+ 
++   /* CPU gating of unsatisfied timeline waits is required for correctness:
++    * Metal may retire a pending GPU event wait after a finite delay. Keep the
++    * common runtime's immediate fast path for satisfied waits, but do not let
++    * MESA_VK_ENABLE_SUBMIT_THREAD=false disable assisted submission. */
++   if (dev->vk.submit_mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE)
++      dev->vk.submit_mode = VK_QUEUE_SUBMIT_MODE_THREADED_ON_DEMAND;
++
+    dev->vk.shader_ops = &kk_device_shader_ops;
+    dev->mtl_handle = pdev->mtl_dev_handle;
+    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
+@@ -473,6 +480,12 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       mtl_stop_gpu_capture();
+    }
+ 
++   /* Stop submission before freeing resources the worker may still use. */
++   if (dev->has_queue) {
++      kk_queue_finish(dev, &dev->queue);
++      dev->has_queue = false;
++   }
++
+    /* Meta first since it may destroy Vulkan objects */
+    kk_device_finish_meta(dev);
+    kk_device_finish_lib(dev);
+@@ -483,11 +496,6 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    if (dev->heap)
+       kk_destroy_bo(dev, dev->heap);
+ 
+-   if (dev->has_queue) {
+-      kk_queue_finish(dev, &dev->queue);
+-      dev->has_queue = false;
+-   }
+-
+    /* Outstanding completion callbacks keep their own reference. */
+    kk_command_allocator_cache_unref(dev->allocator_cache);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index b83269f2bd0a2159cdffcb9518c3472d92f5f281..82f5d4aff2015f1e0bb72a28ec399f8a69d6a141 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1186,6 +1186,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
+ 
+    pdev->sync_binary_type = vk_sync_binary_get_type(&kk_sync_type);
++   pdev->sync_binary_type.sync.move = kk_sync_binary_move;
++   pdev->sync_binary_type.sync.wait_many = kk_sync_binary_wait_many;
+    unsigned st_idx = 0;
+    pdev->sync_types[st_idx++] = &kk_sync_type;
+    pdev->sync_types[st_idx++] = &pdev->sync_binary_type.sync;
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 64922e8a766daa526a11d61d096fcf78d71b248e..4a7026def9df81ec12bbb7678d56165c5c284d02 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -223,6 +223,14 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+       struct vk_sync_signal *signal = &submit->signals[i];
+       struct kk_sync_timeline *sync =
+          container_of(signal->sync, struct kk_sync_timeline, base);
++      /* Later waits on this value are pending and need no CPU gating: any
++       * native work they order behind it comes from a later submission to
++       * this device's one queue, which runs only after this one has enqueued
++       * the signal. Publish that before the enqueue, because Metal can deliver
++       * the signal at once and whoever sees it delivered may destroy the sync
++       * straight away, as vkQueueWaitIdle does with its own. Nothing may touch
++       * the sync once its signal is enqueued. */
++      kk_timeline_mark_pending(signal->sync, signal->signal_value);
+       mtl_signal_event(queue->mtl_handle, sync->mtl_handle,
+                        signal->signal_value);
+    }
+@@ -295,6 +303,9 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+ void
+ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+ {
++   /* Drain and join the submit worker before releasing its native resources. */
++   vk_queue_finish(&queue->vk);
++
+    simple_mtx_lock(&queue->feedback->mutex);
+    queue->feedback->device = NULL;
+    simple_mtx_unlock(&queue->feedback->mutex);
+@@ -304,5 +315,4 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+    mtl_command_queue_remove_residency_set(queue->mtl_handle,
+                                           dev->residency_set.handle);
+    mtl_release(queue->mtl_handle);
+-   vk_queue_finish(&queue->vk);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_sync.c b/src/kosmickrisp/vulkan/kk_sync.c
+index f44200c379e50a828161b257313a2e7a2c5a42e6..e0377497850cb629abde25478d077d1101528b33 100644
+--- a/src/kosmickrisp/vulkan/kk_sync.c
++++ b/src/kosmickrisp/vulkan/kk_sync.c
+@@ -7,6 +7,11 @@
+ #include "kk_sync.h"
+ 
+ #include "kk_device.h"
++#include "vk_sync_binary.h"
++
++#include "vk_util.h"
++
++#include "util/u_atomic.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
+@@ -20,6 +25,8 @@ kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+    timeline->mtl_handle = mtl_new_shared_event(dev->mtl_handle);
+    mtl_shared_event_set_signaled_value(timeline->mtl_handle, initial_value);
++   timeline->pending_value = initial_value;
++   timeline->moved_from = NULL;
+ 
+    return VK_SUCCESS;
+ }
+@@ -39,9 +46,33 @@ kk_timeline_signal(struct vk_device *device, struct vk_sync *sync,
+    struct kk_sync_timeline *timeline =
+       container_of(sync, struct kk_sync_timeline, base);
+    mtl_shared_event_set_signaled_value(timeline->mtl_handle, value);
++   kk_timeline_mark_pending(sync, value);
+    return VK_SUCCESS;
+ }
+ 
++/* Record that a signal operation for this value has been performed on the CPU
++ * or taken by the queue for its Metal timeline, so an observer that sees the
++ * value also sees a signal ordered ahead of any work it submits next. A CPU
++ * signal publishes it after the signal itself. The queue publishes it just
++ * before the enqueue, which orders the same because every later submission to
++ * the device's one queue runs after it, and which it must do because the
++ * enqueued signal can be delivered and its sync destroyed at once. */
++void
++kk_timeline_mark_pending(struct vk_sync *sync, uint64_t value)
++{
++   struct kk_sync_timeline *timeline =
++      container_of(sync, struct kk_sync_timeline, base);
++
++   uint64_t pending = p_atomic_read(&timeline->pending_value);
++   while (value > pending) {
++      uint64_t seen =
++         p_atomic_cmpxchg(&timeline->pending_value, pending, value);
++      if (seen == pending)
++         return;
++      pending = seen;
++   }
++}
++
+ static VkResult
+ kk_timeline_get_value(struct vk_device *device, struct vk_sync *sync,
+                       uint64_t *value)
+@@ -60,34 +91,166 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
+    struct kk_sync_timeline *timeline =
+       container_of(sync, struct kk_sync_timeline, base);
+ 
+-   /* abs_timeout_ns is the point in time when we should stop waiting, not the
+-    * absolute time in ns. Therefore, we need to compute the delta from now to
+-    * when we should stop waiting and convert to ms for Metal to be happy
+-    * (Similar to what dzn does).
+-    */
+-   uint64_t timeout_ms = 0u;
+-   if (abs_timeout_ns == OS_TIMEOUT_INFINITE) {
+-      timeout_ms = OS_TIMEOUT_INFINITE;
+-   } else {
+-      uint64_t cur_time = os_time_get_nano();
+-      uint64_t rel_timeout_ns =
+-         abs_timeout_ns > cur_time ? abs_timeout_ns - cur_time : 0;
+-
+-      timeout_ms =
+-         (rel_timeout_ns / 1000000) + (rel_timeout_ns % 1000000 ? 1 : 0);
++   for (;;) {
++      if (vk_device_is_lost_no_report(device))
++         return VK_ERROR_DEVICE_LOST;
++
++      /* The common runtime uses VK_SYNC_WAIT_PENDING to learn whether a
++       * signal operation has been submitted, never to wait for one to
++       * complete: it decides there whether a queue needs its assisted
++       * submission worker, and it blocks indefinitely on that answer while
++       * moving binary semaphore payloads. A value already enqueued on the
++       * queue's Metal timeline satisfies it, because every native wait this
++       * caller enqueues next is ordered behind that signal. Waiting for
++       * completion instead would hold the caller of vkQueueSubmit for the
++       * whole GPU dependency and would keep the worker enabled for the life
++       * of the device. */
++      if ((wait_flags & VK_SYNC_WAIT_PENDING) &&
++          p_atomic_read(&timeline->pending_value) >= wait_value)
++         return VK_SUCCESS;
++
++      /* Metal takes relative milliseconds; Vulkan provides an absolute
++       * nanosecond deadline. Recompute after every pending-wait slice. */
++      uint64_t timeout_ms;
++      if (abs_timeout_ns == OS_TIMEOUT_INFINITE) {
++         timeout_ms = OS_TIMEOUT_INFINITE;
++      } else {
++         uint64_t now = os_time_get_nano();
++         uint64_t remaining_ns =
++            abs_timeout_ns > now ? abs_timeout_ns - now : 0;
++         timeout_ms = remaining_ns / 1000000 +
++                      (remaining_ns % 1000000 ? 1 : 0);
++      }
++
++      /* Both the submit worker and QueueWaitIdle can wait indefinitely.
++       * Periodically observe device loss without changing their deadline. */
++      timeout_ms = MIN2(timeout_ms, 100);
++      int completed = mtl_shared_event_wait_until_signaled_value(
++         timeline->mtl_handle, wait_value, timeout_ms);
++      if (vk_device_is_lost_no_report(device))
++         return VK_ERROR_DEVICE_LOST;
++      if (completed)
++         return VK_SUCCESS;
++      if (abs_timeout_ns != OS_TIMEOUT_INFINITE &&
++          os_time_get_nano() >= abs_timeout_ns)
++         return VK_TIMEOUT;
++   }
++}
++
++static VkResult
++kk_sync_binary_take_payload(struct vk_device *device, struct vk_sync *dst_sync,
++                            struct vk_sync *src_sync)
++{
++   struct vk_sync_binary *dst = vk_sync_as_binary(dst_sync);
++   struct vk_sync_binary *src = vk_sync_as_binary(src_sync);
++   assert(dst && src);
++   struct kk_sync_timeline *dst_timeline =
++      container_of(&dst->timeline, struct kk_sync_timeline, base);
++   struct kk_sync_timeline *src_timeline =
++      container_of(&src->timeline, struct kk_sync_timeline, base);
++
++   /* Move only the Metal payload and its current point, never the common sync
++    * headers. Reset the recycled destination payload for future source use. */
++   SWAP(dst_timeline->mtl_handle, src_timeline->mtl_handle);
++   SWAP(dst_timeline->pending_value, src_timeline->pending_value);
++   SWAP(dst->next_point, src->next_point);
++   return vk_sync_reset(device, src_sync);
++}
++
++/* A threaded queue moves a permanent binary payload into a temporary inside
++ * vkQueueSubmit, but the signal that payload waits for may still sit in the
++ * submit worker, which unwraps it against whatever payload the semaphore holds
++ * when it gets there. Moving at once would hand that signal the fresh payload
++ * and leave the wait on a point nothing signals, until Metal abandons the
++ * native wait seconds later. Waiting in vkQueueSubmit for the worker to reach
++ * the signal is no answer either, because it can sit behind a batch only the
++ * caller can release. So the temporary only records its source here, and the
++ * worker completes the move in kk_sync_binary_wait_many() when it reaches the
++ * wait: every signal submitted before the wait has been unwrapped by then, and
++ * the wait itself is unwrapped only after. The source outlives the record,
++ * because a semaphore may not be destroyed before every batch waiting on it
++ * has completed (VUID-vkDestroySemaphore-semaphore-01137). An unthreaded queue
++ * has run every signal already, so its move is made at once. */
++VkResult
++kk_sync_binary_move(struct vk_device *device, struct vk_sync *dst_sync,
++                    struct vk_sync *src_sync)
++{
++   struct kk_device *dev = container_of(device, struct kk_device, vk);
++   if (dev->queue.vk.submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED)
++      return kk_sync_binary_take_payload(device, dst_sync, src_sync);
++
++   struct vk_sync_binary *dst = vk_sync_as_binary(dst_sync);
++   assert(dst && vk_sync_as_binary(src_sync));
++   struct kk_sync_timeline *dst_timeline =
++      container_of(&dst->timeline, struct kk_sync_timeline, base);
++   assert(dst_timeline->moved_from == NULL);
++   dst_timeline->moved_from = src_sync;
++   return VK_SUCCESS;
++}
++
++/* A binary semaphore wait is always pending. VUID-vkQueueSubmit-
++ * pWaitSemaphores-03238 requires its signal operation to have been submitted
++ * for execution first, and this device runs one queue in order, so whatever
++ * orders native work behind the answer, the submit worker or an unthreaded
++ * submission, reaches the wait only after the signal; a move made on the
++ * answer waits for the worker too (kk_sync_binary_move). Reporting completion
++ * instead would make vkQueueSubmit wait for the GPU whenever one batch consumes
++ * another batch's semaphore. */
++VkResult
++kk_sync_binary_wait_many(struct vk_device *device, uint32_t wait_count,
++                         const struct vk_sync_wait *waits,
++                         enum vk_sync_wait_flags wait_flags,
++                         uint64_t abs_timeout_ns)
++{
++   for (uint32_t i = 0; i < wait_count; i++) {
++      struct vk_sync_binary *binary = vk_sync_as_binary(waits[i].sync);
++      assert(binary);
++      struct kk_sync_timeline *timeline =
++         container_of(&binary->timeline, struct kk_sync_timeline, base);
++      struct vk_sync *source = timeline->moved_from;
++      if (source == NULL)
++         continue;
++      timeline->moved_from = NULL;
++      VkResult result =
++         kk_sync_binary_take_payload(device, waits[i].sync, source);
++      if (result != VK_SUCCESS)
++         return result;
+    }
+-   int completed = mtl_shared_event_wait_until_signaled_value(
+-      timeline->mtl_handle, wait_value, timeout_ms);
+ 
+-   return completed != 0 ? VK_SUCCESS : VK_TIMEOUT;
++   if (wait_flags & VK_SYNC_WAIT_PENDING)
++      return VK_SUCCESS;
++
++   if (wait_count == 0)
++      return VK_SUCCESS;
++
++   STACK_ARRAY(struct vk_sync_wait, points, wait_count);
++   for (uint32_t i = 0; i < wait_count; i++) {
++      struct vk_sync_binary *binary = vk_sync_as_binary(waits[i].sync);
++      assert(binary);
++      points[i] = (struct vk_sync_wait){
++         .sync = &binary->timeline,
++         .stage_mask = waits[i].stage_mask,
++         .wait_value = binary->next_point,
++      };
++   }
++   VkResult result =
++      vk_sync_wait_many(device, wait_count, points, wait_flags,
++                        abs_timeout_ns);
++   STACK_ARRAY_FINISH(points);
++   return result;
+ }
+ 
+ const struct vk_sync_type kk_sync_type = {
+    .size = sizeof(struct kk_sync_timeline),
++   /* Metal GPU event waits cannot remain pending indefinitely. Assisted
++    * submission waits on the CPU for a time point whose signal has not been
++    * submitted yet, and only then enqueues native work. A point whose signal
++    * is already enqueued needs no CPU wait: it satisfies VK_SYNC_WAIT_PENDING
++    * through kk_timeline_mark_pending, and Metal orders the native wait
++    * behind it. */
+    .features = VK_SYNC_FEATURE_TIMELINE | VK_SYNC_FEATURE_GPU_WAIT |
+                VK_SYNC_FEATURE_CPU_WAIT | VK_SYNC_FEATURE_CPU_SIGNAL |
+-               VK_SYNC_FEATURE_WAIT_PENDING |
+-               VK_SYNC_FEATURE_WAIT_BEFORE_SIGNAL,
++               VK_SYNC_FEATURE_WAIT_PENDING,
+    .init = kk_timeline_init,
+    .finish = kk_timeline_finish,
+    .signal = kk_timeline_signal,
+diff --git a/src/kosmickrisp/vulkan/kk_sync.h b/src/kosmickrisp/vulkan/kk_sync.h
+index da4f149918dfa99b63618adc67ba3bf7be786d92..ec5b69b396ba441e0df0228e1ee7ea8462041ded 100644
+--- a/src/kosmickrisp/vulkan/kk_sync.h
++++ b/src/kosmickrisp/vulkan/kk_sync.h
+@@ -16,8 +16,28 @@ struct kk_queue;
+ struct kk_sync_timeline {
+    struct vk_sync base;
+    mtl_shared_event *mtl_handle;
++   /* Highest value whose signal operation has already been performed on the
++    * CPU or taken by the queue for its Metal timeline; see
++    * kk_timeline_mark_pending(). Any wait at or below it is pending in the
++    * common runtime's sense. */
++   uint64_t pending_value;
++   /* The permanent binary semaphore a temporary still has to take its
++    * payload from, once the submit worker reaches it; see
++    * kk_sync_binary_move(). Null everywhere else. */
++   struct vk_sync *moved_from;
+ };
+ 
+ extern const struct vk_sync_type kk_sync_type;
+ 
++VkResult kk_sync_binary_move(struct vk_device *device, struct vk_sync *dst,
++                             struct vk_sync *src);
++
++VkResult kk_sync_binary_wait_many(struct vk_device *device,
++                                  uint32_t wait_count,
++                                  const struct vk_sync_wait *waits,
++                                  enum vk_sync_wait_flags wait_flags,
++                                  uint64_t abs_timeout_ns);
++
++void kk_timeline_mark_pending(struct vk_sync *sync, uint64_t value);
++
+ #endif
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 2067a00c0a4b8f674f1493e8f2d25539a8e93555..d8c39cafb8859ed2b2daebc9bee986aad6893702 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -601,6 +601,104 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    timeline_wait_loss_test = executable(
++      'test_kosmickrisp_timeline_wait_loss',
++      files('tests/test_timeline_wait_loss.c'),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++        idep_vulkan_runtime_headers,
++        idep_vulkan_util_headers,
++        idep_vulkan_wsi_headers,
++        idep_libkk_shaders_h,
++        dep_thread,
++      ],
++      link_whole : libkk,
++      link_args : ['-Wl,-undefined,dynamic_lookup'],
++    )
++    foreach wait_mode : ['pending', 'idle', 'drain']
++      test(
++        'kosmickrisp_timeline_wait_loss_' + wait_mode,
++        timeline_wait_loss_test,
++        args : [wait_mode],
++        suite : ['kosmickrisp'],
++        env : ['MESA_SHADER_CACHE_DISABLE=true'],
++        timeout : 15,
++      )
++    endforeach
++    timeline_host_wait_test = executable(
++      'test_kosmickrisp_timeline_host_wait',
++      files('tests/test_timeline_host_wait.cpp'),
++      include_directories : kk_test_include_directories,
++      dependencies : [idep_vulkan_runtime_headers, dep_thread],
++      link_with : libvulkan_kosmickrisp,
++      override_options : ['cpp_std=c++20'],
++    )
++    foreach submit_api : ['submit', 'submit2']
++      foreach thread_mode : ['default', 'disabled']
++        thread_environment = []
++        if thread_mode == 'disabled'
++          thread_environment = ['MESA_VK_ENABLE_SUBMIT_THREAD=false']
++        endif
++        test(
++          'kosmickrisp_timeline_host_wait_' + submit_api + '_' + thread_mode,
++          timeline_host_wait_test,
++          args : [submit_api],
++          suite : ['kosmickrisp'],
++          env : ['MESA_SHADER_CACHE_DISABLE=true'] + thread_environment,
++          timeout : 90,
++        )
++        test(
++          'kosmickrisp_timeline_binary_' + submit_api + '_' + thread_mode,
++          timeline_host_wait_test,
++          args : [submit_api, 'mixed'],
++          suite : ['kosmickrisp'],
++          env : ['MESA_SHADER_CACHE_DISABLE=true'] + thread_environment,
++          timeout : 30,
++        )
++      endforeach
++    endforeach
++    timeline_pending_wait_test = executable(
++      'test_kosmickrisp_timeline_pending_wait',
++      files('tests/test_timeline_pending_wait.cpp'),
++      include_directories : kk_test_include_directories,
++      dependencies : [idep_vulkan_runtime_headers, dep_thread],
++      link_with : libvulkan_kosmickrisp,
++      override_options : ['cpp_std=c++20'],
++    )
++    foreach pending_mode : ['deadlock', 'throughput']
++      test(
++        'kosmickrisp_timeline_pending_wait_' + pending_mode,
++        timeline_pending_wait_test,
++        args : [pending_mode],
++        suite : ['kosmickrisp'],
++        env : ['MESA_SHADER_CACHE_DISABLE=true'],
++        timeout : 60,
++      )
++    endforeach
++    test(
++      'kosmickrisp_command_pool_threads',
++      executable(
++        'test_kosmickrisp_command_pool_threads',
++        files('tests/test_command_pool_threads.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : [
++        'MESA_SHADER_CACHE_DISABLE=true',
++        'MESA_VK_ENABLE_SUBMIT_THREAD=true',
++      ],
++      timeout : 90,
++    )
+     test(
+       'kosmickrisp_command_completion',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_pool_threads.c b/src/kosmickrisp/vulkan/tests/test_command_pool_threads.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..33757bc2b999d1542f01c3f5607fe82d2580a14a
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_command_pool_threads.c
+@@ -0,0 +1,207 @@
++/* SPDX-License-Identifier: MIT */
++
++/* Metal cannot run one recording twice, so a resubmitted command buffer is
++ * recorded again inside the queue's submission, and once the queue has a
++ * submit thread that happens on the thread.  The application synchronizes a
++ * command pool only against its own recording, so it may go on recording
++ * another buffer from the same pool while that thread re-records: both take
++ * upload BOs from the pool and give them back.  Meson runs this with the
++ * submit thread forced on, so every submission re-records there. */
++
++#define VK_NO_PROTOTYPES
++#include "kk_cmd_pool.h"
++
++#include "util/list.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++/* Each update takes half an upload BO, so one recording cycles eight. */
++#define UPDATES     16
++#define UPDATE_SIZE 65536
++#define ROUNDS      400
++
++static void
++record(PFN_vkBeginCommandBuffer begin, PFN_vkEndCommandBuffer end,
++       PFN_vkCmdUpdateBuffer update, VkCommandBuffer command, VkBuffer buffer,
++       const void *data, VkCommandBufferUsageFlags flags)
++{
++   VkCommandBufferBeginInfo info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = flags,
++   };
++   CHECK(begin(command, &info) == VK_SUCCESS);
++   for (unsigned i = 0; i < UPDATES; i++)
++      update(command, buffer, (VkDeviceSize)i * UPDATE_SIZE, UPDATE_SIZE, data);
++   CHECK(end(command) == VK_SUCCESS);
++}
++
++int
++main(void)
++{
++   /* A corrupted free list can send the pool round a cycle forever. */
++   alarm(60);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++   CHECK(families);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++   uint32_t family = 0;
++   while (family < family_count &&
++          !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++      family++;
++   CHECK(family < family_count);
++   free(families);
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = family,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkResetCommandBuffer);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdUpdateBuffer);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkCreateFence);
++   LOAD_D(vkWaitForFences);
++   LOAD_D(vkResetFences);
++   LOAD_D(vkDestroyFence);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, family, 0, &queue);
++
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = (VkDeviceSize)UPDATES * UPDATE_SIZE,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   VkBuffer buffer = VK_NULL_HANDLE;
++   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
++   VkMemoryRequirements requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &requirements);
++   VkPhysicalDeviceMemoryProperties properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &properties);
++   uint32_t type = 0;
++   while (type < properties.memoryTypeCount &&
++          !(requirements.memoryTypeBits & (1u << type)))
++      type++;
++   CHECK(type < properties.memoryTypeCount);
++   VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = requirements.size,
++      .memoryTypeIndex = type,
++   };
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &memory_info, NULL, &memory) == VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, buffer, memory, 0) == VK_SUCCESS);
++
++   VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = family,
++   };
++   VkCommandPool pool = VK_NULL_HANDLE;
++   CHECK(vkCreateCommandPool(device, &pool_info, NULL, &pool) == VK_SUCCESS);
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 2,
++   };
++   VkCommandBuffer commands[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++   CHECK(vkAllocateCommandBuffers(device, &command_info, commands) ==
++         VK_SUCCESS);
++   void *data = calloc(1, UPDATE_SIZE);
++   CHECK(data);
++
++   /* commands[0] is submitted again and again, so every submission after
++    * the first records it again on the submit thread. */
++   record(vkBeginCommandBuffer, vkEndCommandBuffer, vkCmdUpdateBuffer,
++          commands[0], buffer, data, 0);
++   VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++   VkFence fence = VK_NULL_HANDLE;
++   CHECK(vkCreateFence(device, &fence_info, NULL, &fence) == VK_SUCCESS);
++   VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &commands[0],
++   };
++   for (unsigned round = 0; round < ROUNDS; round++) {
++      CHECK(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
++      /* While the submit thread re-records commands[0], record the other
++       * buffer from the same pool. */
++      CHECK(vkResetCommandBuffer(commands[1], 0) == VK_SUCCESS);
++      record(vkBeginCommandBuffer, vkEndCommandBuffer, vkCmdUpdateBuffer,
++             commands[1], buffer, data,
++             VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
++      CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ull) ==
++            VK_SUCCESS);
++      CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
++   }
++   CHECK(vkResetCommandBuffer(commands[1], 0) == VK_SUCCESS);
++
++   /* Every BO either recording holds went back to the pool whole, and the
++    * pool's count of them still matches its list. */
++   struct kk_cmd_pool *kk_pool = kk_cmd_pool_from_handle(pool);
++   unsigned listed = list_length(&kk_pool->free_bos);
++   CHECK(listed == kk_pool->num_free_bos);
++   CHECK(listed <= KK_CMD_POOL_BO_MAX);
++
++   free(data);
++   vkDestroyFence(device, fence, NULL);
++   vkDestroyCommandPool(device, pool, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   alarm(0);
++   printf("the submit thread and the application recorded from one pool "
++          "%u times\n", ROUNDS);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_timeline_host_wait.cpp b/src/kosmickrisp/vulkan/tests/test_timeline_host_wait.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c52792a4dd8f4647dbf83c3ebb46dacab84d21d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_timeline_host_wait.cpp
+@@ -0,0 +1,364 @@
++/* SPDX-License-Identifier: MIT */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void
++require(bool ok, const char *operation, VkResult result = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, result);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T
++load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name) \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++struct Buffer {
++   VkBuffer buffer = VK_NULL_HANDLE;
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   void *mapped = nullptr;
++};
++
++int
++main(int argc, char **argv)
++{
++   require(argc == 2 || argc == 3, "expected submit API and optional mixed mode");
++   const bool mixed = argc == 3;
++   require(!mixed || std::strcmp(argv[2], "mixed") == 0, "invalid mixed mode");
++   const bool submit2 = std::strcmp(argv[1], "submit2") == 0;
++   require(submit2 || std::strcmp(argv[1], "submit") == 0,
++           "invalid submit API");
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "timeline-host-wait";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count,
++                                       physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   for (VkPhysicalDevice physical : physicals) {
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
++                                               queues.data());
++      uint32_t family = 0;
++      while (family < queue_count &&
++             !(queues[family].queueFlags & VK_QUEUE_TRANSFER_BIT))
++         ++family;
++      require(family < queue_count, "transfer queue");
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{
++         VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = family;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.synchronization2 = VK_TRUE;
++      VkPhysicalDeviceVulkan12Features features12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      features12.pNext = &features13;
++      features12.timelineSemaphore = VK_TRUE;
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features12;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkUnmapMemory);
++      LOAD_D(vkCreateSemaphore);
++      LOAD_D(vkDestroySemaphore);
++      LOAD_D(vkSignalSemaphore);
++      LOAD_D(vkWaitSemaphores);
++      LOAD_D(vkGetSemaphoreCounterValue);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkResetCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdCopyBuffer);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueSubmit2);
++      VkQueue queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, family, 0, &queue);
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto make_buffer = [&](VkDeviceSize size) {
++         Buffer buffer;
++         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++         info.size = size;
++         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
++                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++         result = vkCreateBuffer(device, &info, nullptr, &buffer.buffer);
++         require(result == VK_SUCCESS, "create buffer", result);
++         VkMemoryRequirements requirements{};
++         vkGetBufferMemoryRequirements(device, buffer.buffer, &requirements);
++         constexpr auto properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++         uint32_t type = 0;
++         while (type < memory_properties.memoryTypeCount &&
++                (!(requirements.memoryTypeBits & (1u << type)) ||
++                 (memory_properties.memoryTypes[type].propertyFlags &
++                  properties) != properties))
++            ++type;
++         require(type < memory_properties.memoryTypeCount,
++                 "coherent memory type");
++         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++         allocation.allocationSize = requirements.size;
++         allocation.memoryTypeIndex = type;
++         result = vkAllocateMemory(device, &allocation, nullptr, &buffer.memory);
++         require(result == VK_SUCCESS, "allocate memory", result);
++         result = vkBindBufferMemory(device, buffer.buffer, buffer.memory, 0);
++         require(result == VK_SUCCESS, "bind buffer", result);
++         result = vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0,
++                               &buffer.mapped);
++         require(result == VK_SUCCESS, "map buffer", result);
++         return buffer;
++      };
++
++      VkSemaphoreCreateInfo binary_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++      VkSemaphore binary = VK_NULL_HANDLE;
++      result = vkCreateSemaphore(device, &binary_info, nullptr, &binary);
++      require(result == VK_SUCCESS, "create reusable binary semaphore", result);
++
++      constexpr uint32_t stages = 12;
++      for (size_t bytes : {size_t(16384), size_t(262144)}) {
++         std::chrono::steady_clock::duration slowest{};
++         std::vector<Buffer> input, output;
++         for (uint32_t i = 0; i < stages; ++i) {
++            input.push_back(make_buffer(bytes));
++            output.push_back(make_buffer(bytes));
++         }
++         VkCommandPoolCreateInfo pool_info{
++            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++         pool_info.queueFamilyIndex = family;
++         VkCommandPool pool = VK_NULL_HANDLE;
++         result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++         require(result == VK_SUCCESS, "create command pool", result);
++         VkCommandBuffer commands[stages]{};
++         VkCommandBufferAllocateInfo allocation{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++         allocation.commandPool = pool;
++         allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++         allocation.commandBufferCount = stages;
++         result = vkAllocateCommandBuffers(device, &allocation, commands);
++         require(result == VK_SUCCESS, "allocate commands", result);
++         std::vector<unsigned char> seed(bytes);
++         for (size_t i = 0; i < bytes; ++i)
++            seed[i] = (i * 131 + i / 7) & 255;
++
++         /* The first chain keeps a host dependency unsatisfied past Metal's
++          * finite native event-wait delay. Later chains exercise immediate
++          * signal/wait turnover, one-time recordings, and pool reuse. */
++         for (uint32_t repetition = 0; repetition < 33; ++repetition) {
++            result = vkResetCommandPool(device, pool, 0);
++            require(result == VK_SUCCESS, "reset command pool", result);
++            for (uint32_t i = 0; i < stages; ++i) {
++               std::memset(input[i].mapped, 0x10 + i, bytes);
++               std::memset(output[i].mapped, 0x80 + i, bytes);
++               VkCommandBufferBeginInfo begin{
++                  VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++               begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++               result = vkBeginCommandBuffer(commands[i], &begin);
++               require(result == VK_SUCCESS, "begin command", result);
++               VkBufferCopy copy{0, 0, bytes};
++               vkCmdCopyBuffer(commands[i], input[i].buffer, output[i].buffer,
++                               1, &copy);
++               VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++               barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++               barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++               vkCmdPipelineBarrier(commands[i], VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                    VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier,
++                                    0, nullptr, 0, nullptr);
++               result = vkEndCommandBuffer(commands[i]);
++               require(result == VK_SUCCESS, "end command", result);
++            }
++            VkSemaphoreTypeCreateInfo type{
++               VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
++            type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++            VkSemaphoreCreateInfo semaphore_info{
++               VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++            semaphore_info.pNext = &type;
++            VkSemaphore semaphore = VK_NULL_HANDLE;
++            result = vkCreateSemaphore(device, &semaphore_info, nullptr,
++                                        &semaphore);
++            require(result == VK_SUCCESS, "create semaphore", result);
++
++            if (mixed) {
++               VkSubmitInfo signal_binary{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++               signal_binary.signalSemaphoreCount = 1;
++               signal_binary.pSignalSemaphores = &binary;
++               result = vkQueueSubmit(queue, 1, &signal_binary, VK_NULL_HANDLE);
++               require(result == VK_SUCCESS, "semaphore-only binary signal", result);
++            }
++
++            /* Submit the entire chain before any host update. QueueSubmit
++             * must return while the first host signal is still unavailable. */
++            for (uint32_t i = 0; i < stages; ++i) {
++               uint64_t wait_value = 2 * i + 1;
++               uint64_t signal_value = wait_value + 1;
++               const uint32_t wait_count = mixed && i == 0 ? 2 : 1;
++               VkSemaphore wait_semaphores[] = {semaphore, binary};
++               uint64_t wait_values[] = {wait_value, 0};
++               if (submit2) {
++                  VkSemaphoreSubmitInfo waits[2]{};
++                  for (uint32_t j = 0; j < wait_count; ++j) {
++                     waits[j].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
++                     waits[j].semaphore = wait_semaphores[j];
++                     waits[j].value = wait_values[j];
++                     waits[j].stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
++                  }
++                  VkSemaphoreSubmitInfo signal{
++                     VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
++                  signal.semaphore = semaphore;
++                  signal.value = signal_value;
++                  signal.stageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
++                  VkCommandBufferSubmitInfo command{
++                     VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
++                  command.commandBuffer = commands[i];
++                  VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
++                  submit.waitSemaphoreInfoCount = wait_count;
++                  submit.pWaitSemaphoreInfos = waits;
++                  submit.commandBufferInfoCount = 1;
++                  submit.pCommandBufferInfos = &command;
++                  submit.signalSemaphoreInfoCount = 1;
++                  submit.pSignalSemaphoreInfos = &signal;
++                  result = vkQueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE);
++               } else {
++                  VkTimelineSemaphoreSubmitInfo timeline{
++                     VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
++                  timeline.waitSemaphoreValueCount = wait_count;
++                  timeline.pWaitSemaphoreValues = wait_values;
++                  timeline.signalSemaphoreValueCount = 1;
++                  timeline.pSignalSemaphoreValues = &signal_value;
++                  VkPipelineStageFlags stages[] = {
++                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                  };
++                  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++                  submit.pNext = &timeline;
++                  submit.waitSemaphoreCount = wait_count;
++                  submit.pWaitSemaphores = wait_semaphores;
++                  submit.pWaitDstStageMask = stages;
++                  submit.commandBufferCount = 1;
++                  submit.pCommandBuffers = &commands[i];
++                  submit.signalSemaphoreCount = 1;
++                  submit.pSignalSemaphores = &semaphore;
++                  result = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
++               }
++               require(result == VK_SUCCESS, "submit pending chain", result);
++            }
++            for (uint32_t i = 0; i < stages; ++i) {
++               if (!mixed && repetition == 0 && i == 8) {
++                  std::this_thread::sleep_for(std::chrono::seconds(5));
++                  uint64_t value = UINT64_MAX;
++                  result = vkGetSemaphoreCounterValue(device, semaphore, &value);
++                  require(result == VK_SUCCESS, "read delayed counter", result);
++                  require(value == 2 * i,
++                          "GPU advanced past an unsatisfied host signal");
++               }
++               std::memcpy(input[i].mapped,
++                           i ? output[i - 1].mapped : seed.data(), bytes);
++               const auto signalled = std::chrono::steady_clock::now();
++               VkSemaphoreSignalInfo signal{
++                  VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
++               signal.semaphore = semaphore;
++               signal.value = 2 * i + 1;
++               result = vkSignalSemaphore(device, &signal);
++               require(result == VK_SUCCESS, "signal host update", result);
++               uint64_t value = 2 * i + 2;
++               VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
++               wait.semaphoreCount = 1;
++               wait.pSemaphores = &semaphore;
++               wait.pValues = &value;
++               result = vkWaitSemaphores(device, &wait, 10000000000ull);
++               require(result == VK_SUCCESS, "wait GPU copy (10 seconds)", result);
++               require(std::memcmp(output[i].mapped, seed.data(), bytes) == 0,
++                       "GPU copy observed stale host data");
++               /* Every dependency of this copy has been signalled, the first
++                * stage's binary semaphore included, so the copy is a round
++                * trip of a fraction of a millisecond. A binary signal lost
++                * to the payload move of a queued submission shows up only as
++                * seconds here: the copy runs once Metal abandons the native
++                * wait, so the chain still completes. */
++               const auto round_trip =
++                  std::chrono::steady_clock::now() - signalled;
++               slowest = std::max(slowest, round_trip);
++               require(round_trip < std::chrono::seconds(1),
++                       "a signalled chain stage took over a second");
++            }
++            vkDestroySemaphore(device, semaphore, nullptr);
++         }
++         vkDestroyCommandPool(device, pool, nullptr);
++         for (const auto &buffers : {input, output}) {
++            for (auto buffer : buffers) {
++               vkUnmapMemory(device, buffer.memory);
++               vkDestroyBuffer(device, buffer.buffer, nullptr);
++               vkFreeMemory(device, buffer.memory, nullptr);
++            }
++         }
++         std::printf("%s: %zu-byte delayed and immediate chains passed, "
++                     "slowest stage %.2f ms\n",
++                     argv[1], bytes,
++                     std::chrono::duration<double, std::milli>(slowest).count());
++      }
++      vkDestroySemaphore(device, binary, nullptr);
++      /* Completion is known from the final timeline wait. Destroy immediately
++       * so queue teardown must join any worker still cleaning its submission. */
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_timeline_pending_wait.cpp b/src/kosmickrisp/vulkan/tests/test_timeline_pending_wait.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d066a52148c095fb9b9d7a860cfd931365815bde
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_timeline_pending_wait.cpp
+@@ -0,0 +1,372 @@
++/* SPDX-License-Identifier: MIT */
++
++/* VK_SYNC_WAIT_PENDING asks whether a signal operation has been submitted.
++ *
++ * "deadlock" submits a batch whose timeline wait only the host can release,
++ * queues a binary semaphore signal behind it, and then submits a batch that
++ * waits on that semaphore. vkQueueSubmit must return: a driver that answers
++ * the runtime's pending question by waiting for completion blocks its caller
++ * until the parked batch is released, which on a virtualized device is the
++ * thread that would deliver the release.
++ *
++ * "throughput" submits long GPU work that signals a binary semaphore and then
++ * a batch that waits on it. vkQueueSubmit must return while that work is
++ * still running instead of serializing the caller against the GPU.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static std::atomic<const char *> current_stage{"startup"};
++
++static void
++stage(const char *name)
++{
++   current_stage.store(name);
++}
++
++static void
++require(bool ok, const char *operation, VkResult result = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, result);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T
++load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name) \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++int
++main(int argc, char **argv)
++{
++   require(argc == 2, "expected a mode");
++   const bool deadlock = std::strcmp(argv[1], "deadlock") == 0;
++   require(deadlock || std::strcmp(argv[1], "throughput") == 0,
++           "invalid mode");
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++
++   /* A driver that waits for completion here never returns. Report the stage
++    * instead of leaving the harness to kill a silent process. */
++   std::thread watchdog([] {
++      std::this_thread::sleep_for(std::chrono::seconds(30));
++      std::fprintf(stderr, "timed out in: %s\n", current_stage.load());
++      std::fflush(stderr);
++      _Exit(1);
++   });
++   watchdog.detach();
++
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "timeline-pending-wait";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count,
++                                       physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   for (VkPhysicalDevice physical : physicals) {
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> families(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
++                                               families.data());
++      uint32_t family = 0;
++      while (family < queue_count &&
++             !(families[family].queueFlags & VK_QUEUE_TRANSFER_BIT))
++         ++family;
++      require(family < queue_count, "transfer queue");
++
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{
++         VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = family;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceVulkan12Features features12{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++      features12.timelineSemaphore = VK_TRUE;
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features12;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateSemaphore);
++      LOAD_D(vkDestroySemaphore);
++      LOAD_D(vkSignalSemaphore);
++      LOAD_D(vkWaitSemaphores);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++      LOAD_D(vkCreateFence);
++      LOAD_D(vkDestroyFence);
++      LOAD_D(vkResetFences);
++      LOAD_D(vkGetFenceStatus);
++      LOAD_D(vkWaitForFences);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkResetCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdCopyBuffer);
++
++      VkQueue queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, family, 0, &queue);
++
++      VkSemaphoreTypeCreateInfo timeline_type{
++         VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
++      timeline_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++      VkSemaphoreCreateInfo timeline_info{
++         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++      timeline_info.pNext = &timeline_type;
++      VkSemaphoreCreateInfo binary_info{
++         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++
++      if (deadlock) {
++         VkSemaphore timeline = VK_NULL_HANDLE;
++         result = vkCreateSemaphore(device, &timeline_info, nullptr, &timeline);
++         require(result == VK_SUCCESS, "create timeline", result);
++         VkSemaphore binary = VK_NULL_HANDLE;
++         result = vkCreateSemaphore(device, &binary_info, nullptr, &binary);
++         require(result == VK_SUCCESS, "create binary", result);
++
++         /* Only the host can release this batch, so assisted submission holds
++          * it and everything queued behind it. */
++         stage("submit the host-gated batch");
++         uint64_t wait_value = 2;
++         uint64_t signal_value = 3;
++         VkTimelineSemaphoreSubmitInfo gated_values{
++            VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
++         gated_values.waitSemaphoreValueCount = 1;
++         gated_values.pWaitSemaphoreValues = &wait_value;
++         gated_values.signalSemaphoreValueCount = 1;
++         gated_values.pSignalSemaphoreValues = &signal_value;
++         VkPipelineStageFlags top = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++         VkSubmitInfo gated{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         gated.pNext = &gated_values;
++         gated.waitSemaphoreCount = 1;
++         gated.pWaitSemaphores = &timeline;
++         gated.pWaitDstStageMask = &top;
++         gated.signalSemaphoreCount = 1;
++         gated.pSignalSemaphores = &timeline;
++         result = vkQueueSubmit(queue, 1, &gated, VK_NULL_HANDLE);
++         require(result == VK_SUCCESS, "submit host-gated batch", result);
++
++         stage("queue a binary signal behind it");
++         VkSubmitInfo signal_binary{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         signal_binary.signalSemaphoreCount = 1;
++         signal_binary.pSignalSemaphores = &binary;
++         result = vkQueueSubmit(queue, 1, &signal_binary, VK_NULL_HANDLE);
++         require(result == VK_SUCCESS, "queue binary signal", result);
++
++         /* The pending question here has an answer that does not depend on
++          * the parked batch: the signal above was submitted first. */
++         stage("submit the batch waiting on that binary semaphore");
++         VkSubmitInfo wait_binary{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         wait_binary.waitSemaphoreCount = 1;
++         wait_binary.pWaitSemaphores = &binary;
++         wait_binary.pWaitDstStageMask = &top;
++         result = vkQueueSubmit(queue, 1, &wait_binary, VK_NULL_HANDLE);
++         require(result == VK_SUCCESS, "submit binary wait", result);
++
++         stage("release the host-gated batch");
++         VkSemaphoreSignalInfo release{
++            VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
++         release.semaphore = timeline;
++         release.value = 2;
++         result = vkSignalSemaphore(device, &release);
++         require(result == VK_SUCCESS, "release host signal", result);
++
++         stage("wait for the released chain");
++         uint64_t released = 3;
++         VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
++         wait.semaphoreCount = 1;
++         wait.pSemaphores = &timeline;
++         wait.pValues = &released;
++         result = vkWaitSemaphores(device, &wait, 10000000000ull);
++         require(result == VK_SUCCESS, "released chain completed", result);
++
++         /* The batch waiting on the binary semaphore runs after the released
++          * one and may not have completed yet; neither semaphore may be
++          * destroyed before it has (VUID-vkDestroySemaphore-semaphore-01137). */
++         stage("drain the queue");
++         result = vkQueueWaitIdle(queue);
++         require(result == VK_SUCCESS, "drain queue", result);
++         vkDestroySemaphore(device, binary, nullptr);
++         vkDestroySemaphore(device, timeline, nullptr);
++         std::printf("deadlock: queued binary wait did not block submission\n");
++      } else {
++         VkPhysicalDeviceMemoryProperties memory_properties{};
++         vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++         const VkDeviceSize bytes = 64u << 20;
++         auto make_buffer = [&](VkBuffer *buffer, VkDeviceMemory *memory) {
++            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++            info.size = bytes;
++            info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
++                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++            require(vkCreateBuffer(device, &info, nullptr, buffer) ==
++                       VK_SUCCESS, "create buffer");
++            VkMemoryRequirements requirements{};
++            vkGetBufferMemoryRequirements(device, *buffer, &requirements);
++            uint32_t type = 0;
++            while (type < memory_properties.memoryTypeCount &&
++                   !(requirements.memoryTypeBits & (1u << type)))
++               ++type;
++            require(type < memory_properties.memoryTypeCount, "memory type");
++            VkMemoryAllocateInfo allocation{
++               VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++            allocation.allocationSize = requirements.size;
++            allocation.memoryTypeIndex = type;
++            require(vkAllocateMemory(device, &allocation, nullptr, memory) ==
++                       VK_SUCCESS, "allocate memory");
++            require(vkBindBufferMemory(device, *buffer, *memory, 0) ==
++                       VK_SUCCESS, "bind buffer");
++         };
++         VkBuffer source = VK_NULL_HANDLE, destination = VK_NULL_HANDLE;
++         VkDeviceMemory source_memory = VK_NULL_HANDLE;
++         VkDeviceMemory destination_memory = VK_NULL_HANDLE;
++         make_buffer(&source, &source_memory);
++         make_buffer(&destination, &destination_memory);
++
++         VkCommandPoolCreateInfo pool_info{
++            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++         pool_info.queueFamilyIndex = family;
++         VkCommandPool pool = VK_NULL_HANDLE;
++         require(vkCreateCommandPool(device, &pool_info, nullptr, &pool) ==
++                    VK_SUCCESS, "create command pool");
++         VkCommandBufferAllocateInfo allocation{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++         allocation.commandPool = pool;
++         allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++         allocation.commandBufferCount = 1;
++         VkCommandBuffer command = VK_NULL_HANDLE;
++         require(vkAllocateCommandBuffers(device, &allocation, &command) ==
++                    VK_SUCCESS, "allocate command buffer");
++
++         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++         VkFence fence = VK_NULL_HANDLE;
++         require(vkCreateFence(device, &fence_info, nullptr, &fence) ==
++                    VK_SUCCESS, "create fence");
++
++         /* Grow the dependency until it is long enough to observe, so a fast
++          * machine reports a real failure rather than a measurement artefact.
++          */
++         bool observed = false;
++         for (uint32_t copies = 64; copies <= 2048 && !observed; copies *= 4) {
++            require(vkResetCommandPool(device, pool, 0) == VK_SUCCESS,
++                    "reset command pool");
++            require(vkResetFences(device, 1, &fence) == VK_SUCCESS,
++                    "reset fence");
++            VkCommandBufferBeginInfo begin{
++               VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            require(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
++                    "begin command buffer");
++            VkBufferCopy copy{0, 0, bytes};
++            for (uint32_t i = 0; i < copies; ++i)
++               vkCmdCopyBuffer(command, source, destination, 1, &copy);
++            require(vkEndCommandBuffer(command) == VK_SUCCESS,
++                    "end command buffer");
++
++            VkSemaphore binary = VK_NULL_HANDLE;
++            require(vkCreateSemaphore(device, &binary_info, nullptr,
++                                      &binary) == VK_SUCCESS,
++                    "create binary");
++
++            stage("submit the long dependency");
++            VkSubmitInfo producer{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++            producer.commandBufferCount = 1;
++            producer.pCommandBuffers = &command;
++            producer.signalSemaphoreCount = 1;
++            producer.pSignalSemaphores = &binary;
++            require(vkQueueSubmit(queue, 1, &producer, fence) == VK_SUCCESS,
++                    "submit producer");
++
++            stage("submit the consumer of that dependency");
++            VkPipelineStageFlags top = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++            VkSubmitInfo consumer{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++            consumer.waitSemaphoreCount = 1;
++            consumer.pWaitSemaphores = &binary;
++            consumer.pWaitDstStageMask = &top;
++            require(vkQueueSubmit(queue, 1, &consumer, VK_NULL_HANDLE) ==
++                       VK_SUCCESS, "submit consumer");
++            const VkResult status = vkGetFenceStatus(device, fence);
++            require(status == VK_SUCCESS || status == VK_NOT_READY,
++                    "producer fence status", status);
++            observed = status == VK_NOT_READY;
++
++            stage("drain");
++            require(vkWaitForFences(device, 1, &fence, VK_TRUE,
++                                    20000000000ull) == VK_SUCCESS,
++                    "drain producer");
++            vkDestroySemaphore(device, binary, nullptr);
++            if (!observed) {
++               std::printf("throughput: %u copies completed too early, "
++                           "lengthening\n", copies);
++            }
++         }
++         require(observed,
++                 "submission waited for the GPU dependency to complete");
++
++         vkDestroyFence(device, fence, nullptr);
++         vkDestroyCommandPool(device, pool, nullptr);
++         vkDestroyBuffer(device, source, nullptr);
++         vkDestroyBuffer(device, destination, nullptr);
++         vkFreeMemory(device, source_memory, nullptr);
++         vkFreeMemory(device, destination_memory, nullptr);
++         std::printf("throughput: submission returned while the GPU "
++                     "dependency was still running\n");
++      }
++
++      stage("destroy device");
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_timeline_wait_loss.c b/src/kosmickrisp/vulkan/tests/test_timeline_wait_loss.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b8dd8bcb60bd1051f698a13ed8314483556d136
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_timeline_wait_loss.c
+@@ -0,0 +1,182 @@
++/* SPDX-License-Identifier: MIT */
++
++#define VK_NO_PROTOTYPES
++#include "kk_device.h"
++#include "kk_queue.h"
++#include "vk_semaphore.h"
++#include "vk_sync.h"
++#include "util/os_time.h"
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++struct idle_wait {
++   PFN_vkQueueWaitIdle wait;
++   VkQueue queue;
++   VkResult result;
++};
++
++static void *
++wait_idle(void *data)
++{
++   struct idle_wait *wait = data;
++   wait->result = wait->wait(wait->queue);
++   return NULL;
++}
++
++static void *
++finish_queue(void *data)
++{
++   struct kk_device *dev = data;
++   kk_queue_finish(dev, &dev->queue);
++   return NULL;
++}
++
++int
++main(int argc, char **argv)
++{
++   CHECK(argc == 2);
++   bool idle = strcmp(argv[1], "idle") == 0;
++   bool drain = strcmp(argv[1], "drain") == 0;
++   CHECK(idle || drain || strcmp(argv[1], "pending") == 0);
++   /* In particular, a failed worker join must not strand the test runner. */
++   alarm(10);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                           .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++   CHECK(count == 1);
++   uint32_t family_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++   CHECK(families);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++   uint32_t family = 0;
++   while (family < family_count &&
++          !(families[family].queueFlags & VK_QUEUE_TRANSFER_BIT))
++      family++;
++   CHECK(family < family_count);
++   free(families);
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = family,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan12Features features = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++      .timelineSemaphore = VK_TRUE,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateSemaphore);
++   LOAD_D(vkDestroySemaphore);
++   LOAD_D(vkSignalSemaphore);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, family, 0, &queue);
++   VkSemaphoreTypeCreateInfo type = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++   };
++   VkSemaphoreCreateInfo semaphore_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++      .pNext = &type,
++   };
++   VkSemaphore semaphore = VK_NULL_HANDLE;
++   CHECK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore) == VK_SUCCESS);
++   struct kk_device *dev = kk_device_from_handle(device);
++   struct vk_sync *sync = vk_semaphore_get_active_sync(
++      vk_semaphore_from_handle(semaphore));
++   for (unsigned pending = 0; pending < 2; pending++) {
++      enum vk_sync_wait_flags flags = pending ? VK_SYNC_WAIT_PENDING :
++                                              VK_SYNC_WAIT_COMPLETE;
++      CHECK(vk_sync_wait(&dev->vk, sync, 1, flags, 0) == VK_TIMEOUT);
++      uint64_t start = os_time_get_nano();
++      uint64_t deadline = start + 250000000ull;
++      CHECK(vk_sync_wait(&dev->vk, sync, 1, flags, deadline) == VK_TIMEOUT);
++      CHECK(os_time_get_nano() >= deadline);
++   }
++   VkSemaphoreSignalInfo signal = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
++      .semaphore = semaphore,
++      .value = 1,
++   };
++   CHECK(vkSignalSemaphore(device, &signal) == VK_SUCCESS);
++   CHECK(vk_sync_wait(&dev->vk, sync, 1, VK_SYNC_WAIT_PENDING, 0) == VK_SUCCESS);
++   CHECK(vk_sync_wait(&dev->vk, sync, 1, VK_SYNC_WAIT_COMPLETE, 0) == VK_SUCCESS);
++
++   uint64_t value = 2;
++   VkTimelineSemaphoreSubmitInfo timeline = {
++      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++      .waitSemaphoreValueCount = 1,
++      .pWaitSemaphoreValues = &value,
++   };
++   VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++   VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .pNext = &timeline,
++      .waitSemaphoreCount = 1,
++      .pWaitSemaphores = &semaphore,
++      .pWaitDstStageMask = &stage,
++   };
++   CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++   struct idle_wait wait = {.wait = vkQueueWaitIdle, .queue = queue};
++   pthread_t thread;
++   if (idle)
++      CHECK(pthread_create(&thread, NULL, wait_idle, &wait) == 0);
++   if (drain)
++      CHECK(pthread_create(&thread, NULL, finish_queue, dev) == 0);
++   usleep(150000);
++   CHECK(vk_device_set_lost(&dev->vk, "injected timeline wait test loss") ==
++         VK_ERROR_DEVICE_LOST);
++   if (idle) {
++      CHECK(pthread_join(thread, NULL) == 0);
++      CHECK(wait.result == VK_ERROR_DEVICE_LOST);
++   }
++   /* Exercise the real owning teardown while the submission is still pending.
++    * The test invokes this internally so it can destroy the semaphore only
++    * after the worker has stopped using it, without invalid Vulkan calls. */
++   if (drain)
++      CHECK(pthread_join(thread, NULL) == 0);
++   else
++      kk_queue_finish(dev, &dev->queue);
++   dev->has_queue = false;
++   vkDestroySemaphore(device, semaphore, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   alarm(0);
++   printf("%s: zero/finite waits and lost-device teardown passed\n", argv[1]);
++   return 0;
++}
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index b6b8ba7e2b4d5b8a3f29f8d190a2fa7f5e5c9d33..65c03393c225cc5f6300b1dcdc36a08feaaeaa76 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -729,6 +729,18 @@ done:
+    return result;
+ }
+ 
++static int
++vk_queue_submit_thread_fail(struct vk_queue *queue, const char *message)
++{
++   /* A drain may already be sleeping while the worker detects device loss.
++    * Publish the failure and wake it under the same mutex as its condition. */
++   mtx_lock(&queue->submit.mutex);
++   vk_queue_set_lost(queue, "%s", message);
++   cnd_broadcast(&queue->submit.pop);
++   mtx_unlock(&queue->submit.mutex);
++   return 1;
++}
++
+ static int
+ vk_queue_submit_thread_func(void *_data)
+ {
+@@ -742,8 +754,7 @@ vk_queue_submit_thread_func(void *_data)
+          int ret = cnd_wait(&queue->submit.push, &queue->submit.mutex);
+          if (ret == thrd_error) {
+             mtx_unlock(&queue->submit.mutex);
+-            vk_queue_set_lost(queue, "cnd_wait failed");
+-            return 1;
++            return vk_queue_submit_thread_fail(queue, "cnd_wait failed");
+          }
+          continue;
+       }
+@@ -759,14 +770,12 @@ vk_queue_submit_thread_func(void *_data)
+                                  submit->wait_count, submit->waits,
+                                  VK_SYNC_WAIT_PENDING, UINT64_MAX);
+       if (unlikely(result != VK_SUCCESS)) {
+-         vk_queue_set_lost(queue, "Wait for time points failed");
+-         return 1;
++         return vk_queue_submit_thread_fail(queue, "Wait for time points failed");
+       }
+ 
+       result = vk_queue_submit_final(queue, submit);
+       if (unlikely(result != VK_SUCCESS)) {
+-         vk_queue_set_lost(queue, "queue::driver_submit failed");
+-         return 1;
++         return vk_queue_submit_thread_fail(queue, "queue::driver_submit failed");
+       }
+ 
+       /* Do all our cleanup of individual fences etc. outside the lock.
+@@ -822,7 +831,9 @@ vk_queue_stop_submit_thread(struct vk_queue *queue)
+ 
+    thrd_join(queue->submit.thread, NULL);
+ 
+-   assert(list_is_empty(&queue->submit.submits));
++   /* Failed submissions are released by vk_queue_finish after the join. */
++   assert(list_is_empty(&queue->submit.submits) ||
++          vk_device_is_lost_no_report(queue->base.device));
+    queue->submit.mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
+ }
+ 

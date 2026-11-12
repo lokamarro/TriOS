@@ -1,0 +1,1333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 17:24:11 +0900
+Subject: [PATCH] uml: adapt standard virtual devices to Darwin host providers
+
+Apply the reviewed final-state topic without intermediate churn.
+---
+ arch/um/drivers/Kconfig           |  41 ++++++-
+ arch/um/drivers/Makefile          |   8 +-
+ arch/um/drivers/chan_user.c       |  43 ++++++-
+ arch/um/drivers/chan_user.h       |   6 +
+ arch/um/drivers/cow_user.c        |   4 +
+ arch/um/drivers/darwin_net_kern.c | 166 +++++++++++++++++++++++++++
+ arch/um/drivers/rtc_kern.c        |  30 ++++-
+ arch/um/drivers/rtc_user.c        | 119 ++++++++++++++++++-
+ arch/um/drivers/ssl.c             |   2 +-
+ arch/um/drivers/ubd_kern.c        | 163 +++++++++++++++++++++++---
+ arch/um/drivers/ubd_user.c        |   4 -
+ arch/um/drivers/virtio_uml.c      |  39 ++++---
+ arch/um/drivers/vnc_input.c       | 183 ++++++++++++++++++++++++++++++
+ arch/um/include/shared/os.h       |   5 +
+ drivers/video/console/Kconfig     |   3 +-
+ 15 files changed, 767 insertions(+), 49 deletions(-)
+ create mode 100644 arch/um/drivers/darwin_net_kern.c
+ create mode 100644 arch/um/drivers/vnc_input.c
+
+diff --git a/arch/um/drivers/Kconfig b/arch/um/drivers/Kconfig
+index 6a0354ca032fb013fff3ee487062f3f8c49eccb2..32721e1b12ab36df3e03e81254bddf46a0e0f6a8 100644
+--- a/arch/um/drivers/Kconfig
++++ b/arch/um/drivers/Kconfig
+@@ -2,6 +2,15 @@
+ 
+ menu "UML Character Devices"
+ 
++config UML_STDIO_CONSOLE
++	bool "UML stdio console"
++	default y
++	help
++	  Build the traditional UML console driver which exposes tty0 through
++	  tty15 as host stdio, terminal, or pseudo-terminal channels. Disable
++	  this when the standard Linux virtual-terminal and framebuffer-console
++	  stack owns the tty major instead.
++
+ config STDERR_CONSOLE
+ 	bool "stderr console"
+ 	default y
+@@ -20,6 +29,16 @@ config SSL
+ 
+ 	  Unless you have a specific reason for disabling this, say Y.
+ 
++config SSL_PORTS
++	int "Number of virtual serial lines"
++	depends on SSL
++	range 1 64
++	default 64
++	help
++	  Set the number of UML serial devices exposed as /dev/ttyS*. Most
++	  desktop guests need only a few serial ports; retain 64 for the
++	  historical UML default.
++
+ config NULL_CHAN
+ 	bool "null channel support"
+ 	help
+@@ -77,6 +96,7 @@ config NOCONFIG_CHAN
+ 
+ config CON_ZERO_CHAN
+ 	string "Default main console channel initialization"
++	depends on UML_STDIO_CONSOLE
+ 	default "fd:0,fd:1"
+ 	help
+ 	  This is the string describing the channel to which the main console
+@@ -87,6 +107,7 @@ config CON_ZERO_CHAN
+ 
+ config CON_CHAN
+ 	string "Default console channel initialization"
++	depends on UML_STDIO_CONSOLE
+ 	default "xterm"
+ 	help
+ 	  This is the string describing the channel to which all consoles
+@@ -142,20 +163,28 @@ endmenu
+ config VIRTIO_UML
+ 	bool "UML driver for virtio devices"
+ 	select VIRTIO
++	select UML_DMA_EMULATION
++	select UML_IOMEM_EMULATION
+ 	help
+ 	  This driver provides support for virtio based paravirtual device
+ 	  drivers over vhost-user sockets.
+ 
++config UML_VNC_INPUT
++	bool "UML VNC keyboard and tablet input"
++	depends on INPUT
++	help
++	  Register keyboard and absolute-pointer input devices backed by an
++	  inherited host descriptor. The Darwin VNC frontend uses this to pass
++	  remote client input into the guest Linux input subsystem.
++
+ config UML_RTC
+ 	bool "UML RTC driver"
+ 	depends on RTC_CLASS
+-	# there's no use in this if PM_SLEEP isn't enabled ...
+-	depends on PM_SLEEP
+ 	help
+-	  When PM_SLEEP is configured, it may be desirable to wake up using
+-	  rtcwake, especially in time-travel mode. This driver enables that
+-	  by providing a fake RTC clock that causes a wakeup at the right
+-	  time.
++	  This driver provides a fake RTC clock with alarm support. It enables
++	  the CLOCK_REALTIME_ALARM and CLOCK_BOOTTIME_ALARM POSIX clocks and,
++	  when PM_SLEEP is configured, can also wake UML from suspend using
++	  rtcwake, especially in time-travel mode.
+ 
+ config UML_PCI
+ 	bool
+diff --git a/arch/um/drivers/Makefile b/arch/um/drivers/Makefile
+index 6bf8cbf71d3cab0cc5e485b7644dd2b884be9e40..91ce72a008dac0ab3e0a6dcab8e7e98bbd616116 100644
+--- a/arch/um/drivers/Makefile
++++ b/arch/um/drivers/Makefile
+@@ -23,11 +23,16 @@ vfio_uml-objs := vfio_kern.o vfio_user.o
+ # When the above is fixed, don't forget to add this too!
+ #targets += $(obj)/pcap.o
+ 
+-obj-y := stdio_console.o fd.o chan_kern.o chan_user.o line.o
++obj-y := fd.o chan_kern.o chan_user.o line.o
++obj-$(CONFIG_UML_STDIO_CONSOLE) += stdio_console.o
+ obj-$(CONFIG_SSL) += ssl.o
+ obj-$(CONFIG_STDERR_CONSOLE) += stderr_console.o
+ 
+ obj-$(CONFIG_UML_NET_VECTOR) += vector.o
++ifeq ($(UML_HOST_OS),Darwin)
++obj-y += darwin_net_kern.o
++CFLAGS_virtio_uml.o += -DUML_HOST_DARWIN
++endif
+ obj-$(CONFIG_MCONSOLE) += mconsole.o
+ obj-$(CONFIG_MMAPPER) += mmapper_kern.o 
+ obj-$(CONFIG_BLK_DEV_UBD) += ubd.o 
+@@ -42,6 +47,7 @@ obj-y += $(harddog-builtin-y) $(harddog-builtin-m)
+ obj-$(CONFIG_BLK_DEV_COW_COMMON) += cow_user.o
+ obj-$(CONFIG_UML_RANDOM) += random.o
+ obj-$(CONFIG_VIRTIO_UML) += virtio_uml.o
++obj-$(CONFIG_UML_VNC_INPUT) += vnc_input.o
+ obj-$(CONFIG_UML_RTC) += rtc.o
+ obj-$(CONFIG_UML_PCI) += virt-pci.o
+ obj-$(CONFIG_UML_PCI_OVER_VIRTIO) += virtio_pcidev.o
+diff --git a/arch/um/drivers/chan_user.c b/arch/um/drivers/chan_user.c
+index 35f9beeb19b3fe6761dcd4735690600403ce3e53..e017e2804e3f992c1f4539d90f648d5161563eca 100644
+--- a/arch/um/drivers/chan_user.c
++++ b/arch/um/drivers/chan_user.c
+@@ -14,6 +14,21 @@
+ #include <os.h>
+ #include <um_malloc.h>
+ 
++#ifdef UML_HOST_DARWIN
++#include <pthread.h>
++
++/*
++ * Darwin's sigprocmask() sets the mask of every thread in the process, so a
++ * console write blocking its own signals would also block every vCPU
++ * carrier's, and a carrier's synchronous SIGSEGV would then retry its
++ * faulting instruction forever.  pthread_sigmask() changes only the calling
++ * thread.
++ */
++#define uml_thread_sigmask pthread_sigmask
++#else
++#define uml_thread_sigmask sigprocmask
++#endif
++
+ void generic_close(int fd, void *unused)
+ {
+ 	close(fd);
+@@ -92,7 +107,7 @@ int generic_console_write(int fd, const char *buf, int n)
+ 	if (isatty(fd)) {
+ 		sigemptyset(&no_sigio);
+ 		sigaddset(&no_sigio, SIGIO);
+-		if (sigprocmask(SIG_BLOCK, &no_sigio, &old))
++		if (uml_thread_sigmask(SIG_BLOCK, &no_sigio, &old))
+ 			goto error;
+ 
+ 		CATCH_EINTR(err = tcgetattr(fd, &save));
+@@ -103,9 +118,11 @@ int generic_console_write(int fd, const char *buf, int n)
+ 		 * The terminal becomes a bit less raw, to handle \n also as
+ 		 * "Carriage Return", not only as "New Line". Otherwise, the new
+ 		 * line won't start at the first column.
++		 * Preserve unread input: console output may share its host tty
++		 * with the input channel. Only the output mode changes here.
+ 		 */
+ 		new.c_oflag |= OPOST;
+-		CATCH_EINTR(err = tcsetattr(fd, TCSAFLUSH, &new));
++		CATCH_EINTR(err = tcsetattr(fd, TCSADRAIN, &new));
+ 		if (err)
+ 			goto error;
+ 	}
+@@ -115,8 +132,8 @@ int generic_console_write(int fd, const char *buf, int n)
+ 	 * EINTR, except for debug.
+ 	 */
+ 	if (isatty(fd)) {
+-		CATCH_EINTR(tcsetattr(fd, TCSAFLUSH, &save));
+-		sigprocmask(SIG_SETMASK, &old, NULL);
++		CATCH_EINTR(tcsetattr(fd, TCSADRAIN, &save));
++		uml_thread_sigmask(SIG_SETMASK, &old, NULL);
+ 	}
+ 
+ 	return err;
+@@ -124,6 +141,23 @@ int generic_console_write(int fd, const char *buf, int n)
+ 	return -errno;
+ }
+ 
++#ifdef UML_HOST_DARWIN
++/*
++ * Only a controlling terminal reports a change of its size, by SIGWINCH to
++ * its foreground process group, so the helper below takes the console's
++ * terminal as its own controlling terminal with setsid(), TIOCSCTTY and
++ * tcsetpgrp().  A Linux host runs the helper as a process of its own.  A
++ * Darwin helper would be a thread, and those calls would move the whole
++ * emulator into a new session and process group led by itself, out of reach
++ * of every signal sent to the group that started it.  A Darwin console
++ * therefore keeps the size its input terminal had when the line opened.
++ */
++void register_winch(int fd, struct tty_port *port)
++{
++	(void)fd;
++	(void)port;
++}
++#else
+ /*
+  * UML SIGWINCH handling
+  *
+@@ -321,3 +355,4 @@ void register_winch(int fd, struct tty_port *port)
+ 			       "synchronization byte, err = %d\n", errno);
+ 	}
+ }
++#endif
+diff --git a/arch/um/drivers/chan_user.h b/arch/um/drivers/chan_user.h
+index e158e16fb3cc9852af0cd496034ce8cd20e03eb2..5591381effd36b3f1f5da9e2d466602aea729e15 100644
+--- a/arch/um/drivers/chan_user.h
++++ b/arch/um/drivers/chan_user.h
+@@ -7,7 +7,13 @@
+ #define __CHAN_USER_H__
+ 
+ #include <init.h>
++#ifdef __UM_HOST__
++#include <stddef.h>
++#include <stdint.h>
++typedef uint8_t __u8;
++#else
+ #include <linux/types.h>
++#endif
+ 
+ struct chan_opts {
+ 	void (*const announce)(char *dev_name, int dev);
+diff --git a/arch/um/drivers/cow_user.c b/arch/um/drivers/cow_user.c
+index dc1d1bcd85ec240d17e4838c7153d0c636f4d97b..66150cedc24a094c52c9c8fa60a9b24e6f73275a 100644
+--- a/arch/um/drivers/cow_user.c
++++ b/arch/um/drivers/cow_user.c
+@@ -11,7 +11,11 @@
+ #include <errno.h>
+ #include <string.h>
+ #include <arpa/inet.h>
++#ifdef __APPLE__
++#include <sys/endian.h>
++#else
+ #include <endian.h>
++#endif
+ #include "cow.h"
+ #include "cow_sys.h"
+ 
+diff --git a/arch/um/drivers/darwin_net_kern.c b/arch/um/drivers/darwin_net_kern.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4291170b64845b5d4fd37616c2665c46ddbe42d9
+--- /dev/null
++++ b/arch/um/drivers/darwin_net_kern.c
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/etherdevice.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++#include <darwin_net.h>
++#include <irq_kern.h>
++
++#define DARWIN_NET_FRAME_SIZE 2048
++#define DARWIN_NET_RX_BUDGET 64
++
++struct darwin_net_private {
++	struct net_device *device;
++	int backend_ready;
++	int receive_irq;
++	unsigned char receive_frame[DARWIN_NET_FRAME_SIZE];
++};
++
++static void darwin_net_receive(struct net_device *device)
++{
++	struct darwin_net_private *private = netdev_priv(device);
++	int budget;
++
++	if (!private->backend_ready || !netif_running(device))
++		return;
++	for (budget = 0; budget < DARWIN_NET_RX_BUDGET; budget++) {
++		struct sk_buff *buffer;
++		int length = darwin_uml_net_read(private->receive_frame,
++						 sizeof(private->receive_frame));
++
++		if (length <= 0)
++			break;
++		buffer = netdev_alloc_skb_ip_align(device, length);
++		if (buffer == NULL) {
++			device->stats.rx_dropped++;
++			continue;
++		}
++		skb_put_data(buffer, private->receive_frame, length);
++		buffer->protocol = eth_type_trans(buffer, device);
++		device->stats.rx_packets++;
++		device->stats.rx_bytes += length;
++		netif_rx(buffer);
++	}
++}
++
++static irqreturn_t darwin_net_interrupt(int irq, void *data)
++{
++	struct net_device *device = data;
++
++	(void)irq;
++	if (!netif_running(device))
++		return IRQ_NONE;
++	darwin_net_receive(device);
++	return IRQ_HANDLED;
++}
++
++static netdev_tx_t darwin_net_transmit(struct sk_buff *buffer,
++				       struct net_device *device)
++{
++	struct darwin_net_private *private = netdev_priv(device);
++	int result;
++
++	if (!private->backend_ready) {
++		device->stats.tx_dropped++;
++		dev_kfree_skb(buffer);
++		return NETDEV_TX_OK;
++	}
++	result = darwin_uml_net_write(buffer->data, buffer->len);
++	if (result == 0) {
++		device->stats.tx_packets++;
++		device->stats.tx_bytes += buffer->len;
++	} else {
++		device->stats.tx_dropped++;
++		device->stats.tx_errors++;
++	}
++	dev_kfree_skb(buffer);
++	return NETDEV_TX_OK;
++}
++
++static int darwin_net_open_device(struct net_device *device)
++{
++	struct darwin_net_private *private = netdev_priv(device);
++	int descriptor;
++	int irq;
++
++	if (!private->backend_ready)
++		return -ENETDOWN;
++	descriptor = darwin_uml_net_irq_fd();
++	if (descriptor < 0)
++		return -ENODEV;
++	irq = um_request_irq(UM_IRQ_ALLOC, descriptor, IRQ_READ,
++			     darwin_net_interrupt, 0, device->name, device);
++	if (irq < 0)
++		return irq;
++	private->receive_irq = irq;
++	device->irq = irq;
++	netif_carrier_on(device);
++	netif_start_queue(device);
++	return 0;
++}
++
++static int darwin_net_close_device(struct net_device *device)
++{
++	struct darwin_net_private *private = netdev_priv(device);
++
++	netif_stop_queue(device);
++	if (private->receive_irq >= 0) {
++		um_free_irq(private->receive_irq, device);
++		private->receive_irq = -1;
++	}
++	return 0;
++}
++
++static const struct net_device_ops darwin_net_device_ops = {
++	.ndo_open = darwin_net_open_device,
++	.ndo_stop = darwin_net_close_device,
++	.ndo_start_xmit = darwin_net_transmit,
++	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_validate_addr = eth_validate_addr,
++};
++
++static int __init darwin_net_init(void)
++{
++	struct darwin_net_private *private;
++	struct net_device *device;
++	unsigned char mac[ETH_ALEN] = { };
++	unsigned int mtu = ETH_DATA_LEN;
++	int backend_result;
++	int result;
++
++	device = alloc_etherdev(sizeof(*private));
++	if (device == NULL)
++		return -ENOMEM;
++	private = netdev_priv(device);
++	private->device = device;
++	private->receive_irq = -1;
++	backend_result = darwin_uml_net_open(mac, &mtu);
++	private->backend_ready = backend_result == 0;
++	device->netdev_ops = &darwin_net_device_ops;
++	device->min_mtu = ETH_MIN_MTU;
++	device->max_mtu = DARWIN_NET_FRAME_SIZE - ETH_HLEN;
++	if (mtu >= device->min_mtu && mtu <= device->max_mtu)
++		device->mtu = mtu;
++	if (private->backend_ready && is_valid_ether_addr(mac))
++		eth_hw_addr_set(device, mac);
++	else
++		eth_hw_addr_random(device);
++	if (!private->backend_ready)
++		netif_carrier_off(device);
++	result = register_netdev(device);
++	if (result != 0) {
++		free_netdev(device);
++		return result;
++	}
++	if (private->backend_ready)
++		pr_info("Darwin user network: registered %s with user-mode NAT\n",
++			device->name);
++	else
++		pr_warn("Darwin user network: %s registered without host carrier "
++			"(%d)\n",
++			device->name, backend_result);
++	return 0;
++}
++late_initcall(darwin_net_init);
+diff --git a/arch/um/drivers/rtc_kern.c b/arch/um/drivers/rtc_kern.c
+index 9158c936c1281441a4e5880e0fc9a22fc9e85212..77295f0444d1a859aa8b64143e9144101f87e5b1 100644
+--- a/arch/um/drivers/rtc_kern.c
++++ b/arch/um/drivers/rtc_kern.c
+@@ -8,15 +8,18 @@
+ #include <linux/suspend.h>
+ #include <linux/err.h>
+ #include <linux/rtc.h>
++#include <init.h>
+ #include <kern_util.h>
+ #include <irq_kern.h>
+ #include <os.h>
+ #include "rtc.h"
+ 
+ static time64_t uml_rtc_alarm_time;
++static time64_t uml_rtc_offset;
+ static bool uml_rtc_alarm_enabled;
+ static struct rtc_device *uml_rtc;
+-static int uml_rtc_irq_fd, uml_rtc_irq;
++static int uml_rtc_irq_fd = -1, uml_rtc_irq = -1;
++static bool uml_rtc_started;
+ 
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+ 
+@@ -36,7 +39,18 @@ static int uml_rtc_read_time(struct device *dev, struct rtc_time *tm)
+ 
+ 	/* Use this to get correct time in time-travel mode */
+ 	read_persistent_clock64(&ts);
+-	rtc_time64_to_tm(timespec64_to_ktime(ts) / NSEC_PER_SEC, tm);
++	rtc_time64_to_tm(timespec64_to_ktime(ts) / NSEC_PER_SEC +
++			 READ_ONCE(uml_rtc_offset), tm);
++
++	return 0;
++}
++
++static int uml_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++	struct timespec64 ts;
++
++	read_persistent_clock64(&ts);
++	WRITE_ONCE(uml_rtc_offset, rtc_tm_to_time64(tm) - ts.tv_sec);
+ 
+ 	return 0;
+ }
+@@ -60,7 +74,8 @@ static int uml_rtc_alarm_irq_enable(struct device *dev, unsigned int enable)
+ 	uml_rtc_alarm_enabled = enable;
+ 
+ 	read_persistent_clock64(&ts);
+-	secs = uml_rtc_alarm_time - ts.tv_sec;
++	secs = uml_rtc_alarm_time -
++		(ts.tv_sec + READ_ONCE(uml_rtc_offset));
+ 
+ 	if (time_travel_mode == TT_MODE_OFF) {
+ 		if (!enable) {
+@@ -93,6 +108,7 @@ static int uml_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alrm)
+ 
+ static const struct rtc_class_ops uml_rtc_ops = {
+ 	.read_time = uml_rtc_read_time,
++	.set_time = uml_rtc_set_time,
+ 	.read_alarm = uml_rtc_read_alarm,
+ 	.alarm_irq_enable = uml_rtc_alarm_irq_enable,
+ 	.set_alarm = uml_rtc_set_alarm,
+@@ -134,15 +150,23 @@ static int uml_rtc_setup(void)
+ 	irq_set_irq_wake(err, 1);
+ 
+ 	uml_rtc_irq = err;
++	uml_rtc_started = true;
+ 	return 0;
+ }
+ 
+ static void uml_rtc_cleanup(void)
+ {
++	if (!uml_rtc_started)
++		return;
++	uml_rtc_started = false;
+ 	um_free_irq(uml_rtc_irq, NULL);
++	uml_rtc_irq = -1;
++	uml_rtc_irq_fd = -1;
+ 	uml_rtc_stop(time_travel_mode != TT_MODE_OFF);
+ }
+ 
++__uml_exitcall(uml_rtc_cleanup);
++
+ static int uml_rtc_probe(struct platform_device *pdev)
+ {
+ 	int err;
+diff --git a/arch/um/drivers/rtc_user.c b/arch/um/drivers/rtc_user.c
+index 67912fcf7b2864daa6539eaeaaa61f14dd08b4b7..dfc7cafc52123d05064f41ce5b4eb9ce9fd254e9 100644
+--- a/arch/um/drivers/rtc_user.c
++++ b/arch/um/drivers/rtc_user.c
+@@ -11,10 +11,57 @@
+ #include <kern_util.h>
+ #include <sys/select.h>
+ #include <stdio.h>
++#ifdef UML_HOST_DARWIN
++#include <limits.h>
++#include <pthread.h>
++#include <signal.h>
++#include <time.h>
++#else
+ #include <sys/timerfd.h>
++#endif
+ #include "rtc.h"
+ 
+-static int uml_rtc_irq_fds[2];
++static int uml_rtc_irq_fds[2] = { -1, -1 };
++
++#ifdef UML_HOST_DARWIN
++static pthread_mutex_t uml_rtc_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t uml_rtc_condition = PTHREAD_COND_INITIALIZER;
++static pthread_t uml_rtc_thread;
++static struct timespec uml_rtc_deadline;
++static bool uml_rtc_thread_running;
++static bool uml_rtc_alarm_armed;
++
++static void *uml_rtc_alarm_thread(void *unused)
++{
++	sigset_t blocked;
++
++	(void)unused;
++	/* The process-wide UML tick must never be delivered to this helper. */
++	sigemptyset(&blocked);
++	sigaddset(&blocked, SIGALRM);
++	(void)pthread_sigmask(SIG_BLOCK, &blocked, NULL);
++
++	pthread_mutex_lock(&uml_rtc_lock);
++	while (uml_rtc_thread_running) {
++		int error;
++
++		while (uml_rtc_thread_running && !uml_rtc_alarm_armed)
++			pthread_cond_wait(&uml_rtc_condition, &uml_rtc_lock);
++		if (!uml_rtc_thread_running)
++			break;
++		error = pthread_cond_timedwait(&uml_rtc_condition,
++			&uml_rtc_lock, &uml_rtc_deadline);
++		if (error != ETIMEDOUT || !uml_rtc_alarm_armed)
++			continue;
++		uml_rtc_alarm_armed = false;
++		pthread_mutex_unlock(&uml_rtc_lock);
++		uml_rtc_send_timetravel_alarm();
++		pthread_mutex_lock(&uml_rtc_lock);
++	}
++	pthread_mutex_unlock(&uml_rtc_lock);
++	return NULL;
++}
++#endif
+ 
+ void uml_rtc_send_timetravel_alarm(void)
+ {
+@@ -27,6 +74,26 @@ int uml_rtc_start(bool timetravel)
+ {
+ 	int err;
+ 
++#ifdef UML_HOST_DARWIN
++	err = os_pipe(uml_rtc_irq_fds, 1, 1);
++	if (err)
++		goto fail;
++	if (!timetravel) {
++		pthread_mutex_lock(&uml_rtc_lock);
++		uml_rtc_alarm_armed = false;
++		uml_rtc_thread_running = true;
++		pthread_mutex_unlock(&uml_rtc_lock);
++		err = pthread_create(&uml_rtc_thread, NULL,
++				     uml_rtc_alarm_thread, NULL);
++		if (err) {
++			err = -err;
++			pthread_mutex_lock(&uml_rtc_lock);
++			uml_rtc_thread_running = false;
++			pthread_mutex_unlock(&uml_rtc_lock);
++			goto fail;
++		}
++	}
++#else
+ 	if (timetravel) {
+ 		err = os_pipe(uml_rtc_irq_fds, 1, 1);
+ 		if (err)
+@@ -46,6 +113,7 @@ int uml_rtc_start(bool timetravel)
+ 			goto fail;
+ 		}
+ 	}
++#endif
+ 
+ 	return uml_rtc_irq_fds[0];
+ fail:
+@@ -55,6 +123,22 @@ int uml_rtc_start(bool timetravel)
+ 
+ int uml_rtc_enable_alarm(unsigned long long delta_seconds)
+ {
++#ifdef UML_HOST_DARWIN
++	struct timespec now;
++
++	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
++		return -errno;
++	if (delta_seconds > (unsigned long long)LLONG_MAX -
++			    (unsigned long long)now.tv_sec)
++		return -EINVAL;
++	pthread_mutex_lock(&uml_rtc_lock);
++	uml_rtc_alarm_armed = delta_seconds != 0;
++	uml_rtc_deadline = now;
++	uml_rtc_deadline.tv_sec += (time_t)delta_seconds;
++	pthread_cond_signal(&uml_rtc_condition);
++	pthread_mutex_unlock(&uml_rtc_lock);
++	return 0;
++#else
+ 	struct itimerspec it = {
+ 		.it_value = {
+ 			.tv_sec = delta_seconds,
+@@ -64,6 +148,7 @@ int uml_rtc_enable_alarm(unsigned long long delta_seconds)
+ 	if (timerfd_settime(uml_rtc_irq_fds[0], 0, &it, NULL))
+ 		return -errno;
+ 	return 0;
++#endif
+ }
+ 
+ void uml_rtc_disable_alarm(void)
+@@ -71,11 +156,43 @@ void uml_rtc_disable_alarm(void)
+ 	uml_rtc_enable_alarm(0);
+ }
+ 
++#ifdef UML_HOST_DARWIN
++/*
++ * Stops the alarm helper and waits until it has left this image.  The RTC
++ * exitcall reaches this through uml_rtc_stop(); a run end the host stops
++ * skips exitcalls and calls it directly, so a later call finds nothing to do.
++ */
++void uml_rtc_stop_alarm_thread(void)
++{
++	bool running;
++
++	pthread_mutex_lock(&uml_rtc_lock);
++	running = uml_rtc_thread_running;
++	uml_rtc_alarm_armed = false;
++	uml_rtc_thread_running = false;
++	pthread_cond_signal(&uml_rtc_condition);
++	pthread_mutex_unlock(&uml_rtc_lock);
++	if (running)
++		(void)pthread_join(uml_rtc_thread, NULL);
++}
++#endif
++
+ void uml_rtc_stop(bool timetravel)
+ {
++#ifdef UML_HOST_DARWIN
++	(void)timetravel;
++	uml_rtc_stop_alarm_thread();
++	if (uml_rtc_irq_fds[1] >= 0)
++		os_close_file(uml_rtc_irq_fds[1]);
++	if (uml_rtc_irq_fds[0] >= 0)
++		os_close_file(uml_rtc_irq_fds[0]);
++	uml_rtc_irq_fds[0] = -1;
++	uml_rtc_irq_fds[1] = -1;
++#else
+ 	if (timetravel)
+ 		os_close_file(uml_rtc_irq_fds[1]);
+ 	else
+ 		ignore_sigio_fd(uml_rtc_irq_fds[0]);
+ 	os_close_file(uml_rtc_irq_fds[0]);
++#endif
+ }
+diff --git a/arch/um/drivers/ssl.c b/arch/um/drivers/ssl.c
+index 8006a5bd578c27a1fdfece03bd2b0e361d1f2b0d..3818fce20a303eb8d4a2ce1398d872bd0eee3fe3 100644
+--- a/arch/um/drivers/ssl.c
++++ b/arch/um/drivers/ssl.c
+@@ -19,7 +19,7 @@
+ 
+ static const int ssl_version = 1;
+ 
+-#define NR_PORTS 64
++#define NR_PORTS CONFIG_SSL_PORTS
+ 
+ static void ssl_announce(char *dev_name, int dev)
+ {
+diff --git a/arch/um/drivers/ubd_kern.c b/arch/um/drivers/ubd_kern.c
+index 37455e74d31452c9bccd1487647c19d01f921400..739c7c843662d2a6b8fd8521e5f211c909c1cb96 100644
+--- a/arch/um/drivers/ubd_kern.c
++++ b/arch/um/drivers/ubd_kern.c
+@@ -36,6 +36,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/platform_device.h>
+ #include <linux/scatterlist.h>
++#include <linux/workqueue.h>
+ #include <kern_util.h>
+ #include "mconsole_kern.h"
+ #include <init.h>
+@@ -57,6 +58,9 @@ struct io_desc {
+ 
+ struct io_thread_req {
+ 	struct request *req;
++#ifdef UML_HOST_DARWIN
++	struct work_struct work;
++#endif
+ 	int fds[2];
+ 	unsigned long offsets[2];
+ 	unsigned long long offset;
+@@ -68,6 +72,8 @@ struct io_thread_req {
+ 	struct io_desc io_desc[];
+ };
+ 
++static void do_io(struct io_thread_req *req, struct io_desc *desc);
++
+ 
+ static struct io_thread_req * (*irq_req_buffer)[];
+ static struct io_thread_req *irq_remainder;
+@@ -476,10 +482,45 @@ static irqreturn_t ubd_intr(int irq, void *dev)
+ /* Only changed by ubd_init, which is an initcall. */
+ static struct os_helper_thread *io_td;
+ 
++#ifdef UML_HOST_DARWIN
++static struct workqueue_struct *darwin_ubd_wq;
++/* Set under ubd_lock once the exitcall has quiesced every disk. */
++static bool darwin_ubd_stopped;
++
++/*
++ * UML runs its exitcalls from machine_power_off() and machine_restart()
++ * while the other virtual CPUs still run tasks: they stop only when the run
++ * ends afterwards, and `poweroff -f` leaves every task running.  Quiesce
++ * every disk first, so that no ->queue_rq() runs or starts again, and then
++ * let destroy_workqueue() complete the requests already handed to it.  A
++ * request submitted later waits in its queue until the run ends, as it
++ * would on a machine that has stopped, instead of reaching a workqueue
++ * that is draining or gone.
++ */
++static void darwin_ubd_stop(void)
++{
++	int i;
++
++	mutex_lock(&ubd_lock);
++	darwin_ubd_stopped = true;
++	for (i = 0; i < MAX_DEV; i++)
++		if (ubd_devs[i].disk)
++			blk_mq_quiesce_queue(ubd_devs[i].disk->queue);
++	mutex_unlock(&ubd_lock);
++	if (darwin_ubd_wq) {
++		destroy_workqueue(darwin_ubd_wq);
++		darwin_ubd_wq = NULL;
++	}
++}
++#endif
++
+ static void kill_io_thread(void)
+ {
+ 	if (io_td)
+ 		os_kill_helper_thread(io_td);
++#ifdef UML_HOST_DARWIN
++	darwin_ubd_stop();
++#endif
+ }
+ 
+ __uml_exitcall(kill_io_thread);
+@@ -840,6 +881,15 @@ static int ubd_add(int n, char **error_out)
+ 	if(ubd_dev->file == NULL)
+ 		goto out;
+ 
++#ifdef UML_HOST_DARWIN
++	/* A disk added after the exitcall would have no workqueue. */
++	if (darwin_ubd_stopped) {
++		*error_out = "ubd is shut down";
++		err = -ESHUTDOWN;
++		goto out;
++	}
++#endif
++
+ 	if (ubd_dev->cow.file)
+ 		lim.max_hw_sectors = 8 * sizeof(long);
+ 	if (!ubd_dev->no_trim) {
+@@ -1108,6 +1158,19 @@ static int __init ubd_driver_init(void)
+ {
+ 	int err;
+ 
++#ifdef UML_HOST_DARWIN
++	/*
++	 * queue_rq() must return before blk_mq_end_request().  An ordered
++	 * workqueue also preserves the single helper's request ordering without
++	 * creating a second Darwin process.
++	 */
++	darwin_ubd_wq = alloc_ordered_workqueue("ubd-darwin",
++						WQ_MEM_RECLAIM);
++	if (!darwin_ubd_wq)
++		return -ENOMEM;
++	return 0;
++#endif
++
+ 	/* Set by CONFIG_BLK_DEV_UBD_SYNC or ubd=sync.*/
+ 	if(global_openflags.s){
+ 		printk(KERN_INFO "ubd: Synchronous mode\n");
+@@ -1257,11 +1320,29 @@ static struct io_thread_req *ubd_alloc_req(struct ubd *dev, struct request *req,
+ 	return io_req;
+ }
+ 
++#ifdef UML_HOST_DARWIN
++static void darwin_ubd_work(struct work_struct *work)
++{
++	struct io_thread_req *io_req =
++		container_of(work, struct io_thread_req, work);
++	int i;
++
++	if (io_req->desc_cnt == 0)
++		do_io(io_req, NULL);
++	else
++		for (i = 0; i < io_req->desc_cnt && !io_req->error; i++)
++			do_io(io_req, &io_req->io_desc[i]);
++	ubd_end_request(io_req);
++}
++#endif
++
+ static int ubd_submit_request(struct ubd *dev, struct request *req)
+ {
+ 	int segs = 0;
+ 	struct io_thread_req *io_req;
++#ifndef UML_HOST_DARWIN
+ 	int ret;
++#endif
+ 	enum req_op op = req_op(req);
+ 
+ 	if (op == REQ_OP_FLUSH)
+@@ -1279,6 +1360,19 @@ static int ubd_submit_request(struct ubd *dev, struct request *req)
+ 	if (segs)
+ 		ubd_map_req(dev, io_req, req);
+ 
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Host I/O still runs inside the UML process, but completion has to be
++	 * deferred until after queue_rq() returns.  Completing synchronously here
++	 * re-enters blk-mq dispatch while it still owns the request.
++	 */
++	INIT_WORK(&io_req->work, darwin_ubd_work);
++	if (!queue_work(darwin_ubd_wq, &io_req->work)) {
++		kfree(io_req);
++		return -EIO;
++	}
++	return sizeof(io_req);
++#else
+ 	ret = os_write_file(thread_fd, &io_req, sizeof(io_req));
+ 	if (ret != sizeof(io_req)) {
+ 		if (ret != -EAGAIN)
+@@ -1286,6 +1380,7 @@ static int ubd_submit_request(struct ubd *dev, struct request *req)
+ 		kfree(io_req);
+ 	}
+ 	return ret;
++#endif
+ }
+ 
+ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
+@@ -1297,7 +1392,9 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 
+ 	blk_mq_start_request(req);
+ 
++#ifndef UML_HOST_DARWIN
+ 	spin_lock_irq(&ubd_dev->lock);
++#endif
+ 
+ 	switch (req_op(req)) {
+ 	case REQ_OP_FLUSH:
+@@ -1312,7 +1409,9 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 		res = BLK_STS_NOTSUPP;
+ 	}
+ 
++#ifndef UML_HOST_DARWIN
+ 	spin_unlock_irq(&ubd_dev->lock);
++#endif
+ 
+ 	if (ret < 0) {
+ 		if (ret == -ENOMEM)
+@@ -1393,6 +1492,48 @@ static int map_error(int error_code)
+  * will result in unpredictable behaviour and/or crashes.
+  */
+ 
++static int ubd_pread_full(int fd, void *buffer, int length, __u64 offset)
++{
++	int completed = 0;
++
++	while (completed < length) {
++		int count = os_pread_file(fd, (char *)buffer + completed,
++					 length - completed, offset + completed);
++
++		if (count == -EINTR)
++			continue;
++		if (count < 0)
++			return count;
++		if (count == 0) {
++			memset((char *)buffer + completed, 0,
++			       length - completed);
++			return length;
++		}
++		completed += count;
++	}
++	return completed;
++}
++
++static int ubd_pwrite_full(int fd, const void *buffer, int length,
++			   __u64 offset)
++{
++	int completed = 0;
++
++	while (completed < length) {
++		int count = os_pwrite_file(fd, (const char *)buffer + completed,
++					  length - completed, offset + completed);
++
++		if (count == -EINTR)
++			continue;
++		if (count < 0)
++			return count;
++		if (count == 0)
++			return -EIO;
++		completed += count;
++	}
++	return completed;
++}
++
+ static int update_bitmap(struct io_thread_req *req, struct io_desc *segment)
+ {
+ 	int n;
+@@ -1400,8 +1541,8 @@ static int update_bitmap(struct io_thread_req *req, struct io_desc *segment)
+ 	if (segment->cow_offset == -1)
+ 		return map_error(0);
+ 
+-	n = os_pwrite_file(req->fds[1], &segment->bitmap_words,
+-			  sizeof(segment->bitmap_words), segment->cow_offset);
++	n = ubd_pwrite_full(req->fds[1], &segment->bitmap_words,
++			      sizeof(segment->bitmap_words), segment->cow_offset);
+ 	if (n != sizeof(segment->bitmap_words))
+ 		return map_error(-n);
+ 
+@@ -1440,20 +1581,14 @@ static void do_io(struct io_thread_req *req, struct io_desc *desc)
+ 
+ 		switch (req_op(req->req)) {
+ 		case REQ_OP_READ:
+-			n = 0;
+-			do {
+-				buf = &buf[n];
+-				len -= n;
+-				n = os_pread_file(req->fds[bit], buf, len, off);
+-				if (n < 0) {
+-					req->error = map_error(-n);
+-					return;
+-				}
+-			} while((n < len) && (n != 0));
+-			if (n < len) memset(&buf[n], 0, len - n);
++			n = ubd_pread_full(req->fds[bit], buf, len, off);
++			if (n < 0) {
++				req->error = map_error(-n);
++				return;
++			}
+ 			break;
+ 		case REQ_OP_WRITE:
+-			n = os_pwrite_file(req->fds[bit], buf, len, off);
++			n = ubd_pwrite_full(req->fds[bit], buf, len, off);
+ 			if(n != len){
+ 				req->error = map_error(-n);
+ 				return;
+diff --git a/arch/um/drivers/ubd_user.c b/arch/um/drivers/ubd_user.c
+index 8e8a8bf518b634378ecdcddd21dcabe01ddcd8c4..b79949ae9d4409119a992d1e2fb00a80f17b39c0 100644
+--- a/arch/um/drivers/ubd_user.c
++++ b/arch/um/drivers/ubd_user.c
+@@ -16,9 +16,6 @@
+ #include <sys/socket.h>
+ #include <sys/mman.h>
+ #include <sys/param.h>
+-#include <endian.h>
+-#include <byteswap.h>
+-
+ #include "ubd.h"
+ #include <os.h>
+ #include <poll.h>
+@@ -75,4 +72,3 @@ int ubd_write_poll(int timeout)
+ 	kernel_pollfd.events = POLLOUT;
+ 	return poll(&kernel_pollfd, 1, timeout);
+ }
+-
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index de7867ae220d0c59dc93b2df1d820a5f77a98603..18a66122189fb54d8726bb1f28c2830f4e7da743 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -21,6 +21,7 @@
+  * Based on Virtio MMIO driver by Pawel Moll, copyright 2011-2014, ARM Ltd.
+  */
+ #include <linux/module.h>
++#include <linux/dma-mapping.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+@@ -424,8 +425,8 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 			vhost_user_reply(vu_dev, &msg.msg, response);
+ 		irq_rc = IRQ_HANDLED;
+ 	}
+-	/* mask EAGAIN as we try non-blocking read until socket is empty */
+-	vu_dev->recv_rc = (rc == -EAGAIN) ? 0 : rc;
++	/* Mask the host's would-block errno after draining the nonblocking fd. */
++	vu_dev->recv_rc = os_error_is_would_block(rc) ? 0 : rc;
+ 	return irq_rc;
+ }
+ 
+@@ -434,8 +435,16 @@ static irqreturn_t vu_req_interrupt(int irq, void *data)
+ 	struct virtio_uml_device *vu_dev = data;
+ 	irqreturn_t ret = IRQ_HANDLED;
+ 
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Darwin has no time-travel comm-handler dispatcher.  Its request fd is
++	 * registered as a normal SIGIO source below, so always drain it here.
++	 */
++	ret = vu_req_read_message(vu_dev, NULL);
++#else
+ 	if (!um_irq_timetravel_handler_used())
+ 		ret = vu_req_read_message(vu_dev, NULL);
++#endif
+ 
+ 	if (vu_dev->recv_rc) {
+ 		vhost_user_check_reset(vu_dev, vu_dev->recv_rc);
+@@ -455,11 +464,13 @@ static irqreturn_t vu_req_interrupt(int irq, void *data)
+ 	return ret;
+ }
+ 
++#ifndef UML_HOST_DARWIN
+ static void vu_req_interrupt_comm_handler(int irq, int fd, void *data,
+ 					  struct time_travel_event *ev)
+ {
+ 	vu_req_read_message(data, ev);
+ }
++#endif
+ 
+ static int vhost_user_init_slave_req(struct virtio_uml_device *vu_dev)
+ {
+@@ -471,10 +482,16 @@ static int vhost_user_init_slave_req(struct virtio_uml_device *vu_dev)
+ 		return rc;
+ 	vu_dev->req_fd = req_fds[0];
+ 
++#ifdef UML_HOST_DARWIN
++	rc = um_request_irq(UM_IRQ_ALLOC, vu_dev->req_fd, IRQ_READ,
++			    vu_req_interrupt, IRQF_SHARED,
++			    vu_dev->pdev->name, vu_dev);
++#else
+ 	rc = um_request_irq_tt(UM_IRQ_ALLOC, vu_dev->req_fd, IRQ_READ,
+ 			       vu_req_interrupt, IRQF_SHARED,
+ 			       vu_dev->pdev->name, vu_dev,
+ 			       vu_req_interrupt_comm_handler);
++#endif
+ 	if (rc < 0)
+ 		goto err_close;
+ 
+@@ -825,7 +842,7 @@ static irqreturn_t vu_interrupt(int irq, void *opaque)
+ 		if (rc == sizeof(n))
+ 			ret |= vring_interrupt(irq, vq);
+ 	} while (rc == sizeof(n) || rc == -EINTR);
+-	WARN(rc != -EAGAIN, "read returned %d\n", rc);
++	WARN(!os_error_is_would_block(rc), "read returned %d\n", rc);
+ 	return ret;
+ }
+ 
+@@ -911,16 +928,12 @@ static int vu_setup_vq_call_fd(struct virtio_uml_device *vu_dev,
+ 	int call_fds[2];
+ 	int rc, irq;
+ 
+-	/* no call FD needed/desired in this case */
+-	if (vu_dev->protocol_features &
+-			BIT_ULL(VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS) &&
+-	    vu_dev->protocol_features &
+-			BIT_ULL(VHOST_USER_PROTOCOL_F_SLAVE_REQ)) {
+-		info->call_fd = -1;
+-		return 0;
+-	}
+-
+-	/* Use a pipe for call fd, since SIGIO is not supported for eventfd */
++	/*
++	 * Always retain a call descriptor, even when in-band notifications are
++	 * negotiated. Darwin has no eventfd and its time-travel backend-request
++	 * IRQ path is not suitable for normal queue completions; the socketpair
++	 * uses the regular UML IRQ path on every host.
++	 */
+ 	rc = os_pipe(call_fds, true, true);
+ 	if (rc < 0)
+ 		return rc;
+diff --git a/arch/um/drivers/vnc_input.c b/arch/um/drivers/vnc_input.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5bc59c8a4381cb99d2297700b5e572a390b7387b
+--- /dev/null
++++ b/arch/um/drivers/vnc_input.c
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * VNC keyboard and absolute-pointer input passed directly from the Darwin
++ * host frontend over an inherited datagram socket.
++ */
++
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/byteorder/generic.h>
++
++#include <init.h>
++#include <irq_kern.h>
++#include <os.h>
++
++struct uml_vnc_input_event {
++	__le16 type;
++	__le16 code;
++	__le32 value;
++} __packed;
++
++static int input_fd = -1;
++static int input_irq = -1;
++static struct input_dev *keyboard;
++static struct input_dev *pointer;
++
++static int __init vnc_input_setup(char *value)
++{
++	if (kstrtoint(value, 10, &input_fd) || input_fd < 0) {
++		pr_err("uml_vnc_input: invalid descriptor '%s'\n", value);
++		input_fd = -1;
++	}
++	return 1;
++}
++__setup("uml_vnc_input.fd=", vnc_input_setup);
++
++static void deliver_event(const struct uml_vnc_input_event *wire)
++{
++	const unsigned int type = le16_to_cpu(wire->type);
++	const unsigned int code = le16_to_cpu(wire->code);
++	const int value = (s32)le32_to_cpu(wire->value);
++
++	if (type == EV_SYN) {
++		input_sync(keyboard);
++		input_sync(pointer);
++	} else if (type == EV_ABS || type == EV_REL ||
++		   (type == EV_KEY && code >= BTN_MISC)) {
++		input_event(pointer, type, code, value);
++	} else {
++		input_event(keyboard, type, code, value);
++	}
++}
++
++static irqreturn_t vnc_input_interrupt(int irq, void *data)
++{
++	struct uml_vnc_input_event events[16];
++	bool handled = false;
++	int bytes;
++	int index;
++
++	(void)irq;
++	(void)data;
++	for (;;) {
++		bytes = os_read_file(input_fd, events, sizeof(events));
++		if (bytes <= 0)
++			break;
++		handled = true;
++		if (bytes % sizeof(events[0])) {
++			pr_warn_ratelimited(
++				"uml_vnc_input: malformed event datagram (%d bytes)\n",
++				bytes);
++			continue;
++		}
++		for (index = 0; index < bytes / sizeof(events[0]); ++index)
++			deliver_event(&events[index]);
++	}
++	return handled ? IRQ_HANDLED : IRQ_NONE;
++}
++
++static void configure_keyboard(struct input_dev *device)
++{
++	unsigned int code;
++
++	device->name = "Darwin UML VNC Keyboard";
++	device->phys = "uml/vnc/input0";
++	device->id.bustype = BUS_VIRTUAL;
++	for (code = KEY_ESC; code < BTN_MISC; ++code)
++		input_set_capability(device, EV_KEY, code);
++}
++
++static void configure_pointer(struct input_dev *device)
++{
++	device->name = "Darwin UML VNC Tablet";
++	device->phys = "uml/vnc/input1";
++	device->id.bustype = BUS_VIRTUAL;
++	__set_bit(INPUT_PROP_POINTER, device->propbit);
++	input_set_capability(device, EV_KEY, BTN_LEFT);
++	input_set_capability(device, EV_KEY, BTN_MIDDLE);
++	input_set_capability(device, EV_KEY, BTN_RIGHT);
++	input_set_capability(device, EV_REL, REL_WHEEL);
++	input_set_capability(device, EV_REL, REL_HWHEEL);
++	input_set_abs_params(device, ABS_X, 0, 32767, 0, 0);
++	input_set_abs_params(device, ABS_Y, 0, 32767, 0, 0);
++}
++
++static int __init vnc_input_init(void)
++{
++	int error;
++
++	if (input_fd < 0)
++		return 0;
++	error = os_set_fd_block(input_fd, 0);
++	if (error)
++		return error;
++
++	keyboard = input_allocate_device();
++	pointer = input_allocate_device();
++	if (!keyboard || !pointer) {
++		error = -ENOMEM;
++		goto free_devices;
++	}
++	configure_keyboard(keyboard);
++	configure_pointer(pointer);
++
++	error = input_register_device(keyboard);
++	if (error)
++		goto free_devices;
++	error = input_register_device(pointer);
++	if (error) {
++		input_free_device(pointer);
++		pointer = NULL;
++		goto unregister_keyboard;
++	}
++
++	input_irq = um_request_irq(UM_IRQ_ALLOC, input_fd, IRQ_READ,
++				   vnc_input_interrupt, 0,
++				   "uml-vnc-input", keyboard);
++	if (input_irq < 0) {
++		error = input_irq;
++		goto unregister_pointer;
++	}
++	pr_info("uml_vnc_input: registered keyboard and tablet at fd=%d\n",
++		input_fd);
++	return 0;
++
++unregister_pointer:
++	input_unregister_device(pointer);
++	pointer = NULL;
++unregister_keyboard:
++	input_unregister_device(keyboard);
++	keyboard = NULL;
++	return error;
++free_devices:
++	input_free_device(pointer);
++	input_free_device(keyboard);
++	pointer = NULL;
++	keyboard = NULL;
++	return error;
++}
++device_initcall(vnc_input_init);
++
++static void vnc_input_cleanup(void)
++{
++	if (input_irq >= 0) {
++		um_free_irq(input_irq, keyboard);
++		input_irq = -1;
++	}
++	if (pointer) {
++		input_unregister_device(pointer);
++		pointer = NULL;
++	}
++	if (keyboard) {
++		input_unregister_device(keyboard);
++		keyboard = NULL;
++	}
++	if (input_fd >= 0) {
++		os_close_file(input_fd);
++		input_fd = -1;
++	}
++}
++__uml_exitcall(vnc_input_cleanup);
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 972ac5c73aa6956a2ee45b2463f6f77bd0fe5657..fdf83b9b617ca7df5dbe2065fc69d5fc2a3f750d 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -191,6 +191,11 @@ extern void get_host_cpu_features(
+ 	void (*flags_helper_func)(char *line),
+ 	void (*cache_helper_func)(char *line));
+ 
++#ifdef UML_HOST_DARWIN
++/* drivers/rtc_user.c */
++extern void uml_rtc_stop_alarm_thread(void);
++#endif
++
+ /* mem.c */
+ extern int create_mem_file(unsigned long long len);
+ 
+diff --git a/drivers/video/console/Kconfig b/drivers/video/console/Kconfig
+index 12f54480f57f8995b125db726f89c2d10ad67e6a..ee238467ee8d423a9137f62bb1fab33e0f590119 100644
+--- a/drivers/video/console/Kconfig
++++ b/drivers/video/console/Kconfig
+@@ -72,7 +72,7 @@ config DUMMY_CONSOLE_ROWS
+ 
+ config FRAMEBUFFER_CONSOLE
+ 	bool "Framebuffer Console support"
+-	depends on FB_CORE && !UML
++	depends on FB_CORE && (!UML || !UML_STDIO_CONSOLE)
+ 	default DRM_FBDEV_EMULATION
+ 	select VT_HW_CONSOLE_BINDING
+ 	select CRC32
+@@ -150,4 +150,3 @@ config STI_CONSOLE
+ 	  The alternative is to use your primary serial port as a console.
+ 
+ endmenu
+-

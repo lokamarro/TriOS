@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 08:51:53 +0900
+Subject: [PATCH] um: apply only changed kernel PTEs in a Darwin kernel TLB
+ sync
+
+A kernel-range walk mapped every present PTE of its range again. A
+vmalloc purge flushes the whole span between the areas it frees, and
+the interpreted BPF programs a seccomp sandbox loads and frees purge on
+every free (vm_reset_perms()), so most host map calls of such a walk
+re-created a mapping the host already had.
+
+Clear a kernel PTE's _PAGE_NEEDSYNC by compare and exchange once its
+host mapping is applied, and skip a kernel PTE, or a 4 KiB profile
+slot none of whose quarters changed, that does not carry the bit. A
+writer that changes the PTE meanwhile has set the bit again and the
+flush it publishes applies the new value. User PTEs keep the bit.
+
+The exact repair of a kernel-address fault sets the bit on the
+faulting page before its walk, so it still applies that page.
+
+A guest loop of fork bursts whose children exit at once, where the
+vfree of their vmapped stacks purges a vmap range every few dozen
+rounds, ran 38% faster on 4 KiB pages and 42% faster on 16 KiB pages
+(4 vCPUs).
+---
+ arch/um/include/asm/tlbflush.h |   1 +
+ arch/um/kernel/tlb.c           | 157 +++++++++++++++++++++++++--------
+ arch/um/kernel/trap.c          |   6 +-
+ 3 files changed, 124 insertions(+), 40 deletions(-)
+
+diff --git a/arch/um/include/asm/tlbflush.h b/arch/um/include/asm/tlbflush.h
+index 458f68c3840a1ef17578329c8470f2fbae2a9cb1..66a6516d9c9cebfe2c14bb75c6104bd761ef2d8e 100644
+--- a/arch/um/include/asm/tlbflush.h
++++ b/arch/um/include/asm/tlbflush.h
+@@ -34,6 +34,7 @@ extern int um_tlb_sync(struct mm_struct *mm);
+ 
+ #ifdef UML_HOST_DARWIN
+ extern void um_tlb_sync_kernel_range(unsigned long start, unsigned long end);
++extern void um_tlb_force_kernel_page(unsigned long page);
+ extern bool um_tlb_sync_pending(struct mm_struct *mm);
+ extern int um_tlb_sync_locked(struct mm_struct *mm, unsigned long start,
+ 			      unsigned long end);
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 518cd56f2c254bc5e66527256eead5f85fb21282..90cdda698b812d9019eb9c237d3123f9754052d5 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -129,6 +129,62 @@ static int kern_unmap(struct mm_id *mm_idp,
+ 	return os_unmap_memory((void *)virt, len);
+ }
+ 
++#ifdef UML_HOST_DARWIN
++/*
++ * A kernel PTE whose host mapping has been applied loses _PAGE_NEEDSYNC, and
++ * a kernel-range walk applies only PTEs that carry it.  A vmalloc purge
++ * flushes the whole span between the areas it frees, which mostly holds live
++ * mappings the host already has, and the walk leaves those alone.  The bit is
++ * cleared only while the PTE still holds the applied value: a writer that
++ * changed it meanwhile has set the bit again, as set_pte() and pte_clear()
++ * always do, and the flush that writer publishes applies the new value.  User
++ * PTEs keep the bit; their walk does not read it.
++ */
++static void darwin_init_mm_pte_applied(pte_t *pte, pte_t applied)
++{
++	unsigned long value = pte_val(applied);
++
++	if (value & _PAGE_NEEDSYNC)
++		(void)try_cmpxchg(&pte_val(*pte), &value,
++				  value & ~_PAGE_NEEDSYNC);
++}
++
++/*
++ * The exact repair of a kernel-address fault applies the faulting page even
++ * when its PTE says the host already has it.
++ */
++void um_tlb_force_kernel_page(unsigned long page)
++{
++	unsigned long value;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++
++	page &= PAGE_MASK;
++	pgd = pgd_offset_k(page);
++	if (pgd_none(*pgd))
++		goto mark;
++	p4d = p4d_offset(pgd, page);
++	if (p4d_none(*p4d))
++		goto mark;
++	pud = pud_offset(p4d, page);
++	if (pud_none(*pud))
++		goto mark;
++	pmd = pmd_offset(pud, page);
++	if (pmd_none(*pmd))
++		goto mark;
++	pte = pte_offset_kernel(pmd, page);
++	value = READ_ONCE(pte_val(*pte));
++	while (!(value & _PAGE_NEEDSYNC) &&
++	       !try_cmpxchg(&pte_val(*pte), &value, value | _PAGE_NEEDSYNC))
++		;
++mark:
++	um_tlb_mark_sync(&init_mm, page, page + PAGE_SIZE);
++}
++#endif
++
+ #ifdef UML_HOST_DARWIN
+ #define DARWIN_HOST_PAGE_SIZE	(16UL * 1024)
+ 
+@@ -208,39 +264,15 @@ static bool darwin_init_mm_slot_congruent(const pte_t *snapshots, int *fd_out,
+ 	return true;
+ }
+ 
+-static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+-					     unsigned long addr,
+-					     struct vm_ops *ops)
++static int darwin_apply_init_mm_slot(struct vm_ops *ops, unsigned long addr,
++				     const pte_t *snapshots)
+ {
+-	pte_t snapshots[4];
+-	pte_t *pte;
+-	spinlock_t *ptl;
+ 	unsigned int index;
+ 	__u64 offset;
+ 	int prot;
+ 	int ret;
+ 	int fd;
+ 
+-	if (WARN_ON_ONCE(ops->mm != &init_mm ||
+-			 (addr & (DARWIN_HOST_PAGE_SIZE - 1))))
+-		return -EINVAL;
+-
+-	/* A 16 KiB-aligned group of four PTEs cannot cross either a PTE page or a
+-	 * PMD boundary. Read every PTE before any host operation, then release the
+-	 * page-table lock before the potentially sleeping host calls. Generic
+-	 * vmalloc writers can update these PTEs without this lock, so the four
+-	 * values are not claimed to be one atomic snapshot. Such a writer publishes
+-	 * its pending range after updating the PTEs, so the serialized later walk
+-	 * reapplies the completed state instead of losing the newer change. The
+-	 * exact fault repair separately republishes a page when host access faults.
+-	 */
+-	pte = pte_offset_kernel(pmd, addr);
+-	ptl = darwin_pte_lockptr(&init_mm, pmd);
+-	spin_lock(ptl);
+-	for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
+-		snapshots[index] = ptep_get(pte + index);
+-	spin_unlock(ptl);
+-
+ 	/* A congruent slot needs no shadow: map it as one shared host page.
+ 	 * The host publishes the dirty quarters of a shadow it replaces, and
+ 	 * stores that reach that shadow meanwhile wait for the shared page.
+@@ -250,10 +282,10 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 		return os_map_memory((void *)addr, fd, offset,
+ 				     DARWIN_HOST_PAGE_SIZE, 1,
+ 				     prot & UM_PROT_WRITE, 0);
+-	for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
++	for (index = 0; index < 4; ++index)
+ 		if (pte_present(snapshots[index]))
+ 			break;
+-	if (index == ARRAY_SIZE(snapshots))
++	if (index == 4)
+ 		return ops->unmap(ops->mm_idp, addr, DARWIN_HOST_PAGE_SIZE);
+ 
+ 	/* Flush every dirty quarter in the existing 16 KiB shadow before a newly
+@@ -269,7 +301,7 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 	 * keeping at least one intended mapping live prevents a transient 16 KiB
+ 	 * host hole during moves between quarters.
+ 	 */
+-	for (index = 0; index < ARRAY_SIZE(snapshots); ++index) {
++	for (index = 0; index < 4; ++index) {
+ 		if (!pte_present(snapshots[index]))
+ 			continue;
+ 		ret = darwin_map_init_mm_pte(ops, addr + index * PAGE_SIZE,
+@@ -277,7 +309,7 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 		if (ret)
+ 			return ret;
+ 	}
+-	for (index = 0; index < ARRAY_SIZE(snapshots); ++index) {
++	for (index = 0; index < 4; ++index) {
+ 		if (pte_present(snapshots[index]))
+ 			continue;
+ 		ret = ops->unmap(ops->mm_idp, addr + index * PAGE_SIZE,
+@@ -288,6 +320,50 @@ static noinline int update_init_mm_pte_slot(pmd_t *pmd,
+ 	return 0;
+ }
+ 
++static noinline int update_init_mm_pte_slot(pmd_t *pmd,
++					     unsigned long addr,
++					     struct vm_ops *ops)
++{
++	pte_t snapshots[4];
++	pte_t *pte;
++	spinlock_t *ptl;
++	unsigned int index;
++	int ret;
++
++	if (WARN_ON_ONCE(ops->mm != &init_mm ||
++			 (addr & (DARWIN_HOST_PAGE_SIZE - 1))))
++		return -EINVAL;
++
++	/* A 16 KiB-aligned group of four PTEs cannot cross either a PTE page or a
++	 * PMD boundary. Read every PTE before any host operation, then release the
++	 * page-table lock before the potentially sleeping host calls. Generic
++	 * vmalloc writers can update these PTEs without this lock, so the four
++	 * values are not claimed to be one atomic snapshot. Such a writer publishes
++	 * its pending range after updating the PTEs, so the serialized later walk
++	 * reapplies the completed state instead of losing the newer change. The
++	 * exact fault repair separately republishes a page when host access faults.
++	 */
++	pte = pte_offset_kernel(pmd, addr);
++	ptl = darwin_pte_lockptr(&init_mm, pmd);
++	spin_lock(ptl);
++	for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
++		snapshots[index] = ptep_get(pte + index);
++	spin_unlock(ptl);
++
++	/* The host already has a slot none of whose quarters changed. */
++	for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
++		if (pte_needsync(snapshots[index]))
++			break;
++	if (index == ARRAY_SIZE(snapshots))
++		return 0;
++	ret = darwin_apply_init_mm_slot(ops, addr, snapshots);
++	if (!ret)
++		for (index = 0; index < ARRAY_SIZE(snapshots); ++index)
++			darwin_init_mm_pte_applied(pte + index,
++						   snapshots[index]);
++	return ret;
++}
++
+ /*
+  * Linux's kernel-alias cache maintenance for a host-private slot. Callers
+  * that share a vmalloc or vmap alias with another alias of the same frames
+@@ -420,9 +496,11 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 		 * UML's original shadow-TLB walker was uniprocessor-only.  Clearing
+ 		 * _PAGE_NEEDSYNC after an unlocked host mapping operation can race a
+ 		 * concurrent zap: the stale write resurrects a PTE after its rmap was
+-		 * removed.  Snapshot under the regular page-table lock and leave the
+-		 * Linux PTE untouched.  Darwin consumes the separately locked per-mm
++		 * removed.  Snapshot under the regular page-table lock and leave a
++		 * user PTE untouched.  Darwin consumes the separately locked per-mm
+ 		 * pending range, so it does not need this bit as a completion marker.
++		 * A kernel PTE, which nothing zaps, loses the bit by compare and
++		 * exchange once applied (darwin_init_mm_pte_applied()).
+ 		 */
+ 		/*
+ 		 * The PMD can change while the walk holds only mmap_read_lock().
+@@ -454,6 +532,9 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ #ifndef UML_HOST_DARWIN
+ 		if (!pte_needsync(pteval))
+ 			continue;
++#else
++		if (ops->mm == &init_mm && !pte_needsync(pteval))
++			continue;
+ #endif
+ 
+ 		if (pte_present(pteval)) {
+@@ -498,6 +579,10 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
+ 
+ #ifdef UML_HOST_DARWIN
++		/* init_mm's page tables are never freed, so its PTE pointer
++		 * outlives the lock. */
++		if (!ret && ops->mm == &init_mm)
++			darwin_init_mm_pte_applied(pte, pteval);
+ 		if (!ret && ops->budget != 0 && --ops->budget == 0) {
+ 			ops->resume = addr + PAGE_SIZE;
+ 			ret = UML_TLB_SYNC_BATCH_FULL;
+@@ -524,7 +609,7 @@ static inline int update_pmd_range(pud_t *pud, unsigned long addr,
+ 		if (!pmd_present(*pmd)) {
+ 			if (pmd_needsync(*pmd)) {
+ #ifdef UML_HOST_DARWIN
+-				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				/* Darwin keeps this _PAGE_NEEDSYNC, so a
+ 				 * cleared kernel entry would re-unmap this
+ 				 * whole span on every covering walk.  Nothing
+ 				 * frees a vmalloc page table, so no init_mm
+@@ -560,7 +645,7 @@ static inline int update_pud_range(p4d_t *p4d, unsigned long addr,
+ 		if (!pud_present(*pud)) {
+ 			if (pud_needsync(*pud)) {
+ #ifdef UML_HOST_DARWIN
+-				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				/* Darwin keeps this _PAGE_NEEDSYNC, so a
+ 				 * cleared kernel entry would re-unmap this
+ 				 * whole span on every covering walk.  Nothing
+ 				 * frees a vmalloc page table, so no init_mm
+@@ -595,7 +680,7 @@ static inline int update_p4d_range(pgd_t *pgd, unsigned long addr,
+ 		if (!p4d_present(*p4d)) {
+ 			if (p4d_needsync(*p4d)) {
+ #ifdef UML_HOST_DARWIN
+-				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				/* Darwin keeps this _PAGE_NEEDSYNC, so a
+ 				 * cleared kernel entry would re-unmap this
+ 				 * whole span on every covering walk.  Nothing
+ 				 * frees a vmalloc page table, so no init_mm
+@@ -629,7 +714,7 @@ static int update_mm_range(struct mm_struct *mm, struct vm_ops *ops,
+ 		if (!pgd_present(*pgd)) {
+ 			if (pgd_needsync(*pgd)) {
+ #ifdef UML_HOST_DARWIN
+-				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				/* Darwin keeps this _PAGE_NEEDSYNC, so a
+ 				 * cleared kernel entry would re-unmap this
+ 				 * whole span on every covering walk.  Nothing
+ 				 * frees a vmalloc page table, so no init_mm
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index 683efe9f4e585258d8223a1459f68e294c9ed4bd..d8a452c5b234ad31f5712d3737201144293c6156 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -368,12 +368,10 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
+ 		 * Kernel has pending updates from set_ptes that were not
+ 		 * flushed yet. Force the exact faulting Linux page into this
+ 		 * snapshot even when an interrupted outer walker already cleared
+-		 * its pending range.
++		 * its pending range or a walk already marked its PTE applied.
+ 		 */
+ #ifdef UML_HOST_DARWIN
+-		unsigned long page = address & PAGE_MASK;
+-
+-		um_tlb_mark_sync(&init_mm, page, page + PAGE_SIZE);
++		um_tlb_force_kernel_page(address);
+ #endif
+ 		err = um_tlb_sync(&init_mm);
+ 		if (err == -ENOMEM)

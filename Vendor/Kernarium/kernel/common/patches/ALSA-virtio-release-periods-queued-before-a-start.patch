@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:05:23 +0900
+Subject: [PATCH] ALSA: virtio: release periods queued before a start
+
+The ack callback queues every whole period the application writes, also
+before the substream is started, and the device holds those periods until
+a START or a RELEASE. The driver released the device's queue only after
+the trigger had stopped the substream. The ALSA core triggers a stop only
+for a running substream and synchronizes it only after such a stop, so a
+substream dropped or prepared again before it had started kept its
+periods on the device: the next prepare, and any hw_params, failed with
+-EBADFD ("invalid I/O queue state"), every retry failed the same way, and
+hw_free kept the messages. Only closing and opening the device again
+released them.
+
+Release the pending messages on the device in prepare, hw_params and
+hw_free instead of refusing the substream. A device may release a
+prepared stream and prepare it again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sound/virtio/virtio_pcm_ops.c | 69 +++++++++++++++++++++++++----------
+ 1 file changed, 50 insertions(+), 19 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 906af639f19c132a890c72fc345c405c25b1a090..f162933da2a06c6228a2e22b31e3006dbd19fac4 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -95,6 +95,8 @@ static const struct virtsnd_a2v_rate g_a2v_rate_map[] = {
+ };
+ 
+ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream);
++static int virtsnd_pcm_flush(struct virtio_pcm_substream *vss);
++static int virtsnd_pcm_release(struct virtio_pcm_substream *vss);
+ 
+ /**
+  * virtsnd_pcm_open() - Open the PCM substream.
+@@ -216,14 +218,11 @@ static int virtsnd_pcm_hw_params(struct snd_pcm_substream *substream,
+ 				 struct snd_pcm_hw_params *hw_params)
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+-	struct virtio_device *vdev = vss->snd->vdev;
+ 	int rc;
+ 
+-	if (virtsnd_pcm_msg_pending_num(vss)) {
+-		dev_err(&vdev->dev, "SID %u: invalid I/O queue state\n",
+-			vss->sid);
+-		return -EBADFD;
+-	}
++	rc = virtsnd_pcm_flush(vss);
++	if (rc)
++		return rc;
+ 
+ 	rc = virtsnd_pcm_dev_set_params(vss, params_buffer_bytes(hw_params),
+ 					params_period_bytes(hw_params),
+@@ -254,8 +253,8 @@ static int virtsnd_pcm_hw_free(struct snd_pcm_substream *substream)
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+ 
+-	/* If the queue is flushed, we can safely free the messages here. */
+-	if (!virtsnd_pcm_msg_pending_num(vss))
++	/* Once the queue is flushed, the messages can be freed here. */
++	if (!virtsnd_pcm_flush(vss))
+ 		virtsnd_pcm_msg_free(vss);
+ 
+ 	return 0;
+@@ -271,22 +270,19 @@ static int virtsnd_pcm_hw_free(struct snd_pcm_substream *substream)
+ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+-	struct virtio_device *vdev = vss->snd->vdev;
+ 	struct virtio_snd_msg *msg;
++	int rc;
+ 
+ 	if (!vss->suspended) {
+-		if (virtsnd_pcm_msg_pending_num(vss)) {
+-			dev_err(&vdev->dev, "SID %u: invalid I/O queue state\n",
+-				vss->sid);
+-			return -EBADFD;
+-		}
++		rc = virtsnd_pcm_flush(vss);
++		if (rc)
++			return rc;
+ 
+ 		vss->buffer_bytes = snd_pcm_lib_buffer_bytes(substream);
+ 	} else {
+ 		struct snd_pcm_runtime *runtime = substream->runtime;
+ 		unsigned int buffer_bytes = snd_pcm_lib_buffer_bytes(substream);
+ 		unsigned int period_bytes = snd_pcm_lib_period_bytes(substream);
+-		int rc;
+ 
+ 		rc = virtsnd_pcm_dev_set_params(vss, buffer_bytes, period_bytes,
+ 						runtime->channels,
+@@ -398,16 +394,51 @@ static int virtsnd_pcm_trigger(struct snd_pcm_substream *substream, int command)
+ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+-	struct virtio_snd *snd = vss->snd;
+-	struct virtio_snd_msg *msg;
+-	unsigned int js = msecs_to_jiffies(virtsnd_msg_timeout_ms);
+-	int rc;
+ 
+ 	cancel_work_sync(&vss->elapsed_period);
+ 
+ 	if (!vss->stopped)
+ 		return 0;
+ 
++	return virtsnd_pcm_release(vss);
++}
++
++/**
++ * virtsnd_pcm_flush() - Take back the I/O messages of a substream that was
++ *                       not stopped.
++ * @vss: VirtIO PCM substream.
++ *
++ * Periods written before a start are queued on the device as well, and the
++ * ALSA core neither stops nor synchronizes a substream it drops or prepares
++ * again without having started it, so its messages can still be pending when
++ * it is prepared or its parameters change. Release them on the device rather
++ * than refuse the substream.
++ *
++ * Context: Process context.
++ * Return: 0 on success, -errno on failure.
++ */
++static int virtsnd_pcm_flush(struct virtio_pcm_substream *vss)
++{
++	if (!virtsnd_pcm_msg_pending_num(vss))
++		return 0;
++
++	return virtsnd_pcm_release(vss);
++}
++
++/**
++ * virtsnd_pcm_release() - Release the substream on the device side.
++ * @vss: VirtIO PCM substream.
++ *
++ * Context: Process context. Takes and releases the VirtIO substream spinlock.
++ * Return: 0 on success, -errno on failure.
++ */
++static int virtsnd_pcm_release(struct virtio_pcm_substream *vss)
++{
++	struct virtio_snd *snd = vss->snd;
++	struct virtio_snd_msg *msg;
++	unsigned int js = msecs_to_jiffies(virtsnd_msg_timeout_ms);
++	int rc;
++
+ 	msg = virtsnd_pcm_ctl_msg_alloc(vss, VIRTIO_SND_R_PCM_RELEASE,
+ 					GFP_KERNEL);
+ 	if (!msg)

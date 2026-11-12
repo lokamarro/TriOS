@@ -1,0 +1,1226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 12:38:51 +0900
+Subject: [PATCH] arm64: use x86 layouts for x86-64 ptrace register access
+
+The x86-64 slice inherited arm64 ptrace layouts that do not match x86
+tracers.  PTRACE_GETREGS wrote the 272-byte arm64 frame into gdb's
+216-byte user_regs_struct and smashed its stack, PTRACE_GETFPREGS was
+unimplemented, and NT_PRFPREG returned the 528-byte arm64 FPSIMD image.
+
+Serve PTRACE_GETREGS, SETREGS, GETFPREGS and SETFPREGS from the x86
+regsets, report FP state as a 512-byte FXSAVE image, and add the
+NT_X86_XSTATE regset, which reports XCR0 in the software-reserved words
+as x86 does.  i386 tasks expose, as Linux's i386 view does, the i387
+FSAVE image as NT_PRFPREG, the FXSAVE image as NT_PRXFPREG, and
+NT_X86_XSTATE.  The signal-frame code and the regsets share one
+conversion between the task FP state and a standard XSAVE image, and
+one between that image and the FSAVE image.
+
+An i386 tracer's requests use the i386 layouts, as in Linux's
+ia32_arch_ptrace(): PEEKUSR and POKEUSR over struct user32, GETREGS and
+SETREGS, GETFPREGS and SETFPREGS as the FSAVE image, and GETFPXREGS and
+SETFPXREGS as the FXSAVE image.  PTRACE_GET_THREAD_AREA and
+SET_THREAD_AREA reach the task's i386 TLS entries for a tracer of
+either ABI.
+
+PTRACE_PEEKUSER and POKEUSER follow x86 struct user rules: other fields
+read as zero, and the debug registers hold what x86 Linux keeps without
+an armed breakpoint.  DR6 reads with its reserved bits set, DR7 reads as
+last written, and DR0 to DR3 stage addresses under x86's length,
+alignment and user-space checks.  UML cannot arm a hardware breakpoint,
+so a DR7 value that enables one fails with EINVAL, as an invalid value
+does on x86, and a debugger never believes one armed.  Exec clears the
+debug registers, and a child inherits DR6 and DR7 but no staged
+breakpoint.
+---
+ arch/arm64/um/asm/processor.h   |  34 +++
+ arch/arm64/um/asm/ptrace-abi.h  |   3 +
+ arch/arm64/um/asm/ptrace.h      |   8 +
+ arch/arm64/um/ptrace.c          | 395 +++++++++++++++++++++++++++++++-
+ arch/arm64/um/signal.c          | 239 ++++++++-----------
+ arch/arm64/um/x86_32_syscalls.c |  32 +++
+ arch/arm64/um/x86_fpstate.h     | 107 +++++++++
+ arch/um/kernel/ptrace.c         |  15 +-
+ 8 files changed, 672 insertions(+), 161 deletions(-)
+ create mode 100644 arch/arm64/um/x86_fpstate.h
+
+diff --git a/arch/arm64/um/asm/processor.h b/arch/arm64/um/asm/processor.h
+index d070ff929a9f79d3d086df7ec6ed26180a193c69..6f1a05af8a7ff752fc39bd72fe6b168e40586d8c 100644
+--- a/arch/arm64/um/asm/processor.h
++++ b/arch/arm64/um/asm/processor.h
+@@ -7,6 +7,24 @@
+ #include <linux/time-internal.h>
+ #include <sysdep/faultinfo.h>
+ 
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++/*
++ * The x86 debug registers a tracer sees.  UML arms no hardware breakpoint,
++ * so they hold only what x86 Linux keeps without one: DR0 to DR3 addresses
++ * staged for a disabled breakpoint, with the length and type its checks
++ * apply to them, DR6 as the last #DB left it, and DR7 as last written.
++ */
++struct uml_x86_64_debugregs {
++	unsigned long address[4];
++	unsigned long dr6;
++	unsigned long dr7;
++	/* Slots holding a staged breakpoint, and each one's DR7 length
++	 * and type field. */
++	unsigned char staged;
++	unsigned char control[4];
++};
++#endif
++
+ struct arch_thread {
+ 	unsigned long tpidr_el0;
+ 	void *darwin_task;
+@@ -15,6 +33,9 @@ struct arch_thread {
+ 	/* PR_SME_VL_INHERIT, which survives exec. */
+ 	bool sme_vl_inherit;
+ #endif
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	struct uml_x86_64_debugregs debugregs;
++#endif
+ };
+ 
+ #define INIT_ARCH_THREAD { .tpidr_el0 = 0, .darwin_task = NULL, \
+@@ -23,6 +44,11 @@ struct arch_thread {
+ static inline void arch_flush_thread(struct arch_thread *thread)
+ {
+ 	thread->tpidr_el0 = 0;
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	/* Like flush_ptrace_hw_breakpoint(): exec drops every breakpoint
++	 * and clears DR6 and DR7. */
++	thread->debugregs = (struct uml_x86_64_debugregs) { 0 };
++#endif
+ }
+ 
+ static inline void arch_copy_thread(struct arch_thread *from,
+@@ -32,6 +58,14 @@ static inline void arch_copy_thread(struct arch_thread *from,
+ #ifdef CONFIG_UML_ARM64_SME
+ 	to->sme_vl_inherit = from->sme_vl_inherit;
+ #endif
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	/* Like x86 copy_thread(): a child inherits DR6 and DR7 but none of
++	 * the parent's breakpoints. */
++	to->debugregs = (struct uml_x86_64_debugregs) {
++		.dr6 = from->debugregs.dr6,
++		.dr7 = from->debugregs.dr7,
++	};
++#endif
+ }
+ 
+ #ifdef CONFIG_UML_ARM64_SME
+diff --git a/arch/arm64/um/asm/ptrace-abi.h b/arch/arm64/um/asm/ptrace-abi.h
+index 3afa6ed84585b358f068303471d9b3d640f20421..7af74c93f494f76334b7b6610fbe1ad56c8a58ee 100644
+--- a/arch/arm64/um/asm/ptrace-abi.h
++++ b/arch/arm64/um/asm/ptrace-abi.h
+@@ -2,8 +2,11 @@
+ #ifndef _ASM_UM_ARM64_PTRACE_ABI_H
+ #define _ASM_UM_ARM64_PTRACE_ABI_H
+ 
++/* The x86-64 slice serves these in subarch_ptrace() with x86 layouts. */
++#ifndef CONFIG_UML_X86_64_USERSPACE_ONLY
+ #define PTRACE_GETREGS 12
+ #define PTRACE_SETREGS 13
++#endif
+ #define PTRACE_GETFPREGS 14
+ #define PTRACE_SETFPREGS 15
+ #define PTRACE_OLDSETOPTIONS 21
+diff --git a/arch/arm64/um/asm/ptrace.h b/arch/arm64/um/asm/ptrace.h
+index 50bb312cff0f0d9e22d268238c92cc5e6aa1a5be..f0ec293ba7b1a9bb5e977f0f6d0bdb83a2aee383 100644
+--- a/arch/arm64/um/asm/ptrace.h
++++ b/arch/arm64/um/asm/ptrace.h
+@@ -39,6 +39,13 @@ static inline long regs_return_value(struct pt_regs *regs)
+ 	return PT_REGS_SYSCALL_RET(regs);
+ }
+ 
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++/* The task's i386 TLS descriptors, as on Linux x86. */
++int ptrace_get_thread_area(struct task_struct *child, int index,
++			   void __user *address);
++int ptrace_set_thread_area(struct task_struct *child, int index,
++			   void __user *address);
++#else
+ static inline int ptrace_get_thread_area(struct task_struct *child, int index,
+ 					 void __user *address)
+ {
+@@ -50,6 +57,7 @@ static inline int ptrace_set_thread_area(struct task_struct *child, int index,
+ {
+ 	return -EIO;
+ }
++#endif
+ 
+ extern void arch_switch_to(struct task_struct *to);
+ 
+diff --git a/arch/arm64/um/ptrace.c b/arch/arm64/um/ptrace.c
+index e8d509dab1e4e87fe0d4d9db8e065385d5be54b9..f355df97e151ed1cc8dd53909aad7f4c0fee4696 100644
+--- a/arch/arm64/um/ptrace.c
++++ b/arch/arm64/um/ptrace.c
+@@ -1,11 +1,44 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
++#include <linux/compat.h>
+ #include <linux/elf.h>
++#include <linux/ptrace.h>
+ #include <linux/regset.h>
+ #include <linux/sched.h>
+ #include <linux/uaccess.h>
+ #include <asm/ptrace.h>
++#include <asm/ptrace-abi.h>
+ #include <asm/user.h>
++#include "x86_fpstate.h"
++
++/* struct user offsets for x86-64 PTRACE_PEEKUSER and PTRACE_POKEUSER. */
++#define UML_X86_64_USER_DEBUGREG 848
++#define UML_X86_64_USER_SIZE 928
++/* struct user32 offsets for the i386 requests. */
++#define UML_X86_32_USER_DEBUGREG 252
++#define UML_X86_32_USER_SIZE 284
++/* DR6 bits x86 reads as set, which Linux keeps flipped in its copy so
++ * that zero is the idle state, and DR6.BS. */
++#define UML_X86_64_DR6_RESERVED 0xffff0ff0UL
++#define UML_X86_64_DR6_STEP 0x4000UL
++/* DR7's local and global enable bits for DR0 to DR3. */
++#define UML_X86_64_DR7_ENABLE_MASK 0xffUL
++/* TASK_SIZE_MAX of a 4-level x86-64 kernel: a breakpoint reaching it would
++ * watch kernel space. */
++#define UML_X86_64_TASK_SIZE_MAX ((1UL << 47) - 4096)
++/* x86 request numbers, which i386 shares. */
++#define UML_X86_64_PTRACE_GETREGS 12
++#define UML_X86_64_PTRACE_SETREGS 13
++#define UML_X86_64_PTRACE_GETFPREGS 14
++#define UML_X86_64_PTRACE_SETFPREGS 15
++#define UML_X86_32_PTRACE_GETFPXREGS 18
++#define UML_X86_32_PTRACE_SETFPXREGS 19
++
++enum {
++	REGSET_XSTATE = REGSET_FP + 1,
++	/* i386 only: its REGSET_FP is the i387 FSAVE image. */
++	REGSET_XFP,
++};
+ 
+ static int register_index(int regno)
+ {
+@@ -158,26 +191,158 @@ int putreg(struct task_struct *child, int regno, unsigned long value)
+ 	return 0;
+ }
+ 
++static bool debugreg_offset(long addr)
++{
++	return addr >= UML_X86_64_USER_DEBUGREG &&
++		addr < UML_X86_64_USER_DEBUGREG + 8 * sizeof(unsigned long);
++}
++
++/* The DR7 length and type field of breakpoint n. */
++static unsigned int dr7_control(unsigned long dr7, unsigned int n)
++{
++	return (dr7 >> (16 + 4 * n)) & 0xf;
++}
++
++/*
++ * Whether a breakpoint of this DR7 length and type at this address is one
++ * x86 Linux accepts, as arch_build_bp_info(), hw_breakpoint_arch_parse()
++ * and arch_check_bp_in_kernelspace() judge it: no I/O type, an execute
++ * breakpoint of length one, an address aligned to its length, and a range
++ * wholly in user space.
++ */
++static bool debugreg_valid(unsigned long address, unsigned int control)
++{
++	static const unsigned char length[] = { 1, 2, 8, 4 };
++	unsigned int type = control & 3;
++	unsigned long bytes = length[control >> 2];
++
++	if (type == 2 || (type == 0 && bytes != 1))
++		return false;
++	if (address & (bytes - 1))
++		return false;
++	return address < UML_X86_64_TASK_SIZE_MAX &&
++		address + bytes - 1 < UML_X86_64_TASK_SIZE_MAX;
++}
++
++/*
++ * Like x86's ptrace_get_debugreg(): DR0 to DR3 read a staged breakpoint's
++ * address, DR6 the last #DB's status with its reserved bits set, and DR7
++ * the last value written.
++ */
++static unsigned long get_debugreg(struct task_struct *child, unsigned long n)
++{
++	const struct uml_x86_64_debugregs *debug = &child->thread.arch.debugregs;
++
++	if (n < 4)
++		return debug->staged & (1U << n) ? debug->address[n] : 0;
++	if (n == 6)
++		return debug->dr6 ^ UML_X86_64_DR6_RESERVED;
++	if (n == 7)
++		return debug->dr7;
++	return 0;
++}
++
++/*
++ * Like x86's ptrace_set_debugreg(), except that UML arms no hardware
++ * breakpoint.  An address in DR0 to DR3 stages a disabled breakpoint, and
++ * DR7 may change a staged one's length and type, both under x86's checks.
++ * A DR7 value that enables a breakpoint fails with EINVAL, as an invalid
++ * one does on x86, so a debugger knows the breakpoint is not armed.
++ */
++static int set_debugreg(struct task_struct *child, unsigned long n,
++			unsigned long value)
++{
++	struct uml_x86_64_debugregs *debug = &child->thread.arch.debugregs;
++	unsigned int i;
++
++	if (n < 4) {
++		/* A new breakpoint starts as x86's one-byte write stub. */
++		unsigned int control = debug->staged & (1U << n) ?
++			debug->control[n] : 1;
++
++		if (!debugreg_valid(value, control))
++			return -EINVAL;
++		debug->address[n] = value;
++		debug->control[n] = control;
++		debug->staged |= 1U << n;
++		return 0;
++	}
++	if (n == 6) {
++		debug->dr6 = value ^ UML_X86_64_DR6_RESERVED;
++		return 0;
++	}
++	if (n != 7)
++		return -EIO;
++	if (value & UML_X86_64_DR7_ENABLE_MASK)
++		return -EINVAL;
++	for (i = 0; i < 4; i++)
++		if ((debug->staged & (1U << i)) &&
++		    !debugreg_valid(debug->address[i], dr7_control(value, i)))
++			return -EINVAL;
++	for (i = 0; i < 4; i++)
++		if (debug->staged & (1U << i))
++			debug->control[i] = dr7_control(value, i);
++	debug->dr7 = value;
++	return 0;
++}
++
+ int peek_user(struct task_struct *child, long addr, long data)
+ {
+-	unsigned long value;
++	unsigned long value = 0;
+ 
+-	if (register_index(addr) < 0)
++	if (addr < 0 || addr >= UML_X86_64_USER_SIZE ||
++	    (addr & (sizeof(unsigned long) - 1)))
+ 		return -EIO;
+-	value = getreg(child, addr);
++	if (register_index(addr) >= 0)
++		value = getreg(child, addr);
++	else if (debugreg_offset(addr))
++		value = get_debugreg(child, (addr - UML_X86_64_USER_DEBUGREG) /
++				     sizeof(unsigned long));
+ 	return put_user(value, (unsigned long __user *)data);
+ }
+ 
+ int poke_user(struct task_struct *child, long addr, long data)
+ {
+-	if (register_index(addr) < 0)
++	if (addr < 0 || addr >= UML_X86_64_USER_SIZE ||
++	    (addr & (sizeof(unsigned long) - 1)))
+ 		return -EIO;
+-	return putreg(child, addr, data);
++	if (register_index(addr) >= 0)
++		return putreg(child, addr, data);
++	if (debugreg_offset(addr))
++		return set_debugreg(child, (addr - UML_X86_64_USER_DEBUGREG) /
++				    sizeof(unsigned long), data);
++	return -EIO;
+ }
+ 
++static const struct user_regset_view uml_x86_64_view;
++
+ long subarch_ptrace(struct task_struct *child, long request,
+ 		    unsigned long addr, unsigned long data)
+ {
++	void __user *datap = (void __user *)data;
++
++	switch (request) {
++	case UML_X86_64_PTRACE_GETREGS:
++		return copy_regset_to_user(child, &uml_x86_64_view,
++					   REGSET_GENERAL, 0,
++					   sizeof(struct user_regs_struct),
++					   datap);
++	case UML_X86_64_PTRACE_SETREGS:
++		return copy_regset_from_user(child, &uml_x86_64_view,
++					     REGSET_GENERAL, 0,
++					     sizeof(struct user_regs_struct),
++					     datap);
++	case UML_X86_64_PTRACE_GETFPREGS:
++		return copy_regset_to_user(child, &uml_x86_64_view,
++					   REGSET_FP, 0,
++					   sizeof(struct uml_x86_64_fpstate),
++					   datap);
++	case UML_X86_64_PTRACE_SETFPREGS:
++		return copy_regset_from_user(child, &uml_x86_64_view,
++					     REGSET_FP, 0,
++					     sizeof(struct uml_x86_64_fpstate),
++					     datap);
++	}
+ 	return -EIO;
+ }
+ 
+@@ -233,11 +398,40 @@ static int genregs32_set(struct task_struct *target,
+ 	return error;
+ }
+ 
++static int fsave_get(struct task_struct *target,
++		     const struct user_regset *regset, struct membuf to)
++{
++	struct uml_x86_32_fsave fsave;
++
++	uml_x86_32_get_fsave(&target->thread.regs.regs, &fsave);
++	return membuf_write(&to, &fsave, sizeof(fsave));
++}
++
++static int fsave_set(struct task_struct *target,
++		     const struct user_regset *regset,
++		     unsigned int pos, unsigned int count,
++		     const void *kbuf, const void __user *ubuf)
++{
++	struct uml_x86_32_fsave fsave;
++	int error;
++
++	/* As on Linux, only a whole image. */
++	if (pos || count != sizeof(fsave))
++		return -EINVAL;
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++				   &fsave, 0, sizeof(fsave));
++	if (!error)
++		uml_x86_32_set_fsave(&target->thread.regs.regs, &fsave);
++	return error;
++}
++
+ static int fpregs_get(struct task_struct *target,
+ 		      const struct user_regset *regset, struct membuf to)
+ {
+-	membuf_write(&to, target->thread.regs.regs.fp, host_fp_size);
+-	return 0;
++	struct uml_x86_64_xstate state;
++
++	uml_x86_64_get_xstate(&target->thread.regs.regs, &state);
++	return membuf_write(&to, &state.fpstate, sizeof(state.fpstate));
+ }
+ 
+ static int fpregs_set(struct task_struct *target,
+@@ -245,8 +439,55 @@ static int fpregs_set(struct task_struct *target,
+ 		      unsigned int pos, unsigned int count,
+ 		      const void *kbuf, const void __user *ubuf)
+ {
+-	return user_regset_copyin(&pos, &count, &kbuf, &ubuf,
+-		target->thread.regs.regs.fp, 0, host_fp_size);
++	struct uml_x86_64_xstate state;
++	int error;
++
++	uml_x86_64_get_xstate(&target->thread.regs.regs, &state);
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++				   &state.fpstate, 0, sizeof(state.fpstate));
++	if (error)
++		return error;
++	return uml_x86_64_set_xstate(&target->thread.regs.regs, &state,
++				     UML_X86_64_XFEATURES);
++}
++
++static int xstate_get(struct task_struct *target,
++		      const struct user_regset *regset, struct membuf to)
++{
++	struct uml_x86_64_xstate state;
++	u64 xcr0 = UML_X86_64_XFEATURES;
++
++	uml_x86_64_get_xstate(&target->thread.regs.regs, &state);
++	/* ptrace reports XCR0 in the first software-reserved word. */
++	memset(&state.fpstate.sw_reserved, 0,
++	       sizeof(state.fpstate.sw_reserved));
++	memcpy(&state.fpstate.sw_reserved, &xcr0, sizeof(xcr0));
++	return membuf_write(&to, &state, sizeof(state));
++}
++
++static int xstate_set(struct task_struct *target,
++		      const struct user_regset *regset,
++		      unsigned int pos, unsigned int count,
++		      const void *kbuf, const void __user *ubuf)
++{
++	struct uml_x86_64_xstate state;
++	unsigned int index;
++	int error;
++
++	if (pos || count != sizeof(state))
++		return -EFAULT;
++	uml_x86_64_get_xstate(&target->thread.regs.regs, &state);
++	error = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++				   &state, 0, sizeof(state));
++	if (error)
++		return error;
++	if (state.header.xfeatures & ~UML_X86_64_XFEATURES)
++		return -EINVAL;
++	for (index = 0; index < ARRAY_SIZE(state.header.reserved); index++)
++		if (state.header.reserved[index])
++			return -EINVAL;
++	return uml_x86_64_set_xstate(&target->thread.regs.regs, &state,
++				     state.header.xfeatures);
+ }
+ 
+ static const struct user_regset uml_x86_64_regsets[] = {
+@@ -260,12 +501,20 @@ static const struct user_regset uml_x86_64_regsets[] = {
+ 	},
+ 	[REGSET_FP] = {
+ 		USER_REGSET_NOTE_TYPE(PRFPREG),
+-		.n = sizeof(elf_fpregset_t) / sizeof(unsigned long),
+-		.size = sizeof(unsigned long),
+-		.align = sizeof(unsigned long),
++		.n = sizeof(struct uml_x86_64_fpstate) / sizeof(u64),
++		.size = sizeof(u64),
++		.align = sizeof(u64),
+ 		.regset_get = fpregs_get,
+ 		.set = fpregs_set,
+ 	},
++	[REGSET_XSTATE] = {
++		USER_REGSET_NOTE_TYPE(X86_XSTATE),
++		.n = sizeof(struct uml_x86_64_xstate) / sizeof(u64),
++		.size = sizeof(u64),
++		.align = sizeof(u64),
++		.regset_get = xstate_get,
++		.set = xstate_set,
++	},
+ };
+ 
+ static const struct user_regset_view uml_x86_64_view = {
+@@ -284,6 +533,30 @@ static const struct user_regset uml_x86_32_regsets[] = {
+ 		.regset_get = genregs32_get,
+ 		.set = genregs32_set,
+ 	},
++	[REGSET_FP] = {
++		USER_REGSET_NOTE_TYPE(PRFPREG),
++		.n = sizeof(struct uml_x86_32_fsave) / sizeof(u32),
++		.size = sizeof(u32),
++		.align = sizeof(u32),
++		.regset_get = fsave_get,
++		.set = fsave_set,
++	},
++	[REGSET_XSTATE] = {
++		USER_REGSET_NOTE_TYPE(X86_XSTATE),
++		.n = sizeof(struct uml_x86_64_xstate) / sizeof(u64),
++		.size = sizeof(u64),
++		.align = sizeof(u64),
++		.regset_get = xstate_get,
++		.set = xstate_set,
++	},
++	[REGSET_XFP] = {
++		USER_REGSET_NOTE_TYPE(PRXFPREG),
++		.n = sizeof(struct uml_x86_64_fpstate) / sizeof(u32),
++		.size = sizeof(u32),
++		.align = sizeof(u32),
++		.regset_get = fpregs_get,
++		.set = fpregs_set,
++	},
+ };
+ 
+ static const struct user_regset_view uml_x86_32_view = {
+@@ -301,3 +574,101 @@ task_user_regset_view(struct task_struct *task)
+ 		return &uml_x86_32_view;
+ 	return &uml_x86_64_view;
+ }
++
++#ifdef CONFIG_COMPAT
++/* Like Linux's getreg32(): struct user32 holds the general registers and the
++ * debug registers, and its other fields, up to and including the offset
++ * just past it, read as zero.
++ */
++static int peek_user32(struct task_struct *child, compat_ulong_t addr,
++		       u32 *value)
++{
++	struct uml_x86_32_user_regs regs;
++
++	if (addr > UML_X86_32_USER_SIZE || (addr & 3))
++		return -EIO;
++	*value = 0;
++	if (addr < sizeof(regs)) {
++		get_user_regs32(&child->thread.regs.regs, &regs);
++		*value = ((u32 *)&regs)[addr / sizeof(u32)];
++	} else if (addr >= UML_X86_32_USER_DEBUGREG &&
++		   addr < UML_X86_32_USER_SIZE) {
++		*value = get_debugreg(child, (addr - UML_X86_32_USER_DEBUGREG) /
++				      sizeof(u32));
++	}
++	return 0;
++}
++
++/* Like Linux's putreg32(): writes to other fields are ignored. */
++static int poke_user32(struct task_struct *child, compat_ulong_t addr,
++		       u32 value)
++{
++	struct uml_x86_32_user_regs regs;
++
++	if (addr > UML_X86_32_USER_SIZE || (addr & 3))
++		return -EIO;
++	if (addr >= UML_X86_32_USER_DEBUGREG && addr < UML_X86_32_USER_SIZE)
++		return set_debugreg(child, (addr - UML_X86_32_USER_DEBUGREG) /
++				    sizeof(u32), value);
++	if (addr >= sizeof(regs))
++		return 0;
++	get_user_regs32(&child->thread.regs.regs, &regs);
++	((u32 *)&regs)[addr / sizeof(u32)] = value;
++	set_user_regs32(&child->thread.regs.regs, &regs);
++	return 0;
++}
++
++/* An i386 tracer's requests, as Linux's ia32_arch_ptrace() serves them: its
++ * register requests use the i386 layouts whatever the tracee's mode.
++ */
++long compat_arch_ptrace(struct task_struct *child, compat_long_t request,
++			compat_ulong_t addr, compat_ulong_t data)
++{
++	void __user *datap = compat_ptr(data);
++	u32 value;
++	int error;
++
++	switch (request) {
++	case PTRACE_PEEKUSR:
++		error = peek_user32(child, addr, &value);
++		return error ? error : put_user(value, (u32 __user *)datap);
++	case PTRACE_POKEUSR:
++		return poke_user32(child, addr, data);
++	case UML_X86_64_PTRACE_GETREGS:
++		return copy_regset_to_user(child, &uml_x86_32_view,
++					   REGSET_GENERAL, 0,
++					   sizeof(struct uml_x86_32_user_regs),
++					   datap);
++	case UML_X86_64_PTRACE_SETREGS:
++		return copy_regset_from_user(child, &uml_x86_32_view,
++					     REGSET_GENERAL, 0,
++					     sizeof(struct uml_x86_32_user_regs),
++					     datap);
++	case UML_X86_64_PTRACE_GETFPREGS:
++		return copy_regset_to_user(child, &uml_x86_32_view,
++					   REGSET_FP, 0,
++					   sizeof(struct uml_x86_32_fsave),
++					   datap);
++	case UML_X86_64_PTRACE_SETFPREGS:
++		return copy_regset_from_user(child, &uml_x86_32_view,
++					     REGSET_FP, 0,
++					     sizeof(struct uml_x86_32_fsave),
++					     datap);
++	case UML_X86_32_PTRACE_GETFPXREGS:
++		return copy_regset_to_user(child, &uml_x86_32_view,
++					   REGSET_XFP, 0,
++					   sizeof(struct uml_x86_64_fpstate),
++					   datap);
++	case UML_X86_32_PTRACE_SETFPXREGS:
++		return copy_regset_from_user(child, &uml_x86_32_view,
++					     REGSET_XFP, 0,
++					     sizeof(struct uml_x86_64_fpstate),
++					     datap);
++	case PTRACE_GET_THREAD_AREA:
++		return ptrace_get_thread_area(child, addr, datap);
++	case PTRACE_SET_THREAD_AREA:
++		return ptrace_set_thread_area(child, addr, datap);
++	}
++	return compat_ptrace_request(child, request, addr, data);
++}
++#endif
+diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
+index 84b1210e87c4a7280016c2c16f6f2a6d3eb67c4a..0707bdfd0051e48c6eb91afcd6d2d7dd31d17bc0 100644
+--- a/arch/arm64/um/signal.c
++++ b/arch/arm64/um/signal.c
+@@ -12,6 +12,7 @@
+ #include <asm/elf.h>
+ #include <asm/ptrace.h>
+ #include <frame_kern.h>
++#include "x86_fpstate.h"
+ #include "x86_syscall_abi.h"
+ 
+ /* Keep these layouts independent from the host architecture headers.  They
+@@ -63,57 +64,8 @@ struct uml_x86_64_rt_sigframe {
+ 	struct siginfo info;
+ };
+ 
+-struct uml_x86_64_fpx_sw_bytes {
+-	unsigned int magic1;
+-	unsigned int extended_size;
+-	unsigned long xfeatures;
+-	unsigned int xstate_size;
+-	unsigned int padding[7];
+-};
+-
+-struct uml_x86_64_fpstate {
+-	unsigned short cwd;
+-	unsigned short swd;
+-	unsigned short twd;
+-	unsigned short fop;
+-	unsigned long rip;
+-	unsigned long rdp;
+-	unsigned int mxcsr;
+-	unsigned int mxcsr_mask;
+-	unsigned int st_space[32];
+-	unsigned int xmm_space[64];
+-	unsigned int reserved2[12];
+-	union {
+-		unsigned int reserved3[12];
+-		struct uml_x86_64_fpx_sw_bytes sw_reserved;
+-	};
+-};
+-
+-struct uml_x86_64_xstate_header {
+-	unsigned long xfeatures;
+-	unsigned long reserved[7];
+-};
+-
+-struct uml_x86_64_xstate {
+-	struct uml_x86_64_fpstate fpstate;
+-	struct uml_x86_64_xstate_header header;
+-	unsigned int ymmh_space[64];
+-};
+-
+-struct uml_x86_32_fpreg {
+-	u16 significand[4];
+-	u16 exponent;
+-};
+-
+ struct uml_x86_32_fpstate_legacy {
+-	u32 control;
+-	u32 status;
+-	u32 tag;
+-	u32 instruction_pointer;
+-	u32 code_selector;
+-	u32 data_pointer;
+-	u32 data_selector;
+-	struct uml_x86_32_fpreg registers[8];
++	struct uml_x86_32_fsave fsave;
+ 	u16 saved_status;
+ 	u16 magic;
+ };
+@@ -184,18 +136,6 @@ struct uml_x86_32_sigframe {
+ 	u8 retcode[8];
+ };
+ 
+-/* The Darwin bridge stores sixteen 256-bit x86 vectors in the same 512-byte
+- * payload used by the arm64 FPSIMD register array.  The remaining words are
+- * x86 control state when the marker is present.
+- */
+-struct uml_x86_64_task_fpstate {
+-	unsigned char vectors[16][32];
+-	unsigned int mxcsr;
+-	unsigned int x87_control_status;
+-	unsigned int x87_tag_top;
+-	unsigned int marker;
+-};
+-
+ #define UML_X86_64_USER_CS 0x33
+ #define UML_X86_64_USER_SS 0x2b
+ #define UML_X86_64_UC_FP_XSTATE 0x1
+@@ -203,13 +143,6 @@ struct uml_x86_64_task_fpstate {
+ #define UML_X86_64_UC_STRICT_RESTORE_SS 0x4
+ #define UML_X86_64_FP_XSTATE_MAGIC1 0x46505853U
+ #define UML_X86_64_FP_XSTATE_MAGIC2 0x46505845U
+-#define UML_X86_64_FP_MARKER 0x58383634U
+-#define UML_X86_64_XFEATURE_X87 (1UL << 0)
+-#define UML_X86_64_XFEATURE_SSE (1UL << 1)
+-#define UML_X86_64_XFEATURE_AVX (1UL << 2)
+-#define UML_X86_64_XFEATURES (UML_X86_64_XFEATURE_X87 | \
+-	UML_X86_64_XFEATURE_SSE | UML_X86_64_XFEATURE_AVX)
+-#define UML_X86_64_XSTATE_SIZE sizeof(struct uml_x86_64_xstate)
+ #define UML_X86_64_XSTATE_FRAME_SIZE \
+ 	(UML_X86_64_XSTATE_SIZE + sizeof(unsigned int))
+ #define UML_X86_32_FSAVE_HEADER_SIZE \
+@@ -219,7 +152,6 @@ struct uml_x86_64_task_fpstate {
+ #define UML_X86_64_X87_SIGNIFICAND_SLOT 19
+ #define UML_X86_64_X87_EXPONENT_SLOT 27
+ #define UML_X86_64_X87_TOP_MASK (7U << 11)
+-#define UML_X86_64_MXCSR_MASK 0xffffU
+ #define UML_X86_64_RFLAGS_TF (1UL << 8)
+ #define UML_X86_64_RFLAGS_DF (1UL << 10)
+ #define UML_X86_64_RFLAGS_RF (1UL << 16)
+@@ -228,9 +160,6 @@ struct uml_x86_64_task_fpstate {
+ #define UML_X86_32_NR_SIGRETURN 119
+ #define UML_X86_32_NR_RT_SIGRETURN 173
+ 
+-static_assert(sizeof(struct uml_x86_64_fpstate) == 512);
+-static_assert(sizeof(struct uml_x86_64_xstate_header) == 64);
+-static_assert(sizeof(struct uml_x86_64_xstate) == 832);
+ static_assert(sizeof(struct uml_x86_32_fpstate_legacy) == 112);
+ static_assert(sizeof(struct uml_x86_32_fpstate) == 624);
+ static_assert(sizeof(struct uml_x86_32_xstate) == 944);
+@@ -304,19 +233,16 @@ static void clear_x86_64_fpstate(struct uml_pt_regs *guest)
+ 	}
+ }
+ 
+-static int save_x86_64_fpstate(struct uml_x86_64_xstate __user *user_state,
+-			       struct pt_regs *regs,
+-			       unsigned int extended_size)
++void uml_x86_64_get_xstate(struct uml_pt_regs *guest,
++			   struct uml_x86_64_xstate *out)
+ {
+ 	struct uml_x86_64_xstate state = { };
+-	struct uml_pt_regs *guest = &regs->regs;
+ 	struct uml_x86_64_task_fpstate *task = x86_64_task_fpstate(guest);
+ 	unsigned short control = 0x037f;
+ 	unsigned short status = 0;
+ 	unsigned short tag = 0xffff;
+ 	unsigned int top = 0;
+ 	unsigned int index;
+-	unsigned int magic2 = UML_X86_64_FP_XSTATE_MAGIC2;
+ 	unsigned int mxcsr = 0x1f80;
+ 
+ 	if (task->marker == UML_X86_64_FP_MARKER) {
+@@ -352,11 +278,22 @@ static int save_x86_64_fpstate(struct uml_x86_64_xstate __user *user_state,
+ 			       task->vectors[index] + 16, 16);
+ 		}
+ 	}
++	state.header.xfeatures = UML_X86_64_XFEATURES;
++	*out = state;
++}
++
++static int save_x86_64_fpstate(struct uml_x86_64_xstate __user *user_state,
++			       struct pt_regs *regs,
++			       unsigned int extended_size)
++{
++	struct uml_x86_64_xstate state;
++	unsigned int magic2 = UML_X86_64_FP_XSTATE_MAGIC2;
++
++	uml_x86_64_get_xstate(&regs->regs, &state);
+ 	state.fpstate.sw_reserved.magic1 = UML_X86_64_FP_XSTATE_MAGIC1;
+ 	state.fpstate.sw_reserved.extended_size = extended_size;
+ 	state.fpstate.sw_reserved.xfeatures = UML_X86_64_XFEATURES;
+ 	state.fpstate.sw_reserved.xstate_size = UML_X86_64_XSTATE_SIZE;
+-	state.header.xfeatures = UML_X86_64_XFEATURES;
+ 
+ 	if (copy_to_user(user_state, &state, sizeof(state)))
+ 		return 1;
+@@ -370,15 +307,12 @@ static int restore_x86_64_fpstate(struct pt_regs *regs,
+ {
+ 	struct uml_x86_64_xstate state = { };
+ 	struct uml_pt_regs *guest = &regs->regs;
+-	struct uml_x86_64_task_fpstate *task = x86_64_task_fpstate(guest);
+ 	struct uml_x86_64_xstate __user *user_state =
+ 		(void __user *)user_address;
+ 	unsigned long present = UML_X86_64_XFEATURE_X87 |
+ 		UML_X86_64_XFEATURE_SSE;
+ 	unsigned int magic2;
+-	unsigned int top;
+ 	unsigned int index;
+-	unsigned short tag = 0xffff;
+ 	bool extended = false;
+ 
+ 	if (!user_address) {
+@@ -421,19 +355,31 @@ static int restore_x86_64_fpstate(struct pt_regs *regs,
+ 		    !(present & UML_X86_64_XFEATURE_SSE))
+ 			return 1;
+ 	}
++	return uml_x86_64_set_xstate(guest, &state, present) ? 1 : 0;
++}
++
++int uml_x86_64_set_xstate(struct uml_pt_regs *guest,
++			  const struct uml_x86_64_xstate *state,
++			  unsigned long present)
++{
++	struct uml_x86_64_task_fpstate *task = x86_64_task_fpstate(guest);
++	unsigned int top;
++	unsigned int index;
++	unsigned short tag = 0xffff;
++
+ 	if ((present & UML_X86_64_XFEATURE_SSE) &&
+-	    (state.fpstate.mxcsr & ~UML_X86_64_MXCSR_MASK))
+-		return 1;
++	    (state->fpstate.mxcsr & ~UML_X86_64_MXCSR_MASK))
++		return -EINVAL;
+ 
+ 	clear_x86_64_fpstate(guest);
+ 	if (present & UML_X86_64_XFEATURE_X87) {
+-		top = (state.fpstate.swd >> 11) & 7;
++		top = (state->fpstate.swd >> 11) & 7;
+ 		for (index = 0; index < 8; index++) {
+ 			unsigned int physical = (top + index) & 7;
+ 			unsigned long significand;
+ 			unsigned short exponent;
+-			unsigned char *slot =
+-				(void *)&state.fpstate.st_space[index * 4];
++			const unsigned char *slot =
++				(const void *)&state->fpstate.st_space[index * 4];
+ 
+ 			memcpy(&significand, slot, sizeof(significand));
+ 			memcpy(&exponent, slot + sizeof(significand),
+@@ -441,7 +387,7 @@ static int restore_x86_64_fpstate(struct pt_regs *regs,
+ 			UPT_X(guest, UML_X86_64_X87_SIGNIFICAND_SLOT + physical) =
+ 				significand;
+ 			x86_64_set_x87_exponent(guest, physical, exponent);
+-			if (state.fpstate.twd & (1U << physical)) {
++			if (state->fpstate.twd & (1U << physical)) {
+ 				unsigned int shift = physical * 2;
+ 				unsigned short value;
+ 
+@@ -450,55 +396,88 @@ static int restore_x86_64_fpstate(struct pt_regs *regs,
+ 				tag = (tag & ~(3U << shift)) | (value << shift);
+ 			}
+ 		}
+-		task->x87_control_status = state.fpstate.cwd |
+-			((unsigned int)(state.fpstate.swd &
++		task->x87_control_status = state->fpstate.cwd |
++			((unsigned int)(state->fpstate.swd &
+ 			  ~UML_X86_64_X87_TOP_MASK) << 16);
+ 		task->x87_tag_top = tag | (top << 16);
+ 	}
+ 	if (present & UML_X86_64_XFEATURE_SSE) {
+-		task->mxcsr = state.fpstate.mxcsr;
++		task->mxcsr = state->fpstate.mxcsr;
+ 		for (index = 0; index < 16; index++)
+ 			memcpy(task->vectors[index],
+-			       &state.fpstate.xmm_space[index * 4], 16);
++			       &state->fpstate.xmm_space[index * 4], 16);
+ 	}
+ 	if (present & UML_X86_64_XFEATURE_AVX)
+ 		for (index = 0; index < 16; index++)
+ 			memcpy(task->vectors[index] + 16,
+-			       &state.ymmh_space[index * 4], 16);
++			       &state->ymmh_space[index * 4], 16);
+ 	return 0;
+ }
+ 
+-static int save_x86_32_fpstate(struct uml_x86_32_xstate __user *user_state,
+-			       struct pt_regs *regs)
++void uml_x86_32_get_fsave(struct uml_pt_regs *guest,
++			  struct uml_x86_32_fsave *fsave)
+ {
+-	struct uml_x86_32_fpstate_legacy legacy = { };
+-	struct uml_pt_regs *guest = &regs->regs;
+-	struct uml_x86_64_task_fpstate *task = x86_64_task_fpstate(guest);
+-	unsigned int top = 0;
++	struct uml_x86_64_xstate state;
++	unsigned int top;
+ 	unsigned int index;
+ 
+-	legacy.control = 0x037f;
+-	legacy.tag = 0xffff;
+-	if (task->marker == UML_X86_64_FP_MARKER) {
+-		top = (task->x87_tag_top >> 16) & 7;
+-		legacy.control = (u16)task->x87_control_status;
+-		/* The task keeps TOP apart from its status word; sigreturn
+-		 * reads it back from the status word. */
+-		legacy.status = ((task->x87_control_status >> 16) &
+-				 ~UML_X86_64_X87_TOP_MASK) | (top << 11);
+-		legacy.saved_status = legacy.status;
+-		legacy.tag = (u16)task->x87_tag_top;
+-	}
++	uml_x86_64_get_xstate(guest, &state);
++	top = (state.fpstate.swd >> 11) & 7;
++	memset(fsave, 0, sizeof(*fsave));
++	fsave->cwd = state.fpstate.cwd | 0xffff0000U;
++	fsave->swd = state.fpstate.swd | 0xffff0000U;
++	fsave->twd = 0xffff0000U;
++	fsave->fcs = upt_x86_64_segment_selector(guest, 1);
++	fsave->fos = upt_x86_64_segment_selector(guest, 3) | 0xffff0000U;
+ 	for (index = 0; index < 8; index++) {
++		const unsigned char *slot =
++			(const void *)&state.fpstate.st_space[index * 4];
+ 		unsigned int physical = (top + index) & 7;
+-		u64 significand = UPT_X(guest,
+-			UML_X86_64_X87_SIGNIFICAND_SLOT + physical);
++		unsigned int tag = 3;
++
++		if (state.fpstate.twd & (1U << physical)) {
++			u64 significand;
++			u16 exponent;
++
++			memcpy(&significand, slot, sizeof(significand));
++			memcpy(&exponent, slot + sizeof(significand),
++			       sizeof(exponent));
++			tag = x86_64_x87_tag(significand, exponent);
++		}
++		fsave->twd |= tag << (physical * 2);
++		memcpy((u8 *)fsave->st_space + index * 10, slot, 10);
++	}
++}
+ 
+-		memcpy(legacy.registers[index].significand, &significand,
+-		       sizeof(significand));
+-		legacy.registers[index].exponent =
+-			x86_64_x87_exponent(guest, physical);
++void uml_x86_32_set_fsave(struct uml_pt_regs *guest,
++			  const struct uml_x86_32_fsave *fsave)
++{
++	struct uml_x86_64_xstate state;
++	unsigned int index;
++
++	uml_x86_64_get_xstate(guest, &state);
++	state.fpstate.cwd = fsave->cwd;
++	state.fpstate.swd = fsave->swd;
++	state.fpstate.twd = 0;
++	state.fpstate.fop = fsave->fcs >> 16;
++	state.fpstate.rip = fsave->fip;
++	state.fpstate.rdp = fsave->foo;
++	for (index = 0; index < 8; index++) {
++		if (((fsave->twd >> (index * 2)) & 3) != 3)
++			state.fpstate.twd |= 1U << index;
++		memcpy(&state.fpstate.st_space[index * 4],
++		       (const u8 *)fsave->st_space + index * 10, 10);
+ 	}
++	uml_x86_64_set_xstate(guest, &state, UML_X86_64_XFEATURES);
++}
++
++static int save_x86_32_fpstate(struct uml_x86_32_xstate __user *user_state,
++			       struct pt_regs *regs)
++{
++	struct uml_x86_32_fpstate_legacy legacy = { };
++
++	uml_x86_32_get_fsave(&regs->regs, &legacy.fsave);
++	legacy.saved_status = legacy.fsave.swd;
+ 	if (copy_to_user(&user_state->fpstate.legacy, &legacy,
+ 			 sizeof(legacy)))
+ 		return 1;
+@@ -512,13 +491,9 @@ static int restore_x86_32_fpstate(struct pt_regs *regs,
+ 				  unsigned long user_address)
+ {
+ 	struct uml_x86_32_fpstate_legacy legacy;
+-	struct uml_pt_regs *guest = &regs->regs;
+-	struct uml_x86_64_task_fpstate *task = x86_64_task_fpstate(guest);
+-	unsigned int top;
+-	unsigned int index;
+ 
+ 	if (!user_address) {
+-		clear_x86_64_fpstate(guest);
++		clear_x86_64_fpstate(&regs->regs);
+ 		return 0;
+ 	}
+ 	if (user_address > U32_MAX - UML_X86_32_XSTATE_FRAME_SIZE ||
+@@ -529,23 +504,9 @@ static int restore_x86_32_fpstate(struct pt_regs *regs,
+ 		user_address + UML_X86_32_FSAVE_HEADER_SIZE,
+ 		UML_X86_32_XSTATE_FRAME_SIZE))
+ 		return 1;
+-
+-	top = ((u16)legacy.status >> 11) & 7;
+-	for (index = 0; index < 8; index++) {
+-		unsigned int physical = (top + index) & 7;
+-		u64 significand;
+-
+-		memcpy(&significand, legacy.registers[index].significand,
+-		       sizeof(significand));
+-		UPT_X(guest, UML_X86_64_X87_SIGNIFICAND_SLOT + physical) =
+-			significand;
+-		x86_64_set_x87_exponent(guest, physical,
+-			legacy.registers[index].exponent);
+-	}
+-	task->x87_control_status = (u16)legacy.control |
+-		((unsigned int)((u16)legacy.status &
+-		  ~UML_X86_64_X87_TOP_MASK) << 16);
+-	task->x87_tag_top = (u16)legacy.tag | (top << 16);
++	/* As on Linux, the i387 image replaces the x87 state of the FXSAVE
++	 * image that follows it. */
++	uml_x86_32_set_fsave(&regs->regs, &legacy.fsave);
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/um/x86_32_syscalls.c b/arch/arm64/um/x86_32_syscalls.c
+index 05a36dea0110573f859fc4487e04f89eb3580ab6..e2b7a3efea0cfccde4ed0f388fee7b46ed540455 100644
+--- a/arch/arm64/um/x86_32_syscalls.c
++++ b/arch/arm64/um/x86_32_syscalls.c
+@@ -111,6 +111,38 @@ uml_x86_32_install_tls(struct task_struct *task,
+ 	return 0;
+ }
+ 
++/* PTRACE_GET_THREAD_AREA and PTRACE_SET_THREAD_AREA name the entry by
++ * their address argument; Linux reads a descriptor's own entry number only
++ * when that is -1.
++ */
++int ptrace_get_thread_area(struct task_struct *child, int index,
++			   void __user *address)
++{
++	struct uml_x86_32_user_desc info;
++
++	if (index < UML_X86_32_TLS_MIN ||
++	    index >= UML_X86_32_TLS_MIN + UML_X86_32_TLS_ENTRIES)
++		return -EINVAL;
++	info = *uml_x86_32_tls_slot(&child->thread.regs.regs,
++				    index - UML_X86_32_TLS_MIN);
++	info.entry_number = index;
++	return copy_to_user(address, &info, sizeof(info)) ? -EFAULT : 0;
++}
++
++int ptrace_set_thread_area(struct task_struct *child, int index,
++			   void __user *address)
++{
++	struct uml_x86_32_user_desc info;
++
++	if (copy_from_user(&info, address, sizeof(info)))
++		return -EFAULT;
++	if (!uml_x86_32_tls_valid(&info))
++		return -EINVAL;
++	if (index != -1)
++		info.entry_number = index;
++	return uml_x86_32_install_tls(child, &info);
++}
++
+ int uml_x86_32_set_task_tls(struct task_struct *task,
+ 			    unsigned long descriptor_address)
+ {
+diff --git a/arch/arm64/um/x86_fpstate.h b/arch/arm64/um/x86_fpstate.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..37fb45bfd63c73d635d7c8ad61f502347abcb31f
+--- /dev/null
++++ b/arch/arm64/um/x86_fpstate.h
+@@ -0,0 +1,107 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM64_X86_FPSTATE_H
++#define __UM_ARM64_X86_FPSTATE_H
++
++#include <linux/build_bug.h>
++#include <linux/types.h>
++
++struct uml_pt_regs;
++
++struct uml_x86_64_fpx_sw_bytes {
++	unsigned int magic1;
++	unsigned int extended_size;
++	unsigned long xfeatures;
++	unsigned int xstate_size;
++	unsigned int padding[7];
++};
++
++struct uml_x86_64_fpstate {
++	unsigned short cwd;
++	unsigned short swd;
++	unsigned short twd;
++	unsigned short fop;
++	unsigned long rip;
++	unsigned long rdp;
++	unsigned int mxcsr;
++	unsigned int mxcsr_mask;
++	unsigned int st_space[32];
++	unsigned int xmm_space[64];
++	unsigned int reserved2[12];
++	union {
++		unsigned int reserved3[12];
++		struct uml_x86_64_fpx_sw_bytes sw_reserved;
++	};
++};
++
++struct uml_x86_64_xstate_header {
++	unsigned long xfeatures;
++	unsigned long reserved[7];
++};
++
++struct uml_x86_64_xstate {
++	struct uml_x86_64_fpstate fpstate;
++	struct uml_x86_64_xstate_header header;
++	unsigned int ymmh_space[64];
++};
++
++/* The Darwin bridge stores sixteen 256-bit x86 vectors in the same 512-byte
++ * payload used by the arm64 FPSIMD register array.  The remaining words are
++ * x86 control state when the marker is present.
++ */
++struct uml_x86_64_task_fpstate {
++	unsigned char vectors[16][32];
++	unsigned int mxcsr;
++	unsigned int x87_control_status;
++	unsigned int x87_tag_top;
++	unsigned int marker;
++};
++
++#define UML_X86_64_FP_MARKER 0x58383634U
++#define UML_X86_64_XFEATURE_X87 (1UL << 0)
++#define UML_X86_64_XFEATURE_SSE (1UL << 1)
++#define UML_X86_64_XFEATURE_AVX (1UL << 2)
++#define UML_X86_64_XFEATURES (UML_X86_64_XFEATURE_X87 | \
++	UML_X86_64_XFEATURE_SSE | UML_X86_64_XFEATURE_AVX)
++#define UML_X86_64_XSTATE_SIZE sizeof(struct uml_x86_64_xstate)
++#define UML_X86_64_MXCSR_MASK 0xffffU
++
++static_assert(sizeof(struct uml_x86_64_fpstate) == 512);
++static_assert(sizeof(struct uml_x86_64_xstate_header) == 64);
++static_assert(sizeof(struct uml_x86_64_xstate) == 832);
++
++/* Convert between the task's packed FP state and a standard-format XSAVE
++ * image.  The signal frame and ptrace regsets share this conversion.
++ */
++void uml_x86_64_get_xstate(struct uml_pt_regs *guest,
++			   struct uml_x86_64_xstate *state);
++int uml_x86_64_set_xstate(struct uml_pt_regs *guest,
++			  const struct uml_x86_64_xstate *state,
++			  unsigned long present);
++
++/* The i387 FSAVE image of an i386 task: its NT_PRFPREG regset and
++ * PTRACE_GETFPREGS, and the head of its signal frame's FP state.  Linux
++ * fills the upper halves of the control, status and tag words and of the
++ * operand selector with ones.
++ */
++struct uml_x86_32_fsave {
++	u32 cwd;
++	u32 swd;
++	u32 twd;
++	u32 fip;
++	u32 fcs;
++	u32 foo;
++	u32 fos;
++	u32 st_space[20];
++};
++
++static_assert(sizeof(struct uml_x86_32_fsave) == 108);
++
++/* As Linux's convert_from_fxsr() and convert_to_fxsr(): the tag word is
++ * derived from the registers, and a write keeps the SSE and AVX state.
++ */
++void uml_x86_32_get_fsave(struct uml_pt_regs *guest,
++			  struct uml_x86_32_fsave *fsave);
++void uml_x86_32_set_fsave(struct uml_pt_regs *guest,
++			  const struct uml_x86_32_fsave *fsave);
++
++#endif
+diff --git a/arch/um/kernel/ptrace.c b/arch/um/kernel/ptrace.c
+index 980cb4daeef7de8a48034a42cd2a5759f12fcff1..8f39b59dc820cb707b29193c9bcb100cedf0d4e9 100644
+--- a/arch/um/kernel/ptrace.c
++++ b/arch/um/kernel/ptrace.c
+@@ -4,7 +4,6 @@
+  */
+ 
+ #include <linux/audit.h>
+-#include <linux/compat.h>
+ #include <linux/ptrace.h>
+ #include <linux/sched.h>
+ #include <linux/uaccess.h>
+@@ -43,7 +42,7 @@ void ptrace_disable(struct task_struct *child)
+ long arch_ptrace(struct task_struct *child, long request,
+ 		 unsigned long addr, unsigned long data)
+ {
+-	int i, ret;
++	int ret;
+ 	unsigned long __user *p = (void __user *)data;
+ 	void __user *vp = p;
+ 
+@@ -65,6 +64,8 @@ long arch_ptrace(struct task_struct *child, long request,
+ 
+ #ifdef PTRACE_GETREGS
+ 	case PTRACE_GETREGS: { /* Get all gp regs from the child. */
++		int i;
++
+ 		if (!access_ok(p, MAX_REG_OFFSET)) {
+ 			ret = -EIO;
+ 			break;
+@@ -80,6 +81,8 @@ long arch_ptrace(struct task_struct *child, long request,
+ #ifdef PTRACE_SETREGS
+ 	case PTRACE_SETREGS: { /* Set all gp regs in the child. */
+ 		unsigned long tmp = 0;
++		int i;
++
+ 		if (!access_ok(p, MAX_REG_OFFSET)) {
+ 			ret = -EIO;
+ 			break;
+@@ -111,14 +114,6 @@ long arch_ptrace(struct task_struct *child, long request,
+ 	return ret;
+ }
+ 
+-#ifdef CONFIG_COMPAT
+-long compat_arch_ptrace(struct task_struct *child, compat_long_t request,
+-		       compat_ulong_t addr, compat_ulong_t data)
+-{
+-	return compat_ptrace_request(child, request, addr, data);
+-}
+-#endif
+-
+ static void send_sigtrap(struct uml_pt_regs *regs, int error_code)
+ {
+ 	/* Send us the fake SIGTRAP */

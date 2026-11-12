@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 21:38:45 +0900
+Subject: [PATCH] vrend: stop a context error from stranding the guest
+
+A command that reports a context error aborts the rest of its buffer and
+leaves the context in error for good: every later submit fails the
+context switch, every later transfer answers EINVAL, and the guest
+receives nothing. A guest blocked on a query result or a readback spins
+on the buffer the host is meant to write and issues no further command,
+so a single unsupported command hangs the guest instead of failing the
+work that used it. On a desktop GL host this costs a whole conformance
+run.
+
+A command can also report the error and still succeed: a shader that
+fails to compile leaves the renderer with no program to draw with, but
+the create-shader command itself has nothing left to do and returns, so
+the error is never paired with a failed dispatch and lives for as long
+as the context does.
+
+A transfer reports its errors the same way but belongs to no buffer, so
+nothing cleared what it set. A context that only ever transfers, as the
+one Android's gralloc mapper creates to lock a buffer for reading does,
+kept its first failed transfer's error and answered EINVAL to every
+transfer after it, each of which reached the guest as
+VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER and a readback of nothing.
+
+Clear the error with the buffer or transfer that carried it, whatever it
+returned. The error stays in the log and the dispatch still fails; what
+no longer happens is the guest losing every command it sends afterwards.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_decode.c   | 26 ++++++++++++++++++++++----
+ src/vrend/vrend_renderer.c | 13 +++++++++++++
+ src/vrend/vrend_renderer.h |  2 ++
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index ad45ca94fc6ea350f15e9571deec05937fff7f0f..71cf1aff031ba8711616e288f718bc67dc3c11cb 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1695,7 +1695,13 @@ static int vrend_decode_ctx_transfer_3d(struct virgl_context *ctx,
+    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+    int ret = vrend_renderer_transfer_iov(dctx->grctx, res->res_id, info,
+                                          transfer_mode);
+-   return vrend_check_no_error(dctx->grctx) || ret ? ret : EINVAL;
++   if (!vrend_check_no_error(dctx->grctx) && !ret)
++      ret = EINVAL;
++   /* A transfer is a command no buffer carries, so it drops its own error:
++    * a context that only transfers never submits the buffer that would.
++    */
++   vrend_clear_context_error(dctx->grctx);
++   return ret;
+ }
+ 
+ static int vrend_decode_ctx_get_blob(struct virgl_context *ctx,
+@@ -2065,7 +2071,7 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+    TRACE_FUNC();
+    struct vrend_decode_ctx *gdctx = (struct vrend_decode_ctx *)ctx;
+    bool bret;
+-   int ret;
++   int ret = 0;
+ 
+ #define TRANSFER_HEADER_SIZE 4096
+ 
+@@ -2099,6 +2105,7 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+       /* check if the guest is doing something bad */
+       if (buf_offset > buf_total) {
+          vrend_report_buffer_error(gdctx->grctx, 0);
++         vrend_clear_context_error(gdctx->grctx);
+          break;
+       }
+ 
+@@ -2115,10 +2122,21 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+                gdctx->base.ctx_id, vrend_get_comand_name(cmd), ret);
+          if (ret == EINVAL)
+             vrend_report_buffer_error(gdctx->grctx, *buf);
+-         return ret;
++         /* The rest of this buffer is abandoned, but the context keeps
++          * serving the guest: see vrend_clear_context_error().
++          */
++         break;
+       }
+    }
+-   return 0;
++   /* A command may report a context error and still succeed: a shader that
++    * fails to compile leaves the renderer with no program to draw with, but
++    * the create-shader command itself has nothing left to do and returns.
++    * The error must not outlive the buffer that carried it either way, or
++    * the context refuses every later command and one bad shader costs the
++    * guest the rest of its session.
++    */
++   vrend_clear_context_error(gdctx->grctx);
++   return ret;
+ }
+ 
+ static int vrend_decode_ctx_get_fencing_fd(UNUSED struct virgl_context *ctx)
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 1114c7795b4133a49bdc25225f263035dfd55d22..b495975eda721276b039b9d60a9d77cc5c377d63 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -1158,6 +1158,19 @@ void vrend_report_context_error_internal(const char *fname, struct vrend_context
+                value);
+ }
+ 
++/* Drop the error state once the command buffer that reported it has been
++ * abandoned. The error itself stays visible in the log and in the failed
++ * dispatch the caller returns; what must not survive is a context that
++ * refuses every later command, because a guest blocked on a query result or
++ * a readback spins on the buffer the host writes and issues nothing more.
++ * One unsupported command then costs the guest its work, not its context.
++ */
++void vrend_clear_context_error(struct vrend_context *ctx)
++{
++   if (ctx)
++      ctx->in_error = false;
++}
++
+ #define CORE_PROFILE_WARN_NONE 0
+ #define CORE_PROFILE_WARN_STIPPLE 1
+ #define CORE_PROFILE_WARN_POLYGON_MODE 2
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index a64a6dc149a3c7b6fe738159889ebf9c0fa79118..8993593a77a7a889b2a301a1b82f3c01f58feb09 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -585,6 +585,8 @@ void vrend_report_context_error_internal(const char *fname, struct vrend_context
+ #define vrend_report_buffer_error(ctx, cmd) \
+     vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, cmd)
+ 
++void vrend_clear_context_error(struct vrend_context *ctx);
++
+ void vrend_fb_bind_texture(struct vrend_resource *res,
+                            GLuint idx,
+                            GLint level, GLint layer);

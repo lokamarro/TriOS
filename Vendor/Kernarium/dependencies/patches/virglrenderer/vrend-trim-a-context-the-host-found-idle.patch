@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:52:39 +0900
+Subject: [PATCH] vrend: trim a context the host found idle
+
+virgl_renderer_context_trim(ctx_id) is how the host tells the renderer that a
+guest context has made no submission for a while and has no fence left to
+retire.  The context's GL contexts then run what glthread and the threaded
+context still have queued behind a glFlush, and the host driver is asked
+(eglTrimContextMESA, where EGL_MESA_context_trim is advertised) to release
+what it keeps for completed work.  Without that, the references a driver holds
+until the context next submits stay for as long as the guest stays quiet,
+which for a compositor or a launcher is minutes.
+
+Every sub context of the context is visited, and the guest's choice of the
+current one is restored.  Nothing waits for the GPU.  A context that is not a
+GL context, or an error context, ignores the call.  The vtable entry is
+optional.
+
+Context 0, the renderer's own context, has no virgl_context, so the call
+trims it directly.  It is where a resource is made and transferred when the
+guest names no context of its own, and a host that deletes such a resource
+would otherwise leave its storage referenced by that context's GL context for
+as long as the renderer stays quiet.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/virgl_context.h          |  4 ++++
+ src/virglrenderer.c          | 17 +++++++++++++++++
+ src/virglrenderer.h          | 11 +++++++++++
+ src/vrend/vrend_decode.c     |  8 ++++++++
+ src/vrend/vrend_renderer.c   | 32 ++++++++++++++++++++++++++++++++
+ src/vrend/vrend_renderer.h   |  3 +++
+ src/vrend/vrend_winsys_egl.c | 17 +++++++++++++++++
+ src/vrend/vrend_winsys_egl.h |  1 +
+ 8 files changed, 93 insertions(+)
+
+diff --git a/src/virgl_context.h b/src/virgl_context.h
+index 25bc10603f0a6bc80db759af8911cba2186e74a3..822917cc32d88d6b02c0c9d88d2495f3546e55ae 100644
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -129,6 +129,10 @@ struct virgl_context {
+                        uint32_t ring_idx,
+                        uint64_t fence_id);
+ 
++   /* Optional.  The host found the context idle: release what it holds for
++    * completed work.  Never waits for the GPU. */
++   void (*trim)(struct virgl_context *ctx);
++
+    /* For DRM native contexts, return the device fd: */
+    int (*get_device_fd)(struct virgl_context *ctx);
+ 
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 4a4b28791803a38f358d88f499f6caba779e7ef2..168cd8a1755ded1861f0e4a3042d4e2f3f5799d2 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -491,6 +491,23 @@ void virgl_renderer_context_poll(uint32_t ctx_id)
+    ctx->retire_fences(ctx);
+ }
+ 
++void virgl_renderer_context_trim(uint32_t ctx_id)
++{
++   TRACE_FUNC();
++   if (ctx_id == 0) {
++      /* The renderer's own context has no virgl_context. */
++      if (state.vrend_initialized)
++         vrend_renderer_host_context_trim();
++      return;
++   }
++
++   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
++   if (!ctx || !ctx->trim)
++      return;
++
++   ctx->trim(ctx);
++}
++
+ int virgl_renderer_context_get_poll_fd(uint32_t ctx_id)
+ {
+    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 88372ec8bc0b688810895001081f6d9d20bd5ff4..2b9c5dab5e96c54f71940a69aebe475bd41c9659 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -487,6 +487,17 @@ VIRGL_EXPORT int virgl_renderer_context_create_fence(uint32_t ctx_id,
+ VIRGL_EXPORT void virgl_renderer_context_poll(uint32_t ctx_id); /* force fences */
+ VIRGL_EXPORT int virgl_renderer_context_get_poll_fd(uint32_t ctx_id);
+ 
++/* Tell the renderer that a context has been idle for a while: the host has
++ * seen no command from it and every fence it asked for has retired. The
++ * renderer flushes what the context's GL contexts still hold back and asks
++ * the host GL driver to release what they keep for completed work. It
++ * never waits for the GPU, and the context stays usable. A context that
++ * has nothing to trim, or is not a GL context, ignores it. Context 0 is the
++ * renderer's own context, where a resource is made and transferred when no
++ * guest context is named; it is trimmed the same way. Call it from the
++ * thread that runs the renderer. */
++VIRGL_EXPORT void virgl_renderer_context_trim(uint32_t ctx_id);
++
+ /* Map a resource to an specific userspace address. If successful, the
+  * mapping is owned by the caller and is its responsibility to unmap
+  * the resource by its own means (i.e. overriding the map with
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index 75b4a818376aadee69e98a799e1d1d1ba63b0c30..1f7f600bc93226e680184e1217639c7ad01e4153 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1700,6 +1700,13 @@ static void vrend_decode_ctx_detach_resource(struct virgl_context *ctx,
+    vrend_renderer_detach_res_ctx(dctx->grctx, res);
+ }
+ 
++static void vrend_decode_ctx_trim(struct virgl_context *ctx)
++{
++   TRACE_FUNC();
++   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
++   vrend_renderer_context_trim(dctx->grctx);
++}
++
+ static int vrend_decode_ctx_transfer_3d(struct virgl_context *ctx,
+                                         struct virgl_resource *res,
+                                         const struct vrend_transfer_info *info,
+@@ -2216,4 +2223,5 @@ static void vrend_decode_ctx_init_base(struct vrend_decode_ctx *dctx,
+    ctx->get_fencing_fd = vrend_decode_ctx_get_fencing_fd;
+    ctx->retire_fences = vrend_decode_ctx_retire_fences;
+    ctx->submit_fence = vrend_decode_ctx_submit_fence;
++   ctx->trim = vrend_decode_ctx_trim;
+ }
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 3423fe7f586d39713e3b91fde8df1d5672bc2247..20af151e94d97a840bf70cb3e0be0f4148af1031 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -13217,6 +13217,38 @@ bool vrend_hw_switch_context(struct vrend_context *ctx, bool now)
+    return true;
+ }
+ 
++/* The host found the context idle.  Each of its GL contexts runs what it
++ * still has queued behind a glFlush, and then the host GL driver is asked to
++ * release what the context keeps for work that has completed: references a
++ * driver holds until the context next submits, which a context that has gone
++ * quiet never does.  The guest's selection of a sub context is untouched. */
++void vrend_renderer_context_trim(struct vrend_context *ctx)
++{
++   if (!ctx || ctx->in_error || !ctx->sub)
++      return;
++
++   struct vrend_sub_context *selected = ctx->sub;
++   list_for_each_entry(struct vrend_sub_context, sub, &ctx->sub_ctxs, head) {
++      if (!vrend_hw_switch_context_with_sub(ctx, sub->sub_ctx_id))
++         continue;
++      glFlush();
++#ifdef HAVE_EPOXY_EGL_H
++      virgl_egl_trim_context(egl);
++#endif
++   }
++   vrend_hw_switch_context_with_sub(ctx, selected->sub_ctx_id);
++}
++
++/* The host's own context, context 0, is where a resource is made, written and
++ * read when the guest names no context of its own: a texture a guest creates
++ * and fills before its first command, a gralloc allocation.  Its GL context
++ * keeps what that work used until it next submits, so it is trimmed like any
++ * other. */
++void vrend_renderer_host_context_trim(void)
++{
++   vrend_renderer_context_trim(vrend_state.ctx0);
++}
++
+ static void vrend_finish_context_switch(struct vrend_context *ctx)
+ {
+    if (ctx->ctx_switch_pending == false)
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 5589b218a457645d6d341f879ae49f393bd9aabd..b520f319ba1c8062c0b0c3a042e0ae6cd725814e 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -593,6 +593,9 @@ void vrend_renderer_get_rect(struct pipe_resource *pres,
+                              uint32_t offset,
+                              int x, int y, int width, int height);
+ 
++void vrend_renderer_context_trim(struct vrend_context *ctx);
++void vrend_renderer_host_context_trim(void);
++
+ void vrend_renderer_attach_res_ctx(struct vrend_context *ctx,
+                                    struct virgl_resource *res);
+ void vrend_renderer_detach_res_ctx(struct vrend_context *ctx,
+diff --git a/src/vrend/vrend_winsys_egl.c b/src/vrend/vrend_winsys_egl.c
+index 7efb9592d04f2213f50868ed828af67c9a54798b..eaaba2840b343f4a6624a2003f290f24aa585ff1 100644
+--- a/src/vrend/vrend_winsys_egl.c
++++ b/src/vrend/vrend_winsys_egl.c
+@@ -75,6 +75,7 @@
+ #define EGL_EXT_PLATFORM_DEVICE                BIT(12)
+ #define EGL_MESA_IMAGE_HOST_POINTER            BIT(13)
+ #define EGL_MESA_GL_INTEROP                    BIT(14)
++#define EGL_MESA_CONTEXT_TRIM                  BIT(15)
+ 
+ static const struct {
+    uint32_t bit;
+@@ -94,6 +95,7 @@ static const struct {
+    { EGL_EXT_PLATFORM_DEVICE, "EGL_EXT_platform_device" },
+    { EGL_MESA_IMAGE_HOST_POINTER, "EGL_MESA_image_host_pointer" },
+    { EGL_MESA_GL_INTEROP, "EGL_MESA_gl_interop" },
++   { EGL_MESA_CONTEXT_TRIM, "EGL_MESA_context_trim" },
+ };
+ 
+ struct egl_funcs {
+@@ -939,6 +941,21 @@ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo
+ #define EGL_HOST_POINTER_SIZE_MESA   0x3296
+ #endif
+ 
++/* EGL_MESA_context_trim: ask the host driver to release what the current
++ * context holds for completed work.  It is the host's to ignore: a driver
++ * without the extension simply keeps its references. */
++bool virgl_egl_trim_context(struct virgl_egl *egl)
++{
++   typedef EGLBoolean (*trim_context_proc)(void);
++   static trim_context_proc trim_context;
++
++   if (!egl || !has_bit(egl->extension_bits, EGL_MESA_CONTEXT_TRIM))
++      return false;
++   if (!trim_context)
++      trim_context = (trim_context_proc)eglGetProcAddress("eglTrimContextMESA");
++   return trim_context && trim_context();
++}
++
+ bool virgl_egl_supports_host_pointer_image(struct virgl_egl *egl)
+ {
+    return has_bit(egl->extension_bits, EGL_MESA_IMAGE_HOST_POINTER);
+diff --git a/src/vrend/vrend_winsys_egl.h b/src/vrend/vrend_winsys_egl.h
+index e51745c46fc874e9b02aeb6cd34670c9ee1826db..1d5ef95f99008216aadc31b8686ce4314798cf2e 100644
+--- a/src/vrend/vrend_winsys_egl.h
++++ b/src/vrend/vrend_winsys_egl.h
+@@ -86,6 +86,7 @@ void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo);
+ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo, int plane);
+ #endif
+ 
++bool virgl_egl_trim_context(struct virgl_egl *egl);
+ bool virgl_egl_supports_host_pointer_image(struct virgl_egl *egl);
+ void *virgl_egl_image_from_host_pointer(struct virgl_egl *egl,
+                                         void *pointer,

@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:14:16 +0900
+Subject: [PATCH] venus: tell the host how much device memory a context holds
+
+The host that grants a Venus guest its device memory knew only the
+total the pool had handed out, not which guest process held it. The
+device memory pool gains an optional account callback. The renderer
+calls it with the allocating context's ID and the memory's size when a
+vkAllocateMemory succeeds, and with minus that size when the memory is
+freed or its device is destroyed with the context. Pages the driver
+only imports, such as the host-visible memory the renderer shares with
+the guest, are not reported: they are not the pool's.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_device_memory.c | 15 +++++++++++++++
+ src/venus/vkr_device_memory.h |  6 ++++++
+ src/venus/vkr_renderer.c      |  9 +++++++++
+ src/venus/vkr_renderer.h      |  6 ++++++
+ src/virglrenderer.c           |  1 +
+ src/virglrenderer.h           |  8 ++++++++
+ 6 files changed, 45 insertions(+)
+
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 2e77f9820349807e0d771b9500cda41338bc91f3..ae27ca53cb96673ead3843bcc20fe3c88972557c 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -570,6 +570,16 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+    mem->native_resource_id = imported_native_resource_id;
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = host_mem_type_index;
++
++   /* The host learns which context holds the memory the driver made for it.
++    * Pages the driver imports are the renderer's or another resource's.
++    */
++   mem->ctx_id = ctx->ctx_id;
++   if (!host_shm && !host_mapping && !imported_native_resource_id) {
++      mem->accounted_size = alloc_info->allocationSize;
++      vkr_renderer_device_memory_account(mem->ctx_id,
++                                         (int64_t)mem->accounted_size);
++   }
+ }
+ 
+ /* A new allocation has to fit the device memory the host granted the guest.
+@@ -733,6 +743,11 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
+ void
+ vkr_device_memory_release(struct vkr_device_memory *mem)
+ {
++   if (mem->accounted_size) {
++      vkr_renderer_device_memory_account(mem->ctx_id,
++                                         -(int64_t)mem->accounted_size);
++      mem->accounted_size = 0;
++   }
+    virgl_resource_native_release(mem->native_resource_id);
+    if (mem->metal_heap_fd >= 0)
+       close(mem->metal_heap_fd);
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index d20ee6d0e190671b005d5f321e1a1c0cfa1980af..e8e9b8d791af8108e3b4c9b5d3af2cbab1038364 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -42,6 +42,12 @@ struct vkr_device_memory {
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+ 
++   /* The context that allocated the memory, and the bytes of it the host was
++    * told the guest holds: none for host pages the driver only imports.
++    */
++   uint32_t ctx_id;
++   uint64_t accounted_size;
++
+    /* A memory backs at most one resource at a time: the one named here while
+     * exported is set.
+     */
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 43a53314cb5a356fb32ca7db0160e7d3d2fd27d7..8936b38d60ff6d15f185e18b9b996780cb74923e 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -104,6 +104,15 @@ vkr_renderer_device_memory_refused(void)
+       pool->refused(pool->data);
+ }
+ 
++void
++vkr_renderer_device_memory_account(uint32_t ctx_id, int64_t delta)
++{
++   const struct vkr_renderer_device_memory_pool *pool =
++      &vkr_state.device_memory_pool;
++   if (pool->limit && pool->account)
++      pool->account(pool->data, ctx_id, delta);
++}
++
+ uint64_t
+ vkr_renderer_get_device_memory_limit(void)
+ {
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index fec7b631a2ff2d4c6c334c7f27b1321c295e059b..a5815912cb918406ace6dd96c1a6242db51df57d 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -32,6 +32,8 @@ struct vkr_renderer_device_memory_pool {
+    void (*release)(void *data, uint64_t size);
+    /* optional */
+    void (*refused)(void *data);
++   /* optional */
++   void (*account)(void *data, uint32_t ctx_id, int64_t delta);
+ };
+ 
+ /* A guest's vkAllocateMemory has been answered with
+@@ -40,6 +42,10 @@ struct vkr_renderer_device_memory_pool {
+ void
+ vkr_renderer_device_memory_refused(void);
+ 
++/* The device memory a context's guest holds changed by `delta` bytes. */
++void
++vkr_renderer_device_memory_account(uint32_t ctx_id, int64_t delta);
++
+ /* A context's ring has failed, from the ring's thread, with no lock of the
+  * context held. The context rejects every command from then on, and its
+  * fences are not going to be retired by the work they follow.
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index d8d39d622bc4402bff8ba87cf379e3b6c666e6b0..a0ab0aa74968730c73293d22425c3beab71fbded 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1755,6 +1755,7 @@ virgl_renderer_set_device_memory_pool(
+       .reserve = pool->reserve,
+       .release = pool->release,
+       .refused = pool->refused,
++      .account = pool->account,
+    };
+    vkr_renderer_set_device_memory_pool(&vkr_pool);
+ #else
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 2485d88aa2738ee898d2af798a2a37830df7402d..972791a2f2dcf0e411cb1789c9cd5de0a4093634 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -606,6 +606,13 @@ virgl_renderer_set_host_visible_aperture_size(uint64_t size);
+  * guest that failed with VK_ERROR_OUT_OF_DEVICE_MEMORY, after the pool had
+  * freed what it could and decided again, so the host can count the refusals
+  * its guest was answered with.
++ *
++ * `account`, if set, is called with a context's ID and a signed byte count
++ * whenever the device memory that context's guest holds changes: its size when
++ * a vkAllocateMemory succeeds, and minus that size when the memory is freed
++ * or its context is destroyed. Only memory the Vulkan driver makes for the
++ * guest counts, not host pages the driver imports. The host can tell which
++ * guest process holds the memory the pool has granted.
+  */
+ struct virgl_renderer_device_memory_pool {
+    uint64_t limit;
+@@ -614,6 +621,7 @@ struct virgl_renderer_device_memory_pool {
+    bool (*reserve)(void *data, uint64_t size);
+    void (*release)(void *data, uint64_t size);
+    void (*refused)(void *data);
++   void (*account)(void *data, uint32_t ctx_id, int64_t delta);
+ };
+ 
+ /*

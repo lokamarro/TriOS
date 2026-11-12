@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 20:58:49 +0900
+Subject: [PATCH] virgl: complete a query a guest spins on without a fence
+
+A guest blocked on a query result spins on the buffer the host writes the
+result into and issues no further commands, so no later fence exists. The
+waiting queries were only re-checked when a fence retired in the same pass,
+and a host driver is allowed to answer "not available yet" to the first few
+non-blocking checks even after the work has finished. The two together
+wedge the guest for good: it polls memory the host has stopped updating.
+
+Check the waiting queries on every pass instead, before fences retire, and
+skip the walk entirely when none are waiting. The caller has no fence of its
+own left to drive that pass either, so also export whether the renderer
+still holds such work: a caller can then keep polling on its own until the
+renderer is idle again.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/virglrenderer.c        |  5 +++++
+ src/virglrenderer.h        |  6 ++++++
+ src/vrend/vrend_renderer.c | 22 ++++++++++++++++++++--
+ src/vrend/vrend_renderer.h |  1 +
+ 4 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 14cd3de9da7180ef5229a799249234325687f671..adacb9a0e19775b56ba0a4a3ab7d44759f866ef2 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -828,6 +828,11 @@ void virgl_renderer_poll(void)
+    virgl_context_foreach(&args);
+ }
+ 
++bool virgl_renderer_has_pending_work(void)
++{
++   return state.vrend_initialized && vrend_renderer_has_pending_work();
++}
++
+ void virgl_renderer_cleanup(UNUSED void *cookie)
+ {
+    TRACE_FUNC();
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 7c6969d9385d4726470146f970e119ecf53ce5b8..d524ce473cdf1376cd9b47e7a79e45d8bb533294 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -172,6 +172,12 @@ struct virgl_renderer_callbacks {
+ VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
+ VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
+ 
++/* True while the renderer holds work that completes only when it is polled,
++ * such as a query result a guest is blocked on. The caller keeps polling
++ * while this reports true even when it has no outstanding fence of its own.
++ */
++VIRGL_EXPORT bool virgl_renderer_has_pending_work(void);
++
+ /* we need to give qemu the cursor resource contents */
+ VIRGL_EXPORT void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height);
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 85917e0d826f4cef991ff8ec0c2c74cf17da7fcb..1114c7795b4133a49bdc25225f263035dfd55d22 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7334,6 +7334,16 @@ void vrend_renderer_poll(void) {
+    }
+ }
+ 
++/* Work the renderer owns that no guest fence will drive to completion.
++ * A guest blocked on a query result spins on the buffer the host fills and
++ * issues no further commands, so the caller has to keep polling on its own
++ * until the renderer reports that it is idle again.
++ */
++bool vrend_renderer_has_pending_work(void)
++{
++   return atomic_load(&vrend_state.has_waiting_queries);
++}
++
+ static void wait_sync(struct vrend_fence *fence)
+ {
+    struct vrend_context *ctx = fence->ctx;
+@@ -11661,11 +11671,19 @@ void vrend_renderer_check_fences(void)
+       }
+    }
+ 
++   /* Queries must be checked before fences are retired, and on every pass
++    * rather than only when a fence retired. A guest waiting for a query
++    * result spins on the buffer the host writes into and issues no further
++    * commands, so no later fence exists to trigger the check; and a host
++    * driver may answer "not available yet" to the first few non-blocking
++    * checks even once the work is done.
++    */
++   if (atomic_load(&vrend_state.has_waiting_queries))
++      vrend_renderer_check_queries();
++
+    if (list_is_empty(&retired_fences))
+       return;
+ 
+-   vrend_renderer_check_queries();
+-
+    list_for_each_entry_safe(struct vrend_fence, fence, &retired_fences, fences) {
+       struct vrend_context *ctx = fence->ctx;
+       ctx->fence_retire(fence->fence_id, ctx->fence_retire_data);
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index ba4a0a054d84657f67aa351318e3bfe0055d1e71..a64a6dc149a3c7b6fe738159889ebf9c0fa79118 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -599,6 +599,7 @@ bool format_is_copy_compatible(enum virgl_formats src, enum virgl_formats dst,
+ void vrend_renderer_prepare_reset(void);
+ void vrend_renderer_reset(void);
+ void vrend_renderer_poll(void);
++bool vrend_renderer_has_pending_work(void);
+ int vrend_renderer_get_poll_fd(void);
+ 
+ unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx,

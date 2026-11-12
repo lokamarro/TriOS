@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 03:53:33 +0900
+Subject: [PATCH] kosmickrisp: give compare-exchange its strong semantics in
+ MSL
+
+NIR's integer compare-exchange, like SPIR-V's OpAtomicCompareExchange, is
+strong: it stores whenever the value it read equals the comparison, so a
+caller that gets the comparison back knows it stored. Metal has only
+atomic_compare_exchange_weak_explicit, which may fail spuriously, and the
+translation kept a single attempt while returning only the value read. A
+spurious failure then reported that same value, and a caller could not tell
+it from a success: a compare-exchange loop took a slot it never wrote.
+
+The integer form now retries while the exchange failed yet read the
+comparison, which makes the weak exchange strong. The float form compares
+bits, which `==` would not, and stays a single attempt with its text
+unchanged. The geometry heap's allocator, which reserves with a
+compare-exchange loop, relies on this. kosmickrisp_msl_compare_exchange
+translates a global compare-exchange and checks for the retry against the
+same comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/compiler/nir_to_msl.c         | 26 ++++-
+ src/kosmickrisp/vulkan/meson.build            |  1 +
+ .../vulkan/tests/test_msl_compare_exchange.c  | 95 +++++++++++++++++++
+ 3 files changed, 118 insertions(+), 4 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_compare_exchange.c
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index c9696a3a1e39c095624822797e6c74b179e758cd..91ed11fad6f28cc5309d3153403f26cb8807bc16 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1364,9 +1364,22 @@ atomic_swap_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+    const char *mem_order = "memory_order_relaxed";
+    const char *type = msl_type_for_def(ctx->types, &instr->def);
+ 
+-   P_IND(ctx, "%s ta%d = ", type, instr->def.index);
++   /* NIR's integer compare-exchange is strong: it stores whenever the value
++    * it read equals the comparison. Metal has only the weak one, which may
++    * fail spuriously and then report that same value, so a caller could not
++    * tell the failure from a success. Retry until the exchange either stores
++    * or reads something else. The float form compares bits, which the `==`
++    * below would not, and stays a single attempt. */
++   const bool strong =
++      nir_intrinsic_atomic_op(instr) == nir_atomic_op_cmpxchg;
++
++   P_IND(ctx, "%s ta%d", type, instr->def.index);
++   if (strong)
++      P(ctx, "; do { ta%d", instr->def.index);
++   P(ctx, " = ");
+    src_to_msl(ctx, &instr->src[1]);
+-   P(ctx, "; %s_explicit((%s atomic_%s*)", atomic_op, scope, type);
++   P(ctx, ";%s %s_explicit((%s atomic_%s*)", strong ? " } while (!" : "",
++     atomic_op, scope, type);
+    if (shared)
+       P(ctx, "&shared_data[");
+    src_to_msl(ctx, &instr->src[0]);
+@@ -1375,8 +1388,13 @@ atomic_swap_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+    P(ctx, ", ");
+    P(ctx, "&ta%d, ", instr->def.index);
+    src_to_msl(ctx, &instr->src[2]);
+-   P(ctx, ", %s, %s);", mem_order, mem_order);
+-   P(ctx, "%s t%d = ta%d;\n", type, instr->def.index, instr->def.index);
++   P(ctx, ", %s, %s)", mem_order, mem_order);
++   if (strong) {
++      P(ctx, " && ta%d == ", instr->def.index);
++      src_to_msl(ctx, &instr->src[1]);
++      P(ctx, ")");
++   }
++   P(ctx, ";%s t%d = ta%d;\n", type, instr->def.index, instr->def.index);
+ }
+ 
+ static void
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index cc5ace87ece355b9fb0f2ffc4cb559d084f70cfe..6e93ab6515937713b39694cdc4d54e54e518e158 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -723,6 +723,7 @@ if with_tests
+     '16bit_varying_io',
+     'msl_temporaries',
+     'msl_coherent_access',
++    'msl_compare_exchange',
+     'subgroup_stages',
+   ]
+     test(
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_compare_exchange.c b/src/kosmickrisp/vulkan/tests/test_msl_compare_exchange.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..10d6ba56724fd6f9d4f9177545fd4f8b02ec2a4a
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_msl_compare_exchange.c
+@@ -0,0 +1,95 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* NIR's integer compare-exchange is strong: it stores whenever the value it
++ * read equals the comparison, so a caller that got the comparison back knows
++ * it stored. Metal has only the weak exchange, which may fail spuriously and
++ * report that same value. The translation must retry until the exchange
++ * either stores or reads something else, and must check the value it reads
++ * against the comparison it made.
++ */
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "kk_test.h"
++
++/* A kernel that exchanges a word of global memory and stores what it read. */
++static char *
++translate(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_COMPUTE, &kk_nir_options, "msl compare exchange");
++   nir_shader *nir = b.shader;
++   nir->info.workgroup_size[0] = 1;
++   nir->info.workgroup_size[1] = 1;
++   nir->info.workgroup_size[2] = 1;
++
++   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 64), 0);
++   nir_def *address = nir_iadd_imm(&b, nir_imul_imm(&b, id, 4), 0x10000);
++   nir_def *comparison = nir_u2u32(&b, id);
++   nir_def *read = nir_global_atomic_swap(
++      &b, 32, address, comparison, nir_iadd_imm(&b, comparison, 7),
++      .atomic_op = nir_atomic_op_cmpxchg);
++   nir_store_global(&b, read, nir_iadd_imm(&b, address, 4096), .align_mul = 4);
++
++   nir_validate_shader(nir, "msl compare exchange");
++   msl_optimize_nir(nir);
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   struct nir_to_msl_options options = {0};
++   char *msl = nir_to_msl(nir, &options);
++   CHECK(msl != NULL);
++   ralloc_free(nir);
++   return msl;
++}
++
++static unsigned
++count(const char *text, const char *needle)
++{
++   unsigned found = 0;
++   for (const char *at = strstr(text, needle); at != NULL;
++        at = strstr(at + 1, needle))
++      found++;
++   return found;
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   char *msl = translate();
++   CHECK(count(msl, "atomic_compare_exchange_weak_explicit(") == 1);
++
++   /* The exchange sits in the condition of a loop that runs again only
++    * while it failed yet read the comparison. */
++   const char *loop = strstr(msl, "; do { ta");
++   CHECK(loop != NULL);
++   const char *exchange =
++      strstr(loop, "} while (! atomic_compare_exchange_weak_explicit(");
++   CHECK(exchange != NULL);
++   const char *retry = strstr(exchange, ") && ta");
++   CHECK(retry != NULL);
++
++   /* The loop reloads the comparison into the variable it passes, and the
++    * retry compares against that same comparison. */
++   char name[32], comparison[32], checked[32], compared[32];
++   CHECK(sscanf(loop, "; do { %31[^ ] = %31[^;];", name, comparison) == 2);
++   CHECK(sscanf(retry, ") && %31[^ ] == %31[^)])", checked, compared) == 2);
++   CHECK(strcmp(name, checked) == 0);
++   CHECK(strcmp(comparison, compared) == 0);
++
++   printf("msl compare exchange PASS\n");
++   ralloc_free(msl);
++   glsl_type_singleton_decref();
++   return 0;
++}

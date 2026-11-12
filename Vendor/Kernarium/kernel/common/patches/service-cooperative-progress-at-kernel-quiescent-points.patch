@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 27 Aug 2026 08:24:28 +0900
+Subject: [PATCH] service cooperative progress at kernel quiescent points
+
+Keep timer checkpoints, safe loop boundaries, quiescent timer service, and the pre-cond_resched poll together as one cooperative-progress topic.
+
+schedule() is such a boundary when its caller stays runnable.  The IPI signal
+handler is only a wake edge, so a task that yields in a retry loop stops its
+CPU when nothing else is runnable there: neither the timer it waits for nor a
+wakeup queued to that CPU is ever serviced.  tty_open() does this while the
+last close of a terminal is still in progress, because tty_reopen() answers
+-EAGAIN and the opener calls schedule() and retries.  A shutdown that restarts
+a console getty then stops for minutes with one carrier looping through
+tty_open() and every other carrier asleep.  A task that is about to block
+needs no poll: it leaves the CPU to the idle loop or to another task.
+
+A TLB walk boundary may reschedule only where no spinlock or RCU read lock is
+held.  flush_tlb_mm() is such a boundary for its direct callers, dup_mmap()
+and the soft-dirty clear, which hold only mmap locks.  The mmu_gather flushes
+from zap_pte_range() under the PTE lock, inside the RCU read section that
+pte_offset_map_lock() opens, so its tlb_flush() never reaches that walk.
+Without CONFIG_PREEMPT_COUNT, cond_resched() there switched tasks with the
+PTE lock held, and even with it reported an RCU quiescent state inside the
+read section.  exit_mmap()'s full-mm gather, the only one that flushed the
+whole mm, needs no host work at all: arch_exit_mmap() has already emptied the
+host generation, and with no task left on the mm nothing maps into it again.
+---
+ arch/um/include/asm/tlb.h          | 31 ++++++++++++++++++++++++
+ arch/um/include/shared/kern_util.h |  3 +++
+ arch/um/kernel/skas/uaccess.c      | 38 +++++++++++++++++++++++++++++-
+ arch/um/kernel/time.c              | 15 ++++++++++++
+ arch/um/kernel/tlb.c               | 13 ++++++++++
+ arch/um/os-Darwin/smp.c            | 23 ++++++++++++++----
+ kernel/sched/core.c                | 29 +++++++++++++++++++++++
+ 7 files changed, 146 insertions(+), 6 deletions(-)
+
+diff --git a/arch/um/include/asm/tlb.h b/arch/um/include/asm/tlb.h
+index ed4e779424897a3d2d195eb5b48feb79083861c0..71fbc5ce6a18f3dd4c66d8ce6c64cfe1f68e4193 100644
+--- a/arch/um/include/asm/tlb.h
++++ b/arch/um/include/asm/tlb.h
+@@ -6,9 +6,40 @@
+ 
+ #include <asm/tlbflush.h>
+ #include <asm/cacheflush.h>
++
++#ifdef UML_HOST_DARWIN
++#define tlb_flush tlb_flush
++static inline void tlb_flush(struct mmu_gather *tlb);
++#endif
++
+ #include <asm-generic/tlb.h>
+ 
+ #ifdef UML_HOST_DARWIN
++/*
++ * The generic tlb_flush() without its flush_tlb_mm(), whose VMA walk
++ * reschedules.  A gather flushes from zap_pte_range() under the PTE lock and
++ * inside the RCU read section pte_offset_map_lock() opens.  exit_mmap()'s
++ * full-mm gather has nothing to flush: arch_exit_mmap() emptied the host
++ * generation before the first zap, and with no task left on the mm nothing
++ * maps into it again.  Any other whole-mm flush, which this port never asks
++ * for, covers every user address without scheduling.
++ */
++static inline void tlb_flush(struct mmu_gather *tlb)
++{
++	struct vm_area_struct vma = {
++		.vm_mm = tlb->mm,
++		.vm_flags = (tlb->vma_exec ? VM_EXEC    : 0) |
++			    (tlb->vma_huge ? VM_HUGETLB : 0),
++	};
++
++	if (tlb->fullmm && !atomic_read(&tlb->mm->mm_users))
++		return;
++	if (tlb->fullmm || tlb->need_flush_all)
++		flush_tlb_range(&vma, 0, TASK_SIZE);
++	else if (tlb->end)
++		flush_tlb_range(&vma, tlb->start, tlb->end);
++}
++
+ /* Darwin range invalidation quiesces every executor for the generation and
+  * advances the mapping epoch before it returns.  Concurrent mmu-gather users
+  * therefore retain the precise range they collected instead of converting it
+diff --git a/arch/um/include/shared/kern_util.h b/arch/um/include/shared/kern_util.h
+index 198ba0cad52645505807ac20faeb9641c6467495..480eda72a4869435404ccfeea1b97fdce330b298 100644
+--- a/arch/um/include/shared/kern_util.h
++++ b/arch/um/include/shared/kern_util.h
+@@ -37,6 +37,9 @@ extern unsigned int do_IRQ(int irq, struct uml_pt_regs *regs);
+ extern void initial_thread_cb(void (*proc)(void *), void *arg);
+ 
+ extern void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs);
++#ifdef UML_HOST_DARWIN
++void darwin_timer_kernel_checkpoint(void);
++#endif
+ 
+ extern void uml_pm_wake(void);
+ 
+diff --git a/arch/um/kernel/skas/uaccess.c b/arch/um/kernel/skas/uaccess.c
+index eebdfd692dbf7a4bf209190f8da07de8fa1dee44..0a79d20d3c871993203998e82fef9496c7a0547e 100644
+--- a/arch/um/kernel/skas/uaccess.c
++++ b/arch/um/kernel/skas/uaccess.c
+@@ -184,6 +184,31 @@ static void mark_user_page_dirty(unsigned long addr, struct page *page,
+ 		folio_set_dirty(folio);
+ }
+ 
++#ifdef UML_HOST_DARWIN
++static void darwin_uaccess_checkpoint(bool may_resched)
++{
++	if (!may_resched || !um_get_signals())
++		return;
++
++	/*
++	 * The fault-enabled half of a futex access can retry this path while a
++	 * sibling changes the same mm.  Native preemption normally bounds that
++	 * kernel loop.  Darwin's cooperative PREEMPT_NONE carriers instead need
++	 * an explicit safe point after all mmap and page-table locks have gone.
++	 *
++	 * The may_resched and logical-IRQ gates exclude atomic futex operations and
++	 * any caller that cannot safely enter Linux interrupt code.  Without
++	 * CONFIG_PREEMPTION, cond_resched() polls the per-CPU deadline before
++	 * testing need_resched, because the cooperative timer is what raises that
++	 * request and wakes the RCU grace-period thread.  It then schedules when
++	 * requested and reports an urgent RCU quiescent state when no task switch
++	 * is required.
++	 */
++	BUILD_BUG_ON(IS_ENABLED(CONFIG_PREEMPTION));
++	cond_resched();
++}
++#endif
++
+ static struct page *maybe_map(unsigned long virt, int is_write)
+ {
+ 	struct page *page;
+@@ -210,6 +235,10 @@ static struct page *maybe_map(unsigned long virt, int is_write)
+ 		if (handle_uaccess_fault(virt, is_write, &dummy_code) ||
+ 		    fatal_signal_pending(current))
+ 			return NULL;
++#ifdef UML_HOST_DARWIN
++		/* Only a fault that may sleep gets here. */
++		darwin_uaccess_checkpoint(true);
++#endif
+ 	}
+ 	if (IS_ERR(page))
+ 		return NULL;
+@@ -280,8 +309,12 @@ static int do_op_one_page(unsigned long addr, int len, int is_write,
+ 		page = NULL;
+ 	}
+ #endif
+-	if (page == NULL)
++	if (!page) {
++#ifdef UML_HOST_DARWIN
++		darwin_uaccess_checkpoint(may_sleep);
++#endif
+ 		return -1;
++	}
+ 
+ #ifdef CONFIG_64BIT
+ 	pagefault_disable();
+@@ -312,6 +345,9 @@ static int do_op_one_page(unsigned long addr, int len, int is_write,
+ 	if (is_write && n >= 0)
+ 		mark_user_page_dirty(user_addr, page, may_sleep);
+ 	unpin_user_mapping(page, is_write);
++#ifdef UML_HOST_DARWIN
++	darwin_uaccess_checkpoint(may_sleep);
++#endif
+ 	return n;
+ }
+ 
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index b46649f2ea64a6d4b289cb0d9ab8c164da804ba1..8b8a647f44ee690582f1f6b4aabb6d3e17b0d12b 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -13,6 +13,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/jiffies.h>
+ #include <linux/mm.h>
++#include <linux/ptrace.h>
+ #include <linux/sched.h>
+ #include <linux/sched/clock.h>
+ #include <linux/spinlock.h>
+@@ -814,6 +815,20 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ 		ct_irq_exit();
+ }
+ 
++#ifdef UML_HOST_DARWIN
++void darwin_timer_kernel_checkpoint(void)
++{
++	/* Cooperative Darwin timers normally run at guest/kernel or idle
++	 * boundaries.  A kernel path can otherwise spin or repeatedly retry before
++	 * the timer has made need_resched() true.  Safe in-kernel callers use this
++	 * tick source after asynchronous timer delivery has been disabled and only
++	 * after releasing locks, with logical IRQs enabled, matching an ordinary
++	 * interrupt of the current kernel frame.
++	 */
++	darwin_timer_poll(&current_pt_regs()->regs);
++}
++#endif
++
+ static int itimer_shutdown(struct clock_event_device *evt)
+ {
+ 	int cpu = evt - &timer_clockevent[0];
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 1db28abe9d40c61beccfd70c3920d82b9eeecbc2..bcb7a240bb0e14ab55dc6ca27902cc2c23c3bcfb 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -686,7 +686,20 @@ void flush_tlb_mm(struct mm_struct *mm)
+ 	for_each_vma(vmi, vma) {
+ 		um_tlb_mark_sync(mm, vma->vm_start, vma->vm_end);
+ #ifdef UML_HOST_DARWIN
++		/*
++		 * The host invalidation may quiesce every sibling executor.  Once it
++		 * returns no thread-local mapping batch is live, and no caller holds
++		 * a spinlock or an RCU read lock: dup_mmap() and the soft-dirty
++		 * clear hold only mmap locks, and the mmu_gather, which flushes under
++		 * the PTE lock, never comes here (see tlb_flush() in asm/tlb.h).
++		 * With logical IRQs enabled, cond_resched() services an expired
++		 * per-CPU deadline at the PREEMPT_NONE scheduling and RCU boundary
++		 * during a large VMA walk.
++		 */
++		BUILD_BUG_ON(IS_ENABLED(CONFIG_PREEMPTION));
+ 		darwin_tlb_invalidate_range(mm, vma->vm_start, vma->vm_end);
++		if (um_get_signals())
++			cond_resched();
+ #endif
+ 	}
+ }
+diff --git a/arch/um/os-Darwin/smp.c b/arch/um/os-Darwin/smp.c
+index a35a5a4dcb5e790a81c572ad6965605cefddf9a8..ad4667cb05383559e781fac47306b9a57eafa019 100644
+--- a/arch/um/os-Darwin/smp.c
++++ b/arch/um/os-Darwin/smp.c
+@@ -32,6 +32,7 @@ static uintptr_t cpu_thread_hazards[CONFIG_NR_CPUS];
+ static unsigned int pending_ipis[CONFIG_NR_CPUS];
+ static unsigned int guest_ipi_sequences[CONFIG_NR_CPUS];
+ static unsigned char guest_executing[CONFIG_NR_CPUS];
++static unsigned int spin_relax_counts[CONFIG_NR_CPUS];
+ static unsigned char ipi_idle_waiting[CONFIG_NR_CPUS];
+ static int ipi_wake_pipes[CONFIG_NR_CPUS][2] = {
+ 	[0 ... CONFIG_NR_CPUS - 1] = { -1, -1 },
+@@ -234,18 +235,30 @@ void darwin_ipi_poll(void)
+ 
+ void darwin_cpu_relax(void)
+ {
+-	int cpu = uml_curr_cpu();
++	int cpu;
+ 
+ 	asm volatile("yield" : : : "memory");
+ 	/* Darwin signals are wake edges, not Linux interrupt frames.  A carrier
+ 	 * waiting synchronously for remote kernel work must therefore service a
+ 	 * pending call-function IPI itself; otherwise two vCPUs can wait on one
+-	 * another forever inside csd_lock_wait().  Only enter Linux interrupt code
+-	 * when local IRQs are enabled.  Other spin loops retain the ordinary yield.
++	 * another forever inside csd_lock_wait().  Cooperative per-CPU timers also
++	 * need a kernel spin boundary: an rwsem optimistic spinner otherwise never
++	 * receives the tick which sets need_resched(), can monopolize its carrier,
++	 * and prevents an RCU grace period from completing.
++	 *
++	 * Only enter Linux interrupt code when local IRQs are enabled.  Throttle the
++	 * timer check because every call reads the monotonic clock, while keeping IPI
++	 * service immediate.  Each index has exactly one fixed carrier writer.
+ 	 */
+-	if (__atomic_load_n(&pending_ipis[cpu], __ATOMIC_ACQUIRE) != 0 &&
+-	    um_get_signals())
++	if (!um_get_signals())
++		return;
++	cpu = uml_curr_cpu();
++	if (__atomic_load_n(&pending_ipis[cpu], __ATOMIC_ACQUIRE) != 0)
+ 		darwin_ipi_poll();
++	/* IPI completion can migrate this task before it resumes. */
++	cpu = uml_curr_cpu();
++	if ((++spin_relax_counts[cpu] & 0xffU) == 0)
++		darwin_timer_kernel_checkpoint();
+ }
+ 
+ int darwin_ipi_idle_fd(void)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index dbd871c6235f42e0462090bc2ccb5d66f0a45d5e..fb32001c2f1af9f0b39e68c374c0530456a101bb 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -82,6 +82,10 @@
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+ 
++#ifdef UML_HOST_DARWIN
++#include <kern_util.h>
++#endif
++
+ #define CREATE_TRACE_POINTS
+ #include <linux/sched/rseq_api.h>
+ #include <trace/events/sched.h>
+@@ -7032,6 +7036,18 @@ asmlinkage __visible void __sched schedule(void)
+ 
+ 	if (!task_is_running(tsk))
+ 		sched_submit_work(tsk);
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Darwin's timer deadlines and IPI vectors are cooperative: a CPU
++	 * services them only at a polling boundary.  A caller which yields while
++	 * it stays runnable, such as the retry loops in tty_open(), reaches none
++	 * when nothing else is runnable on its CPU, so the timer or the queued
++	 * wakeup it is waiting for never arrives.  A task which is about to block
++	 * leaves the CPU to the idle loop or to another task, and both poll.
++	 */
++	else if (!irqs_disabled())
++		darwin_timer_kernel_checkpoint();
++#endif
+ 	__schedule_loop(SM_NONE);
+ 	sched_update_worker(tsk);
+ }
+@@ -7469,6 +7485,19 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
+ #if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
+ int __sched __cond_resched(void)
+ {
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Darwin's per-CPU timer deadlines are cooperative.  Poll at the
++	 * scheduler's central lock-free kernel boundary before testing
++	 * TIF_NEED_RESCHED, because the expired clock event is what raises that
++	 * flag.  IRQ-disabled callers retain the ordinary no-op behavior.  The
++	 * Darwin safe points in uaccess.c and tlb.c rely on this poll and
++	 * assert that the kernel is built without CONFIG_PREEMPTION.
++	 */
++	if (!irqs_disabled())
++		darwin_timer_kernel_checkpoint();
++#endif
++
+ 	if (should_resched(0) && !irqs_disabled()) {
+ 		preempt_schedule_common();
+ 		return 1;

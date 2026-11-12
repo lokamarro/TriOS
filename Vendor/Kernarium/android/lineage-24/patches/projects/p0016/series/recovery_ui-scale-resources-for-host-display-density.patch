@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 05:07:35 +0000
+Subject: [PATCH] recovery_ui: scale resources for host display density
+
+Change-Id: I4266486b63b221b6279c4faeb4698bfbc488837d
+---
+ minui/graphics.cpp          | 43 +++++++++++++++++++++
+ minui/include/minui/minui.h |  6 +++
+ minui/resources.cpp         | 26 +++++++++++++
+ recovery_ui/screen_ui.cpp   | 22 +++++++++--
+ tests/Android.bp            | 10 +++++
+ tests/unit/minui_test.cpp   | 76 +++++++++++++++++++++++++++++++++++++
+ 6 files changed, 179 insertions(+), 4 deletions(-)
+
+diff --git a/minui/graphics.cpp b/minui/graphics.cpp
+index 94ebcbc3f846479dff63401face9b58f5f244624..3bb7fce3b6651c26fd22c697684438900a07f6d1 100644
+--- a/minui/graphics.cpp
++++ b/minui/graphics.cpp
+@@ -387,6 +387,44 @@ unsigned int gr_get_height(const GRSurface* surface) {
+   return surface->height;
+ }
+ 
++// Bitmap fonts use an mdpi glyph grid. Scale each glyph independently so
++// fractional densities cannot mix adjacent characters or the two font faces.
++int gr_scale_font(GRFont* font, unsigned int density) {
++  if (font == nullptr || font->texture == nullptr || font->char_width <= 0 ||
++      font->char_height <= 0 || density < 80 || density > 640) {
++    return -1;
++  }
++  if (density == 160) return 0;
++  const auto width = std::max<uint64_t>(1, (uint64_t(font->char_width) * density + 80) / 160);
++  const auto height = std::max<uint64_t>(1, (uint64_t(font->char_height) * density + 80) / 160);
++  if (width > INT32_MAX / 96 || height > INT32_MAX / 2 ||
++      font->texture->pixel_bytes != 1 ||
++      font->texture->width != size_t(font->char_width) * 96 ||
++      font->texture->height != size_t(font->char_height) * 2) {
++    return -1;
++  }
++  auto scaled = GRSurface::Create(width * 96, height * 2, width * 96, 1);
++  if (!scaled) return -1;
++  for (size_t face = 0; face < 2; ++face) {
++    for (size_t y = 0; y < height; ++y) {
++      const auto source_y = face * font->char_height + y * font->char_height / height;
++      auto* output = scaled->data() + (face * height + y) * scaled->row_bytes;
++      for (size_t glyph = 0; glyph < 96; ++glyph) {
++        for (size_t x = 0; x < width; ++x) {
++          const auto source_x = glyph * font->char_width + x * font->char_width / width;
++          output[glyph * width + x] =
++              font->texture->data()[source_y * font->texture->row_bytes + source_x];
++        }
++      }
++    }
++  }
++  delete font->texture;
++  font->texture = scaled.release();
++  font->char_width = width;
++  font->char_height = height;
++  return 0;
++}
++
+ int gr_init_font(const char* name, GRFont** dest) {
+   GRFont* font = static_cast<GRFont*>(calloc(1, sizeof(*gr_font)));
+   if (font == nullptr) {
+@@ -405,6 +443,11 @@ int gr_init_font(const char* name, GRFont** dest) {
+   font->char_width = font->texture->width / 96;
+   font->char_height = font->texture->height / 2;
+ 
++  // The host supplies density at boot; builds without it keep their original fonts.
++  const auto density = android::base::GetIntProperty<int>("ro.sf.lcd_density", 160, 80, 640);
++  if (gr_scale_font(font, density) != 0) {
++    printf("Failed to scale %s at %d DPI; keeping its original font\n", name, density);
++  }
+   *dest = font;
+ 
+   return 0;
+diff --git a/minui/include/minui/minui.h b/minui/include/minui/minui.h
+index 183a015e8ced1b4998ef814b167664d9266207a7..eee46c0d9f127de8ca8e510c9e78bc130acb883a 100644
+--- a/minui/include/minui/minui.h
++++ b/minui/include/minui/minui.h
+@@ -48,6 +48,9 @@ class GRSurface {
+   // Clones the current GRSurface instance (i.e. an image).
+   std::unique_ptr<GRSurface> Clone() const;
+ 
++  // Scales an mdpi image to a display density, or returns nullptr on failure.
++  std::unique_ptr<GRSurface> Scale(unsigned int density) const;
++
+   virtual uint8_t* data() {
+     return data_.get();
+   }
+@@ -146,6 +149,9 @@ void gr_texticon(int x, int y, const GRSurface* icon);
+ 
+ const GRFont* gr_sys_font();
+ const GRFont* gr_menu_font();
++// Scales an mdpi font to a display density, preserving glyph and face boundaries.
++// On failure the font remains unchanged.
++int gr_scale_font(GRFont* font, unsigned int density);
+ int gr_init_font(const char* name, GRFont** dest);
+ void gr_text(const GRFont* font, int x, int y, const char* s, bool bold);
+ // Returns -1 if font is nullptr.
+diff --git a/minui/resources.cpp b/minui/resources.cpp
+index ce157219502f2f211f848654311c62c78b80e5ba..bf0681516b3cc2e6a166f8bde00a7427e20a1e27 100644
+--- a/minui/resources.cpp
++++ b/minui/resources.cpp
+@@ -27,6 +27,7 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <limits>
+ #include <memory>
+ #include <regex>
+@@ -63,6 +64,31 @@ std::unique_ptr<GRSurface> GRSurface::Clone() const {
+   return result;
+ }
+ 
++std::unique_ptr<GRSurface> GRSurface::Scale(unsigned int density) const {
++  if (density < 80 || density > 640 || width == 0 || height == 0 || pixel_bytes == 0 ||
++      width > INT32_MAX || height > INT32_MAX || width > SIZE_MAX / pixel_bytes ||
++      row_bytes < width * pixel_bytes) {
++    return nullptr;
++  }
++  const auto scaled_width = std::max<uint64_t>(1, (uint64_t(width) * density + 80) / 160);
++  const auto scaled_height = std::max<uint64_t>(1, (uint64_t(height) * density + 80) / 160);
++  if (scaled_width > INT32_MAX || scaled_height > INT32_MAX ||
++      scaled_width > SIZE_MAX / pixel_bytes) {
++    return nullptr;
++  }
++  auto result = Create(scaled_width, scaled_height, scaled_width * pixel_bytes, pixel_bytes);
++  if (!result) return nullptr;
++  for (size_t y = 0; y < scaled_height; ++y) {
++    const auto* source = data() + (uint64_t(y) * height / scaled_height) * row_bytes;
++    auto* target = result->data() + y * result->row_bytes;
++    for (size_t x = 0; x < scaled_width; ++x) {
++      memcpy(target + x * pixel_bytes,
++             source + (uint64_t(x) * width / scaled_width) * pixel_bytes, pixel_bytes);
++    }
++  }
++  return result;
++}
++
+ PngHandler::PngHandler(const std::string& name) {
+   std::string res_path = g_resource_dir + "/" + name + ".png";
+   png_fp_.reset(fopen(res_path.c_str(), "rbe"));
+diff --git a/recovery_ui/screen_ui.cpp b/recovery_ui/screen_ui.cpp
+index 0dcc4c6dde9f9fb3f217d8786bc7e20b0812ee75..416a9cd952dabd9f824401c36224c4d3aa2dc32d 100644
+--- a/recovery_ui/screen_ui.cpp
++++ b/recovery_ui/screen_ui.cpp
+@@ -393,7 +393,9 @@ ScreenRecoveryUI::ScreenRecoveryUI()
+           android::base::GetIntProperty("ro.recovery.ui.margin_height", kDefaultMarginHeight)),
+       animation_fps_(
+           android::base::GetIntProperty("ro.recovery.ui.animation_fps", kDefaultAnimationFps)),
+-      density_(static_cast<float>(android::base::GetIntProperty("ro.sf.lcd_density", 160)) / 160.f),
++      density_(static_cast<float>(android::base::GetIntProperty<int>(
++          "ro.sf.lcd_density", 160,
++          80, 640)) / 160.f),
+       blank_unblank_on_init_(
+           android::base::GetBoolProperty("ro.recovery.ui.blank_unblank_on_init", false)),
+       current_icon_(NONE),
+@@ -1075,25 +1077,37 @@ void ScreenRecoveryUI::ProgressThreadLoop() {
+   }
+ }
+ 
++// Scale once on load. Both RGBA assets and localized alpha text are mdpi;
++// scaling them with the fonts keeps every Recovery screen at the same size.
++static std::unique_ptr<GRSurface> ScaleBitmap(GRSurface* surface) {
++  std::unique_ptr<GRSurface> image(surface);
++  const auto density = android::base::GetIntProperty<int>("ro.sf.lcd_density", 160, 80, 640);
++  if (!image || density == 160) return image;
++  auto scaled = image->Scale(density);
++  if (scaled) return scaled;
++  LOG(ERROR) << "Failed to scale recovery bitmap at " << density << " DPI";
++  return image;
++}
++
+ std::unique_ptr<GRSurface> ScreenRecoveryUI::LoadBitmap(const std::string& filename) {
+   GRSurface* surface;
+   if (auto result = res_create_display_surface(filename.c_str(), &surface); result < 0) {
+     LOG(ERROR) << "Failed to load bitmap " << filename << " (error " << result << ")";
+     return nullptr;
+   }
+-  return std::unique_ptr<GRSurface>(surface);
++  return ScaleBitmap(surface);
+ }
+ 
+ std::unique_ptr<GRSurface> ScreenRecoveryUI::LoadLocalizedBitmap(const std::string& filename) {
+   GRSurface* surface;
+   auto result = res_create_localized_alpha_surface(filename.c_str(), locale_.c_str(), &surface);
+   if (result == 0) {
+-    return std::unique_ptr<GRSurface>(surface);
++    return ScaleBitmap(surface);
+   }
+ 
+   result = res_create_localized_alpha_surface(filename.c_str(), DEFAULT_LOCALE, &surface);
+   if (result == 0) {
+-    return std::unique_ptr<GRSurface>(surface);
++    return ScaleBitmap(surface);
+   }
+ 
+   return nullptr;
+diff --git a/tests/Android.bp b/tests/Android.bp
+index f411a99cd034a4e99db617b7eb4a28feb282bb25..09d5e015c75155ecb9b4d3067d828e870cad0ee1 100644
+--- a/tests/Android.bp
++++ b/tests/Android.bp
+@@ -84,6 +84,16 @@ librecovery_static_libs = [
+     "libtinyxml2",
+ ]
+ 
++// Pixel resources need no Recovery UI, filesystem, or OTA test fixtures.
++cc_test {
++    name: "recovery_minui_test",
++    isolated: true,
++    defaults: ["recovery_test_defaults"],
++    test_suites: ["device-tests"],
++    srcs: ["unit/minui_test.cpp"],
++    static_libs: ["libminui"],
++}
++
+ // recovery image for unittests.
+ // ========================================================
+ genrule {
+diff --git a/tests/unit/minui_test.cpp b/tests/unit/minui_test.cpp
+index c7d7f7eefc1b26533c0ad7a9df6644064ea456b4..6ec99a5e2b409414956adbd8bb7e0f8762e08045 100644
+--- a/tests/unit/minui_test.cpp
++++ b/tests/unit/minui_test.cpp
+@@ -52,3 +52,79 @@ TEST(GRSurfaceTest, Clone) {
+   ASSERT_EQ(std::vector(image->data(), image->data() + image->data_size()),
+             std::vector(image_copy->data(), image_copy->data() + image->data_size()));
+ }
++
++// The source has 96 glyphs and two faces; no scaled pixel may cross either boundary.
++TEST(GRFontScaleTest, PreservesGlyphsAndFaces) {
++  for (unsigned density : {160U, 213U, 240U, 320U, 480U}) {
++    auto surface = GRSurface::Create(192, 4, 192, 1);
++    ASSERT_TRUE(surface);
++    for (size_t face = 0; face < 2; ++face)
++      for (size_t glyph = 0; glyph < 96; ++glyph)
++        for (size_t y = 0; y < 2; ++y)
++          for (size_t x = 0; x < 2; ++x)
++            surface->data()[(face * 2 + y) * 192 + glyph * 2 + x] =
++                (glyph * 3 + face * 17 + y * 5 + x) % 256;
++    GRFont font{surface.release(), 2, 2};
++    ASSERT_EQ(0, gr_scale_font(&font, density));
++    const auto extent = (2 * density + 80) / 160;
++    EXPECT_EQ(extent, font.char_width);
++    EXPECT_EQ(extent, font.char_height);
++    EXPECT_EQ(extent * 96, font.texture->width);
++    EXPECT_EQ(extent * 2, font.texture->height);
++    for (size_t face = 0; face < 2; ++face)
++      for (size_t glyph = 0; glyph < 96; ++glyph)
++        for (size_t y = 0; y < extent; ++y)
++          for (size_t x = 0; x < extent; ++x)
++            EXPECT_EQ((glyph * 3 + face * 17 + (y * 2 / extent) * 5 + x * 2 / extent) % 256,
++                      font.texture->data()[(face * extent + y) * font.texture->row_bytes +
++                                            glyph * extent + x]);
++    delete font.texture;
++  }
++}
++
++TEST(GRFontScaleTest, RejectsInvalidDensityWithoutChangingTheFont) {
++  auto surface = GRSurface::Create(192, 4, 192, 1);
++  GRFont font{surface.get(), 2, 2};
++  EXPECT_EQ(-1, gr_scale_font(&font, 0));
++  EXPECT_EQ(-1, gr_scale_font(&font, 10000));
++  EXPECT_EQ(surface.get(), font.texture);
++  EXPECT_EQ(2, font.char_width);
++  EXPECT_EQ(-1, gr_scale_font(nullptr, 320));
++}
++
++
++TEST(GRSurfaceTest, ScalePreservesPixelsAndRowStride) {
++  for (size_t bytes : {1U, 4U}) {
++    auto image = GRSurface::Create(3, 2, 4 * bytes, bytes);
++    ASSERT_TRUE(image);
++    for (size_t y = 0; y < 2; ++y)
++      for (size_t x = 0; x < 3; ++x)
++        for (size_t c = 0; c < bytes; ++c)
++          image->data()[y * image->row_bytes + x * bytes + c] = y * 40 + x * 10 + c;
++    for (unsigned density : {160U, 213U, 240U, 320U, 480U}) {
++      auto scaled = image->Scale(density);
++      ASSERT_TRUE(scaled);
++      EXPECT_EQ((3 * density + 80) / 160, scaled->width);
++      EXPECT_EQ((2 * density + 80) / 160, scaled->height);
++      EXPECT_EQ(bytes, scaled->pixel_bytes);
++      for (size_t y = 0; y < scaled->height; ++y)
++        for (size_t x = 0; x < scaled->width; ++x)
++          for (size_t c = 0; c < bytes; ++c)
++            EXPECT_EQ((y * 2 / scaled->height) * 40 + (x * 3 / scaled->width) * 10 + c,
++                      scaled->data()[y * scaled->row_bytes + x * bytes + c]);
++    }
++  }
++}
++
++TEST(GRSurfaceTest, ScaleRejectsInvalidInputs) {
++  auto image = GRSurface::Create(3, 2, 12, 4);
++  ASSERT_TRUE(image);
++  EXPECT_FALSE(image->Scale(0));
++  EXPECT_FALSE(image->Scale(10000));
++  auto short_row = GRSurface::Create(3, 2, 3, 4);
++  ASSERT_TRUE(short_row);
++  EXPECT_FALSE(short_row->Scale(320));
++  auto oversized = GRSurface::Create(size_t(INT32_MAX) + 1, 1, 1, 1);
++  ASSERT_TRUE(oversized);
++  EXPECT_FALSE(oversized->Scale(320));
++}

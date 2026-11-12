@@ -1,0 +1,904 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:10:24 +0900
+Subject: [PATCH] kosmickrisp: implement single-texel buffer alignment
+
+Metal needs a texture buffer to start at its own alignment, so a view that
+starts anywhere else is described as a texture that starts up to one
+alignment earlier, texel_offset texels in front of the view, and every
+buffer-image and texel-fetch coordinate is moved forward by that offset.
+
+Metal then bounds-checks against that wider texture rather than the view,
+so a coordinate in [-texel_offset, -1] would read and write the texels in
+front of the view. Each coordinate is therefore checked against the view's
+element count first, unsigned so a negative one fails as well, and one
+outside the view becomes ~0, which lies outside any texture: the read
+returns zero and the write is dropped, as robustBufferAccess2 requires. A
+test reads, fetches and writes one texel in front of, one past and one
+inside a view that starts one texel into its buffer.
+---
+ src/kosmickrisp/bridge/mtl_device.h           |   2 +
+ src/kosmickrisp/bridge/mtl_device.m           |  10 +
+ src/kosmickrisp/bridge/stubs/mtl_device.c     |   7 +
+ src/kosmickrisp/vulkan/kk_buffer_view.c       |  31 +-
+ src/kosmickrisp/vulkan/kk_buffer_view.h       |   1 +
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |   4 +-
+ .../vulkan/kk_descriptor_set_layout.c         |   3 +
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  |   9 +
+ .../vulkan/kk_nir_lower_descriptors.c         |  82 +++-
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   7 +-
+ src/kosmickrisp/vulkan/kk_private.h           |   2 +
+ src/kosmickrisp/vulkan/meson.build            |  13 +
+ .../vulkan/tests/test_texel_buffer_bounds.c   | 393 ++++++++++++++++++
+ .../texel_buffer_bounds_shaders/bounds.comp   |  24 ++
+ .../texel_buffer_bounds_shaders/bounds.comp.h |  68 +++
+ .../texel_buffer_bounds_shaders/generate.sh   |   5 +
+ 16 files changed, 649 insertions(+), 12 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_texel_buffer_bounds.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp
+ create mode 100644 src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/generate.sh
+
+diff --git a/src/kosmickrisp/bridge/mtl_device.h b/src/kosmickrisp/bridge/mtl_device.h
+index 2aae76594af33a5a4e169304a81de26c70dcda58..ec90ac4c60e8aee938c607ef80844a31a38e0253 100644
+--- a/src/kosmickrisp/bridge/mtl_device.h
++++ b/src/kosmickrisp/bridge/mtl_device.h
+@@ -51,6 +51,8 @@ void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,
+                                                 uint64_t *align_B);
+ uint64_t mtl_minimum_linear_texture_alignment_for_pixel_format(
+    mtl_device *device, enum mtl_pixel_format format);
++uint64_t mtl_minimum_texture_buffer_alignment_for_pixel_format(
++   mtl_device *device, enum mtl_pixel_format format);
+ void mtl_heap_texture_size_and_align_with_descriptor(
+    mtl_device *device, struct kk_image_layout *layout, uint64_t *size_B,
+    uint64_t *align_B);
+diff --git a/src/kosmickrisp/bridge/mtl_device.m b/src/kosmickrisp/bridge/mtl_device.m
+index 4f7bc3e91f6d9a079228fa930a8e653fb45f6388..7ccf20bbd91e086443efbabfe385ee6f39deda30 100644
+--- a/src/kosmickrisp/bridge/mtl_device.m
++++ b/src/kosmickrisp/bridge/mtl_device.m
+@@ -264,6 +264,16 @@
+    }
+ }
+ 
++uint64_t
++mtl_minimum_texture_buffer_alignment_for_pixel_format(
++   mtl_device *device, enum mtl_pixel_format format)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      return [dev minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format];
++   }
++}
++
+ void
+ mtl_heap_texture_size_and_align_with_descriptor(mtl_device *device,
+                                                 struct kk_image_layout *layout,
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_device.c b/src/kosmickrisp/bridge/stubs/mtl_device.c
+index ba9614dc5cae7c4a30bdddd8e8d796eb8c8cc2fd..73f3f17481e87b813b98fbc7efe28b19684e7543 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_device.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_device.c
+@@ -116,6 +116,13 @@ mtl_minimum_linear_texture_alignment_for_pixel_format(
+    return 0u;
+ }
+ 
++uint64_t
++mtl_minimum_texture_buffer_alignment_for_pixel_format(
++   mtl_device *device, enum mtl_pixel_format format)
++{
++   return 0u;
++}
++
+ void
+ mtl_heap_texture_size_and_align_with_descriptor(mtl_device *device,
+                                                 struct kk_image_layout *layout,
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 7363e8ff87c51d48dd1ac1356c518d46adbae764..2a1694487bb8386b87234ddd68c4c406d051c0a6 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -16,6 +16,7 @@
+ #include "kk_physical_device.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
++#include "kosmickrisp/bridge/mtl_device.h"
+ #include "kosmickrisp/bridge/mtl_format.h"
+ 
+ #include "vk_format.h"
+@@ -76,8 +77,29 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+        view->vk.format == VK_FORMAT_R32_SINT)
+       usage |= MTL_TEXTURE_USAGE_SHADER_ATOMIC;
+ 
++   const uint64_t element_size_B = vk_format_get_blocksize(view->vk.format);
++   const uint64_t mtl_alignment_B =
++      mtl_minimum_texture_buffer_alignment_for_pixel_format(
++         kk_device_physical(dev)->mtl_dev_handle,
++         supported_format->mtl_pixel_format);
++   assert(util_is_power_of_two_or_zero64(mtl_alignment_B));
++   assert(mtl_alignment_B > 0);
++
++   struct kk_buffer *buffer =
++      container_of(view->vk.buffer, struct kk_buffer, vk);
++   const uint64_t absolute_offset_B =
++      kk_buffer_absolute_offset(buffer, view->vk.offset);
++   const uint64_t aligned_offset_B = absolute_offset_B & ~(mtl_alignment_B - 1);
++   const uint64_t tail_offset_B = absolute_offset_B - aligned_offset_B;
++   assert(tail_offset_B % element_size_B == 0);
++   assert(view->vk.elements <= UINT32_MAX);
++   assert(tail_offset_B / element_size_B <= UINT32_MAX);
++   view->texel_offset = tail_offset_B / element_size_B;
++   assert(view->vk.elements + view->texel_offset <=
++          16384u * 16384u);
++
+    struct kk_image_layout layout = {
+-      .width_px = view->vk.elements,
++      .width_px = view->vk.elements + view->texel_offset,
+       .height_px = 1u,
+       .depth_px = 1u,
+       .layers = 1u,
+@@ -95,13 +117,10 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+             .blue = supported_format->unswizzle.blue,
+             .alpha = supported_format->unswizzle.alpha,
+          },
+-      .linear_stride_B = view->vk.range,
++      .linear_stride_B = view->vk.range + tail_offset_B,
+    };
+-   struct kk_buffer *buffer =
+-      container_of(view->vk.buffer, struct kk_buffer, vk);
+    view->mtl_texel_buffer_handle = mtl_new_texture_with_descriptor_linear(
+-      buffer->mtl_handle, &layout,
+-      kk_buffer_absolute_offset(buffer, view->vk.offset));
++      buffer->mtl_handle, &layout, aligned_offset_B);
+    if (!view->mtl_texel_buffer_handle) {
+       vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.h b/src/kosmickrisp/vulkan/kk_buffer_view.h
+index 8525e50b760be09074e5e70d56dad3edabd7d5c1..b1ce0e0da847267910e24d6082a2e0060ee151a6 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.h
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.h
+@@ -23,6 +23,7 @@ struct kk_buffer_view {
+    struct vk_buffer_view vk;
+    mtl_texture *mtl_texel_buffer_handle;
+    uint64_t texel_buffer_gpu_id;
++   uint32_t texel_offset;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 62dd80260bfeef318a8ccd18d9832760d293cfb8..ae9d752ca1a911affc567f1b077b7b38719ac6b6 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -225,7 +225,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+                        const VkBufferView bufferView, uint32_t binding,
+                        uint32_t elem)
+ {
+-   struct kk_storage_image_descriptor desc = {};
++   struct kk_texel_buffer_descriptor desc = {};
+    if (bufferView != VK_NULL_HANDLE) {
+       VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
+ 
+@@ -233,6 +233,8 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+       assert(view->texel_buffer_gpu_id);
+ 
+       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
++      desc.texel_offset = view->texel_offset;
++      desc.element_count = view->vk.elements;
+    }
+    write_desc(set, binding, elem, &desc, sizeof(desc));
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+index 6e6db1a949cfd4ceb75eff44e3a98b2ed6fb1dd1..828830d07b8254d3a83de820b240b5c8d0cc662f 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+@@ -44,6 +44,9 @@ kk_descriptor_stride_align_for_type(
+ 
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++      *stride = *alignment = sizeof(struct kk_texel_buffer_descriptor);
++      break;
++
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+       *stride = *alignment = sizeof(struct kk_storage_image_descriptor);
+       break;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 0dee65bc71a37905d5fb2baadf89380533066fe4..c0f74932a0392030c5e16a324068b7ebd7f31edf 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -74,6 +74,15 @@ struct kk_storage_image_descriptor {
+ static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+               "kk_storage_image_descriptor has no holes");
+ 
++struct kk_texel_buffer_descriptor {
++   uint64_t image_gpu_resource_id;
++   uint32_t texel_offset;
++   uint32_t element_count;
++};
++
++static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
++              "kk_texel_buffer_descriptor has no holes");
++
+ /* This has to match nir_address_format_64bit_bounded_global */
+ struct kk_buffer_address {
+    uint64_t base_addr;
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 50a1b08765392618508d048b2422de552a587176..9f9b33b8a44f687cde77f661b912af28dfbec4f8 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -384,6 +384,29 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
+                           offset_B, ctx);
+ }
+ 
++/* A texel buffer's Metal texture starts up to one texture-buffer alignment
++ * before its view, so the view's texel i is the texture's texel
++ * i + texel_offset.  Metal bounds-checks against that texture, not the view,
++ * so a coordinate in [-texel_offset, -1] would reach the texels in front of
++ * the view.  Check the coordinate against the view before the shift instead:
++ * the unsigned compare also rejects every negative coordinate, and a rejected
++ * one becomes ~0, which lies outside any texture, so Metal reads zero and
++ * drops the write as robustBufferAccess2 requires.
++ */
++static nir_def *
++shift_texel_buffer_coord(nir_builder *b, nir_def *coord, nir_def *offset,
++                         nir_deref_instr *deref,
++                         const struct lower_descriptors_ctx *ctx)
++{
++   nir_def *element_count = load_resource_deref_desc(
++      b, 1, 32, deref,
++      offsetof(struct kk_texel_buffer_descriptor, element_count), ctx);
++   nir_def *x = nir_channel(b, coord, 0);
++   nir_def *shifted = nir_bcsel(b, nir_ult(b, x, element_count),
++                                nir_iadd(b, x, offset), nir_imm_int(b, -1));
++   return nir_vector_insert_imm(b, coord, shifted, 0);
++}
++
+ static bool
+ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+                    const struct lower_descriptors_ctx *ctx)
+@@ -391,9 +414,40 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+    b->cursor = nir_before_instr(&intr->instr);
+    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+ 
++   if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
++      if (intr->intrinsic == nir_intrinsic_image_deref_size) {
++         nir_def *element_count = load_resource_deref_desc(
++            b, 1, 32, deref,
++            offsetof(struct kk_texel_buffer_descriptor, element_count), ctx);
++         nir_def_rewrite_uses(&intr->def, element_count);
++         return true;
++      }
++
++      switch (intr->intrinsic) {
++      case nir_intrinsic_image_deref_load:
++      case nir_intrinsic_image_deref_sparse_load:
++      case nir_intrinsic_image_deref_store:
++      case nir_intrinsic_image_deref_atomic:
++      case nir_intrinsic_image_deref_atomic_swap: {
++         nir_def *texel_offset = load_resource_deref_desc(
++            b, 1, 32, deref,
++            offsetof(struct kk_texel_buffer_descriptor, texel_offset), ctx);
++         nir_src_rewrite(&intr->src[1],
++                         shift_texel_buffer_coord(b, intr->src[1].ssa,
++                                                  texel_offset, deref, ctx));
++         break;
++      }
++      default:
++         break;
++      }
++   }
++
+    /* Reads and queries use the texture descriptor; writes and atomics PBE. */
+-   unsigned offs =
+-      offsetof(struct kk_storage_image_descriptor, image_gpu_resource_id);
++   unsigned offs = nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF
++                      ? offsetof(struct kk_texel_buffer_descriptor,
++                                 image_gpu_resource_id)
++                      : offsetof(struct kk_storage_image_descriptor,
++                                 image_gpu_resource_id);
+ 
+    nir_def *resource_addr = load_resource_addr(b, 1, 64, deref, offs, ctx);
+ 
+@@ -485,6 +539,30 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+    const uint64_t plane_offset_B =
+       plane * sizeof(struct kk_sampled_image_descriptor);
+ 
++   nir_deref_instr *texture_deref =
++      nir_src_as_deref(nir_src_for_ssa(texture));
++   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
++      assert(plane == 0);
++      if (tex->op == nir_texop_txs) {
++         nir_def *element_count = load_resource_deref_desc(
++            b, 1, 32, texture_deref,
++            offsetof(struct kk_texel_buffer_descriptor, element_count), ctx);
++         nir_def_replace(&tex->def, element_count);
++         return true;
++      }
++
++      const int coord_src_idx =
++         nir_tex_instr_src_index(tex, nir_tex_src_coord);
++      assert(coord_src_idx >= 0);
++      nir_def *texel_offset = load_resource_deref_desc(
++         b, 1, 32, texture_deref,
++         offsetof(struct kk_texel_buffer_descriptor, texel_offset), ctx);
++      nir_src_rewrite(&tex->src[coord_src_idx].src,
++                      shift_texel_buffer_coord(
++                         b, tex->src[coord_src_idx].src.ssa, texel_offset,
++                         texture_deref, ctx));
++   }
++
+    /* LOD bias is passed in the descriptor set, rather than embedded into
+     * the sampler descriptor. There's no spot in the hardware descriptor,
+     * plus this saves on precious sampler heap spots.
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 89de07801dbc3b00614c023a1005ff2e8883ff71..0c11b757d1e2436617c73cd802f53a0da5b873bc 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -515,7 +515,8 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
+       .maxImageDimension3D = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_3D),
+       .maxImageDimensionCube = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_2D),
+       .maxImageArrayLayers = 2048,
+-      .maxTexelBufferElements = 16384 * 16384,
++      /* Reserve room for the alignment prefix hidden by the descriptor. */
++      .maxTexelBufferElements = KK_MAX_TEXEL_BUFFER_ELEMENTS,
+       .maxUniformBufferRange = 65536,
+       .maxStorageBufferRange = UINT32_MAX,
+       .maxPushConstantsSize = KK_MAX_PUSH_SIZE,
+@@ -720,9 +721,9 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
+       .integerDotProduct4x8BitPackedSignedAccelerated = false,
+       .integerDotProduct4x8BitPackedMixedSignednessAccelerated = false,
+       .storageTexelBufferOffsetAlignmentBytes = KK_MIN_TEXEL_BUFFER_ALIGNMENT,
+-      .storageTexelBufferOffsetSingleTexelAlignment = false,
++      .storageTexelBufferOffsetSingleTexelAlignment = true,
+       .uniformTexelBufferOffsetAlignmentBytes = KK_MIN_TEXEL_BUFFER_ALIGNMENT,
+-      .uniformTexelBufferOffsetSingleTexelAlignment = false,
++      .uniformTexelBufferOffsetSingleTexelAlignment = true,
+       .maxBufferSize = pdev->info.max_buffer_size,
+ 
+       /* VK_KHR_push_descriptor */
+diff --git a/src/kosmickrisp/vulkan/kk_private.h b/src/kosmickrisp/vulkan/kk_private.h
+index b58bd219e208f92948ad0f4864a992681f4a5503..a31eadde4320459375e9f1e68bb5d39ea24d55d3 100644
+--- a/src/kosmickrisp/vulkan/kk_private.h
++++ b/src/kosmickrisp/vulkan/kk_private.h
+@@ -22,6 +22,8 @@
+ #define KK_MAX_SAMPLES                   8
+ #define KK_MIN_SSBO_ALIGNMENT            16
+ #define KK_MIN_TEXEL_BUFFER_ALIGNMENT    16
++#define KK_MAX_TEXEL_BUFFER_ELEMENTS     \
++   ((16384u * 16384u) - (KK_MIN_TEXEL_BUFFER_ALIGNMENT - 1u))
+ #define KK_MIN_UBO_ALIGNMENT             64
+ #define KK_MAX_VIEWPORTS                 16
+ #define KK_MAX_DESCRIPTOR_SIZE           64
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index aab37eeb4cf713018e942c533477c0eb81029eec..763133196c0b4a77042a2820253e60c485680f98 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -244,5 +244,18 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 60,
+     )
++    test(
++      'kosmickrisp_texel_buffer_bounds',
++      executable(
++        'test_kosmickrisp_texel_buffer_bounds',
++        files('tests/test_texel_buffer_bounds.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+   endif
+ endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_texel_buffer_bounds.c b/src/kosmickrisp/vulkan/tests/test_texel_buffer_bounds.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d72b609cb40e747de87163e708bd5baa32b84e03
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_texel_buffer_bounds.c
+@@ -0,0 +1,393 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A texel buffer view may start at any texel, but a Metal texture buffer has
++ * to start at Metal's own alignment, so the driver describes a texture that
++ * starts that far before the view and shifts every coordinate forward.  Metal
++ * bounds-checks against its texture, not the view: without a check against
++ * the view, a coordinate just below zero lands on the texels in front of the
++ * view and reads or writes them, where robustBufferAccess2 promises a zero
++ * read and a dropped write.  A coordinate one past the view's end must behave
++ * the same, and one inside it must reach its texel. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++static const uint32_t bounds_comp[] =
++#include "texel_buffer_bounds_shaders/bounds.comp.h"
++   ;
++
++#define WORDS          64u
++#define VIEW_FIRST     1u
++#define VIEW_ELEMENTS  16u
++#define STORED         0xdeadbeefu
++
++static uint32_t
++find_memory_type(const VkPhysicalDeviceMemoryProperties *properties,
++                 uint32_t type_bits, VkMemoryPropertyFlags flags)
++{
++   for (uint32_t i = 0; i < properties->memoryTypeCount; i++) {
++      if ((type_bits & (1u << i)) &&
++          (properties->memoryTypes[i].propertyFlags & flags) == flags)
++         return i;
++   }
++   CHECK(!"no memory type");
++   return 0;
++}
++
++static uint32_t
++original_word(uint32_t index)
++{
++   return 0xa0000000u | index;
++}
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkGetPhysicalDeviceProperties2);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++
++   /* The view starts one texel into the buffer, which only single-texel
++    * alignment allows, and which Metal's texture-buffer alignment does not. */
++   VkPhysicalDeviceTexelBufferAlignmentProperties alignment = {
++      .sType =
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES,
++   };
++   VkPhysicalDeviceProperties2 properties = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++      .pNext = &alignment,
++   };
++   vkGetPhysicalDeviceProperties2(physical, &properties);
++   CHECK(alignment.storageTexelBufferOffsetSingleTexelAlignment);
++   CHECK(alignment.uniformTexelBufferOffsetSingleTexelAlignment);
++
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceRobustness2FeaturesEXT robustness2 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++      .robustBufferAccess2 = VK_TRUE,
++   };
++   VkPhysicalDeviceFeatures features = {.robustBufferAccess = VK_TRUE};
++   const char *extensions[] = {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &robustness2,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = 1,
++      .ppEnabledExtensionNames = extensions,
++      .pEnabledFeatures = &features,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkMapMemory);
++   LOAD_D(vkCreateBufferView);
++   LOAD_D(vkDestroyBufferView);
++   LOAD_D(vkCreateShaderModule);
++   LOAD_D(vkDestroyShaderModule);
++   LOAD_D(vkCreateDescriptorSetLayout);
++   LOAD_D(vkDestroyDescriptorSetLayout);
++   LOAD_D(vkCreatePipelineLayout);
++   LOAD_D(vkDestroyPipelineLayout);
++   LOAD_D(vkCreateComputePipelines);
++   LOAD_D(vkDestroyPipeline);
++   LOAD_D(vkCreateDescriptorPool);
++   LOAD_D(vkDestroyDescriptorPool);
++   LOAD_D(vkAllocateDescriptorSets);
++   LOAD_D(vkUpdateDescriptorSets);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdBindPipeline);
++   LOAD_D(vkCmdBindDescriptorSets);
++   LOAD_D(vkCmdPushConstants);
++   LOAD_D(vkCmdDispatch);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, 0, 0, &queue);
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++
++   /* One host-visible allocation holds the texels at its start and the
++    * shader's results after them. */
++   VkBufferCreateInfo texel_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = WORDS * sizeof(uint32_t),
++      .usage = VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
++               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
++   };
++   VkBuffer texels = VK_NULL_HANDLE;
++   CHECK(vkCreateBuffer(device, &texel_info, NULL, &texels) == VK_SUCCESS);
++   VkBufferCreateInfo result_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = 2 * sizeof(uint32_t),
++      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++   };
++   VkBuffer results = VK_NULL_HANDLE;
++   CHECK(vkCreateBuffer(device, &result_info, NULL, &results) == VK_SUCCESS);
++   VkMemoryRequirements texel_requirements, result_requirements;
++   vkGetBufferMemoryRequirements(device, texels, &texel_requirements);
++   vkGetBufferMemoryRequirements(device, results, &result_requirements);
++   const VkDeviceSize result_offset =
++      (texel_requirements.size + result_requirements.alignment - 1) &
++      ~(result_requirements.alignment - 1);
++   VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = result_offset + result_requirements.size,
++      .memoryTypeIndex = find_memory_type(
++         &memory_properties,
++         texel_requirements.memoryTypeBits & result_requirements.memoryTypeBits,
++         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
++   };
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &memory_info, NULL, &memory) == VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, texels, memory, 0) == VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, results, memory, result_offset) ==
++         VK_SUCCESS);
++   void *mapped = NULL;
++   CHECK(vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) ==
++         VK_SUCCESS);
++   volatile uint32_t *words = mapped;
++   volatile uint32_t *result = (volatile uint32_t *)((char *)mapped +
++                                                     result_offset);
++
++   VkBufferView views[2];
++   for (unsigned i = 0; i < 2; i++) {
++      VkBufferViewCreateInfo view_info = {
++         .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
++         .buffer = texels,
++         .format = VK_FORMAT_R32_UINT,
++         .offset = VIEW_FIRST * sizeof(uint32_t),
++         .range = VIEW_ELEMENTS * sizeof(uint32_t),
++      };
++      CHECK(vkCreateBufferView(device, &view_info, NULL, &views[i]) ==
++            VK_SUCCESS);
++   }
++
++   VkShaderModuleCreateInfo module_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(bounds_comp),
++      .pCode = bounds_comp,
++   };
++   VkShaderModule module = VK_NULL_HANDLE;
++   CHECK(vkCreateShaderModule(device, &module_info, NULL, &module) ==
++         VK_SUCCESS);
++   const VkDescriptorSetLayoutBinding bindings[] = {
++      {0, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1,
++       VK_SHADER_STAGE_COMPUTE_BIT, NULL},
++      {1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1,
++       VK_SHADER_STAGE_COMPUTE_BIT, NULL},
++      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
++       NULL},
++   };
++   VkDescriptorSetLayoutCreateInfo set_layout_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .bindingCount = 3,
++      .pBindings = bindings,
++   };
++   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
++   CHECK(vkCreateDescriptorSetLayout(device, &set_layout_info, NULL,
++                                     &set_layout) == VK_SUCCESS);
++   VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                     2 * sizeof(uint32_t)};
++   VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1,
++      .pSetLayouts = &set_layout,
++      .pushConstantRangeCount = 1,
++      .pPushConstantRanges = &push_range,
++   };
++   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
++   CHECK(vkCreatePipelineLayout(device, &layout_info, NULL,
++                                &pipeline_layout) == VK_SUCCESS);
++   VkComputePipelineCreateInfo pipeline_info = {
++      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++      .stage =
++         {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++            .module = module,
++            .pName = "main",
++         },
++      .layout = pipeline_layout,
++   };
++   VkPipeline pipeline = VK_NULL_HANDLE;
++   CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                  NULL, &pipeline) == VK_SUCCESS);
++
++   const VkDescriptorPoolSize pool_sizes[] = {
++      {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1},
++      {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1},
++      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
++   };
++   VkDescriptorPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++      .maxSets = 1,
++      .poolSizeCount = 3,
++      .pPoolSizes = pool_sizes,
++   };
++   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
++   CHECK(vkCreateDescriptorPool(device, &pool_info, NULL, &descriptor_pool) ==
++         VK_SUCCESS);
++   VkDescriptorSetAllocateInfo set_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++      .descriptorPool = descriptor_pool,
++      .descriptorSetCount = 1,
++      .pSetLayouts = &set_layout,
++   };
++   VkDescriptorSet set = VK_NULL_HANDLE;
++   CHECK(vkAllocateDescriptorSets(device, &set_info, &set) == VK_SUCCESS);
++   VkDescriptorBufferInfo result_desc = {results, 0, VK_WHOLE_SIZE};
++   const VkWriteDescriptorSet writes[] = {
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstSet = set,
++         .dstBinding = 0,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
++         .pTexelBufferView = &views[0],
++      },
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstSet = set,
++         .dstBinding = 1,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
++         .pTexelBufferView = &views[1],
++      },
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstSet = set,
++         .dstBinding = 2,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++         .pBufferInfo = &result_desc,
++      },
++   };
++   vkUpdateDescriptorSets(device, 3, writes, 0, NULL);
++
++   VkCommandPoolCreateInfo command_pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = 0,
++   };
++   VkCommandPool command_pool = VK_NULL_HANDLE;
++   CHECK(vkCreateCommandPool(device, &command_pool_info, NULL,
++                             &command_pool) == VK_SUCCESS);
++   VkCommandBufferAllocateInfo command_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = command_pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VkCommandBuffer command = VK_NULL_HANDLE;
++   CHECK(vkAllocateCommandBuffers(device, &command_info, &command) ==
++         VK_SUCCESS);
++
++   /* Just in front of the view, just past its end, and its first texel. */
++   const int32_t coords[] = {-1, (int32_t)VIEW_ELEMENTS, 0};
++   for (unsigned c = 0; c < 3; c++) {
++      for (uint32_t i = 0; i < WORDS; i++)
++         words[i] = original_word(i);
++      result[0] = result[1] = 0x55555555u;
++
++      VkCommandBufferBeginInfo begin = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++      };
++      CHECK(vkBeginCommandBuffer(command, &begin) == VK_SUCCESS);
++      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
++      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
++                              pipeline_layout, 0, 1, &set, 0, NULL);
++      const uint32_t push[2] = {(uint32_t)coords[c], STORED};
++      vkCmdPushConstants(command, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
++                         0, sizeof(push), push);
++      vkCmdDispatch(command, 1, 1, 1);
++      CHECK(vkEndCommandBuffer(command) == VK_SUCCESS);
++      VkSubmitInfo submit = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .commandBufferCount = 1,
++         .pCommandBuffers = &command,
++      };
++      CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++      CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++
++      unsigned changed = 0;
++      for (uint32_t i = 0; i < WORDS; i++)
++         changed += words[i] != original_word(i);
++      fprintf(stderr,
++              "coord %d: loaded 0x%08x, fetched 0x%08x, %u word(s) changed\n",
++              coords[c], result[0], result[1], changed);
++      if (coords[c] < 0 || coords[c] >= (int32_t)VIEW_ELEMENTS) {
++         CHECK(result[0] == 0u);
++         CHECK(result[1] == 0u);
++         CHECK(changed == 0u);
++      } else {
++         const uint32_t word = VIEW_FIRST + (uint32_t)coords[c];
++         CHECK(result[0] == original_word(word));
++         CHECK(result[1] == original_word(word));
++         CHECK(words[word] == STORED);
++         CHECK(changed == 1u);
++      }
++   }
++
++   vkDestroyCommandPool(device, command_pool, NULL);
++   vkDestroyDescriptorPool(device, descriptor_pool, NULL);
++   vkDestroyPipeline(device, pipeline, NULL);
++   vkDestroyPipelineLayout(device, pipeline_layout, NULL);
++   vkDestroyDescriptorSetLayout(device, set_layout, NULL);
++   vkDestroyShaderModule(device, module, NULL);
++   for (unsigned i = 0; i < 2; i++)
++      vkDestroyBufferView(device, views[i], NULL);
++   vkDestroyBuffer(device, results, NULL);
++   vkDestroyBuffer(device, texels, NULL);
++   vkFreeMemory(device, memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("a texel buffer access outside its view reads zero and writes "
++          "nothing\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp b/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..79ba3f295448c06709ccee8e5ac09fa454c43e7c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp
+@@ -0,0 +1,24 @@
++#version 450
++
++/* Read one texel through a storage and a uniform texel buffer view of the same
++ * range, then write it through the storage view. */
++layout(local_size_x = 1) in;
++
++layout(set = 0, binding = 0, r32ui) uniform uimageBuffer storage_view;
++layout(set = 0, binding = 1) uniform usamplerBuffer uniform_view;
++layout(set = 0, binding = 2, std430) buffer Result {
++   uint loaded;
++   uint fetched;
++} result;
++
++layout(push_constant) uniform Push {
++   int coord;
++   uint value;
++} push;
++
++void main()
++{
++   result.loaded = imageLoad(storage_view, push.coord).x;
++   result.fetched = texelFetch(uniform_view, push.coord).x;
++   imageStore(storage_view, push.coord, uvec4(push.value));
++}
+diff --git a/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp.h b/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0628c99f78343301b5e8fd3bf3238ca46c968fa
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/bounds.comp.h
+@@ -0,0 +1,68 @@
++{0x07230203,0x00010600,0x000d000b,0x0000002d,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x0000002e,0x00020011,0x0000002f,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000e,0x00000012,
++0x0000001f,0x00060010,0x00000004,0x00000011,
++0x00000001,0x00000001,0x00000001,0x00030047,
++0x00000007,0x00000002,0x00050048,0x00000007,
++0x00000000,0x00000023,0x00000000,0x00050048,
++0x00000007,0x00000001,0x00000023,0x00000004,
++0x00040047,0x00000009,0x00000021,0x00000002,
++0x00040047,0x00000009,0x00000022,0x00000000,
++0x00040047,0x0000000e,0x00000021,0x00000000,
++0x00040047,0x0000000e,0x00000022,0x00000000,
++0x00030047,0x00000010,0x00000002,0x00050048,
++0x00000010,0x00000000,0x00000023,0x00000000,
++0x00050048,0x00000010,0x00000001,0x00000023,
++0x00000004,0x00040047,0x0000001f,0x00000021,
++0x00000001,0x00040047,0x0000001f,0x00000022,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000000,0x0004001e,0x00000007,
++0x00000006,0x00000006,0x00040020,0x00000008,
++0x0000000c,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x0000000c,0x00040015,0x0000000a,
++0x00000020,0x00000001,0x0004002b,0x0000000a,
++0x0000000b,0x00000000,0x00090019,0x0000000c,
++0x00000006,0x00000005,0x00000000,0x00000000,
++0x00000000,0x00000002,0x00000021,0x00040020,
++0x0000000d,0x00000000,0x0000000c,0x0004003b,
++0x0000000d,0x0000000e,0x00000000,0x0004001e,
++0x00000010,0x0000000a,0x00000006,0x00040020,
++0x00000011,0x00000009,0x00000010,0x0004003b,
++0x00000011,0x00000012,0x00000009,0x00040020,
++0x00000013,0x00000009,0x0000000a,0x00040017,
++0x00000016,0x00000006,0x00000004,0x00040020,
++0x0000001a,0x0000000c,0x00000006,0x0004002b,
++0x0000000a,0x0000001c,0x00000001,0x00090019,
++0x0000001d,0x00000006,0x00000005,0x00000000,
++0x00000000,0x00000000,0x00000001,0x00000000,
++0x00040020,0x0000001e,0x00000000,0x0000001d,
++0x0004003b,0x0000001e,0x0000001f,0x00000000,
++0x00040020,0x00000029,0x00000009,0x00000006,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x0000000c,0x0000000f,0x0000000e,0x00050041,
++0x00000013,0x00000014,0x00000012,0x0000000b,
++0x0004003d,0x0000000a,0x00000015,0x00000014,
++0x00060062,0x00000016,0x00000017,0x0000000f,
++0x00000015,0x00002000,0x00050051,0x00000006,
++0x00000019,0x00000017,0x00000000,0x00050041,
++0x0000001a,0x0000001b,0x00000009,0x0000000b,
++0x0003003e,0x0000001b,0x00000019,0x0004003d,
++0x0000001d,0x00000020,0x0000001f,0x0006005f,
++0x00000016,0x00000023,0x00000020,0x00000015,
++0x00002000,0x00050051,0x00000006,0x00000024,
++0x00000023,0x00000000,0x00050041,0x0000001a,
++0x00000025,0x00000009,0x0000001c,0x0003003e,
++0x00000025,0x00000024,0x0004003d,0x0000000c,
++0x00000026,0x0000000e,0x00050041,0x00000029,
++0x0000002a,0x00000012,0x0000001c,0x0004003d,
++0x00000006,0x0000002b,0x0000002a,0x00070050,
++0x00000016,0x0000002c,0x0000002b,0x0000002b,
++0x0000002b,0x0000002b,0x00050063,0x00000026,
++0x00000015,0x0000002c,0x00002000,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..baecf0a7d67c687ea881f1ef75861917f58cf3e3
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/texel_buffer_bounds_shaders/generate.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++glslc -O --target-env=vulkan1.3 -mfmt=c bounds.comp -o bounds.comp.h

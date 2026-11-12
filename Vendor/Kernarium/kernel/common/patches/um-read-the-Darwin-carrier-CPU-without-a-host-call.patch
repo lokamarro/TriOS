@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:40:12 +0900
+Subject: [PATCH] um: read the Darwin carrier CPU without a host call
+
+`current` is cpu_tasks[uml_curr_cpu()], and on Darwin uml_curr_cpu()
+asked pthread_getspecific() behind an acquiring load: a call through
+the PLT into libsystem_pthread on every use. On an iPad that cost 3.5%
+of all vCPU time in a WebGL workload, and 1.1% to 1.5% on a Mac.
+
+Keep each carrier's CPU number itself in a second pthread key, where
+no carrier reads as 0, and read that key's word from the thread's TSD
+directly: TPIDRRO_EL0 holds the TSD base and the word lies key * 8
+bytes into it. The layout is Darwin's own, so every carrier checks it
+against pthread_getspecific() at bring-up, with a base that must lie
+in its own pthread structure and name the thread, and with the carrier
+key's word, which is never NULL there, as the proof. The direct read
+is enabled once a carrier has checked it and disabled for good, with a
+warning, by any mismatch, which sends every reader back to the call.
+---
+ arch/um/os-Darwin/smp.c | 88 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 81 insertions(+), 7 deletions(-)
+
+diff --git a/arch/um/os-Darwin/smp.c b/arch/um/os-Darwin/smp.c
+index eeac8ec76eea0b72406a3a85cf4b08bf8c38ce9d..59a78eac66d9722b184243d82e8dd79f865b3ba8 100644
+--- a/arch/um/os-Darwin/smp.c
++++ b/arch/um/os-Darwin/smp.c
+@@ -25,9 +25,18 @@ struct cpu_thread_data {
+ 	jmp_buf native_context;
+ };
+ 
++
+ static pthread_key_t current_cpu_key;
++/* The carrier's CPU itself, so that no carrier, which is NULL, reads as 0. */
++static pthread_key_t current_cpu_number_key;
+ static pthread_once_t current_cpu_once = PTHREAD_ONCE_INIT;
+ static int current_cpu_key_ready;
++/*
++ * The byte offset of current_cpu_number_key's word in a thread's TSD once a
++ * carrier has verified the layout, 0 until then, and negative for good after
++ * a mismatch.  See uml_curr_cpu().
++ */
++static long current_cpu_slot;
+ static uintptr_t cpu_threads[CONFIG_NR_CPUS];
+ static uintptr_t cpu_thread_hazards[CONFIG_NR_CPUS];
+ static unsigned int pending_ipis[CONFIG_NR_CPUS];
+@@ -60,15 +69,14 @@ static void create_current_cpu_key(void)
+ 	 * It remains registered while custom UML longjmp moves execution between
+ 	 * Linux task stacks, and runs only when that carrier finally exits.
+ 	 */
+-	if (pthread_key_create(&current_cpu_key, retire_cpu_carrier) != 0)
++	if (pthread_key_create(&current_cpu_key, retire_cpu_carrier) != 0 ||
++	    pthread_key_create(&current_cpu_number_key, NULL) != 0)
+ 		panic("Darwin: unable to create current CPU key");
+ 	__atomic_store_n(&current_cpu_key_ready, 1, __ATOMIC_RELEASE);
+ }
+ 
+-int uml_curr_cpu(void)
++static noinline int current_cpu_from_key(void)
+ {
+-	struct cpu_thread_data *carrier;
+-
+ 	/* cpu_relax() reaches this on every spin iteration, so the read path
+ 	 * carries no pthread_once.  Every carrier creates the key before it runs
+ 	 * any Linux code, and a thread which reads before that has no carrier at
+@@ -76,8 +84,28 @@ int uml_curr_cpu(void)
+ 	 */
+ 	if (__atomic_load_n(&current_cpu_key_ready, __ATOMIC_ACQUIRE) == 0)
+ 		return 0;
+-	carrier = pthread_getspecific(current_cpu_key);
+-	return carrier == NULL ? 0 : carrier->cpu;
++	return (int)(uintptr_t)pthread_getspecific(current_cpu_number_key);
++}
++
++int uml_curr_cpu(void)
++{
++	long slot = __atomic_load_n(&current_cpu_slot, __ATOMIC_RELAXED);
++	uintptr_t base;
++
++	/*
++	 * `current` asks for the CPU on every use, and pthread_getspecific() is
++	 * a call into the host, which iOS pays an order of magnitude more for
++	 * than macOS.  Read the key's word directly instead: TPIDRRO_EL0 holds
++	 * the thread's TSD base, and the word lies current_cpu_slot bytes into
++	 * it.  That layout is Darwin's own, not an interface, so each carrier
++	 * checks it against pthread_getspecific() as it comes up, and any
++	 * mismatch sends every reader back to the call.
++	 */
++	if (__builtin_expect(slot <= 0, 0))
++		return current_cpu_from_key();
++	__asm__ volatile("mrs %0, tpidrro_el0" : "=r" (base));
++	return (int)*(const uintptr_t *)((base & ~(uintptr_t)7) +
++					 (unsigned long)slot);
+ }
+ 
+ /* The boot thread owns the kernel until it hands CPU0 to a carrier, and each
+@@ -174,6 +202,49 @@ static void name_cpu_carrier(int cpu)
+ 	(void)pthread_setname_np(name);
+ }
+ 
++/*
++ * Whether this thread's TSD, at TPIDRRO_EL0, holds what pthread_getspecific()
++ * returns for `key` at the key's slot.  The base must lie inside this
++ * thread's own pthread structure, where Darwin keeps the TSD, and name the
++ * thread in its first word, so nothing is read through a register whose
++ * meaning has changed.
++ */
++static int current_cpu_key_matches(pthread_key_t key)
++{
++	unsigned long slot = (unsigned long)key * sizeof(void *);
++	uintptr_t self = (uintptr_t)pthread_self();
++	uintptr_t base;
++
++	__asm__ volatile("mrs %0, tpidrro_el0" : "=r" (base));
++	base &= ~(uintptr_t)7;
++	if (base < self || base - self >= 4096 || slot == 0 || slot >= 8192 ||
++	    *(const uintptr_t *)base != self)
++		return 0;
++	return *(void *const *)(base + slot) == pthread_getspecific(key);
++}
++
++static void check_current_cpu_slot(int cpu)
++{
++	long slot = (long)((unsigned long)current_cpu_number_key *
++			   sizeof(void *));
++	long expected = 0;
++
++	/* The carrier key's value is never NULL here, which makes it the
++	 * proof of the layout that a CPU0 number of NULL could not be. */
++	if (!current_cpu_key_matches(current_cpu_key) ||
++	    !current_cpu_key_matches(current_cpu_number_key)) {
++		if (__atomic_exchange_n(&current_cpu_slot, -1L,
++					__ATOMIC_RELAXED) >= 0)
++			os_warn("Darwin: CPU%d's thread-specific data is not "
++				"where expected; reading the CPU through "
++				"pthread_getspecific()\n", cpu);
++		return;
++	}
++	/* The first carrier enables the read; a refusal is never undone. */
++	(void)__atomic_compare_exchange_n(&current_cpu_slot, &expected, slot, 0,
++					  __ATOMIC_RELAXED, __ATOMIC_RELAXED);
++}
++
+ void darwin_set_current_cpu(int cpu)
+ {
+ 	struct cpu_thread_data *carrier;
+@@ -183,6 +254,7 @@ void darwin_set_current_cpu(int cpu)
+ 	carrier = pthread_getspecific(current_cpu_key);
+ 	if (carrier == NULL || carrier->cpu != cpu)
+ 		panic("Darwin: CPU%d is not running on its fixed carrier", cpu);
++	check_current_cpu_slot(cpu);
+ 	name_cpu_carrier(cpu);
+ 	darwin_publish_cpu_thread(cpu, pthread_self());
+ }
+@@ -534,7 +606,9 @@ static void *cpu_carrier(void *argument)
+ 	int primary;
+ 
+ 	if (pthread_once(&current_cpu_once, create_current_cpu_key) != 0 ||
+-	    pthread_setspecific(current_cpu_key, data) != 0)
++	    pthread_setspecific(current_cpu_key, data) != 0 ||
++	    pthread_setspecific(current_cpu_number_key,
++				(void *)(uintptr_t)data->cpu) != 0)
+ 		panic("Darwin: unable to register fixed CPU carrier");
+ 	darwin_set_current_cpu(data->cpu);
+ 	if (setjmp(data->native_context) != 0)

@@ -1,0 +1,560 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 20:35:40 +0900
+Subject: [PATCH] kosmickrisp: match initial render pass attachment samples
+
+Collect attachment sample counts before setting the Metal 4 render-pass default. Color-only multisample passes otherwise start with a raster sample count of one, leaving their source draw and subsequent resolves invalid.
+
+Add a native GPU regression for single-sample controls, default and maintenance10 command resolves, and dynamic attachment resolves. Cover linear UNORM and sRGB with default, enabled and skipped transfer functions.
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |   6 +-
+ src/kosmickrisp/vulkan/meson.build            |  20 +
+ .../vulkan/tests/test_maintenance10_resolve.c | 484 ++++++++++++++++++
+ 3 files changed, 508 insertions(+), 2 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_maintenance10_resolve.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 919b4245cb27ab6d958ef47c193fb364427c7aa5..2e01607f9b38b001da2bc8d82fae20a427b0614d 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -391,8 +391,6 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       pass_descriptor, framebuffer_extent.width);
+    mtl_render_pass_descriptor_set_render_target_height(
+       pass_descriptor, framebuffer_extent.height);
+-   mtl_render_pass_descriptor_set_default_raster_sample_count(
+-      pass_descriptor, 1u);
+ 
+    /* Check if we are rendering to the whole framebuffer. Required to understand
+     * if we need to load to avoid clearing all attachment when loading.
+@@ -432,6 +430,10 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    kk_set_depth_stencil_attachments(
+       pass_descriptor, render, render->bound_attachments,
+       force_attachment_load);
++   /* Metal 4 also uses this count for color-only passes. Set it after
++    * collecting attachment samples, before starting the initial encoder. */
++   mtl_render_pass_descriptor_set_default_raster_sample_count(
++      pass_descriptor, MAX2(render->samples, 1u));
+ 
+    /* Render targets are always arrays */
+    mtl_render_pass_descriptor_set_render_target_array_length(
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index b5e13a139311a7aa8710c74a114b89c39191daa5..a1624c1f33577d927e0a5acab8b399722994e27a 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -348,6 +348,26 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_maintenance10_resolve',
++      executable(
++        'test_kosmickrisp_maintenance10_resolve',
++        files('tests/test_maintenance10_resolve.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_pipeline_statistics_gpu',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_maintenance10_resolve.c b/src/kosmickrisp/vulkan/tests/test_maintenance10_resolve.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab791b907faea88344fae6e4d760241c3a9bce6c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_maintenance10_resolve.c
+@@ -0,0 +1,484 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Draw different colors in every sample, then exercise command and attachment
++ * resolves. NIR construction keeps the test independent of a shader compiler
++ * executable; all rendering, resolving and readback use Vulkan entry points. */
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/vulkan/kk_entrypoints.h"
++#include "nir_builder.h"
++#include "util/format_srgb.h"
++
++#include <math.h>
++#include <stdlib.h>
++
++#define CHECK(expr) do { \
++   VkResult result_ = (expr); \
++   if (result_ != VK_SUCCESS) { \
++      fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #expr, result_); \
++      abort(); \
++   } \
++} while (0)
++
++enum { WIDTH = 16, HEIGHT = 16, PIXELS = WIDTH * HEIGHT };
++
++struct context {
++   VkDevice device;
++   VkQueue queue;
++   VkCommandBuffer cmd;
++   const struct vk_device_dispatch_table *api;
++   VkPhysicalDeviceMemoryProperties memory;
++};
++
++struct image {
++   VkImage image;
++   VkDeviceMemory memory;
++   VkImageView view;
++};
++
++static uint32_t
++memory_type(struct context *ctx, uint32_t bits, VkMemoryPropertyFlags flags)
++{
++   for (uint32_t i = 0; i < ctx->memory.memoryTypeCount; i++) {
++      if ((bits & BITFIELD_BIT(i)) &&
++          (ctx->memory.memoryTypes[i].propertyFlags & flags) == flags)
++         return i;
++   }
++   abort();
++}
++
++static struct image
++create_image(struct context *ctx, VkFormat format,
++             VkSampleCountFlagBits samples)
++{
++   const VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = {WIDTH, HEIGHT, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = samples,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   struct image image;
++   CHECK(ctx->api->CreateImage(ctx->device, &info, NULL, &image.image));
++   VkMemoryRequirements req;
++   ctx->api->GetImageMemoryRequirements(ctx->device, image.image, &req);
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = memory_type(ctx, req.memoryTypeBits,
++                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++   };
++   CHECK(ctx->api->AllocateMemory(ctx->device, &alloc, NULL, &image.memory));
++   CHECK(ctx->api->BindImageMemory(ctx->device, image.image, image.memory, 0));
++   const VkImageViewCreateInfo view = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image.image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = info.format,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   CHECK(ctx->api->CreateImageView(ctx->device, &view, NULL, &image.view));
++   return image;
++}
++
++static void
++destroy_image(struct context *ctx, struct image image)
++{
++   ctx->api->DestroyImageView(ctx->device, image.view, NULL);
++   ctx->api->DestroyImage(ctx->device, image.image, NULL);
++   ctx->api->FreeMemory(ctx->device, image.memory, NULL);
++}
++
++static nir_shader *
++build_vertex_shader(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, NULL,
++                                                 "maintenance10-source-vs");
++   nir_def *id = nir_load_vertex_id(&b);
++   nir_def *x = nir_u2f32(&b, nir_iand_imm(&b, nir_ishl_imm(&b, id, 1), 2));
++   nir_def *y = nir_u2f32(&b, nir_iand_imm(&b, id, 2));
++   nir_variable *position = nir_variable_create(
++      b.shader, nir_var_shader_out, glsl_vec4_type(), "gl_Position");
++   position->data.location = VARYING_SLOT_POS;
++   nir_store_var(&b, position,
++      nir_vec4(&b, nir_fadd_imm(&b, nir_fmul_imm(&b, x, 2), -1),
++                   nir_fadd_imm(&b, nir_fmul_imm(&b, y, 2), -1),
++                   nir_imm_float(&b, 0), nir_imm_float(&b, 1)), 0xf);
++   return b.shader;
++}
++
++static nir_shader *
++build_fragment_shader(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL,
++                                                 "maintenance10-source-fs");
++   nir_def *sample = nir_u2f32(&b, nir_load_sample_id(&b));
++   nir_variable *color = nir_variable_create(
++      b.shader, nir_var_shader_out, glsl_vec4_type(), "outColor");
++   color->data.location = FRAG_RESULT_DATA0;
++   nir_store_var(&b, color,
++      nir_vec4(&b, nir_fadd_imm(&b, nir_fmul_imm(&b, sample, 0.125), 0.125),
++                   nir_fadd_imm(&b, nir_fmul_imm(&b, sample, -0.125), 0.75),
++                   nir_imm_float(&b, 0.5), nir_imm_float(&b, 1)), 0xf);
++   b.shader->info.fs.uses_sample_shading = true;
++   return b.shader;
++}
++
++static VkPipeline
++create_pipeline(struct context *ctx, VkPipelineLayout layout,
++                VkFormat format, VkSampleCountFlagBits samples)
++{
++   const VkPipelineShaderStageNirCreateInfoMESA nir[] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
++       .nir = build_vertex_shader()},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
++       .nir = build_fragment_shader()},
++   };
++   const VkPipelineShaderStageCreateInfo stages[] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .pNext = &nir[0], .stage = VK_SHADER_STAGE_VERTEX_BIT, .pName = "main"},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .pNext = &nir[1], .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .pName = "main"},
++   };
++   const VkPipelineVertexInputStateCreateInfo vi = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
++   };
++   const VkPipelineInputAssemblyStateCreateInfo ia = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
++   };
++   const VkViewport viewport = {0, 0, WIDTH, HEIGHT, 0, 1};
++   const VkRect2D scissor = {{0, 0}, {WIDTH, HEIGHT}};
++   const VkPipelineViewportStateCreateInfo vp = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1, .pViewports = &viewport,
++      .scissorCount = 1, .pScissors = &scissor,
++   };
++   const VkPipelineRasterizationStateCreateInfo rs = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL,
++      .cullMode = VK_CULL_MODE_NONE,
++      .lineWidth = 1,
++   };
++   const VkPipelineMultisampleStateCreateInfo ms = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = samples,
++      .sampleShadingEnable = VK_TRUE,
++      .minSampleShading = 1,
++   };
++   const VkPipelineColorBlendAttachmentState att = {.colorWriteMask = 0xf};
++   const VkPipelineColorBlendStateCreateInfo cb = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .logicOp = VK_LOGIC_OP_CLEAR,
++      .attachmentCount = 1, .pAttachments = &att,
++   };
++   const VkPipelineRenderingCreateInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1, .pColorAttachmentFormats = &format,
++   };
++   const VkGraphicsPipelineCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++      .pNext = &rendering,
++      .stageCount = 2, .pStages = stages,
++      .pVertexInputState = &vi, .pInputAssemblyState = &ia,
++      .pViewportState = &vp, .pRasterizationState = &rs,
++      .pMultisampleState = &ms, .pColorBlendState = &cb,
++      .layout = layout,
++   };
++   VkPipeline pipeline;
++   CHECK(ctx->api->CreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1,
++                                         &info, NULL, &pipeline));
++   ralloc_free(nir[0].nir);
++   ralloc_free(nir[1].nir);
++   return pipeline;
++}
++
++static void
++image_barrier(struct context *ctx, VkImage image, VkImageLayout old_layout,
++              VkImageLayout new_layout)
++{
++   const VkImageMemoryBarrier barrier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = old_layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 :
++         VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
++      .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
++      .oldLayout = old_layout, .newLayout = new_layout,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   ctx->api->CmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
++}
++
++static unsigned
++expected_channel(VkFormat format, VkSampleCountFlagBits samples,
++                 VkResolveImageFlagsKHR flags, unsigned channel)
++{
++   const bool srgb = format == VK_FORMAT_R8G8B8A8_SRGB && channel < 3;
++   const bool transfer = srgb &&
++      !(flags & VK_RESOLVE_IMAGE_SKIP_TRANSFER_FUNCTION_BIT_KHR);
++   float accum = 0;
++   for (unsigned sample = 0; sample < samples; sample++) {
++      const float color[] = {0.125f + 0.125f * sample,
++                             0.75f - 0.125f * sample, 0.5f, 1.0f};
++      float stored = srgb ? util_format_linear_to_srgb_float(color[channel])
++                          : color[channel];
++      stored = roundf(stored * 255.0f) / 255.0f;
++      accum += transfer ? util_format_srgb_to_linear_float(stored) : stored;
++   }
++   float resolved = accum / samples;
++   if (transfer)
++      resolved = util_format_linear_to_srgb_float(resolved);
++   return lroundf(resolved * 255.0f);
++}
++
++static bool
++test_resolve(struct context *ctx, VkFormat format,
++             VkSampleCountFlagBits samples, bool explicit_mode,
++             VkResolveImageFlagsKHR flags, bool attachment_resolve)
++{
++   struct image source = create_image(ctx, format, samples);
++   struct image target = create_image(ctx, format, VK_SAMPLE_COUNT_1_BIT);
++   const VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++   };
++   VkPipelineLayout layout;
++   CHECK(ctx->api->CreatePipelineLayout(ctx->device, &layout_info, NULL, &layout));
++   VkPipeline pipeline = create_pipeline(ctx, layout, format, samples);
++
++   VkBuffer buffer;
++   const VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = PIXELS * 4,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   CHECK(ctx->api->CreateBuffer(ctx->device, &buffer_info, NULL, &buffer));
++   VkMemoryRequirements req;
++   ctx->api->GetBufferMemoryRequirements(ctx->device, buffer, &req);
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = memory_type(ctx, req.memoryTypeBits,
++         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
++   };
++   VkDeviceMemory memory;
++   CHECK(ctx->api->AllocateMemory(ctx->device, &alloc, NULL, &memory));
++   CHECK(ctx->api->BindBufferMemory(ctx->device, buffer, memory, 0));
++   uint8_t *pixels;
++   CHECK(ctx->api->MapMemory(ctx->device, memory, 0, VK_WHOLE_SIZE, 0,
++                             (void **)&pixels));
++   memset(pixels, 0xa5, PIXELS * 4);
++
++   CHECK(ctx->api->ResetCommandBuffer(ctx->cmd, 0));
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++   };
++   CHECK(ctx->api->BeginCommandBuffer(ctx->cmd, &begin));
++   image_barrier(ctx, source.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++   if (attachment_resolve)
++      image_barrier(ctx, target.image, VK_IMAGE_LAYOUT_UNDEFINED,
++                    VK_IMAGE_LAYOUT_GENERAL);
++   VkRenderingAttachmentFlagsKHR attachment_flags = 0;
++   if (flags & VK_RESOLVE_IMAGE_SKIP_TRANSFER_FUNCTION_BIT_KHR)
++      attachment_flags |=
++         VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR;
++   if (flags & VK_RESOLVE_IMAGE_ENABLE_TRANSFER_FUNCTION_BIT_KHR)
++      attachment_flags |=
++         VK_RENDERING_ATTACHMENT_RESOLVE_ENABLE_TRANSFER_FUNCTION_BIT_KHR;
++   const VkRenderingAttachmentFlagsInfoKHR flags_info = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
++      .flags = attachment_flags,
++   };
++   const VkRenderingAttachmentInfo attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .pNext = attachment_resolve ? &flags_info : NULL,
++      .imageView = source.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .resolveMode = attachment_resolve ? VK_RESOLVE_MODE_AVERAGE_BIT
++                                       : VK_RESOLVE_MODE_NONE,
++      .resolveImageView = attachment_resolve ? target.view : VK_NULL_HANDLE,
++      .resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++   };
++   const VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = {{0, 0}, {WIDTH, HEIGHT}}, .layerCount = 1,
++      .colorAttachmentCount = 1, .pColorAttachments = &attachment,
++   };
++   ctx->api->CmdBeginRendering(ctx->cmd, &rendering);
++   ctx->api->CmdBindPipeline(ctx->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++   ctx->api->CmdDraw(ctx->cmd, 3, 1, 0, 0);
++   ctx->api->CmdEndRendering(ctx->cmd);
++   image_barrier(ctx, source.image, VK_IMAGE_LAYOUT_GENERAL,
++                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++
++   VkImage readback_image = source.image;
++   if (attachment_resolve) {
++      image_barrier(ctx, target.image, VK_IMAGE_LAYOUT_GENERAL,
++                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++      readback_image = target.image;
++   } else if (samples != VK_SAMPLE_COUNT_1_BIT) {
++      image_barrier(ctx, target.image, VK_IMAGE_LAYOUT_UNDEFINED,
++                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++      const VkResolveImageModeInfoKHR mode = {
++         .sType = VK_STRUCTURE_TYPE_RESOLVE_IMAGE_MODE_INFO_KHR,
++         .flags = flags,
++         .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
++      };
++      const VkImageResolve2 region = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2,
++         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++         .extent = {WIDTH, HEIGHT, 1},
++      };
++      const VkResolveImageInfo2 resolve = {
++         .sType = VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2,
++         .pNext = explicit_mode ? &mode : NULL,
++         .srcImage = source.image,
++         .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++         .dstImage = target.image,
++         .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++         .regionCount = 1, .pRegions = &region,
++      };
++      ctx->api->CmdResolveImage2(ctx->cmd, &resolve);
++      image_barrier(ctx, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++      readback_image = target.image;
++   }
++   const VkBufferImageCopy copy = {
++      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .imageExtent = {WIDTH, HEIGHT, 1},
++   };
++   ctx->api->CmdCopyImageToBuffer(ctx->cmd, readback_image,
++      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
++   const VkMemoryBarrier host = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++   };
++   ctx->api->CmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
++   CHECK(ctx->api->EndCommandBuffer(ctx->cmd));
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1, .pCommandBuffers = &ctx->cmd,
++   };
++   CHECK(ctx->api->QueueSubmit(ctx->queue, 1, &submit, VK_NULL_HANDLE));
++   CHECK(ctx->api->QueueWaitIdle(ctx->queue));
++   unsigned expected[4];
++   for (unsigned c = 0; c < 4; c++)
++      expected[c] = expected_channel(format, samples, flags, c);
++   unsigned bad = 0;
++   for (unsigned i = 0; i < PIXELS; i++)
++      for (unsigned c = 0; c < 4; c++)
++         bad += abs((int)pixels[4 * i + c] - (int)expected[c]) > 1;
++   printf("format=%u samples=%u explicit_mode=%u flags=%u attachment=%u "
++          "pixel0=%u,%u,%u,%u expected=%u,%u,%u,%u mismatches=%u\n",
++      format, samples, explicit_mode, flags, attachment_resolve,
++      pixels[0], pixels[1], pixels[2], pixels[3],
++      expected[0], expected[1], expected[2], expected[3], bad);
++   ctx->api->UnmapMemory(ctx->device, memory);
++   ctx->api->DestroyBuffer(ctx->device, buffer, NULL);
++   ctx->api->FreeMemory(ctx->device, memory, NULL);
++   ctx->api->DestroyPipeline(ctx->device, pipeline, NULL);
++   ctx->api->DestroyPipelineLayout(ctx->device, layout, NULL);
++   destroy_image(ctx, source);
++   destroy_image(ctx, target);
++   return bad == 0;
++}
++
++int
++main(void)
++{
++   const VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .apiVersion = VK_API_VERSION_1_3,
++   };
++   const VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   VkInstance instance;
++   CHECK(kk_CreateInstance(&instance_info, NULL, &instance));
++   PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)
++      kk_GetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices");
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(enumerate(instance, &count, &physical));
++   const float priority = 1;
++   const VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &priority,
++   };
++   const VkPhysicalDeviceMaintenance10FeaturesKHR maintenance10 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR,
++      .maintenance10 = VK_TRUE,
++   };
++   const VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .pNext = (void *)&maintenance10, .dynamicRendering = VK_TRUE,
++   };
++   const VkPhysicalDeviceFeatures features = {.sampleRateShading = VK_TRUE};
++   const char *extensions[] = {VK_KHR_MAINTENANCE_10_EXTENSION_NAME};
++   const VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &features13,
++      .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
++      .pEnabledFeatures = &features,
++      .enabledExtensionCount = ARRAY_SIZE(extensions),
++      .ppEnabledExtensionNames = extensions,
++   };
++   struct context ctx = {0};
++   CHECK(kk_CreateDevice(physical, &device_info, NULL, &ctx.device));
++   PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
++      (PFN_vkGetPhysicalDeviceMemoryProperties)kk_GetInstanceProcAddr(
++         instance, "vkGetPhysicalDeviceMemoryProperties");
++   get_memory(physical, &ctx.memory);
++   ctx.api = &kk_device_from_handle(ctx.device)->exposed_dispatch_table;
++   ctx.api->GetDeviceQueue(ctx.device, 0, 0, &ctx.queue);
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = 0,
++   };
++   VkCommandPool pool;
++   CHECK(ctx.api->CreateCommandPool(ctx.device, &pool_info, NULL, &pool));
++   const VkCommandBufferAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   CHECK(ctx.api->AllocateCommandBuffers(ctx.device, &alloc, &ctx.cmd));
++   bool pass = true;
++   const VkFormat formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
++   for (unsigned i = 0; i < ARRAY_SIZE(formats); i++) {
++      pass &= test_resolve(&ctx, formats[i], VK_SAMPLE_COUNT_1_BIT,
++                           false, 0, false);
++      pass &= test_resolve(&ctx, formats[i], VK_SAMPLE_COUNT_4_BIT,
++                           false, 0, false);
++      const VkResolveImageFlagsKHR flags[] = {
++         0, VK_RESOLVE_IMAGE_ENABLE_TRANSFER_FUNCTION_BIT_KHR,
++         VK_RESOLVE_IMAGE_SKIP_TRANSFER_FUNCTION_BIT_KHR,
++      };
++      for (unsigned f = 0; f < ARRAY_SIZE(flags); f++) {
++         if (formats[i] != VK_FORMAT_R8G8B8A8_SRGB && f > 0)
++            continue;
++         pass &= test_resolve(&ctx, formats[i], VK_SAMPLE_COUNT_4_BIT,
++                              true, flags[f], false);
++         pass &= test_resolve(&ctx, formats[i], VK_SAMPLE_COUNT_4_BIT,
++                              true, flags[f], true);
++      }
++   }
++   ctx.api->DestroyCommandPool(ctx.device, pool, NULL);
++   ctx.api->DestroyDevice(ctx.device, NULL);
++   kk_DestroyInstance(instance, NULL);
++   return pass ? 0 : 1;
++}

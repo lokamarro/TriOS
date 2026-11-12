@@ -1,0 +1,713 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 18:21:12 +0900
+Subject: [PATCH] kosmickrisp: retire dead values before MSL translation
+
+MSL type inference reaches a value only through its uses, so a value whose
+last consumer disappears keeps no type at all. The final copy propagation in
+msl_optimize_nir does exactly that: propagating a copy through a widened
+vector abandons the vector and its mov, and nir_to_msl then translates those
+survivors, emitting a literal "UNTYPED!" for every constant they read. Metal
+rejects the resulting source, the pipeline never compiles, and the draw
+silently contributes nothing. A fragment shader that writes a constant ivec3
+to a four-component integer render target hits this, so the OpenGL CTS reads
+back uninitialized attachment memory:
+dEQP-GL45-ES31.functional.shaders.builtin_constants.core.max_compute_work_group_count
+and .max_compute_work_group_size report garbage for the vertex, fragment and
+geometry stages while the buffer-backed tessellation and compute stages, which
+never build the wide vector, report the correct values.
+
+Run dead code elimination after that propagation, as the Intel and Imagination
+backends do after their own out-of-SSA copy propagation, so no untyped value
+reaches translation. Add a regression that draws single-pixel points into a
+R32G32B32A32_SINT attachment from both a constant fragment output and a flat
+integer varying, covering the one-pixel target the shader executor uses.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+(cherry picked from commit af95235f0e96aeb17acd7fa489805c110ee12fc7)
+(cherry picked from commit 70d4f0c9fccbe129c1873254a9d05e4bb878269a)
+---
+ src/kosmickrisp/compiler/nir_to_msl.c         |   5 +
+ src/kosmickrisp/vulkan/meson.build            |  20 +
+ .../tests/integer_point_shaders/constant.frag |   8 +
+ .../integer_point_shaders/constant.frag.h     |  19 +
+ .../tests/integer_point_shaders/generate.sh   |   7 +
+ .../integer_point_shaders/passthrough.frag    |   8 +
+ .../integer_point_shaders/passthrough.frag.h  |  21 +
+ .../tests/integer_point_shaders/point.vert    |  10 +
+ .../tests/integer_point_shaders/point.vert.h  |  47 ++
+ .../vulkan/tests/test_integer_point_target.c  | 449 ++++++++++++++++++
+ 10 files changed, 594 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/integer_point_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_integer_point_target.c
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 14770e63fa4974e23da92856cddcd176dffca313..cd62fbda0a3c61f641210a44f9869917c468df83 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2440,6 +2440,11 @@ msl_optimize_nir(struct nir_shader *nir)
+    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+    NIR_PASS(_, nir, nir_trivialize_registers);
+    NIR_PASS(_, nir, nir_opt_copy_prop);
++   /* Copy propagation abandons the wider values a propagated copy used to
++    * read. MSL type inference only reaches a value through its uses, so an
++    * abandoned vector reaches translation with no type and is emitted as
++    * invalid MSL. Retire the dead producers instead. */
++   NIR_PASS(_, nir, nir_opt_dce);
+ 
+    return progress;
+ }
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 1effd6a312656c64e0722c29c2bb6a0906f8876c..7da4c78ea345ac71d1d4318633c69563caecefda 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -438,6 +438,26 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_integer_point_target',
++      executable(
++        'test_kosmickrisp_integer_point_target',
++        files('tests/test_integer_point_target.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_raster_discard',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag b/src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..be9663a8b82fba91b7c5f243d181597b4a1152b9
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(location = 0) flat in ivec3 vtx_result;
++layout(location = 0) out ivec3 o_result;
++void main(void)
++{
++   o_result = ivec3(2147483646, 65535, 65535);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag.h b/src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b2bcdfb7565d38df416ab1bc09e0bc983feabd9
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/constant.frag.h
+@@ -0,0 +1,19 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00030010,0x00000004,
++0x00000007,0x00040047,0x00000009,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040017,0x00000007,
++0x00000006,0x00000003,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x0004002b,0x00000006,
++0x0000000a,0x7ffffffe,0x0004002b,0x00000006,
++0x0000000b,0x0000ffff,0x0006002c,0x00000007,
++0x0000000c,0x0000000a,0x0000000b,0x0000000b,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0003003e,
++0x00000009,0x0000000c,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/integer_point_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..a16f8af8a09632c105ae5b0536775f2eb1954831
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in point.vert constant.frag passthrough.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag b/src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..549773fa217bb75fbfdb2ff677db644482dd19ba
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(location = 0) flat in ivec3 vtx_result;
++layout(location = 0) out ivec3 o_result;
++void main(void)
++{
++   o_result = vtx_result;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag.h b/src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e824b5fe83a1d42eb88d563ce84eb97be1df39f1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/passthrough.frag.h
+@@ -0,0 +1,21 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000b,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00030047,0x0000000b,
++0x0000000e,0x00040047,0x0000000b,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040017,0x00000007,
++0x00000006,0x00000003,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000007,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x0000000c,
++0x0000000b,0x0003003e,0x00000009,0x0000000c,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert b/src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b33145a50642fefc904c01c7c0982677c9323c0
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(location = 0) in vec4 a_position;
++layout(location = 0) flat out ivec3 vtx_result;
++void main(void)
++{
++   gl_Position = a_position;
++   gl_PointSize = 1.0;
++   vtx_result = ivec3(2147483646, 65535, 65535);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert.h b/src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1951355fdd0b1b886f23a356886f2e4f54c357cb
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/integer_point_shaders/point.vert.h
+@@ -0,0 +1,47 @@
++{0x07230203,0x00010600,0x000d000b,0x0000001f,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000011,0x0000001b,
++0x00030047,0x0000000b,0x00000002,0x00050048,
++0x0000000b,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x0000000b,0x00000001,0x0000000b,
++0x00000001,0x00050048,0x0000000b,0x00000002,
++0x0000000b,0x00000003,0x00050048,0x0000000b,
++0x00000003,0x0000000b,0x00000004,0x00040047,
++0x00000011,0x0000001e,0x00000000,0x00030047,
++0x0000001b,0x0000000e,0x00040047,0x0000001b,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000001,0x0004001c,0x0000000a,
++0x00000006,0x00000009,0x0006001e,0x0000000b,
++0x00000007,0x00000006,0x0000000a,0x0000000a,
++0x00040020,0x0000000c,0x00000003,0x0000000b,
++0x0004003b,0x0000000c,0x0000000d,0x00000003,
++0x00040015,0x0000000e,0x00000020,0x00000001,
++0x0004002b,0x0000000e,0x0000000f,0x00000000,
++0x00040020,0x00000010,0x00000001,0x00000007,
++0x0004003b,0x00000010,0x00000011,0x00000001,
++0x00040020,0x00000013,0x00000003,0x00000007,
++0x0004002b,0x0000000e,0x00000015,0x00000001,
++0x0004002b,0x00000006,0x00000016,0x3f800000,
++0x00040020,0x00000017,0x00000003,0x00000006,
++0x00040017,0x00000019,0x0000000e,0x00000003,
++0x00040020,0x0000001a,0x00000003,0x00000019,
++0x0004003b,0x0000001a,0x0000001b,0x00000003,
++0x0004002b,0x0000000e,0x0000001c,0x7ffffffe,
++0x0004002b,0x0000000e,0x0000001d,0x0000ffff,
++0x0006002c,0x00000019,0x0000001e,0x0000001c,
++0x0000001d,0x0000001d,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x00000012,
++0x00000011,0x00050041,0x00000013,0x00000014,
++0x0000000d,0x0000000f,0x0003003e,0x00000014,
++0x00000012,0x00050041,0x00000017,0x00000018,
++0x0000000d,0x00000015,0x0003003e,0x00000018,
++0x00000016,0x0003003e,0x0000001b,0x0000001e,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_integer_point_target.c b/src/kosmickrisp/vulkan/tests/test_integer_point_target.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1d769705020d66c31471a5823532e376a81fe31
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_integer_point_target.c
+@@ -0,0 +1,449 @@
++/* SPDX-License-Identifier: MIT */
++
++/* One-pixel point rasterization into a three-component signed-integer colour
++ * attachment, mirroring the OpenGL CTS shader-executor path that reads an
++ * ivec3 built-in constant back through a 1x1 RGBA32I renderbuffer. */
++
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/vulkan/kk_entrypoints.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(expr) do { \
++   VkResult result_ = (expr); \
++   if (result_ != VK_SUCCESS) { \
++      fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #expr, result_); \
++      abort(); \
++   } \
++} while (0)
++
++static const uint32_t point_vert_spirv[] =
++#include "integer_point_shaders/point.vert.h"
++;
++static const uint32_t constant_frag_spirv[] =
++#include "integer_point_shaders/constant.frag.h"
++;
++static const uint32_t passthrough_frag_spirv[] =
++#include "integer_point_shaders/passthrough.frag.h"
++;
++
++static const int32_t expected[3] = {2147483646, 65535, 65535};
++static const int32_t sentinel = -559038737; /* 0xdeadbeef */
++
++static PFN_vkGetPhysicalDeviceMemoryProperties memory_properties;
++
++static uint32_t
++memory_type(VkPhysicalDevice physical, uint32_t bits, VkMemoryPropertyFlags want)
++{
++   VkPhysicalDeviceMemoryProperties props;
++   memory_properties(physical, &props);
++   for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
++      if ((bits & (1u << i)) &&
++          (props.memoryTypes[i].propertyFlags & want) == want)
++         return i;
++   }
++   fprintf(stderr, "no memory type for 0x%x / 0x%x\n", bits, want);
++   abort();
++}
++
++struct context {
++   VkDevice device;
++   const struct vk_device_dispatch_table *api;
++   VkPhysicalDevice physical;
++   VkQueue queue;
++   VkCommandBuffer command;
++   VkPipelineLayout layout;
++   VkShaderModule vertex;
++};
++
++static unsigned
++run_case(struct context *ctx, const char *name, VkShaderModule fragment,
++         uint32_t width)
++{
++   const struct vk_device_dispatch_table *api = ctx->api;
++   const VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R32G32B32A32_SINT,
++      .extent = {width, 1, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkImage image;
++   CHECK(api->CreateImage(ctx->device, &image_info, NULL, &image));
++   VkMemoryRequirements requirements;
++   api->GetImageMemoryRequirements(ctx->device, image, &requirements);
++   const VkMemoryAllocateInfo image_allocation = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = requirements.size,
++      .memoryTypeIndex = memory_type(ctx->physical, requirements.memoryTypeBits,
++                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++   };
++   VkDeviceMemory image_memory;
++   CHECK(api->AllocateMemory(ctx->device, &image_allocation, NULL,
++                             &image_memory));
++   CHECK(api->BindImageMemory(ctx->device, image, image_memory, 0));
++   const VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = VK_FORMAT_R32G32B32A32_SINT,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   VkImageView view;
++   CHECK(api->CreateImageView(ctx->device, &view_info, NULL, &view));
++
++   const VkPipelineShaderStageCreateInfo stages[2] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .stage = VK_SHADER_STAGE_VERTEX_BIT,
++       .module = ctx->vertex,
++       .pName = "main"},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
++       .module = fragment,
++       .pName = "main"},
++   };
++   const VkVertexInputBindingDescription binding = {0, 4 * sizeof(float),
++                                                    VK_VERTEX_INPUT_RATE_VERTEX};
++   const VkVertexInputAttributeDescription attribute = {
++      0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
++   const VkPipelineVertexInputStateCreateInfo vertex_input = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
++      .vertexBindingDescriptionCount = 1,
++      .pVertexBindingDescriptions = &binding,
++      .vertexAttributeDescriptionCount = 1,
++      .pVertexAttributeDescriptions = &attribute,
++   };
++   const VkPipelineInputAssemblyStateCreateInfo assembly = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
++   };
++   const VkViewport viewport = {0.0f, 0.0f, (float)width, 1.0f, 0.0f, 1.0f};
++   const VkRect2D scissor = {{0, 0}, {width, 1}};
++   const VkPipelineViewportStateCreateInfo viewport_state = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1,
++      .pViewports = &viewport,
++      .scissorCount = 1,
++      .pScissors = &scissor,
++   };
++   const VkPipelineRasterizationStateCreateInfo raster = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL,
++      .cullMode = VK_CULL_MODE_NONE,
++      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
++      .lineWidth = 1.0f,
++   };
++   const VkPipelineMultisampleStateCreateInfo multisample = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
++   };
++   const VkPipelineColorBlendAttachmentState blend_attachment = {
++      .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
++   };
++   const VkPipelineColorBlendStateCreateInfo blend = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .attachmentCount = 1,
++      .pAttachments = &blend_attachment,
++   };
++   const VkFormat color_format = VK_FORMAT_R32G32B32A32_SINT;
++   const VkPipelineRenderingCreateInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1,
++      .pColorAttachmentFormats = &color_format,
++   };
++   const VkGraphicsPipelineCreateInfo pipeline_info = {
++      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++      .pNext = &rendering,
++      .stageCount = 2,
++      .pStages = stages,
++      .pVertexInputState = &vertex_input,
++      .pInputAssemblyState = &assembly,
++      .pViewportState = &viewport_state,
++      .pRasterizationState = &raster,
++      .pMultisampleState = &multisample,
++      .pColorBlendState = &blend,
++      .layout = ctx->layout,
++   };
++   VkPipeline pipeline;
++   CHECK(api->CreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1,
++                                      &pipeline_info, NULL, &pipeline));
++
++   const VkDeviceSize vertex_bytes = (VkDeviceSize)width * 4 * sizeof(float);
++   const VkDeviceSize color_bytes = (VkDeviceSize)width * 4 * sizeof(int32_t);
++   const VkBufferCreateInfo vertex_buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = vertex_bytes,
++      .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++   };
++   VkBuffer vertices;
++   CHECK(api->CreateBuffer(ctx->device, &vertex_buffer_info, NULL, &vertices));
++   const VkBufferCreateInfo readback_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = color_bytes,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   VkBuffer readback;
++   CHECK(api->CreateBuffer(ctx->device, &readback_info, NULL, &readback));
++   VkMemoryRequirements vertex_requirements, readback_requirements;
++   api->GetBufferMemoryRequirements(ctx->device, vertices, &vertex_requirements);
++   api->GetBufferMemoryRequirements(ctx->device, readback,
++                                    &readback_requirements);
++   const VkMemoryPropertyFlags host =
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   const VkMemoryAllocateInfo vertex_allocation = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = vertex_requirements.size,
++      .memoryTypeIndex =
++         memory_type(ctx->physical, vertex_requirements.memoryTypeBits, host),
++   };
++   const VkMemoryAllocateInfo readback_allocation = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = readback_requirements.size,
++      .memoryTypeIndex =
++         memory_type(ctx->physical, readback_requirements.memoryTypeBits, host),
++   };
++   VkDeviceMemory vertex_memory, readback_memory;
++   CHECK(api->AllocateMemory(ctx->device, &vertex_allocation, NULL,
++                             &vertex_memory));
++   CHECK(api->AllocateMemory(ctx->device, &readback_allocation, NULL,
++                             &readback_memory));
++   CHECK(api->BindBufferMemory(ctx->device, vertices, vertex_memory, 0));
++   CHECK(api->BindBufferMemory(ctx->device, readback, readback_memory, 0));
++
++   float *positions;
++   CHECK(api->MapMemory(ctx->device, vertex_memory, 0, VK_WHOLE_SIZE, 0,
++                        (void **)&positions));
++   for (uint32_t i = 0; i < width; i++) {
++      positions[i * 4 + 0] = -1.0f + 2.0f * (((float)i + 0.5f) / (float)width);
++      positions[i * 4 + 1] = 0.0f;
++      positions[i * 4 + 2] = 0.0f;
++      positions[i * 4 + 3] = 1.0f;
++   }
++   api->UnmapMemory(ctx->device, vertex_memory);
++
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   CHECK(api->BeginCommandBuffer(ctx->command, &begin));
++   const VkImageMemoryBarrier to_attachment = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   api->CmdPipelineBarrier(ctx->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
++                           NULL, 1, &to_attachment);
++   const VkRenderingAttachmentInfo attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++      .clearValue = {.color = {.int32 = {sentinel, sentinel, sentinel,
++                                         sentinel}}},
++   };
++   const VkRenderingInfo rendering_info = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = {{0, 0}, {width, 1}},
++      .layerCount = 1,
++      .colorAttachmentCount = 1,
++      .pColorAttachments = &attachment,
++   };
++   api->CmdBeginRendering(ctx->command, &rendering_info);
++   api->CmdBindPipeline(ctx->command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                        pipeline);
++   const VkDeviceSize offset = 0;
++   api->CmdBindVertexBuffers(ctx->command, 0, 1, &vertices, &offset);
++   api->CmdDraw(ctx->command, width, 1, 0, 0);
++   api->CmdEndRendering(ctx->command);
++   const VkImageMemoryBarrier to_source = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   api->CmdPipelineBarrier(ctx->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
++                           NULL, 1, &to_source);
++   const VkBufferImageCopy region = {
++      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .imageExtent = {width, 1, 1},
++   };
++   api->CmdCopyImageToBuffer(ctx->command, image,
++                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
++                             &region);
++   CHECK(api->EndCommandBuffer(ctx->command));
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &ctx->command,
++   };
++   CHECK(api->QueueSubmit(ctx->queue, 1, &submit, VK_NULL_HANDLE));
++   CHECK(api->QueueWaitIdle(ctx->queue));
++
++   int32_t *pixels;
++   CHECK(api->MapMemory(ctx->device, readback_memory, 0, VK_WHOLE_SIZE, 0,
++                        (void **)&pixels));
++   unsigned failures = 0;
++   for (uint32_t i = 0; i < width; i++) {
++      for (unsigned c = 0; c < 3; c++) {
++         if (pixels[i * 4 + c] != expected[c]) {
++            if (failures++ < 4) {
++               fprintf(stderr,
++                       "%s width %u: pixel %u is (%d, %d, %d); expected (%d, "
++                       "%d, %d)\n",
++                       name, width, i, pixels[i * 4], pixels[i * 4 + 1],
++                       pixels[i * 4 + 2], expected[0], expected[1],
++                       expected[2]);
++            }
++            break;
++         }
++      }
++   }
++   if (!failures)
++      printf("%s width %u PASS\n", name, width);
++   api->UnmapMemory(ctx->device, readback_memory);
++
++   api->DestroyPipeline(ctx->device, pipeline, NULL);
++   api->DestroyBuffer(ctx->device, vertices, NULL);
++   api->DestroyBuffer(ctx->device, readback, NULL);
++   api->FreeMemory(ctx->device, vertex_memory, NULL);
++   api->FreeMemory(ctx->device, readback_memory, NULL);
++   api->DestroyImageView(ctx->device, view, NULL);
++   api->DestroyImage(ctx->device, image, NULL);
++   api->FreeMemory(ctx->device, image_memory, NULL);
++   return failures;
++}
++
++int
++main(void)
++{
++   const VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .apiVersion = VK_API_VERSION_1_3,
++   };
++   const VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   VkInstance instance;
++   CHECK(kk_CreateInstance(&instance_info, NULL, &instance));
++   PFN_vkEnumeratePhysicalDevices enumerate =
++      (PFN_vkEnumeratePhysicalDevices)kk_GetInstanceProcAddr(
++         instance, "vkEnumeratePhysicalDevices");
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(enumerate(instance, &count, &physical));
++   memory_properties = (PFN_vkGetPhysicalDeviceMemoryProperties)
++      kk_GetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties");
++   const float priority = 1.0f;
++   const VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   const VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device;
++   CHECK(kk_CreateDevice(physical, &device_info, NULL, &device));
++   struct context ctx = {
++      .device = device,
++      .api = &kk_device_from_handle(device)->exposed_dispatch_table,
++      .physical = physical,
++   };
++   const struct vk_device_dispatch_table *api = ctx.api;
++   api->GetDeviceQueue(device, 0, 0, &ctx.queue);
++   const VkCommandPoolCreateInfo commands_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = 0,
++   };
++   VkCommandPool commands;
++   CHECK(api->CreateCommandPool(device, &commands_info, NULL, &commands));
++   const VkCommandBufferAllocateInfo command_allocation = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = commands,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   CHECK(api->AllocateCommandBuffers(device, &command_allocation,
++                                     &ctx.command));
++   const VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++   };
++   CHECK(api->CreatePipelineLayout(device, &layout_info, NULL, &ctx.layout));
++
++   const VkShaderModuleCreateInfo vertex_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(point_vert_spirv),
++      .pCode = point_vert_spirv,
++   };
++   CHECK(api->CreateShaderModule(device, &vertex_info, NULL, &ctx.vertex));
++   const VkShaderModuleCreateInfo constant_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(constant_frag_spirv),
++      .pCode = constant_frag_spirv,
++   };
++   VkShaderModule constant_fragment;
++   CHECK(api->CreateShaderModule(device, &constant_info, NULL,
++                                 &constant_fragment));
++   const VkShaderModuleCreateInfo passthrough_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(passthrough_frag_spirv),
++      .pCode = passthrough_frag_spirv,
++   };
++   VkShaderModule passthrough_fragment;
++   CHECK(api->CreateShaderModule(device, &passthrough_info, NULL,
++                                 &passthrough_fragment));
++
++   unsigned failures = 0;
++   static const uint32_t widths[] = {1, 2, 64};
++   for (unsigned i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
++      CHECK(api->ResetCommandPool(device, commands, 0));
++      failures += run_case(&ctx, "constant fragment output", constant_fragment,
++                           widths[i]);
++      CHECK(api->ResetCommandPool(device, commands, 0));
++      failures += run_case(&ctx, "flat integer varying", passthrough_fragment,
++                           widths[i]);
++   }
++
++   api->DestroyShaderModule(device, ctx.vertex, NULL);
++   api->DestroyShaderModule(device, constant_fragment, NULL);
++   api->DestroyShaderModule(device, passthrough_fragment, NULL);
++   api->DestroyPipelineLayout(device, ctx.layout, NULL);
++   api->DestroyCommandPool(device, commands, NULL);
++   api->DestroyDevice(device, NULL);
++   kk_DestroyInstance(instance, NULL);
++
++   if (failures) {
++      fprintf(stderr, "integer point target FAIL (%u problems)\n", failures);
++      return 1;
++   }
++   printf("integer point target PASS\n");
++   return 0;
++}

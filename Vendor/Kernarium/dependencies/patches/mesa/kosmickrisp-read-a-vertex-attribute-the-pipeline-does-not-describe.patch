@@ -1,0 +1,349 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 09:52:56 +0900
+Subject: [PATCH] kosmickrisp: read a vertex attribute the pipeline does not
+ describe
+
+A vertex shader may declare an input that the pipeline's vertex-input
+state leaves undescribed. Vulkan does not make that an error: the values
+read are the implementation's default vertex attribute value, which
+VK_KHR_maintenance9 publishes as
+VkPhysicalDeviceMaintenance9PropertiesKHR::defaultVertexAttributeValue,
+and this driver reports
+VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR.
+
+Neither fetch path could express such an attribute. The MSL backend
+declares an [[attribute(n)]] for every location nir->info.inputs_read
+names, while kk_gather_metal_vertex_fetch() fills the MTLVertexDescriptor
+from the vertex-input state's attributes_valid, so an undescribed
+location left Metal a [[stage_in]] member it had nothing to fill:
+"Vertex attribute attribute_1(1) is missing from the vertex descriptor",
+which kk_new_render_pipeline_state reports as
+VK_ERROR_INVALID_SHADER_NV and which fails the whole pipeline, not just
+that attribute. The lowered fetch is no better placed: its attribute
+array holds PIPE_FORMAT_NONE there, which has no channel to decode and
+no buffer to decode it from.
+
+Resolve the read to the default value while the load still says whether
+the shader wants a float or an integer, and take the attribute out of
+the interface the two paths describe. x, y and z read zero and w reads
+one, so a shader that declares a vec4 and a shader that reads only w
+both see what the property promises, and Metal keeps filling the missing
+components of a described attribute itself.
+
+dEQP-VK.pipeline.monolithic.vertex_input.misc.unbound_input and
+unbound_input_integer failed pipeline creation outright; both now pass.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_nir_lower_vbo.c     |  71 +++++++++
+ src/kosmickrisp/vulkan/kk_nir_lower_vbo.h     |   2 +
+ src/kosmickrisp/vulkan/kk_shader.c            |  12 ++
+ src/kosmickrisp/vulkan/meson.build            |  20 +++
+ .../tests/test_unbound_vertex_attribute.c     | 148 ++++++++++++++++++
+ 5 files changed, 253 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_unbound_vertex_attribute.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
+index 1217364bde7fbf302095e86e77e62ed1aa453959..fee8437fdc2cf9ec49f74905646d2789dfa95e80 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
+@@ -146,6 +146,77 @@ load_unaligned_components(nir_builder *b, nir_def *base,
+    return nir_vec(b, components, num_components);
+ }
+ 
++/* Vulkan lets a vertex shader declare an input that the vertex-input state
++ * leaves undescribed.  Reading it is not an error: the value is the
++ * implementation's default vertex attribute value, which VK_KHR_maintenance9
++ * makes observable as VkPhysicalDeviceMaintenance9PropertiesKHR::
++ * defaultVertexAttributeValue, and this device reports
++ * VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR.
++ *
++ * Neither fetch path can express an undescribed attribute.  Metal's own fetch
++ * needs a vertex-descriptor entry for every [[attribute(n)]] the MSL declares
++ * and rejects the whole pipeline without one - "Vertex attribute
++ * attribute_1(1) is missing from the vertex descriptor", surfaced as
++ * VK_ERROR_INVALID_SHADER_NV - while the lowered fetch has no format to decode
++ * and no buffer to decode it from.  Resolve the read to the default value
++ * before either path sees it, which also drops the attribute from the
++ * interface the two of them describe.
++ */
++static bool
++lower_unbound_attrib(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_input)
++      return false;
++
++   const uint32_t attributes_valid = *(const uint32_t *)data;
++   nir_src *offset_src = nir_get_io_offset_src(intr);
++   assert(nir_src_is_const(*offset_src) && "no attribute indirects");
++
++   const unsigned location = nir_intrinsic_io_semantics(intr).location +
++                             nir_src_as_uint(*offset_src) -
++                             VERT_ATTRIB_GENERIC0;
++   if (location < KK_MAX_ATTRIBS &&
++       (attributes_valid & BITFIELD_BIT(location)))
++      return false;
++
++   const nir_alu_type type =
++      nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
++   const unsigned component = nir_intrinsic_component(intr);
++   const unsigned bit_size = intr->def.bit_size;
++
++   nir_const_value values[NIR_MAX_VEC_COMPONENTS] = {0};
++   for (unsigned i = 0; i < intr->def.num_components; ++i) {
++      if (component + i != 3u)
++         values[i] = nir_const_value_for_raw_uint(0u, bit_size);
++      else if (type == nir_type_float)
++         values[i] = nir_const_value_for_float(1.0, bit_size);
++      else
++         values[i] = nir_const_value_for_int(1, bit_size);
++   }
++
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def_replace(
++      &intr->def,
++      nir_build_imm(b, intr->def.num_components, bit_size, values));
++   return true;
++}
++
++bool
++kk_nir_lower_unbound_vbo(nir_shader *nir, uint32_t attributes_valid)
++{
++   assert(nir->info.stage == MESA_SHADER_VERTEX);
++
++   const uint64_t described =
++      (uint64_t)attributes_valid << VERT_ATTRIB_GENERIC0;
++   if (!(nir->info.inputs_read & ~described))
++      return false;
++
++   bool progress = nir_shader_intrinsics_pass(
++      nir, lower_unbound_attrib, nir_metadata_control_flow, &attributes_valid);
++   nir->info.inputs_read &= described;
++   return progress;
++}
++
+ static bool
+ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
+index 7cb1ed3d6b09257d160faf1dc5949eef4c358415..ee5af3521b809c3823b7040f5fcf75fa6591d0b6 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
+@@ -38,6 +38,8 @@ struct kk_attribute {
+ bool kk_nir_lower_vbo(nir_shader *shader, struct kk_attribute *attribs,
+                       bool robustness2, bool byte_strides);
+ 
++bool kk_nir_lower_unbound_vbo(nir_shader *shader, uint32_t attributes_valid);
++
+ bool kk_vbo_supports_format(enum pipe_format format);
+ 
+ unsigned kk_vbo_interchange_alignment(enum pipe_format format);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index ec257e243bb6952916866aed58acbc95615386e4..17fa07010f1e2ce21974d0d7cdb07f28529b0b27 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1658,6 +1658,18 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+       const bool emulated_vs =
+          nir->info.next_stage == MESA_SHADER_TESS_CTRL || force_sw_vs;
+ 
++      /* An input the vertex-input state does not describe reads the device's
++       * default vertex attribute value, not an error.  Resolve those reads
++       * before either fetch path runs: Metal's fetch rejects a pipeline whose
++       * shader declares an attribute its vertex descriptor does not, and the
++       * lowered fetch has no format to decode. */
++      bool unbound_attribs = false;
++      if (state != NULL && state->vi != NULL)
++         NIR_PASS(unbound_attribs, nir, kk_nir_lower_unbound_vbo,
++                  state->vi->attributes_valid);
++      if (unbound_attribs)
++         shader->info.vs.attribs_read = kk_gather_vs_attribs_read(nir);
++
+       /* VBO lowering needs to go here otherwise, the linking step removes all
+        * inputs since we read vertex attributes from UBOs. */
+       if (!emulated_vs &&
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 099a3a803a0f2fcbbc6923587954a60dcbc16236..82f92a89697e3f4238726d2cd378897c98848f4a 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1169,6 +1169,26 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_unbound_vertex_attribute',
++    executable(
++      'test_kosmickrisp_unbound_vertex_attribute',
++      files(
++        'tests/test_unbound_vertex_attribute.c',
++        'kk_nir_lower_vbo.c',
++      ),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_msl_to_nir,
++        idep_libkk_shaders_h,
++        idep_vulkan_runtime_headers,
++        idep_vulkan_util_headers,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_clip_cull_distance_io',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_unbound_vertex_attribute.c b/src/kosmickrisp/vulkan/tests/test_unbound_vertex_attribute.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..14107118f0fd473c67bdad2b25a3aba13b55e43e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_unbound_vertex_attribute.c
+@@ -0,0 +1,148 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A vertex shader may declare an input that the vertex-input state does not
++ * describe.  Vulkan does not make that an error: the read returns the device's
++ * default vertex attribute value, which this driver reports as
++ * VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR.  Neither fetch
++ * path can express such an attribute - Metal rejects a pipeline whose shader
++ * declares an [[attribute(n)]] its vertex descriptor does not carry, and the
++ * lowered fetch has no format to decode - so the read is resolved before
++ * either of them runs, and the attribute leaves the shader's interface.
++ */
++
++#include "kosmickrisp/vulkan/kk_nir_lower_vbo.h"
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++
++#include <assert.h>
++
++#define UNBOUND_LOCATION 1
++
++static nir_builder
++build_shader(unsigned num_components, unsigned component,
++             nir_alu_type dest_type)
++{
++   static const nir_shader_compiler_options options = {0};
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_VERTEX, &options, "unbound vertex attribute test");
++   b.shader->info.io_lowered = true;
++
++   nir_def *value = nir_load_input(
++      &b, num_components, nir_alu_type_get_type_size(dest_type),
++      nir_imm_int(&b, 0), .base = UNBOUND_LOCATION, .range = 1,
++      .component = component, .dest_type = dest_type,
++      .io_semantics = (nir_io_semantics) {
++         .location = VERT_ATTRIB_GENERIC0 + UNBOUND_LOCATION,
++         .num_slots = 1,
++      });
++   nir_store_global(&b, value, nir_imm_int64(&b, 0x1000),
++                    .align_mul = sizeof(uint32_t));
++   b.shader->info.inputs_read =
++      BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + UNBOUND_LOCATION);
++
++   return b;
++}
++
++static unsigned
++count_input_loads(nir_shader *shader)
++{
++   unsigned loads = 0;
++
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic ==
++                   nir_intrinsic_load_input)
++               loads++;
++         }
++      }
++   }
++
++   return loads;
++}
++
++static nir_intrinsic_instr *
++find_store_global(nir_shader *shader)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic ==
++                   nir_intrinsic_store_global)
++               return nir_instr_as_intrinsic(instr);
++         }
++      }
++   }
++
++   return NULL;
++}
++
++/* The undescribed read becomes the default value, and the attribute is gone
++ * from the interface the two fetch paths describe. */
++static void
++check_default_value(unsigned num_components, unsigned component,
++                    nir_alu_type dest_type, const uint32_t *expected)
++{
++   nir_builder b = build_shader(num_components, component, dest_type);
++
++   assert(kk_nir_lower_unbound_vbo(b.shader, BITFIELD_BIT(0)));
++   nir_validate_shader(b.shader, "after unbound vertex attribute lowering");
++
++   assert(b.shader->info.inputs_read == 0);
++   assert(count_input_loads(b.shader) == 0);
++
++   nir_intrinsic_instr *store = find_store_global(b.shader);
++   assert(store != NULL);
++
++   nir_const_value *value = nir_src_as_const_value(store->src[0]);
++   assert(value != NULL);
++   for (unsigned i = 0; i < num_components; ++i)
++      assert(value[i].u32 == expected[i]);
++
++   ralloc_free(b.shader);
++}
++
++/* An attribute the state does describe is left for the fetch path to read. */
++static void
++check_described_attribute_is_untouched(void)
++{
++   nir_builder b = build_shader(4, 0, nir_type_float32);
++
++   assert(!kk_nir_lower_unbound_vbo(b.shader,
++                                    BITFIELD_BIT(UNBOUND_LOCATION)));
++   assert(b.shader->info.inputs_read ==
++          BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + UNBOUND_LOCATION));
++   assert(count_input_loads(b.shader) == 1);
++
++   ralloc_free(b.shader);
++}
++
++int
++main(void)
++{
++   static const uint32_t float_vec4[] = {0u, 0u, 0u, 0x3f800000u};
++   static const uint32_t integer_vec4[] = {0u, 0u, 0u, 1u};
++   static const uint32_t leading_xyz[] = {0u, 0u, 0u};
++   static const uint32_t float_w[] = {0x3f800000u};
++   static const uint32_t integer_w[] = {1u};
++
++   /* x, y and z read zero and w reads one, in the shader's own type. */
++   check_default_value(4, 0, nir_type_float32, float_vec4);
++   check_default_value(4, 0, nir_type_uint32, integer_vec4);
++   check_default_value(4, 0, nir_type_int32, integer_vec4);
++
++   /* A component offset names the attribute's own channels, so a load that
++    * starts at w reads one and one that stops short of it does not. */
++   check_default_value(3, 0, nir_type_float32, leading_xyz);
++   check_default_value(1, 3, nir_type_float32, float_w);
++   check_default_value(1, 3, nir_type_uint32, integer_w);
++
++   check_described_attribute_is_untouched();
++   return 0;
++}

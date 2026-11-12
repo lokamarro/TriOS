@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 07:22:39 +0000
+Subject: [PATCH] um: receive Darwin user network frames with NAPI
+
+The driver drained up to 64 frames straight from the interrupt handler. The
+host readiness descriptor is level triggered, so a sustained inbound stream
+re-arms the interrupt the moment the handler returns and the CPU never leaves
+interrupt context long enough for the backlog softirq to make progress. That
+is a receive livelock, and it is reachable from ordinary use: an "adb push" of
+a 512 MiB file over a forwarded port wedged a booted Android 17 guest every
+time, while a 3 GiB guest-local write through the same block stack completed
+in 10 s at 293 MB/s.
+
+The wedged guest kept taking timer ticks - RCU reported "2515 ticks this GP"
+rather than the zero that marks Darwin timer starvation - and sampling the
+carriers showed them spinning in darwin_cpu_relax and _raw_spin_lock_bh, the
+per-CPU backlog lock, while other carriers sat in darwin_ipi_idle_drain.
+
+Move the receive path to NAPI, which is what arch/um/drivers/vector_kern.c
+already does on this architecture. The interrupt handler only schedules the
+poll, so repeated interrupts collapse into one NAPI_STATE_SCHED test, and the
+draining happens under a budget in softirq context that ksoftirqd can defer.
+Receive through napi_gro_receive() so a bulk TCP stream also stops paying
+per-segment stack cost.
+
+Change-Id: If1980b33f5489d259fbc2db0774272f162157558
+---
+ arch/um/drivers/darwin_net_kern.c | 53 ++++++++++++++++++++++++-------
+ 1 file changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/arch/um/drivers/darwin_net_kern.c b/arch/um/drivers/darwin_net_kern.c
+index 4291170b64845b5d4fd37616c2665c46ddbe42d9..32b45034da9b82267bd9ffb4a0fd2a960744fd45 100644
+--- a/arch/um/drivers/darwin_net_kern.c
++++ b/arch/um/drivers/darwin_net_kern.c
+@@ -9,29 +9,47 @@
+ #include <irq_kern.h>
+ 
+ #define DARWIN_NET_FRAME_SIZE 2048
+-#define DARWIN_NET_RX_BUDGET 64
+ 
+ struct darwin_net_private {
+ 	struct net_device *device;
++	struct napi_struct napi;
+ 	int backend_ready;
+ 	int receive_irq;
+ 	unsigned char receive_frame[DARWIN_NET_FRAME_SIZE];
+ };
+ 
+-static void darwin_net_receive(struct net_device *device)
++/*
++ * NAPI owns the receive path. The host readiness descriptor is level
++ * triggered, so draining it from the interrupt handler re-arms the interrupt
++ * immediately and a sustained stream never lets the CPU leave interrupt
++ * context - a textbook receive livelock. Budgeted softirq polling is what
++ * bounds that, exactly as arch/um/drivers/vector_kern.c already does.
++ */
++static int darwin_net_poll(struct napi_struct *napi, int budget)
+ {
+-	struct darwin_net_private *private = netdev_priv(device);
+-	int budget;
++	struct darwin_net_private *private =
++		container_of(napi, struct darwin_net_private, napi);
++	struct net_device *device = private->device;
++	int work_done = 0;
+ 
+-	if (!private->backend_ready || !netif_running(device))
+-		return;
+-	for (budget = 0; budget < DARWIN_NET_RX_BUDGET; budget++) {
++	/* Serialized by NAPI, so the single receive frame needs no lock. */
++	while (work_done < budget) {
+ 		struct sk_buff *buffer;
+ 		int length = darwin_uml_net_read(private->receive_frame,
+ 						 sizeof(private->receive_frame));
+ 
+ 		if (length <= 0)
+ 			break;
++		work_done++;
++		/* The provider is the embedder's: a frame longer than the buffer
++		 * would copy past it, and one shorter than an Ethernet header
++		 * would let eth_type_trans() read past the copied data. */
++		if (length < ETH_HLEN ||
++		    length > (int)sizeof(private->receive_frame)) {
++			device->stats.rx_length_errors++;
++			device->stats.rx_errors++;
++			continue;
++		}
+ 		buffer = netdev_alloc_skb_ip_align(device, length);
+ 		if (buffer == NULL) {
+ 			device->stats.rx_dropped++;
+@@ -41,18 +59,24 @@ static void darwin_net_receive(struct net_device *device)
+ 		buffer->protocol = eth_type_trans(buffer, device);
+ 		device->stats.rx_packets++;
+ 		device->stats.rx_bytes += length;
+-		netif_rx(buffer);
++		napi_gro_receive(napi, buffer);
+ 	}
++	/* Short of budget means the descriptor drained; anything that arrives
++	 * after this point raises the level-triggered interrupt again. */
++	if (work_done < budget)
++		napi_complete_done(napi, work_done);
++	return work_done;
+ }
+ 
+ static irqreturn_t darwin_net_interrupt(int irq, void *data)
+ {
+ 	struct net_device *device = data;
++	struct darwin_net_private *private = netdev_priv(device);
+ 
+ 	(void)irq;
+-	if (!netif_running(device))
++	if (!private->backend_ready || !netif_running(device))
+ 		return IRQ_NONE;
+-	darwin_net_receive(device);
++	napi_schedule(&private->napi);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -90,10 +114,15 @@ static int darwin_net_open_device(struct net_device *device)
+ 	descriptor = darwin_uml_net_irq_fd();
+ 	if (descriptor < 0)
+ 		return -ENODEV;
++	netif_napi_add(device, &private->napi, darwin_net_poll);
++	napi_enable(&private->napi);
+ 	irq = um_request_irq(UM_IRQ_ALLOC, descriptor, IRQ_READ,
+ 			     darwin_net_interrupt, 0, device->name, device);
+-	if (irq < 0)
++	if (irq < 0) {
++		napi_disable(&private->napi);
++		netif_napi_del(&private->napi);
+ 		return irq;
++	}
+ 	private->receive_irq = irq;
+ 	device->irq = irq;
+ 	netif_carrier_on(device);
+@@ -110,6 +139,8 @@ static int darwin_net_close_device(struct net_device *device)
+ 		um_free_irq(private->receive_irq, device);
+ 		private->receive_irq = -1;
+ 	}
++	napi_disable(&private->napi);
++	netif_napi_del(&private->napi);
+ 	return 0;
+ }
+ 

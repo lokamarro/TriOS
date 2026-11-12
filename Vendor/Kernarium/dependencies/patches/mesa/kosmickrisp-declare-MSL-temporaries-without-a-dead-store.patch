@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 14:51:41 +0900
+Subject: [PATCH] kosmickrisp: declare MSL temporaries without a dead store
+
+MSL has no SSA form, so nir_to_msl declares every value at function scope
+and assigns it where its instruction sits.  The declaration also carried an
+initializer, so each temporary was written twice: once with a zero that no
+path can observe, and once with the value.  The shader leaves SSA form with
+phi webs only, so a temporary is always assigned by its own instruction
+before any use can read it, and widening its C scope to the whole function
+only matches the dominance the definition already has.  Registers are the
+exception - a phi web can be read on a path that has not written it - so
+those keep their zero.
+
+The dead store is not merely wasted text.  Metal's out-of-process compiler
+degrades sharply in the number of entry-block stores: the compute shader
+that KHR-Single-GL46.arrays_of_arrays_gl.SubroutineFunctionCalls2 builds
+for dmat4 declares 79822 temporaries after the GL front end emulates fp64
+in software, and Metal answers the 8.4 MB source with
+XPC_ERROR_CONNECTION_INTERRUPTED after 938 s and several retries.  Dropping
+the 79822 dead stores - 9% of the source - compiles the same shader in
+28 s.  A library that fails to build leaves the draw with no pipeline, so
+the test read back zeroes and reported an invalid result.
+
+(cherry picked from commit 41d93b279ff8d8dd9f776f13b386f4add2755107)
+(cherry picked from commit df9f8eb5bd5e2f1fa1e086298577886fa1c4fc84)
+---
+ src/kosmickrisp/compiler/msl_private.h        |   1 -
+ src/kosmickrisp/compiler/msl_type_inference.c |   6 -
+ src/kosmickrisp/compiler/nir_to_msl.c         |  13 +-
+ src/kosmickrisp/vulkan/meson.build            |  14 ++
+ .../vulkan/tests/test_msl_temporaries.c       | 223 ++++++++++++++++++
+ 5 files changed, 246 insertions(+), 11 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_temporaries.c
+
+diff --git a/src/kosmickrisp/compiler/msl_private.h b/src/kosmickrisp/compiler/msl_private.h
+index 6d57f2760f2dc66d246d44aa756759282d6cf323..00577811fdf4a55067d9a8effc891bb269da6650 100644
+--- a/src/kosmickrisp/compiler/msl_private.h
++++ b/src/kosmickrisp/compiler/msl_private.h
+@@ -81,7 +81,6 @@ uint32_t msl_output_num_components(struct nir_to_msl_ctx *ctx,
+                                    uint32_t location);
+ 
+ bool msl_src_is_float(struct nir_to_msl_ctx *ctx, nir_src *src);
+-bool msl_def_is_sampler(struct nir_to_msl_ctx *ctx, nir_def *def);
+ bool msl_def_is_texture(struct nir_to_msl_ctx *ctx, nir_def *def);
+ 
+ void msl_nir_lower_subgroups(nir_shader *nir);
+diff --git a/src/kosmickrisp/compiler/msl_type_inference.c b/src/kosmickrisp/compiler/msl_type_inference.c
+index a65587e0589e4f9509966fb50432ecd8110b4766..a419aff0c94ffc328010302bbf7c014189f7996a 100644
+--- a/src/kosmickrisp/compiler/msl_type_inference.c
++++ b/src/kosmickrisp/compiler/msl_type_inference.c
+@@ -882,12 +882,6 @@ msl_src_is_float(struct nir_to_msl_ctx *ctx, nir_src *src)
+    return get_type(ctx->types, src) == TYPE_FLOAT;
+ }
+ 
+-bool
+-msl_def_is_sampler(struct nir_to_msl_ctx *ctx, nir_def *def)
+-{
+-   return get_type(ctx->types, def) == TYPE_SAMPLER;
+-}
+-
+ bool
+ msl_def_is_texture(struct nir_to_msl_ctx *ctx, nir_def *def)
+ {
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index cd62fbda0a3c61f641210a44f9869917c468df83..76b3cc9740463a32d5b4dc1ebad096a7bc09fc05 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2533,6 +2533,14 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
+    }
+ }
+ 
++/* Every value below holds an SSA definition: the shader leaves SSA form with
++ * phi webs only, so each name is assigned by its own instruction before any
++ * use can read it.  Declaring them at function scope only widens their C
++ * scope to match the NIR dominance they already have, so no initializer is
++ * needed - and a shader with tens of thousands of temporaries pays for one
++ * dead store per name in Metal's compiler, which is the difference between a
++ * large shader compiling and the out-of-process compiler being interrupted.
++ */
+ static void
+ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+ {
+@@ -2568,10 +2576,7 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+             const char *type = msl_type_for_def(ctx->types, def);
+             if (!type)
+                continue;
+-            if (msl_def_is_sampler(ctx, def)) {
+-               P_IND(ctx, "%s t%u;\n", type, def->index);
+-            } else
+-               P_IND(ctx, "%s t%u = %s(0);\n", type, def->index, type);
++            P_IND(ctx, "%s t%u;\n", type, def->index);
+          }
+       }
+    }
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index fba8ae283dc86e6832c30a7c1326b1030c0b4d4e..8355b907eb513a899339c7aa4e6c144a194dbbc8 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -774,6 +774,20 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_msl_temporaries',
++    executable(
++      'test_kosmickrisp_msl_temporaries',
++      files('tests/test_msl_temporaries.c'),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_msl_to_nir,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_pipeline_statistics',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c b/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f65860e7d4baf25aa0379875e18fe7c902e71db
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c
+@@ -0,0 +1,223 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* MSL has no SSA form, so every value is declared at function scope and then
++ * assigned where its instruction sits.  The declarations must not carry an
++ * initializer: the shader leaves SSA form with phi webs only, so a temporary
++ * is always assigned before it can be read, and a dead store per name costs
++ * Metal's out-of-process compiler dearly once a shader has tens of thousands
++ * of them.  Registers are the exception - a phi web can be read on a path
++ * that has not written it - so those keep their zero.
++ */
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(condition)                                                     \
++   do {                                                                      \
++      if (!(condition)) {                                                    \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,    \
++                 #condition);                                                \
++         abort();                                                            \
++      }                                                                      \
++   } while (0)
++
++/* A fragment shader with a counted loop, so the translation produces both
++ * plain temporaries and the registers a phi web lowers to. */
++static nir_shader *
++build_accumulating_fs(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "msl temporary declarations");
++   nir_shader *nir = b.shader;
++   nir->info.io_lowered = true;
++
++   nir_variable *total =
++      nir_local_variable_create(b.impl, glsl_float_type(), "total");
++   nir_variable *index =
++      nir_local_variable_create(b.impl, glsl_uint_type(), "index");
++   nir_store_var(&b, total, nir_imm_float(&b, 0.0f), 0x1);
++   nir_store_var(&b, index, nir_imm_int(&b, 0), 0x1);
++
++   nir_def *coord = nir_trim_vector(&b, nir_load_frag_coord(&b), 2);
++
++   nir_push_loop(&b);
++   {
++      nir_def *i = nir_load_var(&b, index);
++      nir_push_if(&b, nir_uge_imm(&b, i, 4));
++      {
++         nir_jump(&b, nir_jump_break);
++      }
++      nir_pop_if(&b, NULL);
++
++      nir_def *scale = nir_u2f32(&b, i);
++      nir_def *term = nir_fadd(&b, nir_fmul(&b, nir_channel(&b, coord, 0), scale),
++                               nir_channel(&b, coord, 1));
++      nir_store_var(&b, total, nir_fadd(&b, nir_load_var(&b, total), term),
++                    0x1);
++      nir_store_var(&b, index, nir_iadd_imm(&b, i, 1), 0x1);
++   }
++   nir_pop_loop(&b, NULL);
++
++   nir_def *result = nir_vec4(&b, nir_load_var(&b, total),
++                              nir_imm_float(&b, 1.0f),
++                              nir_imm_float(&b, 0.0f),
++                              nir_imm_float(&b, 1.0f));
++   nir_store_output(&b, result, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_float32,
++                    .io_semantics.location = FRAG_RESULT_DATA0,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
++
++   nir_validate_shader(nir, "msl temporary declarations");
++   return nir;
++}
++
++struct name {
++   char text[32];
++   bool assigned;
++};
++
++struct scan {
++   struct name *names;
++   unsigned count, capacity;
++   unsigned initialized_temporaries;
++   unsigned initialized_registers;
++   unsigned declared_registers;
++};
++
++static struct name *
++intern(struct scan *scan, const char *text)
++{
++   for (unsigned i = 0; i < scan->count; i++) {
++      if (strcmp(scan->names[i].text, text) == 0)
++         return &scan->names[i];
++   }
++   if (scan->count == scan->capacity) {
++      scan->capacity = scan->capacity ? scan->capacity * 2 : 64;
++      scan->names = realloc(scan->names, scan->capacity * sizeof(*scan->names));
++      CHECK(scan->names != NULL);
++   }
++   struct name *entry = &scan->names[scan->count++];
++   CHECK(strlen(text) < sizeof(entry->text));
++   strcpy(entry->text, text);
++   entry->assigned = false;
++   return entry;
++}
++
++/* Copy the identifier starting at @cursor, or return NULL when it is not a
++ * "t<number>" / "r<number>" name. */
++static const char *
++value_name(const char *cursor, char *out, size_t out_size)
++{
++   if (*cursor != 't' && *cursor != 'r')
++      return NULL;
++   size_t length = 1;
++   while (cursor[length] >= '0' && cursor[length] <= '9')
++      length++;
++   if (length == 1 || length >= out_size)
++      return NULL;
++   memcpy(out, cursor, length);
++   out[length] = '\0';
++   return cursor + length;
++}
++
++static void
++scan_msl(const char *msl, struct scan *scan)
++{
++   memset(scan, 0, sizeof(*scan));
++
++   for (const char *line = msl; *line;) {
++      const char *end = strchr(line, '\n');
++      const size_t length = end ? (size_t)(end - line) : strlen(line);
++      char buffer[512];
++      const size_t copied = length < sizeof(buffer) - 1 ? length
++                                                        : sizeof(buffer) - 1;
++      memcpy(buffer, line, copied);
++      buffer[copied] = '\0';
++      line = end ? end + 1 : line + length;
++
++      const char *cursor = buffer;
++      while (*cursor == ' ')
++         cursor++;
++
++      /* "<type> <name>..." is a declaration; "<name>..." is an assignment. */
++      const char *space = strchr(cursor, ' ');
++      char text[32];
++      if (space != NULL && value_name(space + 1, text, sizeof(text)) != NULL) {
++         const char *rest = space + 1 + strlen(text);
++         const bool initialized = rest[0] == ' ' && rest[1] == '=';
++         if (text[0] == 'r') {
++            scan->declared_registers++;
++            scan->initialized_registers += initialized;
++         } else {
++            scan->initialized_temporaries += initialized;
++         }
++         intern(scan, text);
++         continue;
++      }
++
++      const char *rest = value_name(cursor, text, sizeof(text));
++      if (rest == NULL)
++         continue;
++      while (*rest == '.' || (*rest >= 'w' && *rest <= 'z') || *rest == ' ')
++         rest++;
++      if (*rest == '=' && rest[1] != '=')
++         intern(scan, text)->assigned = true;
++   }
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   nir_shader *nir = build_accumulating_fs();
++   msl_optimize_nir(nir);
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++   BITSET_CLEAR(nir->info.system_values_read, SYSTEM_VALUE_FRAG_COORD);
++
++   struct nir_to_msl_options options = {0};
++   char *msl = nir_to_msl(nir, &options);
++   CHECK(msl != NULL);
++
++   struct scan scan;
++   scan_msl(msl, &scan);
++
++   /* The shader has to be large enough for the checks below to mean
++    * something, and the loop has to have produced a phi web. */
++   CHECK(scan.count > 8);
++   CHECK(scan.declared_registers > 0);
++
++   /* No temporary carries a dead initializer, and every one of them is
++    * assigned, which is what makes the initializer dead. */
++   CHECK(scan.initialized_temporaries == 0);
++   CHECK(scan.initialized_registers == scan.declared_registers);
++
++   for (unsigned i = 0; i < scan.count; i++) {
++      if (scan.names[i].text[0] == 'r')
++         continue;
++      if (!scan.names[i].assigned) {
++         fprintf(stderr, "temporary %s is never assigned\n",
++                 scan.names[i].text);
++         abort();
++      }
++   }
++
++   printf("msl temporaries PASS %u values, %u registers\n", scan.count,
++          scan.declared_registers);
++
++   free(scan.names);
++   ralloc_free(msl);
++   ralloc_free(nir);
++   glsl_type_singleton_decref();
++   return 0;
++}

@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:36:50 +0900
+Subject: [PATCH] kosmickrisp: let the host release the command storage its
+ devices cache
+
+A Metal command allocator keeps its storage at its high-water mark, so
+the allocators a device caches for the next recording (up to 64 MiB a
+device) stay charged to the process while nothing records. The host
+counts them against the memory it grants the GPU, and a device frees
+them only through its own recordings: a host that is about to refuse an
+allocation had no way to ask for them back.
+
+kk_release_cached_memory(), exported by the driver library beside
+kk_set_device_memory_pool(), releases every allocator the process's
+devices cache and returns how many bytes of command storage that gave
+back. The caches are kept in a list that lives from a cache's creation
+until its last reference is dropped; the walk holds the list's lock, so
+it never reaches a cache that is being freed, and takes a cache's own
+lock only to take its allocators out. It takes no lock of a device, a
+queue or the pool, so a host may call it from any thread, outside the
+driver. Allocators a recording holds are not in a cache and stay.
+
+test_command_allocator_budget fills the cache, releases it through the
+export, checks the byte count and the empty cache, records again and
+checks that the new recording's allocator reaches the cache.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_device.c            | 60 +++++++++++++++++++
+ src/kosmickrisp/vulkan/kk_device.h            | 14 +++++
+ .../vulkan/kk_device_memory_pool.h            | 12 ++++
+ .../tests/test_command_allocator_budget.c     | 41 +++++++++++++
+ 4 files changed, 127 insertions(+)
+
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index f28456a4350ed568d9899372a38ed8bc6ba27af0..89f170d9baa083d073e6d50cfbdf0898f213000e 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -17,6 +17,7 @@
+ #include "kosmickrisp/bridge/mtl_device.h"
+ #include "kosmickrisp/bridge/ns_process_info.h"
+ 
++#include "util/macros.h"
+ #include "util/u_atomic.h"
+ 
+ #include "kk_dispatch_cmd.h"
+@@ -27,6 +28,7 @@
+ #include "vk_pipeline_cache.h"
+ 
+ #include <stdlib.h>
++#include <string.h>
+ #include <time.h>
+ 
+ struct kk_mtl_compiler {
+@@ -273,6 +275,16 @@ kk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
+    return VK_SUCCESS;
+ }
+ 
++/* Every live cache of the process, for kk_release_cached_memory(). A cache
++ * is on the list from its creation until its last reference is dropped,
++ * and is freed only after it has left the list under the list's lock, so a
++ * walk that holds the lock never reaches a freed cache. Neither lock is
++ * taken while the other is held in the opposite order: the list's lock is
++ * taken before a cache's and never inside it. */
++static simple_mtx_t kk_allocator_caches_mutex = SIMPLE_MTX_INITIALIZER;
++static struct list_head kk_allocator_caches = {&kk_allocator_caches,
++                                               &kk_allocator_caches};
++
+ struct kk_command_allocator_cache *
+ kk_command_allocator_cache_create(void)
+ {
+@@ -281,6 +293,10 @@ kk_command_allocator_cache_create(void)
+       return NULL;
+    cache->refcount = 1;
+    simple_mtx_init(&cache->mutex, mtx_plain);
++
++   simple_mtx_lock(&kk_allocator_caches_mutex);
++   list_addtail(&cache->link, &kk_allocator_caches);
++   simple_mtx_unlock(&kk_allocator_caches_mutex);
+    return cache;
+ }
+ 
+@@ -297,6 +313,10 @@ kk_command_allocator_cache_unref(struct kk_command_allocator_cache *cache)
+    if (!p_atomic_dec_zero(&cache->refcount))
+       return;
+ 
++   simple_mtx_lock(&kk_allocator_caches_mutex);
++   list_del(&cache->link);
++   simple_mtx_unlock(&kk_allocator_caches_mutex);
++
+    for (unsigned i = 0; i < cache->count; i++)
+       mtl_release(cache->entries[i]);
+    simple_mtx_destroy(&cache->mutex);
+@@ -345,6 +365,46 @@ kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+       mtl_release(allocator);
+ }
+ 
++uint64_t
++kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache)
++{
++   mtl_command_allocator *released[KK_COMMAND_ALLOCATOR_CACHE_MAX];
++   unsigned count;
++   uint64_t bytes;
++
++   /* Metal returns an allocator's storage to the kernel when the allocator is
++    * released, which takes as long as it takes; do it with the lock dropped
++    * so a completion thread handing storage back is not held up by it. */
++   simple_mtx_lock(&cache->mutex);
++   count = cache->count;
++   bytes = cache->bytes;
++   memcpy(released, cache->entries, count * sizeof(released[0]));
++   cache->count = 0;
++   cache->bytes = 0;
++   simple_mtx_unlock(&cache->mutex);
++
++   for (unsigned i = 0; i < count; i++)
++      mtl_release(released[i]);
++   return bytes;
++}
++
++PUBLIC uint64_t
++kk_release_cached_memory(void)
++{
++   uint64_t bytes = 0;
++
++   /* The lock stays held across the walk, which keeps every cache alive: the
++    * last reference to one is dropped under the same lock. The trim takes a
++    * cache's lock for a moment and nothing of the list's. */
++   simple_mtx_lock(&kk_allocator_caches_mutex);
++   list_for_each_entry(struct kk_command_allocator_cache, cache,
++                       &kk_allocator_caches, link) {
++      bytes += kk_command_allocator_cache_trim(cache);
++   }
++   simple_mtx_unlock(&kk_allocator_caches_mutex);
++   return bytes;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+                 const VkDeviceCreateInfo *pCreateInfo,
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 947d9c4358629c7e462b009d4369b46da4024663..2c08ef87c40a6c4d5c6204a058ebe861bd3c58fe 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -129,6 +129,9 @@ struct kk_precompiled_cache {
+ 
+ struct kk_command_allocator_cache {
+    int refcount;
++   /* In the list of caches kk_release_cached_memory() walks, from creation
++    * until the last reference is dropped. */
++   struct list_head link;
+    simple_mtx_t mutex;
+    unsigned count;
+    uint64_t bytes;
+@@ -147,6 +150,11 @@ kk_command_allocator_cache_take(struct kk_command_allocator_cache *cache);
+  * is full. Safe to call from Metal's completion thread. */
+ void kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+                                      mtl_command_allocator *allocator);
++/* Releases every allocator the cache keeps and returns how many bytes of
++ * command storage that returned. Allocators a recording holds are not in the
++ * cache and stay. Takes only the cache's own lock. */
++uint64_t
++kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache);
+ 
+ struct kk_device {
+    struct vk_device vk;
+@@ -236,6 +244,12 @@ bool kk_device_pooled(const struct kk_device *dev);
+ bool kk_device_pool_reserve(const struct kk_device *dev, VkDeviceSize size);
+ void kk_device_pool_release(const struct kk_device *dev, VkDeviceSize size);
+ VkDeviceSize kk_device_pool_headroom(const struct kk_device *dev);
++/* The process-wide count of host memory the devices import by pointer: added
++ * once Metal has made its buffer over the memory and subtracted before the
++ * buffer is released, so Metal's allocation counter never holds an import
++ * the count does not. */
++void kk_imported_host_memory_add(uint64_t bytes);
++void kk_imported_host_memory_sub(uint64_t bytes);
+ 
+ static inline struct kk_physical_device *
+ kk_device_physical(const struct kk_device *dev)
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+index f4f6b6a01d8b777d28647d2e93b7301f3851e8fa..98314ff2379420c0b1776186e08225edb7f7f46a 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -43,6 +43,8 @@
+ 
+ #pragma once
+ 
++#include <stdint.h>
++
+ #include <vulkan/vulkan_core.h>
+ 
+ #ifdef __cplusplus
+@@ -76,6 +78,16 @@ typedef struct VkDeviceMemoryPoolCreateInfoKK {
+  * pUserData may be released after it. Exported by the driver library. */
+ void kk_set_device_memory_pool(const VkDeviceMemoryPoolCreateInfoKK *pPool);
+ 
++/* Releases the memory every device of the process keeps for reuse and no
++ * recording holds, which the pool counts against the host: the command
++ * allocators that completed recordings handed back to their device. Returns
++ * how many bytes of command storage that returned to the kernel. Exported by
++ * the driver library.
++ *
++ * It takes only locks that protect the caches themselves, never a device's,
++ * a queue's or the pool's, so any thread may call it. */
++uint64_t kk_release_cached_memory(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+index 26a3d8da18e8a4526e110ea901aec576c9b47363..b6f128deb16fa1b78a0fefa9a58bc52fba899bae 100644
+--- a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
++++ b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+@@ -11,6 +11,7 @@
+ #define VK_NO_PROTOTYPES
+ #include "kosmickrisp/vulkan/kk_cmd_buffer.h"
+ #include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/vulkan/kk_device_memory_pool.h"
+ #include "kosmickrisp/bridge/mtl_command_buffer.h"
+ 
+ #include <stdio.h>
+@@ -221,6 +222,44 @@ main(void)
+       }
+    }
+ 
++   /* The host asks for the cached storage back, as it does when the memory
++    * pool is about to refuse an allocation: every allocator the cache keeps
++    * is released and counted, and the device records again, taking a fresh
++    * allocator that reaches the cache when its recording completes. */
++   for (unsigned round = 0; round < 2; round++) {
++      VkCommandBufferBeginInfo small_begin = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++      CHECK(vkBeginCommandBuffer(commands[2], &small_begin) == VK_SUCCESS);
++      vkCmdFillBuffer(commands[2], buffer, 0, 4096, 7);
++      CHECK(vkEndCommandBuffer(commands[2]) == VK_SUCCESS);
++      VkSubmitInfo small = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                            .commandBufferCount = 1,
++                            .pCommandBuffers = &commands[2]};
++      CHECK(vkQueueSubmit(queue, 1, &small, VK_NULL_HANDLE) == VK_SUCCESS);
++      CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++
++      unsigned cached;
++      uint64_t bytes;
++      struct timespec start, now;
++      clock_gettime(CLOCK_MONOTONIC, &start);
++      for (;;) {
++         cache_state(dev, &cached, &bytes);
++         clock_gettime(CLOCK_MONOTONIC, &now);
++         if (cached > 0 || now.tv_sec - start.tv_sec > 5)
++            break;
++         struct timespec pause = {0, 1000000};
++         nanosleep(&pause, NULL);
++      }
++      CHECK(cached > 0 && bytes > 0);
++      if (round == 0) {
++         CHECK(kk_release_cached_memory() >= bytes);
++         cache_state(dev, &cached, &bytes);
++         CHECK(cached == 0 && bytes == 0);
++         CHECK(kk_release_cached_memory() == 0);
++      }
++   }
++
+    vkDestroyCommandPool(device, pool, NULL);
+    vkDestroyBuffer(device, buffer, NULL);
+    vkFreeMemory(device, buffer_memory, NULL);
+@@ -228,6 +267,8 @@ main(void)
+    vkDestroyImage(device, image, NULL);
+    vkFreeMemory(device, image_memory, NULL);
+    kk_test_destroy(&t);
++   /* The caches of a destroyed device leave the list the host walks. */
++   kk_release_cached_memory();
+    printf("command allocator budget ok\n");
+    return 0;
+ }

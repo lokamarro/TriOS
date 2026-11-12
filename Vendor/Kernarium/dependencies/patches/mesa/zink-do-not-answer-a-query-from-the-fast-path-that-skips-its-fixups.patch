@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 15:15:23 +0900
+Subject: [PATCH] zink: do not answer a query from the fast path that skips its
+ fixups
+
+zink_get_query_result() has a non-blocking shortcut that reads one Vulkan
+query straight into the result and returns, taken once a caller has polled
+the same query object NOWAIT_CHECK_THRESHOLD times without the batch being
+known complete.  zink_get_query_result_resource() has the same shortcut for
+query buffer objects.  Both bypass check_query_results(), which is where a
+query's starts are summed and where GL_VERTICES_SUBMITTED_ARB is halved for
+a start that recorded a GL_LINE_LOOP draw -- the primitive is decomposed
+into twice as many line vertices before the driver sees it, so the raw
+Vulkan counter is double what the API submitted.
+
+The shortcut is therefore only correct when check_query_results() would do
+nothing but hand back that one value.  Require exactly one start, so a query
+split across starts is still summed, and refuse it for a vertices query any
+of whose starts carries the line-loop flag.  Only the vertices query is ever
+stamped with that flag, so no other query type changes path.
+
+Found through KHR-GL46.pipeline_statistics_query_tests_ARB.functional_
+primitives_vertices_submitted_and_clipping_input_output_primitives, which
+reported exactly twice the submitted vertices for GL_LINE_LOOP on five to
+seven of its queries per run, on a different set of draw entry points every
+time.  The draw entry point was never relevant: what varied was whether the
+poll counter had reached the threshold before the batch completed.
+---
+ src/gallium/drivers/zink/zink_query.c | 32 ++++++++++++++++++++++++---
+ 1 file changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_query.c b/src/gallium/drivers/zink/zink_query.c
+index 15629a176668932fb44efd098ed4c982dc89e709..5469eed32a2b0a54b8745d010508cd4bc8458b48 100644
+--- a/src/gallium/drivers/zink/zink_query.c
++++ b/src/gallium/drivers/zink/zink_query.c
+@@ -104,6 +104,23 @@ get_num_starts(struct zink_query *q)
+    return util_dynarray_num_elements(&q->starts, struct zink_query_start);
+ }
+ 
++/* True when any of the query's starts recorded a GL_LINE_LOOP draw, so its
++ * IA_VERTICES result has to go through check_query_results() to be halved.
++ * Only the vertices query is ever stamped, so this is false everywhere else.
++ */
++static inline bool
++needs_line_loop_fixup(struct zink_query *q)
++{
++   if (q->type != PIPE_QUERY_PIPELINE_STATISTICS_SINGLE ||
++       q->index != PIPE_STAT_QUERY_IA_VERTICES)
++      return false;
++   util_dynarray_foreach(&q->starts, struct zink_query_start, start) {
++      if (start->was_line_loop)
++         return true;
++   }
++   return false;
++}
++
+ static void
+ update_query_id(struct zink_context *ctx, struct zink_query *q);
+ 
+@@ -1165,8 +1182,16 @@ zink_get_query_result(struct pipe_context *pctx,
+    if (!wait && !zink_screen_usage_check_completion_fast(screen, query->batch_uses)) {
+       if (query->result_check_counter++ < NOWAIT_CHECK_THRESHOLD)
+          return false;
+-      /* simple queries can use the "fast" path which (probably) avoids directly accessing a syncobj */
+-      if (query->buffer_count == 1 && get_num_results(query) == 1 && query->type != PIPE_QUERY_TIME_ELAPSED) {
++      /* simple queries can use the "fast" path which (probably) avoids directly accessing a syncobj.
++       * It reads one Vulkan query straight into the result and returns, so it is only correct where
++       * check_query_results() would do nothing but hand back that one value: a query split across
++       * several starts has to sum them, and a start that recorded a GL_LINE_LOOP draw has to halve
++       * its vertex count, because the primitive was decomposed into twice as many line vertices
++       * before the driver ever saw it.
++       */
++      if (query->buffer_count == 1 && get_num_results(query) == 1 &&
++          get_num_starts(query) == 1 && query->type != PIPE_QUERY_TIME_ELAPSED &&
++          !needs_line_loop_fixup(query)) {
+          struct zink_query_start *start = util_dynarray_top_ptr(&query->starts, struct zink_query_start);
+          unsigned query_id = start->vkq[0]->query_id;
+          VkResult ret = VKCTX(GetQueryPoolResults)(screen->dev, start->vkq[0]->pool->query_pool, query_id, 1,
+@@ -1479,7 +1504,8 @@ zink_get_query_result_resource(struct pipe_context *pctx,
+    if (!is_time_query(query) && !is_bool_query(query)) {
+       if (num_queries == 1 && !is_emulated_primgen(query) &&
+                               query->type != PIPE_QUERY_PRIMITIVES_EMITTED &&
+-                              !is_bool_query(query)) {
++                              !is_bool_query(query) &&
++                              !needs_line_loop_fixup(query)) {
+          if (size_flags == VK_QUERY_RESULT_64_BIT) {
+             if (query->needs_update)
+                update_qbo(ctx, query);

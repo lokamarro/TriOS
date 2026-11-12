@@ -1,0 +1,766 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 16:36:57 +0900
+Subject: [PATCH] Embedding: hand segmentation to the host
+
+An embedding host models x86 segmentation as Linux user code sees it,
+the GDT the kernel gives every task, its TLS entries and LDT, and each
+segment register's descriptor cache, for its other engine too, so
+FEXCore leaves every instruction that reads or changes that state to
+it: MOV and POP to a segment register, LDS, LES, LSS, LFS and LGS, far
+CALL, JMP and RET, direct and indirect, IRET, and LAR, LSL, VERR, VERW,
+SLDT and STR. Each stops the dispatch unretired with
+EMBEDDER_SIGNAL_SEGMENT, and the host completes it, raises its fault,
+or switches the execution mode. Outside 64-bit mode C4 and C5 with a
+memory ModRM decode as LES and LDS, and 9A and EA, which the base
+table never reached, as direct far CALL and JMP.
+
+In compatibility mode an access through FS or GS first passes an
+inline check of its offset against Embedder.SegmentChecks, a low bound
+and a span per register that the host derives from the limit with room
+for the widest access. A string instruction, XLAT, a gather, a masked
+store, an extended-state image or a store through CS goes to the host
+instead, unless Embedder.SegmentBypass is set. Either stops the
+dispatch with EMBEDDER_SIGNAL_SEGMENT_CHECK, and the host checks the
+access exactly and runs the instruction alone under the bypass. A
+context made with SetEmbedderSegmented, for a task whose ES, SS or DS
+has a base or a limit, adds each memory operand's segment base: SS for
+an address based on ESP or EBP, and DS otherwise.
+
+Selectors read from state in either mode, PUSH of a segment register
+pushes its selector, and Embedder.SegmentBases and SegmentPresent go.
+---
+ FEXCore/Source/Interface/Context/Context.h    |   7 +
+ FEXCore/Source/Interface/Core/Core.cpp        |   5 +
+ FEXCore/Source/Interface/Core/Frontend.cpp    |  14 ++
+ .../Interface/Core/OpcodeDispatcher.cpp       | 237 +++++++++++++-----
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  13 +-
+ .../OpcodeDispatcher/SecondaryGroupTables.h   |   8 +
+ .../Core/OpcodeDispatcher/SecondaryTables.h   |   3 +
+ .../Interface/Core/X86Tables/BaseTables.cpp   |  12 +-
+ .../Core/X86Tables/SecondaryGroupTables.cpp   |  32 +--
+ .../Core/X86Tables/SecondaryTables.cpp        |   8 +-
+ .../Interface/Core/X86Tables/X86Tables.h      |   2 +
+ FEXCore/include/FEXCore/Core/Context.h        |   9 +
+ FEXCore/include/FEXCore/Core/CoreState.h      |  32 ++-
+ 13 files changed, 286 insertions(+), 96 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 62b3fc1f168e6549775d267b8c39f9d6e12805a6..5cf4f65d5c79ef6da837ba63e3e48aff18daea24 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -184,6 +184,9 @@ public:
+   void SetEmbedderFPMode(uint32_t Mode) override {
+     EmbedderFPMode = Mode;
+   }
++  void SetEmbedderSegmented(bool Segmented) override {
++    EmbedderSegmented = Segmented;
++  }
+   void ExecuteEmbedded(FEXCore::Core::InternalThreadState* Thread, bool SingleInst, uint32_t SingleInstFPMode) override;
+ 
+   void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
+@@ -437,6 +440,10 @@ public:
+   // During ExecuteEmbedded(): the mode its single instruction is translated
+   // for, if not zero.
+   uint32_t EmbedderSingleInstFPMode {};
++  // Set by SetEmbedderSegmented(): compatibility-mode operands with no
++  // segment override add the base of DS, or of SS for one based on ESP or
++  // EBP.
++  bool EmbedderSegmented {false};
+ 
+   uint32_t StrictSplitLockMutex {};
+ 
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 0bf876cff72f1e48073ccb505b44379d5728abe7..82f17d6c63b73942d3585daba01016c8c9e50f40 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -708,6 +708,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);
++          // Compatibility mode: an access through FS or GS passes its
++          // segment's check before the instruction does anything.
++          if (Embedded && !BlockInfo->Is64BitMode) {
++            Thread->OpDispatcher->EmbedderSegmentCheck(DecodedInfo);
++          }
+           // Embedded: MXCSR does not govern 3DNow!, whose host arithmetic
+           // and checks leave the guest's MXCSR flags, in FPSR and in the
+           // state, as they were.
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index fbf5fdd1e6d503d1cd4a740b362cc8d90858e316..08d8b838461d4344ba81a92ced6d4c9ad72a0b73 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -549,6 +549,12 @@ Decoder::DecodedBlockStatus Decoder::NormalOp(const FEXCore::X86Tables::X86InstI
+     Bytes >>= 1;
+   }
+ 
++  // A direct far CALL or JMP: an offset of the operand size, then the
++  // selector.
++  if (Info->MoreBytes == 6 && (Info->Flags & FEXCore::X86Tables::InstFlags::FLAGS_SETS_RIP) && HasNarrowingDisplacement) {
++    Bytes = 4;
++  }
++
+   if ((Info->Flags & FEXCore::X86Tables::InstFlags::FLAGS_MEM_OFFSET) && (DecodeInst->Flags & DecodeFlags::FLAG_ADDRESS_SIZE)) {
+     // If we have a memory offset and have the address size override then divide it just like narrowing displacement
+     Bytes >>= 1;
+@@ -777,6 +783,14 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+     uint16_t X87Op = ((Op - 0xD8) << 8) | ModRMByte;
+     return NormalOp(&(*X87Table)[X87Op], X87Op);
+   } else if (Info->Type == FEXCore::X86Tables::TYPE_VEX_TABLE_PREFIX) {
++    // Outside 64-bit mode C4 and C5 are LES and LDS unless the next byte's
++    // top two bits are both set, which a memory ModRM never has.
++    if (CTX->Embedded && !BlockInfo.Is64BitMode) {
++      const auto Next = PeekByte(0);
++      if (Next && (*Next & 0xC0) != 0xC0) {
++        return NormalOp(&FEXCore::X86Tables::LegacyFarPointerOps[Op == 0xC4 ? 0 : 1], Op);
++      }
++    }
+     if (!VEXTable) {
+       // AVX not enabled.
+       return DecodedBlockStatus::INVALID_INST;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index a07fae1fe8d30b8cb45529cbf867327c5058a044..d08371117aa8ee33ea1277c0094d64231a8598c2 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -166,6 +166,10 @@ RSP
+ SS
+ */
+ void OpDispatchBuilder::IRETOp(OpcodeArgs) {
++  if (CTX->Embedded) {
++    EmbedderSegmentOp(Op);
++    return;
++  }
+   // IRET keeps a 32-bit default operand size in 64-bit mode too: IRETQ
+   // needs REX.W, and 0x66 selects 16 bits. A narrower RIP, CS, RFLAGS,
+   // RSP or SS is zero-extended by its load.
+@@ -418,7 +422,8 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
+   const auto DstSize = OpSizeFromDst(Op);
+ 
+   Ref Src {};
+-  if (!Is64BitMode) {
++  // Embedded, the selectors are the host's in either mode.
++  if (!Is64BitMode || CTX->Embedded) {
+     switch (SegmentReg) {
+     case FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX: {
+       Src = _LoadContextGPR(SrcSize, offsetof(FEXCore::Core::CPUState, es_idx));
+@@ -523,6 +528,10 @@ void OpDispatchBuilder::POPAOp(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
++  if (CTX->Embedded) {
++    EmbedderSegmentOp(Op);
++    return;
++  }
+   const auto SrcSize = OpSizeFromSrc(Op);
+   const auto DstSize = OpSizeFromDst(Op);
+ 
+@@ -998,6 +1007,10 @@ static OpSize FarTransferSize(X86Tables::DecodedOp Op) {
+ }
+ 
+ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
++  if (CTX->Embedded) {
++    EmbedderSegmentOp(Op);
++    return;
++  }
+   const auto SrcSize = FarTransferSize(Op);
+ 
+   // Calculate flags early.
+@@ -1023,6 +1036,10 @@ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::CALLFARIndirectOp(OpcodeArgs) {
++  if (CTX->Embedded) {
++    EmbedderSegmentOp(Op);
++    return;
++  }
+   const auto SrcSize = FarTransferSize(Op);
+ 
+   // Calculate flags early.
+@@ -1066,6 +1083,10 @@ void OpDispatchBuilder::CALLFARIndirectOp(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::RETFARIndirectOp(OpcodeArgs) {
++  if (CTX->Embedded) {
++    EmbedderSegmentOp(Op);
++    return;
++  }
+   const auto GPRSize = GetGPROpSize();
+   const auto SrcSize = FarTransferSize(Op);
+ 
+@@ -1422,6 +1443,11 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+     default: UnimplementedOp(Op); return;
+     }
+ 
++    if (CTX->Embedded) {
++      EmbedderSegmentOp(Op);
++      return;
++    }
++
+     Ref Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], OpSize::i16Bit, Op->Flags);
+ 
+     switch (Op->Dest.Data.GPR.GPR) {
+@@ -1445,10 +1471,6 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       if (!Is64BitMode) {
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
+-      } else if (CTX->Embedded) {
+-        // An embedding host keeps the base arch_prctl set; only the
+-        // selector changes.
+-        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+       } else {
+         LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
+         DecodeFailure = true;
+@@ -1459,10 +1481,6 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       if (!Is64BitMode) {
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
+-      } else if (CTX->Embedded) {
+-        // An embedding host keeps the base arch_prctl set; only the
+-        // selector changes.
+-        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+       } else {
+         LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
+         DecodeFailure = true;
+@@ -1492,7 +1510,8 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       break;
+     case FEXCore::X86State::REG_RBP: // GS
+     case FEXCore::X86State::REG_R13: // GS
+-      if (Is64BitMode) {
++      // Embedded, the host's segment model loads the selector in either mode.
++      if (Is64BitMode && !CTX->Embedded) {
+         Segment = Constant(0);
+       } else {
+         Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, gs_idx));
+@@ -1500,7 +1519,7 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       break;
+     case FEXCore::X86State::REG_RSP: // FS
+     case FEXCore::X86State::REG_R12: // FS
+-      if (Is64BitMode) {
++      if (Is64BitMode && !CTX->Embedded) {
+         Segment = Constant(0);
+       } else {
+         Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, fs_idx));
+@@ -4380,6 +4399,11 @@ Ref OpDispatchBuilder::GetSegment(uint32_t Flags, uint32_t DefaultPrefix, bool O
+       // Or the argument only uses a specific prefix (with override set)
+       Prefix = DefaultPrefix;
+     }
++    // Embedded, a segmented context's operands reach through DS unless
++    // their callers name another default.
++    if (Prefix == FEXCore::X86Tables::DecodeFlags::FLAG_NO_PREFIX && CTX->Embedded && CTX->EmbedderSegmented) {
++      Prefix = FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX;
++    }
+     // With the segment register optimization we store the GDT bases directly in the segment register to remove indexed loads
+     Ref SegmentResult {};
+     switch (Prefix) {
+@@ -4509,27 +4533,6 @@ void OpDispatchBuilder::CheckLegacySegmentWrite(Ref NewNode, uint32_t SegmentReg
+ }
+ 
+ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg) {
+-  if (CTX->Embedded) {
+-    // The descriptor tables are host memory, which embedded code reaches only
+-    // through the guest TLB. Long mode ignores the CS/SS/DS/ES bases and the
+-    // host keeps FS/GS bases itself, so a selector load changes no base.
+-    if (Is64BitMode || (SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX &&
+-                        SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX)) {
+-      return;
+-    }
+-    // 32-bit code: the host's table of GDT bases gives FS and GS theirs, for
+-    // an RPL 3 selector of the first 32 entries; every other selector loads
+-    // base 0.
+-    Ref Entry = _Bfe(OpSize::i32Bit, 5, 3, Segment);
+-    Ref Base = _LoadContextGPRIndexed(Entry, OpSize::i32Bit, offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentBases[0]), 4);
+-    Ref Checked = _And(OpSize::i32Bit, Segment, _Constant(0xff07));
+-    Ref NewBase = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ, Checked, Constant(3), Base, Constant(0));
+-    // The whole cached base, zero-extended, as the host reads it back.
+-    _StoreContextGPR(OpSize::i64Bit, NewBase,
+-                     SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX ? offsetof(FEXCore::Core::CPUState, fs_cached) :
+-                                                                                     offsetof(FEXCore::Core::CPUState, gs_cached));
+-    return;
+-  }
+   // Use BFE to extract the selector index in bits [15,3] of the segment register.
+   // In some cases the upper 16-bits of the 32-bit GPR contain garbage to ignore.
+   auto GDT = _Bfe(OpSize::i32Bit, 1, 2, Segment);
+@@ -4661,7 +4664,7 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
+   const auto GPRSize = GetGPROpSize();
+ 
+   AddressMode A {};
+-  A.Segment = GetSegment(Op->Flags);
++  A.Segment = GetSegment(Op->Flags, EmbedderDefaultSegment(Operand));
+   A.AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
+   A.NonTSO = AccessType == MemoryAccessType::NONTSO || AccessType == MemoryAccessType::STREAM;
+ 
+@@ -5125,40 +5128,13 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+ }
+ 
+ void OpDispatchBuilder::LSLOp(OpcodeArgs) {
+-  if (!CTX->Embedded) {
+-    // Emulate by always returning failure, this deviates from both Linux and Windows but
+-    // shouldn't be depended on by anything.
+-    SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0));
++  if (CTX->Embedded) {
++    EmbedderSegmentOp(Op);
+     return;
+   }
+-
+-  // Embedded, the GDT entries Linux gives user code that LSL can read: the
+-  // flat 32-bit code, data and 64-bit code segments at entries 4, 5 and 6;
+-  // the per-CPU segment at entry 15, whose limit is the processor number
+-  // RDPID reads; and a TLS entry the host installed, which the C libraries
+-  // give a flat limit. Any other selector, an LDT's included, reads as
+-  // unusable: ZF clear and the destination as it was. The selector is read
+-  // from memory too.
+-  CalculateDeferredFlags();
+-  Ref Selector = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+-  Ref Entry = _Bfe(OpSize::i32Bit, 13, 3, Selector);
+-  Ref Present = _Or(OpSize::i32Bit, _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentPresent)),
+-                    Constant((1U << 4) | (1U << 5) | (1U << 6) | (1U << 15)));
+-  // A shift takes its amount modulo 32, so an entry past 31 and an LDT
+-  // selector are ruled out first.
+-  Ref InGDT = Select01(OpSize::i32Bit, CondClass::EQ, _And(OpSize::i32Bit, Selector, Constant(0xFF04)), Constant(0));
+-  Ref Valid = _And(OpSize::i32Bit, InGDT, _And(OpSize::i32Bit, _Lshr(OpSize::i32Bit, Present, Entry), Constant(1)));
+-  Ref Limit = _Select(OpSize::i64Bit, OpSize::i32Bit, CondClass::EQ, Entry, Constant(15), _ProcessorID(), Constant(0xFFFFFFFF));
+-
+-  const auto Register = Op->Dest.Data.GPR.GPR;
+-  Ref Old = LoadGPRRegister(Register);
+-  Ref New {};
+-  switch (OpSizeFromDst(Op)) {
+-  case OpSize::i16Bit: New = _Bfi(OpSize::i64Bit, 16, 0, Old, Limit); break;
+-  default: New = _Bfe(OpSize::i64Bit, 32, 0, Limit); break;
+-  }
+-  StoreGPRRegister(Register, _Select(OpSize::i64Bit, OpSize::i32Bit, CondClass::NEQ, Valid, Constant(0), New, Old));
+-  SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Valid);
++  // Emulate by always returning failure, this deviates from both Linux and Windows but
++  // shouldn't be depended on by anything.
++  SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0));
+ }
+ 
+ void OpDispatchBuilder::INTOp(OpcodeArgs) {
+@@ -5539,6 +5515,137 @@ void OpDispatchBuilder::BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDe
+   }
+ }
+ 
++void OpDispatchBuilder::EmbedderSegmentOp(OpcodeArgs) {
++  if (!CTX->Embedded) {
++    UnimplementedOp(Op);
++    return;
++  }
++  // The host runs the instruction from the state at its start.
++  CalculateDeferredFlags();
++  FlushRegisterCache();
++  BreakOp(Op, FEXCore::IR::BreakDefinition {
++                .ErrorRegister = 0,
++                .Signal = Core::EMBEDDER_SIGNAL_SEGMENT,
++                .TrapNumber = 0,
++                .si_code = 0,
++              });
++}
++
++uint32_t OpDispatchBuilder::EmbedderDefaultSegment(const X86Tables::DecodedOperand& Operand) const {
++  if (!CTX->Embedded || !CTX->EmbedderSegmented || Is64BitMode) {
++    return X86Tables::DecodeFlags::FLAG_NO_PREFIX;
++  }
++  uint8_t Base = X86State::REG_INVALID;
++  if (Operand.IsGPRDirect()) {
++    Base = Operand.Data.GPR.GPR;
++  } else if (Operand.IsGPRIndirect()) {
++    Base = Operand.Data.GPRIndirect.GPR;
++  } else if (Operand.IsSIB()) {
++    Base = Operand.Data.SIB.Base;
++  }
++  return Base == X86State::REG_RSP || Base == X86State::REG_RBP ? X86Tables::DecodeFlags::FLAG_SS_PREFIX :
++                                                                 X86Tables::DecodeFlags::FLAG_NO_PREFIX;
++}
++
++void OpDispatchBuilder::EmbedderSegmentCheck(OpcodeArgs) {
++  const uint32_t Prefix = Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS;
++  const bool CS = Prefix == X86Tables::DecodeFlags::FLAG_CS_PREFIX;
++  const bool GS = Prefix == X86Tables::DecodeFlags::FLAG_GS_PREFIX;
++  if (!CTX->Embedded || Is64BitMode || !Op->TableInfo || (!CS && !GS && Prefix != X86Tables::DecodeFlags::FLAG_FS_PREFIX)) {
++    return;
++  }
++  const auto Fn = Op->TableInfo->OpcodeDispatcher.OpDispatch;
++  // LEA and the hint NOPs reach no memory.
++  if (Fn == &OpDispatchBuilder::LEAOp || Fn == &OpDispatchBuilder::NOPOp) {
++    return;
++  }
++  const auto IsMemory = [&](const X86Tables::DecodedOperand& Operand) {
++    return Operand.IsGPRDirect() || Operand.IsGPRIndirect() || Operand.IsRIPRelative() || Operand.IsSIB() ||
++           (Operand.IsLiteral() && (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_MEM_OFFSET) != 0);
++  };
++  const X86Tables::DecodedOperand* Memory {};
++  for (const auto* Operand : {&Op->Dest, &Op->Src[0], &Op->Src[1], &Op->Src[2]}) {
++    if (IsMemory(*Operand)) {
++      Memory = Operand;
++      break;
++    }
++  }
++  // What the check of one offset cannot cover: a string instruction's or
++  // XLAT's implicit operand, a masked store's, a gather's elements, and the
++  // images of more than the check's slack.
++  const bool Implicit = Fn == &OpDispatchBuilder::MOVSOp || Fn == &OpDispatchBuilder::CMPSOp || Fn == &OpDispatchBuilder::STOSOp ||
++                        Fn == &OpDispatchBuilder::LODSOp || Fn == &OpDispatchBuilder::SCASOp || Fn == &OpDispatchBuilder::XLATOp ||
++                        Fn == &OpDispatchBuilder::MASKMOVOp || Fn == &OpDispatchBuilder::AVX128_MASKMOV ||
++                        (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_VEX_VSIB) != 0;
++  const bool Large = Memory && (Fn == &OpDispatchBuilder::FXSaveOp || Fn == &OpDispatchBuilder::FXRStoreOp ||
++                                Fn == &OpDispatchBuilder::XSaveOp || Fn == &OpDispatchBuilder::LoadFenceOrXRSTOR ||
++                                Fn == &OpDispatchBuilder::MemFenceOrXSAVEOPT || Fn == &OpDispatchBuilder::X87FNSAVE ||
++                                Fn == &OpDispatchBuilder::X87FRSTOR);
++  bool Guard {};
++  if (CS) {
++    // CS is the flat code segment, which every read passes and every write
++    // faults: only an operand the instruction may write needs the host.
++    Guard = Memory == &Op->Dest || Implicit || Large;
++  } else {
++    Guard = Implicit || Large;
++  }
++  const auto GPRSize = GetGPROpSize();
++  if (Guard) {
++    CalculateDeferredFlags();
++    Ref Bypass = _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentBypass));
++    auto CondJump_ = CondJump(Bypass, CondClass::EQ);
++    auto FaultBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetTrueJumpTarget(CondJump_, FaultBlock);
++    SetCurrentCodeBlock(FaultBlock);
++    StartNewBlock();
++    _StoreContextGPR(GPRSize, GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++    Break({
++      .ErrorRegister = 0,
++      .Signal = Core::EMBEDDER_SIGNAL_SEGMENT_CHECK,
++      .TrapNumber = 0,
++      .si_code = 0,
++    });
++    auto NextBlock = CreateNewCodeBlockAfter(FaultBlock);
++    SetFalseJumpTarget(CondJump_, NextBlock);
++    SetCurrentCodeBlock(NextBlock);
++    StartNewBlock();
++    return;
++  }
++  if (CS || !Memory) {
++    return;
++  }
++  // The offset, before the segment's base, at the address size.
++  Ref Offset {};
++  if (Memory->IsLiteral()) {
++    Offset = Constant(Memory->Literal() & ((Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) ? 0xFFFFULL : 0xFFFF'FFFFULL));
++  } else {
++    Offset = LoadSourceGPR_WithOpSize(Op, *Memory, OpSize::i32Bit, Op->Flags, {.LoadData = false});
++    Offset = _Bfe(OpSize::i64Bit, 32, 0, Offset);
++  }
++  Ref Low = _LoadContextGPR(OpSize::i64Bit, GS ? offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentChecks[1].Low) :
++                                                  offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentChecks[0].Low));
++  Ref Span = _LoadContextGPR(OpSize::i64Bit, GS ? offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentChecks[1].Span) :
++                                                   offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentChecks[0].Span));
++  Ref Relative = _Sub(OpSize::i64Bit, Offset, Low);
++  CalculateDeferredFlags();
++  auto CondJump_ = CondJump(Relative, Span, InvalidNode, InvalidNode, CondClass::UGT, OpSize::i64Bit);
++  auto FaultBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++  SetTrueJumpTarget(CondJump_, FaultBlock);
++  SetCurrentCodeBlock(FaultBlock);
++  StartNewBlock();
++  _StoreContextGPR(GPRSize, GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++  Break({
++    .ErrorRegister = 0,
++    .Signal = Core::EMBEDDER_SIGNAL_SEGMENT_CHECK,
++    .TrapNumber = 0,
++    .si_code = 0,
++  });
++  auto NextBlock = CreateNewCodeBlockAfter(FaultBlock);
++  SetFalseJumpTarget(CondJump_, NextBlock);
++  SetCurrentCodeBlock(NextBlock);
++  StartNewBlock();
++}
++
+ void OpDispatchBuilder::UnimplementedOp(OpcodeArgs) {
+   BreakOp(Op, FEXCore::IR::BreakDefinition {
+                 .ErrorRegister = 0,
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 8dc8dd076a081fbae55afaffaa92a4e00a0e6c1e..48a59d31f8115a77e2bae8806b6085cf1f812dc9 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -331,6 +331,13 @@ public:
+   // saves the host's FPSR as it starts, and under DAZ without FTZ each part
+   // of an instruction they check does.
+   void EmbedderFPEndInstruction();
++  // Embedded: leaves the dispatch at the instruction with
++  // EMBEDDER_SIGNAL_SEGMENT, for the host to run.
++  void EmbedderSegmentOp(FEXCore::X86Tables::DecodedOp Op);
++  // Embedded, compatibility mode: at the start of an instruction, the inline
++  // check of its access through FS or GS, or the guard of one the check does
++  // not cover (EMBEDDER_SIGNAL_SEGMENT_CHECK).
++  void EmbedderSegmentCheck(FEXCore::X86Tables::DecodedOp Op);
+ 
+   void ResetHandledLock() {
+     HandledLock = false;
+@@ -1722,8 +1729,12 @@ private:
+   [[nodiscard]]
+   Ref MakeSegmentAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, IR::OpSize OpSize) {
+     Ref Mem = LoadSourceGPR_WithOpSize(Op, Operand, OpSize, Op->Flags, {.LoadData = false});
+-    return AppendSegmentOffset(Mem, Op->Flags);
++    return AppendSegmentOffset(Mem, Op->Flags, EmbedderDefaultSegment(Operand));
+   }
++  // Embedded, in a segmented context: SS for a memory operand based on ESP
++  // or EBP, which x86 reaches through SS; otherwise no default, which the
++  // context makes DS.
++  uint32_t EmbedderDefaultSegment(const X86Tables::DecodedOperand& Operand) const;
+   [[nodiscard]]
+   Ref MakeSegmentAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand) {
+     return MakeSegmentAddress(Op, Operand, OpSizeFromSrc(Op));
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
+index 369b7f6c4a4604a5e60b04da5e347042ec95e0ca..035e172b46fb6e9cf38d8bd4eb05f6c7a8801249 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
+@@ -10,6 +10,14 @@ constexpr uint16_t PF_66 = 2;
+ constexpr uint16_t PF_F2 = 3;
+ constexpr DispatchTableEntry OpDispatch_SecondaryGroupTables[] = {
+   // GROUP 6
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 0), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 0), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 0), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F2, 0), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 4), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 4), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 4), 2, &OpDispatchBuilder::EmbedderSegmentOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F2, 4), 2, &OpDispatchBuilder::EmbedderSegmentOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 2), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
+index f3ee6a18a43dbb223f914844221e0da1b181b09a..e62278bb5c01ae97de1a10113c955514e570f61e 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
+@@ -5,6 +5,7 @@
+ namespace FEXCore::IR {
+ constexpr DispatchTableEntry OpDispatch_TwoByteOpTable[] = {
+   // Instructions
++  {0x02, 1, &OpDispatchBuilder::EmbedderSegmentOp},
+   {0x03, 1, &OpDispatchBuilder::LSLOp},
+   {0x06, 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {0x07, 1, &OpDispatchBuilder::SYSRETOp},
+@@ -42,7 +43,9 @@ constexpr DispatchTableEntry OpDispatch_TwoByteOpTable[] = {
+   {0xAD, 1, &OpDispatchBuilder::SHRDOp},
+   {0xAF, 1, &OpDispatchBuilder::IMUL1SrcOp},
+   {0xB0, 2, &OpDispatchBuilder::CMPXCHGOp},                                            // CMPXCHG
++  {0xB2, 1, &OpDispatchBuilder::EmbedderSegmentOp},                                    // LSS
+   {0xB3, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::BTOp, 0, BTAction::BTClear>}, // BTR
++  {0xB4, 2, &OpDispatchBuilder::EmbedderSegmentOp},                                    // LFS, LGS
+   {0xB6, 2, &OpDispatchBuilder::MOVZXOp},
+   {0xBB, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::BTOp, 0, BTAction::BTComplement>}, // BTC
+   {0xBC, 1, &OpDispatchBuilder::BSFOp},                                                     // BSF
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp
+index e7bc3a7a737bd68c5ac011739f5159b7ebbca697..7b389e69de01cf56d372df8f3f38c7cd3233f07f 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp
+@@ -135,7 +135,7 @@ constexpr std::array<X86InstInfo[2], ENTRY_MAX> Primary_ArchSelect_LUT = {{
+   },
+   // ENTRY_9A
+   {
+-    {"CALLF",  TYPE_INST, FLAGS_NONE, 0, { .OpDispatch = nullptr } },
++    {"CALLF",  TYPE_INST, FLAGS_SETS_RIP | FLAGS_BLOCK_END, 6, { .OpDispatch = &IR::OpDispatchBuilder::EmbedderSegmentOp } },
+     {"", TYPE_INVALID, FLAGS_NONE, 0, { .OpDispatch = nullptr } },
+   },
+   // ENTRY_A0
+@@ -180,11 +180,16 @@ constexpr std::array<X86InstInfo[2], ENTRY_MAX> Primary_ArchSelect_LUT = {{
+   },
+   // ENTRY_EA
+   {
+-    {"JMPF",   TYPE_INST, FLAGS_NONE, 0, { .OpDispatch = nullptr } },
++    {"JMPF",   TYPE_INST, FLAGS_SETS_RIP | FLAGS_BLOCK_END, 6, { .OpDispatch = &IR::OpDispatchBuilder::EmbedderSegmentOp } },
+     {"", TYPE_INVALID, FLAGS_NONE, 0, { .OpDispatch = nullptr } },
+   },
+ }};
+ 
++const std::array<X86InstInfo, 2> LegacyFarPointerOps = {{
++  {"LES", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0, { .OpDispatch = &IR::OpDispatchBuilder::EmbedderSegmentOp } },
++  {"LDS", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY, 0, { .OpDispatch = &IR::OpDispatchBuilder::EmbedderSegmentOp } },
++}};
++
+ const std::array<X86InstInfo, MAX_PRIMARY_TABLE_SIZE> BaseOps = []() consteval {
+   std::array<X86InstInfo, MAX_PRIMARY_TABLE_SIZE> Table{};
+ 
+@@ -331,6 +336,8 @@ const std::array<X86InstInfo, MAX_PRIMARY_TABLE_SIZE> BaseOps = []() consteval {
+     {0x98, 1, X86InstInfo{"CDQE",   TYPE_INST, FLAGS_NONE,     0}},
+     {0x99, 1, X86InstInfo{"CQO",    TYPE_INST, FLAGS_NONE,     0}},
+ 
++    {0x9A, 1, X86InstInfo{"", TYPE_ARCH_DISPATCHER, FLAGS_NONE, 0, { .Indirect = Primary_ArchSelect_LUT[ENTRY_9A] }}},
++
+     // These three are all X87 instructions
+     {0x9B, 1, X86InstInfo{"FWAIT",  TYPE_INST, FLAGS_NONE,                              0}},
+     {0x9C, 1, X86InstInfo{"PUSHF",  TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF),         0}},
+@@ -388,6 +395,7 @@ const std::array<X86InstInfo, MAX_PRIMARY_TABLE_SIZE> BaseOps = []() consteval {
+ 
+     {0xE8, 1, X86InstInfo{"CALL",   TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF) | FLAGS_SETS_RIP | FLAGS_SRC_SEXT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_BLOCK_END | FLAGS_CALL , 4}},
+     {0xE9, 1, X86InstInfo{"JMP",    TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF) | FLAGS_SETS_RIP | FLAGS_SRC_SEXT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_BLOCK_END , 4}},
++    {0xEA, 1, X86InstInfo{"", TYPE_ARCH_DISPATCHER, FLAGS_NONE, 0, { .Indirect = Primary_ArchSelect_LUT[ENTRY_EA] }}},
+     {0xEB, 1, X86InstInfo{"JMP",    TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF) | FLAGS_SETS_RIP | FLAGS_SRC_SEXT | FLAGS_BLOCK_END ,                             1}},
+ 
+     // Should just throw GP
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
+index 580fc5fb4eee7e2ee0f8b9aa9a60bf62062f7213..1256544e8329989e69bdb466fc790225868237b6 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
+@@ -61,39 +61,39 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     // Pulls from other MODRM table
+ 
+     // GROUP 6
+-    {OPD(TYPE_GROUP_6, PF_NONE, 0), 1, X86InstInfo{"SLDT",  TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+-    {OPD(TYPE_GROUP_6, PF_NONE, 1), 1, X86InstInfo{"STR",   TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
++    {OPD(TYPE_GROUP_6, PF_NONE, 0), 1, X86InstInfo{"SLDT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_NONE, 1), 1, X86InstInfo{"STR",   TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 2), 1, X86InstInfo{"LLDT",  TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 3), 1, X86InstInfo{"LTR",   TYPE_INST, FLAGS_NONE,       0}},
+-    {OPD(TYPE_GROUP_6, PF_NONE, 4), 1, X86InstInfo{"VERR",  TYPE_UNDEC, FLAGS_MODRM, 0}},
+-    {OPD(TYPE_GROUP_6, PF_NONE, 5), 1, X86InstInfo{"VERW",  TYPE_UNDEC, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_NONE, 4), 1, X86InstInfo{"VERR",  TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_NONE, 5), 1, X86InstInfo{"VERW",  TYPE_INST, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 6), 1, X86InstInfo{"",      TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 7), 1, X86InstInfo{"",      TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+-    {OPD(TYPE_GROUP_6, PF_F3, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+-    {OPD(TYPE_GROUP_6, PF_F3, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
++    {OPD(TYPE_GROUP_6, PF_F3, 0), 1, X86InstInfo{"SLDT",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_F3, 1), 1, X86InstInfo{"STR",     TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 2), 1, X86InstInfo{"LLDT",    TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+-    {OPD(TYPE_GROUP_6, PF_F3, 4), 1, X86InstInfo{"VERR",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+-    {OPD(TYPE_GROUP_6, PF_F3, 5), 1, X86InstInfo{"VERW",    TYPE_UNDEC, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_F3, 4), 1, X86InstInfo{"VERR",    TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_F3, 5), 1, X86InstInfo{"VERW",    TYPE_INST, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 6), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 7), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+-    {OPD(TYPE_GROUP_6, PF_66, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+-    {OPD(TYPE_GROUP_6, PF_66, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
++    {OPD(TYPE_GROUP_6, PF_66, 0), 1, X86InstInfo{"SLDT",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_66, 1), 1, X86InstInfo{"STR",     TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_66, 2), 1, X86InstInfo{"LLDT",    TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_66, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+-    {OPD(TYPE_GROUP_6, PF_66, 4), 1, X86InstInfo{"VERR",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+-    {OPD(TYPE_GROUP_6, PF_66, 5), 1, X86InstInfo{"VERW",    TYPE_UNDEC, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_66, 4), 1, X86InstInfo{"VERR",    TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_66, 5), 1, X86InstInfo{"VERW",    TYPE_INST, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_66, 6), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_66, 7), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+-    {OPD(TYPE_GROUP_6, PF_F2, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+-    {OPD(TYPE_GROUP_6, PF_F2, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
++    {OPD(TYPE_GROUP_6, PF_F2, 0), 1, X86InstInfo{"SLDT",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_F2, 1), 1, X86InstInfo{"STR",     TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 2), 1, X86InstInfo{"LLDT",    TYPE_INST, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+-    {OPD(TYPE_GROUP_6, PF_F2, 4), 1, X86InstInfo{"VERR",    TYPE_UNDEC, FLAGS_MODRM, 0}},
+-    {OPD(TYPE_GROUP_6, PF_F2, 5), 1, X86InstInfo{"VERW",    TYPE_UNDEC, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_F2, 4), 1, X86InstInfo{"VERR",    TYPE_INST, FLAGS_MODRM, 0}},
++    {OPD(TYPE_GROUP_6, PF_F2, 5), 1, X86InstInfo{"VERW",    TYPE_INST, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 6), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 7), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+index 76cb6065128258674a7595a3a16d63126293f22a..9a724f91c0a007af7c116fc1a375737e1446159b 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+@@ -55,7 +55,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+     {0x00, 1, X86InstInfo{"",           TYPE_GROUP_6, FLAGS_MODRM | FLAGS_NO_OVERLAY,                                                                                 0}},
+     {0x01, 1, X86InstInfo{"",           TYPE_GROUP_7, FLAGS_NO_OVERLAY,                                                                                 0}},
+     // These two load segment register data
+-    {0x02, 1, X86InstInfo{"LAR",        TYPE_UNDEC, FLAGS_NO_OVERLAY,                                                                                   0}},
++    {0x02, 1, X86InstInfo{"LAR",        TYPE_INST, GenFlagsSrcSize(SIZE_16BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                                                                   0}},
+     {0x03, 1, X86InstInfo{"LSL",        TYPE_INST, GenFlagsSrcSize(SIZE_16BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                                                                    0}},
+     {0x04, 1, X86InstInfo{"",           TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                                 0}},
+     {0x05, 1, X86InstInfo{"",           TYPE_ARCH_DISPATCHER, FLAGS_NONE, 0, { .Indirect = Secondary_ArchSelect_LUT[ENTRY_05] }}},
+@@ -220,10 +220,10 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+ 
+     {0xB0, 1, X86InstInfo{"CMPXCHG", TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY | FLAGS_SUPPORTS_LOCK, 0}},
+     {0xB1, 1, X86InstInfo{"CMPXCHG", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY | FLAGS_SUPPORTS_LOCK,                               0}},
+-    {0xB2, 1, X86InstInfo{"LSS",     TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                                0}},
++    {0xB2, 1, X86InstInfo{"LSS",     TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY | FLAGS_NO_OVERLAY,                                                                                0}},
+     {0xB3, 1, X86InstInfo{"BTR",     TYPE_INST, FLAGS_DEBUG_MEM_ACCESS | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY | FLAGS_SUPPORTS_LOCK,   0}},
+-    {0xB4, 1, X86InstInfo{"LFS",     TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                                0}},
+-    {0xB5, 1, X86InstInfo{"LGS",     TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                                0}},
++    {0xB4, 1, X86InstInfo{"LFS",     TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY | FLAGS_NO_OVERLAY,                                                                                0}},
++    {0xB5, 1, X86InstInfo{"LGS",     TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY | FLAGS_NO_OVERLAY,                                                                                0}},
+     {0xB6, 1, X86InstInfo{"MOVZX",   TYPE_INST, GenFlagsSrcSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                        0}},
+     {0xB7, 1, X86InstInfo{"MOVZX",   TYPE_INST, GenFlagsSrcSize(SIZE_16BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                       0}},
+     {0xB8, 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,                                                                                      0}},
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 3010516f6196223b21876e672afe96822ea8ba86..91b856b460d5ed072950f5128b2828028d4d8677 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -533,6 +533,8 @@ constexpr size_t MAX_VEX_TABLE_SIZE = (1 << 13);
+ constexpr size_t MAX_VEX_GROUP_TABLE_SIZE = (1 << 7);
+ 
+ extern const std::array<X86InstInfo, MAX_PRIMARY_TABLE_SIZE> BaseOps;
++// LES (C4) and LDS (C5) outside 64-bit mode, for an embedding host.
++extern const std::array<X86InstInfo, 2> LegacyFarPointerOps;
+ extern const std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps;
+ extern const std::array<X86InstInfo, MAX_REP_MOD_TABLE_SIZE> RepModOps;
+ extern const std::array<X86InstInfo, MAX_REPNE_MOD_TABLE_SIZE> RepNEModOps;
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index b76e5d644975c9d22472f54df5e17b4a5963e158..56f8dc14af2360c375a806ca7aa5571d0c1b682c 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -91,6 +91,15 @@ public:
+    */
+   FEX_DEFAULT_VISIBILITY virtual void SetEmbedderFPMode(uint32_t Mode) = 0;
+ 
++  /**
++   * @brief Makes an embedded context translate for compatibility-mode code
++   * whose ES, SS or DS has a base: a memory operand with no segment override
++   * adds DS's base, or SS's for one based on ESP or EBP, as x86 does.
++   * Otherwise only an override adds a base. Implicit stack and string
++   * accesses add none; the host runs those itself. Call before InitCore.
++   */
++  FEX_DEFAULT_VISIBILITY virtual void SetEmbedderSegmented(bool Segmented) = 0;
++
+   /**
+    * @brief Runs a thread until it exits through an embedder exit.
+    *
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index d1a9b88c4dbaa37dd56c684d5c1485f27c6f6f52..30f2d7a9e92247f75d766ff20d5108dcb9ac2029 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -415,6 +415,18 @@ constexpr uint32_t EMBEDDER_ACCESS_UNRETIRED_SHIFT = 32;
+ constexpr uint8_t EMBEDDER_SIGNAL_SYSCALL = 0xFE;
+ // ... and for integer divide errors (#DE).
+ constexpr uint8_t EMBEDDER_SIGNAL_DIVIDE = 0xFD;
++// ... for an instruction that loads or inspects segment state, which the host
++// runs against the descriptor tables its kernel keeps: a MOV or POP to a
++// segment register, LDS, LES, LSS, LFS and LGS, a far CALL, JMP or RET, IRET,
++// LAR, LSL, VERR, VERW, SLDT and STR. RIP names the instruction, which has
++// done nothing.
++constexpr uint8_t EMBEDDER_SIGNAL_SEGMENT = 0xFC;
++// ... for a compatibility-mode instruction whose access through FS or GS
++// failed its inline check (Embedder.SegmentChecks), or which reaches FS, GS
++// or CS in a way the check does not cover while Embedder.SegmentBypass is
++// clear. RIP names the instruction, which has done nothing; the host checks
++// its accesses exactly.
++constexpr uint8_t EMBEDDER_SIGNAL_SEGMENT_CHECK = 0xFB;
+ 
+ // SIMD floating point for an embedding host, which wants x86's results on any
+ // host: an EmbedderFPCheck op takes the host's result where it is x86's and
+@@ -693,14 +705,18 @@ struct CpuStateFrame {
+     uint32_t CodeSizePerNode {};
+     // Compiles on this thread that restarted for a larger buffer.
+     uint32_t CodeBufferRestarts {};
+-    // 32-bit code: the base an FS or GS load of GDT entry n takes with
+-    // RPL 3, selector n << 3 | 3. Any other selector, and a load of ES, CS,
+-    // SS or DS, gives base 0, and no selector load faults. The host fills it
+-    // from the descriptors its kernel installed before each dispatch.
+-    uint32_t SegmentBases[32] {};
+-    // Bit n: GDT entry n holds a TLS descriptor the host's kernel
+-    // installed, whose limit LSL reads as flat.
+-    uint32_t SegmentPresent {};
++    // Compatibility mode: the inline checks of FS ([0]) and GS ([1]). An
++    // access at offset O through the segment passes when O - Low <= Span,
++    // unsigned; the host leaves 63 bytes of slack, so the check of an
++    // access's first byte covers all of it.
++    struct {
++      uint64_t Low;
++      uint64_t Span;
++    } SegmentChecks[2] {};
++    // Nonzero while the host runs one instruction whose accesses it checked
++    // itself: the checks pass it, and so does the guard of an access they do
++    // not cover.
++    uint32_t SegmentBypass {};
+     // Bounce buffer for an access that crosses a guest page, an ordered
+     // access across a 16-byte granule, and the copy of a locked operand
+     // across one.

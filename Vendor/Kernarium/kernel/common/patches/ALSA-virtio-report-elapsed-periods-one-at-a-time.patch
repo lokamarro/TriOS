@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:04:37 +0900
+Subject: [PATCH] ALSA: virtio: report elapsed periods one at a time
+
+The driver tells the ALSA core of progress through hw_ptr, a byte offset
+inside the buffer that the indirect PCM helper and the core read as a
+change since their last look, modulo the buffer size. The interrupt
+handler added every completed message to hw_ptr and scheduled one
+elapsed-period work, which a burst of completions shares.
+
+When the guest cannot run that work for longer than the buffer lasts, a
+stall of the guest or a device that delivers late completions at once,
+every queued period completes before the core looks again: hw_ptr comes
+back to where it was, the core sees no progress, and the indirect state
+still counts the whole buffer as queued, so no period is ever queued
+again. Unless the core's in-interrupt jiffies check happens to see the
+lost buffer first, which any non-interrupt position update in between
+prevents, the stream then stays running with nothing queued and every
+write times out with -EIO; when the check does catch it, the stream
+xruns, but with a stop threshold of the boundary even that stalls,
+because the check corrects only the core's position and not the indirect
+state.
+
+Count completed bytes apart from hw_ptr and let the work move hw_ptr by
+one period at a time, under the stream lock, updating the core after
+each. The core then accounts for every period: an underrun substream
+xruns as on any other device, and one whose stop threshold is the
+boundary carries on with its whole buffer free to refill.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sound/virtio/virtio_pcm.c     | 31 ++++++++++++++++++++++++++++++-
+ sound/virtio/virtio_pcm.h     |  6 +++++-
+ sound/virtio/virtio_pcm_msg.c | 14 +++++---------
+ sound/virtio/virtio_pcm_ops.c |  1 +
+ 4 files changed, 41 insertions(+), 11 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm.c b/sound/virtio/virtio_pcm.c
+index 67b8020d2d5a7f6f3dc6f1e55885c6ec939d6299..fc98735d3c7e1bae6616605434a490006eff6ef8 100644
+--- a/sound/virtio/virtio_pcm.c
++++ b/sound/virtio/virtio_pcm.c
+@@ -310,8 +310,37 @@ static void virtsnd_pcm_period_elapsed(struct work_struct *work)
+ {
+ 	struct virtio_pcm_substream *vss =
+ 		container_of(work, struct virtio_pcm_substream, elapsed_period);
++	struct snd_pcm_substream *substream = vss->substream;
++	size_t period_bytes = snd_pcm_lib_period_bytes(substream);
+ 
+-	snd_pcm_period_elapsed(vss->substream);
++	/*
++	 * The ALSA core learns how far the substream moved from the change of
++	 * hw_ptr, a position inside the buffer, so a move of a whole buffer
++	 * looks to it like none. Completions pile up that far while this work
++	 * cannot run, when the guest stalls or the device delivers late
++	 * completions at once, and the core then saw every period played and
++	 * queued none again: the stream stalled for good, or ran into an xrun
++	 * only when the core's own jiffies check happened to catch the lost
++	 * buffer. Move hw_ptr by one period at a time and update the core
++	 * after each, so that it accounts for every period and stops an
++	 * underrun substream as it would any other.
++	 */
++	guard(pcm_stream_lock_irq)(substream);
++	while (snd_pcm_running(substream)) {
++		size_t bytes;
++
++		scoped_guard(spinlock_irqsave, &vss->lock) {
++			bytes = min(vss->elapsed_bytes, period_bytes);
++			vss->elapsed_bytes -= bytes;
++			vss->hw_ptr += bytes;
++			if (vss->hw_ptr >= vss->buffer_bytes)
++				vss->hw_ptr -= vss->buffer_bytes;
++		}
++		if (!bytes)
++			break;
++
++		snd_pcm_period_elapsed_under_stream_lock(substream);
++	}
+ }
+ 
+ /**
+diff --git a/sound/virtio/virtio_pcm.h b/sound/virtio/virtio_pcm.h
+index fff17cfe7d169099a5049068a2ade322b6604842..4fd4807ab99a7971ffb01812a08fe2c8bfbfbdeb 100644
+--- a/sound/virtio/virtio_pcm.h
++++ b/sound/virtio/virtio_pcm.h
+@@ -28,7 +28,10 @@ struct virtio_pcm_msg;
+  * @lock: Spinlock that protects fields shared by interrupt handlers and
+  *        substream operators.
+  * @buffer_bytes: Current buffer size in bytes.
+- * @hw_ptr: Substream hardware pointer value in bytes [0 ... buffer_bytes).
++ * @hw_ptr: Substream hardware pointer value in bytes [0 ... buffer_bytes),
++ *          as the ALSA core has been told of it.
++ * @elapsed_bytes: Bytes the device has completed since, which the
++ *                 elapsed-period work has yet to add to @hw_ptr.
+  * @xfer_enabled: Data transfer state (0 - off, 1 - on).
+  * @xfer_xrun: Data underflow/overflow state (0 - no xrun, 1 - xrun).
+  * @stopped: True if the substream is stopped and must be released on the device
+@@ -55,6 +58,7 @@ struct virtio_pcm_substream {
+ 	spinlock_t lock;
+ 	size_t buffer_bytes;
+ 	size_t hw_ptr;
++	size_t elapsed_bytes;
+ 	bool xfer_enabled;
+ 	bool xfer_xrun;
+ 	bool stopped;
+diff --git a/sound/virtio/virtio_pcm_msg.c b/sound/virtio/virtio_pcm_msg.c
+index d04763aba507ecd3a1e87c3a4a0f1ef585345820..b8c363b28c06674166e006b3830c20a46ec48334 100644
+--- a/sound/virtio/virtio_pcm_msg.c
++++ b/sound/virtio/virtio_pcm_msg.c
+@@ -317,23 +317,19 @@ static void virtsnd_pcm_msg_complete(struct virtio_pcm_msg *msg,
+ 	struct virtio_pcm_substream *vss = msg->substream;
+ 
+ 	/*
+-	 * hw_ptr always indicates the buffer position of the first I/O message
+-	 * in the virtqueue. Therefore, on each completion of an I/O message,
+-	 * the hw_ptr value is unconditionally advanced.
++	 * Each completion of an I/O message is progress of the substream. The
++	 * elapsed-period work moves hw_ptr by it and tells the ALSA core.
+ 	 */
+ 	guard(spinlock)(&vss->lock);
+ 	/*
+ 	 * If the capture substream returned an incorrect status, then just
+-	 * increase the hw_ptr by the message size.
++	 * count the message size.
+ 	 */
+ 	if (vss->direction == SNDRV_PCM_STREAM_PLAYBACK ||
+ 	    written_bytes <= sizeof(msg->status))
+-		vss->hw_ptr += msg->length;
++		vss->elapsed_bytes += msg->length;
+ 	else
+-		vss->hw_ptr += written_bytes - sizeof(msg->status);
+-
+-	if (vss->hw_ptr >= vss->buffer_bytes)
+-		vss->hw_ptr -= vss->buffer_bytes;
++		vss->elapsed_bytes += written_bytes - sizeof(msg->status);
+ 
+ 	msg->length = 0;
+ 
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 9f5646c752dbbdfb7fd7fb08c91be5bb9a79526b..906af639f19c132a890c72fc345c405c25b1a090 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -303,6 +303,7 @@ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ 	 * into the middle of the restarted buffer.
+ 	 */
+ 	vss->hw_ptr = 0;
++	vss->elapsed_bytes = 0;
+ 	vss->xfer_xrun = false;
+ 	vss->suspended = false;
+ 	vss->msg_count = 0;

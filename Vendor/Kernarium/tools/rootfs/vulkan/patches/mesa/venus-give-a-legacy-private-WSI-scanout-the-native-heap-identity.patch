@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 12:18:35 +0900
+Subject: [PATCH] venus: give a legacy private WSI scanout the native heap
+ identity
+
+Common WSI chains VkExternalMemoryImageCreateInfo on every swapchain image it
+creates, and on a paired Metal renderer that chain is what turns an optimal
+scanout image into a native MTLHeap alias with the logical row pitch the
+window system's implicit dma-buf envelope needs. A legacy private WSI client
+such as Gamescope does not go through common WSI: it chains only Mesa's
+private wsi_image_create_info with the scanout hint, allocates dedicated
+memory for the image, exports that allocation as a dma-buf, and reads the
+stride it hands to its DRM backend from vkGetImageSubresourceLayout. Its image
+therefore reached the renderer with no external handle type, was not a native
+heap alias, never acquired the envelope, and reported the renderer's layout
+for an optimal image, whose row pitch is not a stride at all. The exported
+buffer could not be scanned out.
+
+Recognise that image where it is created: a scanout request that is not a
+prime blit source, carries no external image chain, and meets a renderer whose
+image handle type is the native heap. Append the external image chain with the
+renderer's handle type, exactly as common WSI's own images carry it, so the
+existing native path gives it the same heap identity, per-image budget and
+logical row pitch. Record that the image is a legacy private scanout, and
+apply the envelope's row pitch to its own subresource-layout query, because
+that public entry point is the only one such a client has.
+
+The envelope is applied through one header-only helper shared with common
+WSI's private layout hook, which keeps its previous behaviour. An ordinary
+Vulkan image, a linear or explicitly modified image, and every subresource
+other than the single colour plane at mip 0, layer 0 still return the
+renderer's result byte for byte; the native test pins each of those cases and
+that only rowPitch changes. The modifier policy is untouched: a native-heap
+renderer still offers common WSI no DRM format modifiers.
+---
+ src/virtio/vulkan/tests/vn_wsi_native_test.c | 28 +++++++++++++++++
+ src/virtio/vulkan/vn_image.c                 | 32 ++++++++++++++++++--
+ src/virtio/vulkan/vn_image.h                 |  1 +
+ src/virtio/vulkan/vn_wsi.c                   | 11 +++----
+ src/virtio/vulkan/vn_wsi_native.h            | 15 +++++++++
+ 5 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/src/virtio/vulkan/tests/vn_wsi_native_test.c b/src/virtio/vulkan/tests/vn_wsi_native_test.c
+index 01c76b2e1a1af8acaf718cc07a873e1e8846fb3c..bb939aa0468bb2d82acdac324424ecbb8ece871f 100644
+--- a/src/virtio/vulkan/tests/vn_wsi_native_test.c
++++ b/src/virtio/vulkan/tests/vn_wsi_native_test.c
+@@ -6,6 +6,7 @@
+ #include "../vn_wsi_native.h"
+ 
+ #include <stdio.h>
++#include <string.h>
+ 
+ #define CHECK(expr)                                                           \
+    do {                                                                      \
+@@ -166,6 +167,33 @@ main(void)
+    CHECK(!vn_wsi_native_heap_scanout(false, false));
+    CHECK(!vn_wsi_native_heap_scanout(true, false));
+ 
++   /* Legacy scanout obtains a nonzero stride without changing offset, size,
++    * array pitch or depth pitch. Public queries and other subresources stay
++    * byte-identical to the renderer's result.
++    */
++   const VkSubresourceLayout original = {64, 480000, 0, 480064, 960128};
++   VkSubresourceLayout layout = original;
++   VkImageSubresource subresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
++   vn_wsi_native_apply_row_pitch(false, 1600, &subresource, &layout);
++   CHECK(!memcmp(&layout, &original, sizeof(layout)));
++   vn_wsi_native_apply_row_pitch(true, 0, &subresource, &layout);
++   CHECK(!memcmp(&layout, &original, sizeof(layout)));
++   vn_wsi_native_apply_row_pitch(true, 1600, &subresource, &layout);
++   CHECK(layout.rowPitch == 1600);
++   layout.rowPitch = original.rowPitch;
++   CHECK(!memcmp(&layout, &original, sizeof(layout)));
++   const VkImageSubresource excluded_subresources[] = {
++      {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0},
++      {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0},
++      {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0},
++      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1},
++   };
++   for (unsigned i = 0; i < sizeof(excluded_subresources) /
++                                sizeof(excluded_subresources[0]); i++) {
++      vn_wsi_native_apply_row_pitch(true, 1600, &excluded_subresources[i],
++                                    &layout);
++      CHECK(!memcmp(&layout, &original, sizeof(layout)));
++   }
+    puts("Venus WSI native-heap envelope tests passed");
+    return 0;
+ }
+diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
+index 921a044ddd1ef4d5d8485a36fc50b53f55cc32a7..ade1a73627f2ea6dbba8e700898ac10f5031ecc9 100644
+--- a/src/virtio/vulkan/vn_image.c
++++ b/src/virtio/vulkan/vn_image.c
+@@ -21,6 +21,7 @@
+ #include "vn_device_memory.h"
+ #include "vn_physical_device.h"
+ #include "vn_wsi.h"
++#include "vn_wsi_native.h"
+ 
+ #define IMAGE_REQS_CACHE_MAX_ENTRIES 500
+ 
+@@ -484,6 +485,7 @@ vn_image_fix_create_info(
+ {
+    local_info->create = *create_info;
+    VkBaseOutStructure *cur = (void *)&local_info->create;
++   bool has_external_info = false;
+ 
+    vk_foreach_struct_const(src, create_info->pNext) {
+       void *next = NULL;
+@@ -491,6 +493,7 @@ vn_image_fix_create_info(
+       case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO:
+          memcpy(&local_info->external, src, sizeof(local_info->external));
+          local_info->external.handleTypes = renderer_handle_type;
++         has_external_info = true;
+          next = &local_info->external;
+          break;
+       case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO:
+@@ -527,6 +530,14 @@ vn_image_fix_create_info(
+       }
+    }
+ 
++   if (!has_external_info) {
++      local_info->external = (VkExternalMemoryImageCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++         .handleTypes = renderer_handle_type,
++      };
++      cur->pNext = (void *)&local_info->external;
++      cur = (void *)&local_info->external;
++   }
+    cur->pNext = NULL;
+ 
+    return &local_info->create;
+@@ -593,13 +604,23 @@ vn_CreateImage(VkDevice device,
+     */
+    if (wsi_info) {
+       struct vn_image_create_info local_info;
+-      if (external_info &&
+-          external_info->handleTypes != renderer_handle_type) {
++      /* Legacy private WSI clients such as Gamescope omit the external
++       * image chain but still export their dedicated scanout allocation.
++       * Give that image the same native heap identity as common WSI.
++       */
++      const bool legacy_native_scanout =
++         wsi_info->scanout && !wsi_info->blit_src && !external_info &&
++         renderer_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
++      if (legacy_native_scanout ||
++          (external_info &&
++           external_info->handleTypes != renderer_handle_type)) {
+          pCreateInfo = vn_image_fix_create_info(
+             pCreateInfo, renderer_handle_type, &local_info);
+       }
+ 
+       result = vn_wsi_create_image(dev, pCreateInfo, wsi_info, alloc, &img);
++      if (result == VK_SUCCESS)
++         img->wsi.legacy_native_scanout = legacy_native_scanout;
+    } else if (anb_info) {
+       result = vn_android_image_from_anb(dev, pCreateInfo, alloc, &img);
+    } else if (ahb_info) {
+@@ -810,6 +831,13 @@ vn_GetImageSubresourceLayout(VkDevice device,
+    /* TODO local cache */
+    vn_call_vkGetImageSubresourceLayout(dev->primary_ring, device, image,
+                                        pSubresource, pLayout);
++   /* The private MESA scanout contract uses this entry point for its
++    * implicit dma-buf envelope. Ordinary Vulkan images keep the renderer's
++    * layout, including every linear or explicitly modified image.
++    */
++   vn_wsi_native_apply_row_pitch(img->wsi.legacy_native_scanout,
++                                 img->wsi.native_heap_row_pitch,
++                                 pSubresource, pLayout);
+ }
+ 
+ /* image view commands */
+diff --git a/src/virtio/vulkan/vn_image.h b/src/virtio/vulkan/vn_image.h
+index 143971103dd0b74fa9bd64bfea71045fbd989969..76b37f052bb95562714e2bbf2c586d336c52b102 100644
+--- a/src/virtio/vulkan/vn_image.h
++++ b/src/virtio/vulkan/vn_image.h
+@@ -55,6 +55,7 @@ struct vn_image {
+ 
+    struct {
+       bool is_prime_blit_src;
++      bool legacy_native_scanout;
+ 
+       /* Logical DRI3 envelope, not the native heap's physical row layout. */
+       uint32_t native_heap_row_pitch;
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+index 5993eca5e5458e82c41cee812ac4bf6c605b55d3..8b278e1070f695ea365e6ae2061d41a67d248daf 100644
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -152,10 +152,8 @@ vn_wsi_get_image_subresource_layout(VkDevice device, VkImage image,
+ {
+    vn_GetImageSubresourceLayout(device, image, subresource, layout);
+    const struct vn_image *img = vn_image_from_handle(image);
+-   if (img->wsi.native_heap_row_pitch &&
+-       subresource->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+-       !subresource->mipLevel && !subresource->arrayLayer)
+-      layout->rowPitch = img->wsi.native_heap_row_pitch;
++   vn_wsi_native_apply_row_pitch(true, img->wsi.native_heap_row_pitch,
++                                 subresource, layout);
+ }
+ 
+ VkResult
+@@ -232,8 +230,9 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
+       supports_drm_format_modifier,
+       physical_dev->external_memory.renderer_supports_metal_heap);
+    if (physical_dev->external_memory.renderer_supports_metal_heap) {
+-      /* Only common WSI sees the logical implicit-import envelope.  Public
+-       * Vulkan layout queries still return the renderer's actual result.
++      /* Only common WSI sees the logical implicit-import envelope.  Ordinary
++       * Vulkan images still return the renderer's actual layout; the legacy
++       * private MESA scanout path applies the same envelope at its query.
+        */
+       physical_dev->wsi_device.GetImageSubresourceLayout =
+          vn_wsi_get_image_subresource_layout;
+diff --git a/src/virtio/vulkan/vn_wsi_native.h b/src/virtio/vulkan/vn_wsi_native.h
+index 4b234327e3f72ffe3ccb23e4ba5ae51e844d2fd8..312f20c6b3eb7aef4c1e8152fd7eca84671d7ab0 100644
+--- a/src/virtio/vulkan/vn_wsi_native.h
++++ b/src/virtio/vulkan/vn_wsi_native.h
+@@ -115,4 +115,19 @@ vn_wsi_native_heap_scanout(bool supports_drm_format_modifier,
+    return renderer_supports_metal_heap && !supports_drm_format_modifier;
+ }
+ 
++/* A private MESA scanout image carries an implicit dma-buf envelope even
++ * when its native storage is optimal. Do not expose that envelope for an
++ * ordinary Vulkan image or a different subresource.
++ */
++static inline void
++vn_wsi_native_apply_row_pitch(bool private_scanout, uint32_t row_pitch,
++                              const VkImageSubresource *subresource,
++                              VkSubresourceLayout *layout)
++{
++   if (private_scanout && row_pitch &&
++       subresource->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
++       !subresource->mipLevel && !subresource->arrayLayer)
++      layout->rowPitch = row_pitch;
++}
++
+ #endif /* VN_WSI_NATIVE_H */

@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 07:38:06 +0900
+Subject: [PATCH] uml: complete or report a Darwin kernel-range TLB flush
+
+flush_tlb_kernel_range() discarded um_tlb_sync()'s result. On Darwin
+flush_cache_vmap() and flush_cache_vunmap() are both that macro, so every
+vmalloc map and unmap in the guest went through one call whose failure nobody
+observed.
+
+The unmap side cannot be recovered afterwards. __purge_vmap_area_lazy() calls
+flush_tlb_kernel_range() immediately before releasing the addresses for reuse,
+so a dropped unmap leaves the host serving a page the guest has freed, at an
+address the allocator may hand out at once. Nothing ever faults on a mapping
+that should not exist, so the lazy repair in segv() cannot notice. A guest
+kernel write through such an address lands in whatever took the page over,
+which is the "BUG: Bad page map" and "Bad swap file entry" class of damage.
+
+Route the kernel range through um_tlb_sync_kernel_range(), which retries a
+transient host failure a bounded number of times and otherwise stops the
+kernel rather than returning with the host and init_mm disagreeing. A nested
+request -- a kernel-range flush raised from inside the walker that already
+owns the turnstile, which um_tlb_sync_init_mm() reports as -EDEADLK -- is
+recorded and drained by that walker before it releases ownership, so it is
+deferred but never dropped. Draining is keyed on that request alone, not on
+um_tlb_sync_pending(), because set_ptes() marks constantly and a
+pending-based loop re-walks the whole range on every sync.
+
+A failed init_mm host map now unmaps its own address, so a map failure
+degrades to "not mapped", which segv() already repairs, instead of leaving
+older backing live under a page table entry that names a different page.
+
+Finally, assert what the wide-unmap arms rely on. Darwin compiles out
+pmd_mkuptodate() and friends, so _PAGE_NEEDSYNC is never cleared and a
+cleared kernel entry would re-unmap its whole span on every covering walk.
+Nothing frees a vmalloc page table, so no init_mm entry reaches those arms --
+measured over 38163 kernel-range flushes, where the arms fired 2934 times for
+user mms and never for init_mm. WARN_ON_ONCE() keeps that true.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ arch/um/include/asm/tlbflush.h |   5 ++
+ arch/um/kernel/tlb.c           | 111 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 115 insertions(+), 1 deletion(-)
+
+diff --git a/arch/um/include/asm/tlbflush.h b/arch/um/include/asm/tlbflush.h
+index bd049ef7a30551999bbafa7b3bfef08932df43d6..458f68c3840a1ef17578329c8470f2fbae2a9cb1 100644
+--- a/arch/um/include/asm/tlbflush.h
++++ b/arch/um/include/asm/tlbflush.h
+@@ -33,6 +33,7 @@
+ extern int um_tlb_sync(struct mm_struct *mm);
+ 
+ #ifdef UML_HOST_DARWIN
++extern void um_tlb_sync_kernel_range(unsigned long start, unsigned long end);
+ extern bool um_tlb_sync_pending(struct mm_struct *mm);
+ extern int um_tlb_sync_locked(struct mm_struct *mm, unsigned long start,
+ 			      unsigned long end);
+@@ -74,7 +75,11 @@ static inline void flush_tlb_kernel_range(unsigned long start,
+ 	um_tlb_mark_sync(&init_mm, start, end);
+ 
+ 	/* Kernel needs to be synced immediately */
++#ifdef UML_HOST_DARWIN
++	um_tlb_sync_kernel_range(start, end);
++#else
+ 	um_tlb_sync(&init_mm);
++#endif
+ }
+ 
+ #endif
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index aeef0bd64b989e85535fce0cdf67cea1de8a9599..fe69a5b2fc988009bce2481ebeb524dad94a6680 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -333,6 +333,15 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 
+ 			ret = ops->mmap(ops->mm_idp, addr, PAGE_SIZE,
+ 					prot, fd, offset);
++#ifdef UML_HOST_DARWIN
++			/* Nothing ever faults on a kernel mapping that names
++			 * the wrong page, so a failed map must not leave the
++			 * previous backing live here.  Degrade to "not
++			 * mapped", which the repair in segv() owns.
++			 */
++			if (unlikely(ret && ops->mm == &init_mm))
++				(void)ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
++#endif
+ 		} else
+ 			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
+ 
+@@ -362,6 +371,16 @@ static inline int update_pmd_range(pud_t *pud, unsigned long addr,
+ 		next = pmd_addr_end(addr, end);
+ 		if (!pmd_present(*pmd)) {
+ 			if (pmd_needsync(*pmd)) {
++#ifdef UML_HOST_DARWIN
++				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				 * cleared kernel entry would re-unmap this
++				 * whole span on every covering walk.  Nothing
++				 * frees a vmalloc page table, so no init_mm
++				 * entry reaches this arm; assert it rather
++				 * than rely on it silently.
++				 */
++				WARN_ON_ONCE(ops->mm == &init_mm);
++#endif
+ 				ret = ops->unmap(ops->mm_idp, addr,
+ 						 next - addr);
+ #ifndef UML_HOST_DARWIN
+@@ -388,6 +407,16 @@ static inline int update_pud_range(p4d_t *p4d, unsigned long addr,
+ 		next = pud_addr_end(addr, end);
+ 		if (!pud_present(*pud)) {
+ 			if (pud_needsync(*pud)) {
++#ifdef UML_HOST_DARWIN
++				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				 * cleared kernel entry would re-unmap this
++				 * whole span on every covering walk.  Nothing
++				 * frees a vmalloc page table, so no init_mm
++				 * entry reaches this arm; assert it rather
++				 * than rely on it silently.
++				 */
++				WARN_ON_ONCE(ops->mm == &init_mm);
++#endif
+ 				ret = ops->unmap(ops->mm_idp, addr,
+ 						 next - addr);
+ #ifndef UML_HOST_DARWIN
+@@ -413,6 +442,16 @@ static inline int update_p4d_range(pgd_t *pgd, unsigned long addr,
+ 		next = p4d_addr_end(addr, end);
+ 		if (!p4d_present(*p4d)) {
+ 			if (p4d_needsync(*p4d)) {
++#ifdef UML_HOST_DARWIN
++				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				 * cleared kernel entry would re-unmap this
++				 * whole span on every covering walk.  Nothing
++				 * frees a vmalloc page table, so no init_mm
++				 * entry reaches this arm; assert it rather
++				 * than rely on it silently.
++				 */
++				WARN_ON_ONCE(ops->mm == &init_mm);
++#endif
+ 				ret = ops->unmap(ops->mm_idp, addr,
+ 						 next - addr);
+ #ifndef UML_HOST_DARWIN
+@@ -437,6 +476,16 @@ static int update_mm_range(struct mm_struct *mm, struct vm_ops *ops,
+ 		next = pgd_addr_end(addr, end);
+ 		if (!pgd_present(*pgd)) {
+ 			if (pgd_needsync(*pgd)) {
++#ifdef UML_HOST_DARWIN
++				/* Darwin never clears _PAGE_NEEDSYNC, so a
++				 * cleared kernel entry would re-unmap this
++				 * whole span on every covering walk.  Nothing
++				 * frees a vmalloc page table, so no init_mm
++				 * entry reaches this arm; assert it rather
++				 * than rely on it silently.
++				 */
++				WARN_ON_ONCE(ops->mm == &init_mm);
++#endif
+ 				ret = ops->unmap(ops->mm_idp, addr,
+ 						 next - addr);
+ #ifndef UML_HOST_DARWIN
+@@ -674,8 +723,23 @@ static int __um_tlb_sync(struct mm_struct *mm,
+ #ifdef UML_HOST_DARWIN
+ static struct task_struct *init_mm_tlb_owner;
+ 
++/*
++ * Raised by um_tlb_sync_kernel_range() when a kernel-range flush is requested
++ * from inside the walker that already owns the turnstile.  The owner drains it
++ * before releasing, so such a request is deferred but never dropped.
++ */
++static bool init_mm_tlb_nested;
++
++/*
++ * A nested request can only come from a host operation the walker itself
++ * performed, so the drain converges.  Bound it anyway: looping forever inside
++ * the kernel would be worse than stopping with a diagnosis.
++ */
++#define UM_TLB_KERNEL_DRAIN_ROUNDS 8
++
+ static noinline int um_tlb_sync_init_mm(void)
+ {
++	unsigned int round;
+ 	int ret;
+ 
+ 	/* A host fault inside an init_mm host mapping operation re-enters the
+@@ -691,7 +755,16 @@ static noinline int um_tlb_sync_init_mm(void)
+ 		goto clear_owner;
+ 	}
+ 	WRITE_ONCE(init_mm_tlb_owner, current);
+-	ret = __um_tlb_sync(&init_mm, false, 0, 0);
++	for (round = 0; round < UM_TLB_KERNEL_DRAIN_ROUNDS; round++) {
++		/* Clear before walking so a request raised during the walk is
++		 * seen by the next test rather than lost.
++		 */
++		WRITE_ONCE(init_mm_tlb_nested, false);
++		ret = __um_tlb_sync(&init_mm, false, 0, 0);
++		if (ret || !READ_ONCE(init_mm_tlb_nested))
++			goto clear_owner;
++	}
++	panic("Nested kernel TLB sync did not converge");
+ clear_owner:
+ 	WRITE_ONCE(init_mm_tlb_owner, NULL);
+ 	mutex_unlock(&init_mm.context.turnstile);
+@@ -709,6 +782,42 @@ int um_tlb_sync(struct mm_struct *mm)
+ }
+ 
+ #ifdef UML_HOST_DARWIN
++/* A transient host failure is worth retrying; a persistent one is not. */
++#define UM_TLB_KERNEL_SYNC_ATTEMPTS 4
++
++/*
++ * flush_cache_vmap() and flush_cache_vunmap() are both flush_tlb_kernel_range()
++ * on this port, so every vmalloc map and unmap arrives here.  The unmap side
++ * cannot be recovered later: __purge_vmap_area_lazy() releases the address for
++ * reuse immediately afterwards, and nothing ever faults on a mapping that
++ * should not exist, so the lazy repair in segv() never learns of it.  A guest
++ * that returns from this function may assume the host agrees with init_mm's
++ * page tables over the range, or that the kernel has stopped.
++ */
++void um_tlb_sync_kernel_range(unsigned long start, unsigned long end)
++{
++	unsigned int attempt;
++	int ret = 0;
++
++	for (attempt = 0; attempt < UM_TLB_KERNEL_SYNC_ATTEMPTS; attempt++) {
++		ret = um_tlb_sync(&init_mm);
++		if (!ret)
++			return;
++		/* The walker that owns the turnstile is on this task's stack
++		 * and drains the range before it releases ownership, so the
++		 * request is deferred to it rather than dropped.
++		 */
++		if (ret == -EDEADLK) {
++			WRITE_ONCE(init_mm_tlb_nested, true);
++			return;
++		}
++	}
++
++	if (ret == -ENOMEM)
++		report_enomem();
++	panic("Failed to sync kernel TLBs over %#lx-%#lx: %d", start, end, ret);
++}
++
+ bool um_tlb_sync_pending(struct mm_struct *mm)
+ {
+ 	unsigned long flags;

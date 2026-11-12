@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:10:26 +0900
+Subject: [PATCH] ext4: index a block group quietly and again when the insert
+ failed
+
+mb_set_largest_free_order() and mb_update_avg_fragment_size() move a
+group between the order xarrays under the group lock. The insert can only
+use the atomic reserves, and when memory is that short it fails with
+-ENOMEM. The code already treats that as harmless, since a group that is
+not indexed is found by the linear traversal of the later criteria, but
+the failed atomic allocation prints warn_alloc()'s report and stack trace
+all the same, from writeback, in the middle of the pressure that caused
+it:
+
+  kworker/u19:1: page allocation failure: order:0,
+      mode:0x40830(GFP_ATOMIC|__GFP_RECLAIMABLE|__GFP_COMP)
+   __xas_nomem
+   __xa_insert
+   mb_set_largest_free_order
+   mb_mark_used
+   ext4_mb_regular_allocator
+   ext4_writepages
+   wb_workfn
+
+The failure also loses state for longer than it needs to. Both functions
+return early when the group's order is unchanged, so a group whose insert
+failed stays out of its order xarray until the order changes, however
+many blocks are allocated from or freed to it, and the scans that read
+the xarrays for the quick criteria keep passing it over.
+
+Insert with __GFP_NOWARN, as every caller that handles the failure does,
+and let an update that finds the order unchanged check that the group is
+indexed and insert it again if not. A group is missing only after a
+failed insert, and the check is one lookup under the group lock.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ fs/ext4/mballoc.c | 60 ++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 38 insertions(+), 22 deletions(-)
+
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index bef6cbb7ef74f5eabaaecd412e9efc05897f2262..0a6fa5e67d0d8678fce1cfbe6bd2e3fd0ed31293 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -858,6 +858,22 @@ static int mb_avg_fragment_size_order(struct super_block *sb, ext4_grpblk_t len)
+ 	return order;
+ }
+ 
++/*
++ * Index @grp in @xa under its own group number. The group lock is held, so
++ * the xarray node can only come from the atomic reserves, and the insert fails
++ * when memory is that short. That is not fatal: a group that is not indexed is
++ * found by the linear traversal the later criteria fall back on, and the next
++ * update of the group's order finds it missing and indexes it again, so the
++ * failure costs a worse choice of group, not an allocation. The caller has
++ * handled it, which is why it must not warn: warn_alloc() prints a stack
++ * trace for every failed atomic allocation, and under memory pressure that
++ * adds to the very pressure that caused it.
++ */
++static int mb_index_group(struct xarray *xa, struct ext4_group_info *grp)
++{
++	return xa_insert(xa, grp->bb_group, grp, GFP_ATOMIC | __GFP_NOWARN);
++}
++
+ /* Move group to appropriate avg_fragment_size list */
+ static void
+ mb_update_avg_fragment_size(struct super_block *sb, struct ext4_group_info *grp)
+@@ -871,21 +887,21 @@ mb_update_avg_fragment_size(struct super_block *sb, struct ext4_group_info *grp)
+ 	old = grp->bb_avg_fragment_size_order;
+ 	new = grp->bb_fragments == 0 ? -1 :
+ 	      mb_avg_fragment_size_order(sb, grp->bb_free / grp->bb_fragments);
+-	if (new == old)
+-		return;
+-
+-	if (old >= 0)
++	if (new == old) {
++		/* Only a group whose last insert failed is missing. */
++		if (new < 0 || xa_load(&sbi->s_mb_avg_fragment_size[new],
++				       grp->bb_group))
++			return;
++	} else if (old >= 0) {
+ 		xa_erase(&sbi->s_mb_avg_fragment_size[old], grp->bb_group);
++	}
+ 
+ 	grp->bb_avg_fragment_size_order = new;
+ 	if (new >= 0) {
+-		/*
+-		 * Cannot use __GFP_NOFAIL because we hold the group lock.
+-		 * Although allocation for insertion may fails, it's not fatal
+-		 * as we have linear traversal to fall back on.
+-		 */
+-		int err = xa_insert(&sbi->s_mb_avg_fragment_size[new],
+-				    grp->bb_group, grp, GFP_ATOMIC);
++		/* Cannot use __GFP_NOFAIL because we hold the group lock. */
++		int err = mb_index_group(&sbi->s_mb_avg_fragment_size[new],
++					 grp);
++
+ 		if (err)
+ 			mb_debug(sb, "insert group: %u to s_mb_avg_fragment_size[%d] failed, err %d",
+ 				 grp->bb_group, new, err);
+@@ -1252,10 +1268,13 @@ mb_set_largest_free_order(struct super_block *sb, struct ext4_group_info *grp)
+ 			break;
+ 
+ 	/* No need to move between order lists? */
+-	if (new == old)
+-		return;
+-
+-	if (old >= 0) {
++	if (new == old) {
++		/* Only a group whose last insert failed is missing. */
++		if (new < 0 || !test_opt2(sb, MB_OPTIMIZE_SCAN) ||
++		    !grp->bb_free ||
++		    xa_load(&sbi->s_mb_largest_free_orders[new], grp->bb_group))
++			return;
++	} else if (old >= 0) {
+ 		struct xarray *xa = &sbi->s_mb_largest_free_orders[old];
+ 
+ 		if (!xa_empty(xa) && xa_load(xa, grp->bb_group))
+@@ -1264,13 +1283,10 @@ mb_set_largest_free_order(struct super_block *sb, struct ext4_group_info *grp)
+ 
+ 	grp->bb_largest_free_order = new;
+ 	if (test_opt2(sb, MB_OPTIMIZE_SCAN) && new >= 0 && grp->bb_free) {
+-		/*
+-		 * Cannot use __GFP_NOFAIL because we hold the group lock.
+-		 * Although allocation for insertion may fails, it's not fatal
+-		 * as we have linear traversal to fall back on.
+-		 */
+-		int err = xa_insert(&sbi->s_mb_largest_free_orders[new],
+-				    grp->bb_group, grp, GFP_ATOMIC);
++		/* Cannot use __GFP_NOFAIL because we hold the group lock. */
++		int err = mb_index_group(&sbi->s_mb_largest_free_orders[new],
++					 grp);
++
+ 		if (err)
+ 			mb_debug(sb, "insert group: %u to s_mb_largest_free_orders[%d] failed, err %d",
+ 				 grp->bb_group, new, err);

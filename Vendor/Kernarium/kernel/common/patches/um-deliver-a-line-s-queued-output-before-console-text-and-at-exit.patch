@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:29:17 +0900
+Subject: [PATCH] um: deliver a line's queued output before console text and at
+ exit
+
+When a line's host channel takes less than a write offers, as a Darwin
+PTY does once its reader falls 1 KiB behind, line_write() queues the
+rest in the line's ring and the write interrupt sends it later. Two
+paths ignored that queue.
+
+A console write went straight to the channel. A kernel message written
+while the ring held the tail of a task's write therefore reached the
+host inside that write's text: the head of the task's line, the whole
+kernel message, then the rest of the line.
+
+The exitcalls closed the lines without sending the ring, so output a
+task wrote just before it powered off, halted or restarted the machine
+was lost, although its write had returned.
+
+Write the ring out first in both cases, waiting for the channel to take
+more for up to 1 s before a console write and up to 2 s at exit.
+Console text then follows everything the line accepted before it, and
+a host that keeps reading receives a task's last output. A channel that
+fails, or a host that stops reading for longer, ends the wait as before.
+---
+ arch/um/drivers/chan.h          |  1 +
+ arch/um/drivers/chan_kern.c     |  8 +++++
+ arch/um/drivers/chan_user.c     | 20 ++++++++++++
+ arch/um/drivers/chan_user.h     |  1 +
+ arch/um/drivers/line.c          | 58 ++++++++++++++++++++++++++++++++-
+ arch/um/drivers/line.h          |  2 ++
+ arch/um/drivers/ssl.c           |  7 +---
+ arch/um/drivers/stdio_console.c |  7 +---
+ 8 files changed, 91 insertions(+), 13 deletions(-)
+
+diff --git a/arch/um/drivers/chan.h b/arch/um/drivers/chan.h
+index 7296ee02a34415e318c4c89afea55859adf50c07..0099dc41ab9582725c71ca685fb80a2fe22db6db 100644
+--- a/arch/um/drivers/chan.h
++++ b/arch/um/drivers/chan.h
+@@ -33,6 +33,7 @@ extern int parse_chan_pair(char *str, struct line *line, int device,
+ 			   const struct chan_opts *opts, char **error_out);
+ extern int write_chan(struct chan *chan, const u8 *buf, size_t len,
+ 			     int write_irq);
++extern int wait_chan_writable(struct chan *chan, int timeout_ms);
+ extern int console_write_chan(struct chan *chan, const char *buf, 
+ 			      int len);
+ extern int console_open_chan(struct line *line, struct console *co);
+diff --git a/arch/um/drivers/chan_kern.c b/arch/um/drivers/chan_kern.c
+index be683af0648c2416789af63b00b86c38ed522e77..d8f9719d3f3a4e9c70c92724ebb0fb59ef199fd8 100644
+--- a/arch/um/drivers/chan_kern.c
++++ b/arch/um/drivers/chan_kern.c
+@@ -295,6 +295,14 @@ int write_chan(struct chan *chan, const u8 *buf, size_t len, int write_irq)
+ 	return ret;
+ }
+ 
++int wait_chan_writable(struct chan *chan, int timeout_ms)
++{
++	if (!chan || !chan->opened || !chan->ops->write)
++		return -ENODEV;
++
++	return generic_wait_writable(chan->fd_out, timeout_ms);
++}
++
+ int console_write_chan(struct chan *chan, const char *buf, int len)
+ {
+ 	int n, ret = 0;
+diff --git a/arch/um/drivers/chan_user.c b/arch/um/drivers/chan_user.c
+index e017e2804e3f992c1f4539d90f648d5161563eca..7f845ee808fffe4ce159a26284c19d69135c7722 100644
+--- a/arch/um/drivers/chan_user.c
++++ b/arch/um/drivers/chan_user.c
+@@ -6,6 +6,7 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <poll.h>
+ #include <sched.h>
+ #include <signal.h>
+ #include <termios.h>
+@@ -76,6 +77,25 @@ int generic_write(int fd, const __u8 *buf, size_t n, void *unused)
+ 	return -errno;
+ }
+ 
++/*
++ * Waits for up to timeout_ms until fd can take more output. Returns 1 when it
++ * can, or when it reports a condition the next write returns as an error, and
++ * 0 when the time runs out or a host signal ends the wait first, so that the
++ * caller checks its own deadline again.
++ */
++int generic_wait_writable(int fd, int timeout_ms)
++{
++	struct pollfd pollfd = { .fd = fd, .events = POLLOUT };
++	int n;
++
++	n = poll(&pollfd, 1, timeout_ms);
++	if (n > 0)
++		return 1;
++	if (n == 0 || errno == EINTR)
++		return 0;
++	return -errno;
++}
++
+ int generic_window_size(int fd, void *unused, unsigned short *rows_out,
+ 			unsigned short *cols_out)
+ {
+diff --git a/arch/um/drivers/chan_user.h b/arch/um/drivers/chan_user.h
+index 5591381effd36b3f1f5da9e2d466602aea729e15..5062fe4d43762d3d6b9b314a77b674c1607df629 100644
+--- a/arch/um/drivers/chan_user.h
++++ b/arch/um/drivers/chan_user.h
+@@ -41,6 +41,7 @@ extern void generic_close(int fd, void *unused);
+ extern int generic_read(int fd, __u8 *c_out, void *unused);
+ extern int generic_write(int fd, const __u8 *buf, size_t n, void *unused);
+ extern int generic_console_write(int fd, const char *buf, int n);
++extern int generic_wait_writable(int fd, int timeout_ms);
+ extern int generic_window_size(int fd, void *unused, unsigned short *rows_out,
+ 			       unsigned short *cols_out);
+ extern void generic_free(void *data);
+diff --git a/arch/um/drivers/line.c b/arch/um/drivers/line.c
+index ffa37c3e25dc8b88d270a5471dbf8fc7734611be..4855ed7ac96d34f00296cfca5e452c84330dc258 100644
+--- a/arch/um/drivers/line.c
++++ b/arch/um/drivers/line.c
+@@ -16,6 +16,13 @@
+ 
+ #define LINE_BUFSIZE 4096
+ 
++/*
++ * How long a console write waits for the output a line has queued to reach
++ * the host, and how long the exitcalls wait for it before closing the lines.
++ */
++#define LINE_CONSOLE_DRAIN_MS 1000
++#define LINE_EXIT_DRAIN_MS 2000
++
+ static irqreturn_t line_interrupt(int irq, void *data)
+ {
+ 	struct chan *chan = data;
+@@ -154,6 +161,44 @@ static int flush_buffer(struct line *line)
+ 	return line->head == line->tail;
+ }
+ 
++/*
++ * Writes the ring out, waiting for the host channel to take more until the
++ * ring is empty, the channel fails, or os_nsecs() passes deadline. A host
++ * channel takes less than a write offers whenever its reader falls behind,
++ * and the ring then holds the rest of what the line accepted.
++ *
++ * Must be called while holding line->lock!
++ */
++static void drain_buffer(struct line *line, long long deadline)
++{
++	long long left;
++
++	while (flush_buffer(line) == 0) {
++		left = deadline - os_nsecs();
++		if (left <= 0)
++			return;
++		if (wait_chan_writable(line->chan_out,
++				       (left + NSEC_PER_MSEC - 1) /
++				       NSEC_PER_MSEC) < 0)
++			return;
++	}
++}
++
++/*
++ * Console text goes out behind what the line has queued, rather than through
++ * the middle of a write the host channel took only part of.
++ */
++void line_console_write(struct line *line, const char *string,
++			unsigned int len)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&line->lock, flags);
++	drain_buffer(line, os_nsecs() + LINE_CONSOLE_DRAIN_MS * NSEC_PER_MSEC);
++	console_write_chan(line->chan_out, string, len);
++	spin_unlock_irqrestore(&line->lock, flags);
++}
++
+ void line_flush_buffer(struct tty_struct *tty)
+ {
+ 	struct line *line = tty->driver_data;
+@@ -380,12 +425,23 @@ void line_hangup(struct tty_struct *tty)
+ 	tty_port_hangup(&line->port);
+ }
+ 
++/*
++ * A write returns once the line has queued it, so the output a task wrote
++ * just before the machine stops reaches the host only if the lines deliver
++ * their rings before they close.
++ */
+ void close_lines(struct line *lines, int nlines)
+ {
++	long long deadline = os_nsecs() + LINE_EXIT_DRAIN_MS * NSEC_PER_MSEC;
++	unsigned long flags;
+ 	int i;
+ 
+-	for(i = 0; i < nlines; i++)
++	for (i = 0; i < nlines; i++) {
++		spin_lock_irqsave(&lines[i].lock, flags);
++		drain_buffer(&lines[i], deadline);
++		spin_unlock_irqrestore(&lines[i].lock, flags);
+ 		close_chan(&lines[i]);
++	}
+ }
+ 
+ int setup_one_line(struct line *lines, int n, char *init,
+diff --git a/arch/um/drivers/line.h b/arch/um/drivers/line.h
+index fe5425e9656b05dd7ce96be5976860650904c59d..b10cc97ff41b5ab622246ef65271a42aeb82db72 100644
+--- a/arch/um/drivers/line.h
++++ b/arch/um/drivers/line.h
+@@ -69,6 +69,8 @@ extern int line_setup(char **conf, unsigned nlines, char **def,
+ extern ssize_t line_write(struct tty_struct *tty, const u8 *buf, size_t len);
+ extern unsigned int line_chars_in_buffer(struct tty_struct *tty);
+ extern void line_flush_buffer(struct tty_struct *tty);
++extern void line_console_write(struct line *line, const char *string,
++			       unsigned int len);
+ extern void line_flush_chars(struct tty_struct *tty);
+ extern unsigned int line_write_room(struct tty_struct *tty);
+ extern void line_throttle(struct tty_struct *tty);
+diff --git a/arch/um/drivers/ssl.c b/arch/um/drivers/ssl.c
+index 3818fce20a303eb8d4a2ce1398d872bd0eee3fe3..51fdbd8c2e9ee94dcd460e007a2c50b3c54c84d0 100644
+--- a/arch/um/drivers/ssl.c
++++ b/arch/um/drivers/ssl.c
+@@ -111,12 +111,7 @@ static int ssl_init_done;
+ static void ssl_console_write(struct console *c, const char *string,
+ 			      unsigned len)
+ {
+-	struct line *line = &serial_lines[c->index];
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&line->lock, flags);
+-	console_write_chan(line->chan_out, string, len);
+-	spin_unlock_irqrestore(&line->lock, flags);
++	line_console_write(&serial_lines[c->index], string, len);
+ }
+ 
+ static struct tty_driver *ssl_console_device(struct console *c, int *index)
+diff --git a/arch/um/drivers/stdio_console.c b/arch/um/drivers/stdio_console.c
+index 1c239737d88ec75644151f19341f9362103952ce..e02003d1da828ef6cf781f0d613eb1fa381ab2f5 100644
+--- a/arch/um/drivers/stdio_console.c
++++ b/arch/um/drivers/stdio_console.c
+@@ -112,12 +112,7 @@ static const struct tty_operations console_ops = {
+ static void uml_console_write(struct console *console, const char *string,
+ 			      unsigned len)
+ {
+-	struct line *line = &vts[console->index];
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&line->lock, flags);
+-	console_write_chan(line->chan_out, string, len);
+-	spin_unlock_irqrestore(&line->lock, flags);
++	line_console_write(&vts[console->index], string, len);
+ }
+ 
+ static struct tty_driver *uml_console_device(struct console *c, int *index)

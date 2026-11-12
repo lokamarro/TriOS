@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 11:10:07 +0900
+Subject: [PATCH] kosmickrisp: let a host release only the allocators idle for
+ a while
+
+A host that is about to refuse an allocation asks the driver for the
+command storage its devices cache. A device that is still recording
+hands its allocators back at every completion and takes them again
+for the next frame, so releasing them frees memory that the workload
+allocates again within a second: an Android guest drawing WebGL at the
+full budget went past it by about 100 MiB that way, after each refusal
+had made room the guest then took.
+
+A cached allocator now carries the time it was given back, and
+kk_release_idle_cached_memory() releases only those a cache has kept
+for at least the time it is given. The cache hands out the newest
+allocator, so its entries stay in the order they were given and the
+idle ones are the oldest. kk_release_cached_memory() releases them all,
+as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_device.c            | 47 +++++++++++++++----
+ src/kosmickrisp/vulkan/kk_device.h            | 13 +++--
+ .../vulkan/kk_device_memory_pool.h            |  8 ++++
+ .../tests/test_command_allocator_budget.c     | 24 ++++++++--
+ 4 files changed, 73 insertions(+), 19 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 89f170d9baa083d073e6d50cfbdf0898f213000e..1300d3663a4019d52c805625c059883464743005 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -31,6 +31,14 @@
+ #include <string.h>
+ #include <time.h>
+ 
++static uint64_t
++kk_monotonic_ns(void)
++{
++   struct timespec now;
++   clock_gettime(CLOCK_MONOTONIC, &now);
++   return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
++}
++
+ struct kk_mtl_compiler {
+    mtl_compiler *handle;
+    uint32_t refcount;
+@@ -355,6 +363,7 @@ kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+        size <= KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B &&
+        size <= KK_COMMAND_ALLOCATOR_RETAIN_MAX_B - cache->bytes) {
+       cache->sizes[cache->count] = size;
++      cache->given_ns[cache->count] = kk_monotonic_ns();
+       cache->entries[cache->count++] = allocator;
+       cache->bytes += size;
+       allocator = NULL;
+@@ -366,21 +375,33 @@ kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+ }
+ 
+ uint64_t
+-kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache)
++kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache,
++                                uint64_t min_idle_ns)
+ {
+    mtl_command_allocator *released[KK_COMMAND_ALLOCATOR_CACHE_MAX];
+-   unsigned count;
+-   uint64_t bytes;
++   unsigned count = 0;
++   uint64_t bytes = 0;
++   const uint64_t now_ns = kk_monotonic_ns();
+ 
+    /* Metal returns an allocator's storage to the kernel when the allocator is
+     * released, which takes as long as it takes; do it with the lock dropped
+-    * so a completion thread handing storage back is not held up by it. */
++    * so a completion thread handing storage back is not held up by it. The
++    * entries are in the order they were given, so the idle ones come first. */
+    simple_mtx_lock(&cache->mutex);
+-   count = cache->count;
+-   bytes = cache->bytes;
+-   memcpy(released, cache->entries, count * sizeof(released[0]));
+-   cache->count = 0;
+-   cache->bytes = 0;
++   while (count < cache->count &&
++          now_ns - cache->given_ns[count] >= min_idle_ns) {
++      released[count] = cache->entries[count];
++      bytes += cache->sizes[count];
++      count++;
++   }
++   const unsigned kept = cache->count - count;
++   memmove(cache->entries, cache->entries + count,
++           kept * sizeof(cache->entries[0]));
++   memmove(cache->sizes, cache->sizes + count, kept * sizeof(cache->sizes[0]));
++   memmove(cache->given_ns, cache->given_ns + count,
++           kept * sizeof(cache->given_ns[0]));
++   cache->count = kept;
++   cache->bytes -= bytes;
+    simple_mtx_unlock(&cache->mutex);
+ 
+    for (unsigned i = 0; i < count; i++)
+@@ -390,6 +411,12 @@ kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache)
+ 
+ PUBLIC uint64_t
+ kk_release_cached_memory(void)
++{
++   return kk_release_idle_cached_memory(0);
++}
++
++PUBLIC uint64_t
++kk_release_idle_cached_memory(uint64_t min_idle_ns)
+ {
+    uint64_t bytes = 0;
+ 
+@@ -399,7 +426,7 @@ kk_release_cached_memory(void)
+    simple_mtx_lock(&kk_allocator_caches_mutex);
+    list_for_each_entry(struct kk_command_allocator_cache, cache,
+                        &kk_allocator_caches, link) {
+-      bytes += kk_command_allocator_cache_trim(cache);
++      bytes += kk_command_allocator_cache_trim(cache, min_idle_ns);
+    }
+    simple_mtx_unlock(&kk_allocator_caches_mutex);
+    return bytes;
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index dd3e79ec0460f4e6dfac3a0320b326b83ff99521..b601917ca76a2a4a5e87f62dd804db7658349472 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -137,6 +137,9 @@ struct kk_command_allocator_cache {
+    uint64_t bytes;
+    mtl_command_allocator *entries[KK_COMMAND_ALLOCATOR_CACHE_MAX];
+    uint64_t sizes[KK_COMMAND_ALLOCATOR_CACHE_MAX];
++   /* When each entry was given back (CLOCK_MONOTONIC). A take returns the
++    * newest, so the entries stay in the order they were given. */
++   uint64_t given_ns[KK_COMMAND_ALLOCATOR_CACHE_MAX];
+ };
+ 
+ struct kk_command_allocator_cache *kk_command_allocator_cache_create(void);
+@@ -150,11 +153,13 @@ kk_command_allocator_cache_take(struct kk_command_allocator_cache *cache);
+  * is full. Safe to call from Metal's completion thread. */
+ void kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+                                      mtl_command_allocator *allocator);
+-/* Releases every allocator the cache keeps and returns how many bytes of
+- * command storage that returned. Allocators a recording holds are not in the
+- * cache and stay. Takes only the cache's own lock. */
++/* Releases every allocator the cache has kept for at least min_idle_ns and
++ * returns how many bytes of command storage that returned. Allocators a
++ * recording holds are not in the cache and stay. Takes only the cache's own
++ * lock. */
+ uint64_t
+-kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache);
++kk_command_allocator_cache_trim(struct kk_command_allocator_cache *cache,
++                                uint64_t min_idle_ns);
+ 
+ struct kk_device {
+    struct vk_device vk;
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+index 3050ebacfdfb8db012fa9c288ba30c2615c4562c..9b089e9c7158a3d10cbcca20a56852701750a7be 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
+@@ -89,6 +89,14 @@ void kk_set_device_memory_pool(const VkDeviceMemoryPoolCreateInfoKK *pPool);
+  * a queue's or the pool's, so any thread may call it. */
+ uint64_t kk_release_cached_memory(void);
+ 
++/* As kk_release_cached_memory(), but only for the allocators a cache has kept
++ * for at least min_idle_ns: what a device that is still recording hands back
++ * and takes again, frame after frame, stays with it. A host about to refuse
++ * an allocation asks for this, so that a refusal does not free the storage of
++ * a workload that would only allocate it again. Exported by the driver
++ * library. */
++uint64_t kk_release_idle_cached_memory(uint64_t min_idle_ns);
++
+ /* The bytes of host memory the process's devices hold by import: memory that
+  * exists already and a device maps by its address
+  * (VkImportMemoryHostPointerInfoEXT). Metal counts such a buffer in the
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+index b6f128deb16fa1b78a0fefa9a58bc52fba899bae..343e3349d2da76bc5ec5f27851d5be4f7d5359f8 100644
+--- a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
++++ b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+@@ -222,10 +222,11 @@ main(void)
+       }
+    }
+ 
+-   /* The host asks for the cached storage back, as it does when the memory
+-    * pool is about to refuse an allocation: every allocator the cache keeps
+-    * is released and counted, and the device records again, taking a fresh
+-    * allocator that reaches the cache when its recording completes. */
++   /* The host asks for the cached storage back, only what has been idle for
++    * a while when the memory pool is about to refuse an allocation, all of it
++    * otherwise: the allocators are released and counted, and the device
++    * records again, taking a fresh allocator that reaches the cache when its
++    * recording completes. */
+    for (unsigned round = 0; round < 2; round++) {
+       VkCommandBufferBeginInfo small_begin = {
+          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+@@ -253,10 +254,23 @@ main(void)
+       }
+       CHECK(cached > 0 && bytes > 0);
+       if (round == 0) {
+-         CHECK(kk_release_cached_memory() >= bytes);
++         /* Storage given back a moment ago is not idle: a host that asks
++          * only for idle storage leaves it, and gets it once it has waited
++          * long enough. */
++         const uint64_t given = bytes;
++         CHECK(kk_release_idle_cached_memory(60ull * 1000000000ull) == 0);
++         cache_state(dev, &cached, &bytes);
++         CHECK(cached > 0 && bytes == given);
++         struct timespec idle = {0, 20000000};
++         nanosleep(&idle, NULL);
++         CHECK(kk_release_idle_cached_memory(10000000ull) >= given);
+          cache_state(dev, &cached, &bytes);
+          CHECK(cached == 0 && bytes == 0);
+          CHECK(kk_release_cached_memory() == 0);
++      } else {
++         CHECK(kk_release_cached_memory() >= bytes);
++         cache_state(dev, &cached, &bytes);
++         CHECK(cached == 0 && bytes == 0);
+       }
+    }
+ 

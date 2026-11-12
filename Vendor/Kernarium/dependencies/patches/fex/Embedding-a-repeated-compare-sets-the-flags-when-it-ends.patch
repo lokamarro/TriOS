@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:33:01 +0900
+Subject: [PATCH] Embedding: a repeated compare sets the flags when it ends
+
+REPE CMPS, REPNE CMPS, REPE SCAS and REPNE SCAS set the flags of their
+last element's compare when they finish. A fault, an interrupt or a
+single-step trap between two elements shows the flags the instruction
+started with. The embedded loops set the flags of every element, which
+the frame of such a stop showed.
+
+They now test each element with ordinary arithmetic, which leaves the
+host's condition flags, the guest's, alone, keep the last operands in
+the frame (Embedder.StringOperands) and set the flags when the loop
+ends.
+---
+ .../Interface/Core/OpcodeDispatcher.cpp       | 190 +++++++++++++-----
+ .../Source/Interface/Core/OpcodeDispatcher.h  |   5 +
+ FEXCore/include/FEXCore/Core/CoreState.h      |   3 +
+ 3 files changed, 151 insertions(+), 47 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index dba99bf0aa7d1d3ce78759ed33cbb3553d2a1f3a..cf5bf6d1a295874f3678263dfab08d71291635cb 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3580,6 +3580,16 @@ IR::OpSize OpDispatchBuilder::GetStringOpSize(X86Tables::DecodedOp Op) const {
+   return !Is64BitMode || (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) ? OpSize::i32Bit : OpSize::i64Bit;
+ }
+ 
++// 1 when Value is zero and 0 when it is not, and the reverse, without
++// touching the host's condition flags.
++Ref OpDispatchBuilder::Zero01(Ref Value) {
++  return _Lshr(OpSize::i64Bit, _CountLeadingZeroes(OpSize::i64Bit, Value), Constant(6));
++}
++
++Ref OpDispatchBuilder::NonZero01(Ref Value) {
++  return _Lshr(OpSize::i64Bit, _Or(OpSize::i64Bit, Value, _Neg(OpSize::i64Bit, Value)), Constant(63));
++}
++
+ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
+   if (!Is64BitMode && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
+     LogMan::Msg::EFmt("CMPSOp: Address size override (0x67) not supported in 32-bit mode (OP: 0x{:04X}).", Op->OP);
+@@ -3619,73 +3629,89 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
+       StoreGPRRegister(X86State::REG_RSI, Dest_RSI, AddrSize);
+     }
+   } else if (CTX->Embedded) {
+-    // An embedding host stops the loop between elements, for its budget or
+-    // for a fault, and reads the flags there, so each element leaves the
+-    // flags of its own compare, as the SCAS loop does.
++    // x86 sets the flags when the loop ends, from the last element's
++    // compare. A fault, an interrupt or a single-step trap between two
++    // elements shows the flags the instruction started with, which the
++    // host's condition flags hold. The loop tests with ordinary arithmetic
++    // and keeps the last operands in the frame.
+     CalculateDeferredFlags();
+ 
+     const bool REPE = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX;
+ 
+-    ForeachDirection([this, Op, Size, AddrSize, REPE](int32_t PtrDir) {
+-      auto JumpStart = Jump();
+-      auto LoopStart = CreateNewCodeBlockAfter(GetCurrentBlock());
+-      SetJumpTarget(JumpStart, LoopStart);
+-      SetCurrentCodeBlock(LoopStart);
+-      StartNewBlock();
++    // If rcx = 0, skip the whole loop.
++    Ref Counter = LoadGPRRegister(X86State::REG_RCX);
++    auto OuterJump = CondJump(Counter, CondClass::EQ);
+ 
+-      // Leave when RCX is 0.
+-      Ref Counter = LoadGPRRegister(X86State::REG_RCX);
+-      auto CounterJump = CondJump(Counter, CondClass::EQ);
+-      IRPair<IROp_CondJump> InnerJump;
++    auto BeforeLoop = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetFalseJumpTarget(OuterJump, BeforeLoop);
++    SetCurrentCodeBlock(BeforeLoop);
++    StartNewBlock();
+ 
+-      auto LoopTail = CreateNewCodeBlockAfter(LoopStart);
+-      SetFalseJumpTarget(CounterJump, LoopTail);
+-      SetCurrentCodeBlock(LoopTail);
+-      StartNewBlock();
++    ForeachDirection([this, Op, Size, AddrSize, REPE](int32_t PtrDir) {
++      auto JumpIntoLoop = Jump();
+ 
+-      {
+-        Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
+-        Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
++      auto LoopHeader = CreateNewCodeBlockAfter(GetCurrentBlock());
++      SetCurrentCodeBlock(LoopHeader);
++      StartNewBlock();
++      SetJumpTarget(JumpIntoLoop, LoopHeader);
+ 
+-        Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+-        Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
++      Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
++      Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+ 
+-        auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
+-        auto Src2 = _LoadMemGPR(Size, Dest_RSI, Size);
++      Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
++      Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+ 
+-        CalculateFlags_SUB(Size, Src2, Src1);
+-        CalculateDeferredFlags();
++      auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
++      auto Src2 = _LoadMemGPR(Size, Dest_RSI, Size);
+ 
+-        Ref TailCounter = Sub(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RCX), 1);
+-        StoreGPRRegister(X86State::REG_RCX, TailCounter);
++      _StoreContextGPR(OpSize::i64Bit, Src1, EmbedderStringOperands);
++      _StoreContextGPR(OpSize::i64Bit, Src2, EmbedderStringOperands + 8);
+ 
+-        Dest_RDI = Add(AddrSize, Src_RDI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
+-        if (Is64BitMode && AddrSize == OpSize::i32Bit) {
+-          Dest_RDI = _Bfe(OpSize::i64Bit, 32, 0, Dest_RDI);
+-          StoreGPRRegister(X86State::REG_RDI, Dest_RDI);
+-        } else {
+-          StoreGPRRegister(X86State::REG_RDI, Dest_RDI, AddrSize);
+-        }
++      Ref TailCounter = Sub(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RCX), 1);
++      StoreGPRRegister(X86State::REG_RCX, TailCounter);
+ 
+-        Dest_RSI = Add(AddrSize, Src_RSI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
+-        if (Is64BitMode && AddrSize == OpSize::i32Bit) {
+-          Dest_RSI = _Bfe(OpSize::i64Bit, 32, 0, Dest_RSI);
+-          StoreGPRRegister(X86State::REG_RSI, Dest_RSI);
+-        } else {
+-          StoreGPRRegister(X86State::REG_RSI, Dest_RSI, AddrSize);
+-        }
++      Dest_RDI = Add(AddrSize, Src_RDI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
++      if (Is64BitMode && AddrSize == OpSize::i32Bit) {
++        Dest_RDI = _Bfe(OpSize::i64Bit, 32, 0, Dest_RDI);
++        StoreGPRRegister(X86State::REG_RDI, Dest_RDI);
++      } else {
++        StoreGPRRegister(X86State::REG_RDI, Dest_RDI, AddrSize);
++      }
+ 
+-        CalculateDeferredFlags();
+-        InnerJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+-        SetTrueJumpTarget(InnerJump, LoopStart);
++      Dest_RSI = Add(AddrSize, Src_RSI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
++      if (Is64BitMode && AddrSize == OpSize::i32Bit) {
++        Dest_RSI = _Bfe(OpSize::i64Bit, 32, 0, Dest_RSI);
++        StoreGPRRegister(X86State::REG_RSI, Dest_RSI);
++      } else {
++        StoreGPRRegister(X86State::REG_RSI, Dest_RSI, AddrSize);
+       }
+ 
+-      auto LoopEnd = CreateNewCodeBlockAfter(LoopTail);
+-      SetTrueJumpTarget(CounterJump, LoopEnd);
++      // Go on while the count is not zero and, for REPE, the operands are
++      // equal, or for REPNE, they differ.
++      Ref Differ = _Xor(OpSize::i64Bit, Src1, Src2);
++      Ref Continue = _And(OpSize::i64Bit, REPE ? Zero01(Differ) : NonZero01(Differ), NonZero01(TailCounter));
++      auto InnerJump = CondJump(Continue, CondClass::NEQ);
++      SetTrueJumpTarget(InnerJump, LoopHeader);
++
++      auto LoopEnd = CreateNewCodeBlockAfter(GetCurrentBlock());
+       SetFalseJumpTarget(InnerJump, LoopEnd);
+       SetCurrentCodeBlock(LoopEnd);
+       StartNewBlock();
+     });
++
++    {
++      Ref Src1 = _LoadContextGPR(OpSize::i64Bit, EmbedderStringOperands);
++      Ref Src2 = _LoadContextGPR(OpSize::i64Bit, EmbedderStringOperands + 8);
++      CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
++      CalculateDeferredFlags();
++    }
++    auto Jump_ = Jump();
++
++    auto Exit = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetJumpTarget(Jump_, Exit);
++    SetTrueJumpTarget(OuterJump, Exit);
++    SetCurrentCodeBlock(Exit);
++    StartNewBlock();
+   } else {
+     // Calculate flags early.
+     CalculateDeferredFlags();
+@@ -3909,6 +3935,76 @@ void OpDispatchBuilder::SCASOp(OpcodeArgs) {
+     } else {
+       StoreGPRRegister(X86State::REG_RDI, TailDest_RDI, AddrSize);
+     }
++  } else if (CTX->Embedded) {
++    // As CMPS does, the loop sets the flags of the last element's compare
++    // when it ends, and keeps the guest's flags until then. The accumulator
++    // does not change, so only the last memory operand waits in the frame.
++    CalculateDeferredFlags();
++
++    const bool REPE = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX;
++
++    // If rcx = 0, skip the whole loop.
++    Ref Counter = LoadGPRRegister(X86State::REG_RCX);
++    auto OuterJump = CondJump(Counter, CondClass::EQ);
++
++    auto BeforeLoop = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetFalseJumpTarget(OuterJump, BeforeLoop);
++    SetCurrentCodeBlock(BeforeLoop);
++    StartNewBlock();
++
++    ForeachDirection([this, Op, Size, AddrSize, REPE](int32_t Dir) {
++      auto JumpIntoLoop = Jump();
++
++      auto LoopHeader = CreateNewCodeBlockAfter(GetCurrentBlock());
++      SetCurrentCodeBlock(LoopHeader);
++      StartNewBlock();
++      SetJumpTarget(JumpIntoLoop, LoopHeader);
++
++      Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
++      Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
++
++      auto Src1 = LoadGPRRegister(X86State::REG_RAX, Size);
++      auto Src2 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
++
++      _StoreContextGPR(OpSize::i64Bit, Src2, EmbedderStringOperands);
++
++      Ref TailCounter = Sub(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RCX), 1);
++      StoreGPRRegister(X86State::REG_RCX, TailCounter);
++
++      Ref TailDest_RDI = Add(AddrSize, Src_RDI, Dir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
++      if (Is64BitMode && AddrSize == OpSize::i32Bit) {
++        TailDest_RDI = _Bfe(OpSize::i64Bit, 32, 0, TailDest_RDI);
++        StoreGPRRegister(X86State::REG_RDI, TailDest_RDI);
++      } else {
++        StoreGPRRegister(X86State::REG_RDI, TailDest_RDI, AddrSize);
++      }
++
++      // Go on while the count is not zero and, for REPE, the operands are
++      // equal, or for REPNE, they differ.
++      Ref Differ = _Xor(OpSize::i64Bit, Src1, Src2);
++      Ref Continue = _And(OpSize::i64Bit, REPE ? Zero01(Differ) : NonZero01(Differ), NonZero01(TailCounter));
++      auto InnerJump = CondJump(Continue, CondClass::NEQ);
++      SetTrueJumpTarget(InnerJump, LoopHeader);
++
++      auto LoopEnd = CreateNewCodeBlockAfter(GetCurrentBlock());
++      SetFalseJumpTarget(InnerJump, LoopEnd);
++      SetCurrentCodeBlock(LoopEnd);
++      StartNewBlock();
++    });
++
++    {
++      Ref Src1 = LoadGPRRegister(X86State::REG_RAX, Size);
++      Ref Src2 = _LoadContextGPR(OpSize::i64Bit, EmbedderStringOperands);
++      CalculateFlags_SUB(OpSizeFromSrc(Op), Src1, Src2);
++      CalculateDeferredFlags();
++    }
++    auto Jump_ = Jump();
++
++    auto Exit = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetJumpTarget(Jump_, Exit);
++    SetTrueJumpTarget(OuterJump, Exit);
++    SetCurrentCodeBlock(Exit);
++    StartNewBlock();
+   } else {
+     // Calculate flags early. because end of block
+     CalculateDeferredFlags();
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index f671e645f184563f890ed7d28b89619e79e23abd..9f9fcd0a08feb17fac368a9783461ec7770835dd 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1551,6 +1551,11 @@ private:
+   void EmbedderCheckMXCSR(Ref MXCSR, Ref Selected = nullptr);
+   // Embedded: faults as a read of the byte at Addr, as CLFLUSH, CLFLUSHOPT and CLWB do.
+   void EmbedderCacheLineProbe(Ref Addr);
++  // The operands of the last element of an embedded repeated compare, which
++  // wait in the frame until the loop sets the flags.
++  static constexpr auto EmbedderStringOperands = offsetof(FEXCore::Core::CpuStateFrame, Embedder.StringOperands);
++  Ref Zero01(Ref Value);
++  Ref NonZero01(Ref Value);
+   // Embedded, while the x87 control word unmasks an exception: x87 checks.
+   bool EmbedderX87Checks() const;
+   // With x87 checks, EmbedderX87Commit(Mask).
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 30f2d7a9e92247f75d766ff20d5108dcb9ac2029..c12f83da21c56932bbf3c2d688f1ac30ca0fa287 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -737,6 +737,9 @@ struct CpuStateFrame {
+     // replace (EmbedderSaveFPFlags).
+     uint32_t FPSRBefore {};
+     uint32_t FPSRPart {};
++    // The operands of the last element of a repeated string compare, from
++    // which the instruction sets the flags when its loop ends.
++    uint64_t StringOperands[2] {};
+   } Embedder;
+ 
+   // Pointers that the JIT needs to load to remove relocations

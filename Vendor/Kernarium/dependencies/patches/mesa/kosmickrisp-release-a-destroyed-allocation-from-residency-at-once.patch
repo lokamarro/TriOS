@@ -1,0 +1,599 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 23:33:37 +0900
+Subject: [PATCH] kosmickrisp: release a destroyed allocation from residency at
+ once
+
+A residency set holds every allocation of its last commit, and removing
+an allocation takes effect only at the next commit. The device set is
+committed only when work is submitted, so memory freed after a submission
+had made it resident stayed allocated until the device's next
+submission. A client that frees and reallocates without submitting, or
+never submits again, accumulated the freed memory.
+
+Commit the set whenever an allocation leaves it. Vulkan requires the work
+that uses an object to finish before the object is destroyed, so the
+commit cannot take residency from pending work.
+
+That commit and the release after it run on the freeing thread, beside
+the queue commits of the submitting thread. Metal reads the residency
+sets of a queue while it commits to it, and the methods of a set are not
+thread-safe: under Metal's GPU validation the queue commit walks every
+heap of the device set, so a heap removed and released meanwhile was
+freed under the walk, and every validated run of
+KHR-GLES31.core.texture_cube_map_array.sampling crashed in
+HeapUsageTable::processHeapEntry. Commit to a queue under the lock that
+every write to the set holds. A write then waits for at most the commit
+in flight, so a freed allocation still stops counting against the device
+when vkFreeMemory returns. Staging writes for the committing thread
+instead cost that thread 40% of its submissions under a storm of
+allocations, where the lock costs the allocating thread a third of its
+allocations and the submitting thread nothing.
+
+test_residency_commit_race allocates and frees memory on one thread
+while another submits, under shader validation; without the lock it
+crashes almost every run.
+---
+ src/kosmickrisp/vulkan/kk_device.c            |  47 +++-
+ src/kosmickrisp/vulkan/kk_device.h            |   5 +
+ src/kosmickrisp/vulkan/kk_queue.c             |   6 +-
+ src/kosmickrisp/vulkan/meson.build            |  37 +++
+ .../tests/test_residency_commit_race.cpp      | 257 ++++++++++++++++++
+ .../vulkan/tests/test_residency_release.m     | 117 ++++++++
+ 6 files changed, 460 insertions(+), 9 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_residency_commit_race.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_residency_release.m
+
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 83ccc40a2920313e3978351cc724e76cd4f49e37..17247a46280e67677483b64f9ab04ba98ce526fa 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -554,14 +554,30 @@ kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+-void
+-kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
++/* A residency set holds every allocation of its last commit, and a removal
++ * takes effect only at the next commit. The device set is otherwise committed
++ * only when work is submitted, so a destroyed allocation that a submission
++ * once made resident would stay allocated until the device's next submission,
++ * which may never come. Commit the removal at once. Vulkan requires work that
++ * uses an object to finish before the object is destroyed, so this cannot take
++ * residency from pending work.
++ */
++static void
++kk_device_remove_from_residency_set(struct kk_device *dev,
++                                    mtl_allocation *allocation)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_remove_allocation(dev->residency_set.handle, heap);
++   mtl_residency_set_remove_allocation(dev->residency_set.handle, allocation);
++   mtl_residency_set_commit(dev->residency_set.handle);
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
++void
++kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
++{
++   kk_device_remove_from_residency_set(dev, heap);
++}
++
+ void
+ kk_device_add_buffer_to_residency_set(struct kk_device *dev, mtl_buffer *buffer)
+ {
+@@ -574,9 +590,7 @@ void
+ kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+                                            mtl_buffer *buffer)
+ {
+-   simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_remove_allocation(dev->residency_set.handle, buffer);
+-   simple_mtx_unlock(&dev->residency_set.mutex);
++   kk_device_remove_from_residency_set(dev, buffer);
+ }
+ 
+ void
+@@ -590,9 +604,28 @@ kk_device_add_texture_to_residency_set(struct kk_device *dev, mtl_texture *textu
+ void
+ kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                             mtl_texture *texture)
++{
++   kk_device_remove_from_residency_set(dev, texture);
++}
++
++/* Metal attaches the residency sets of a queue to the work committed to it,
++ * reading them during the commit, and the methods of a set are not
++ * thread-safe. Under Metal's GPU validation the commit also walks every heap
++ * of the device set, and a heap another thread removed and released during
++ * that walk was freed under it. Every write to the device set holds its
++ * mutex, so a commit holding it too keeps every write out of the commit, and
++ * the commit only ever sees heaps that are still alive. A write waits for at
++ * most the commit in flight, which keeps a freed allocation from counting
++ * against the device once vkFreeMemory returns. No feedback handler takes the
++ * mutex, so one Metal dispatches before commit returns cannot deadlock
++ * against it. */
++void
++kk_device_commit_to_queue(struct kk_device *dev, mtl_command_queue *queue,
++                          mtl_command_buffer **command_buffers, uint32_t count,
++                          mtl_commit_options *options)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_remove_allocation(dev->residency_set.handle, texture);
++   mtl_command_queue_commit(queue, command_buffers, count, options);
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index b6abffab30bf792984aa9890ae4d44b0abf3ba76..e726ab2ed10d6d309944ffe67f53eca7fec883cc 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -221,6 +221,11 @@ void kk_device_add_texture_to_residency_set(struct kk_device *dev,
+ void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                                 mtl_texture *texture);
+ void kk_device_make_resources_resident(struct kk_device *dev);
++/* Commits to a queue the device set is attached to, never while the set is
++ * being written. */
++void kk_device_commit_to_queue(struct kk_device *dev, mtl_command_queue *queue,
++                               mtl_command_buffer **command_buffers,
++                               uint32_t count, mtl_commit_options *options);
+ 
+ /* Required to create a sampler */
+ mtl_sampler *kk_sampler_create(struct kk_device *dev,
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index d595b8a606cdcd547dd3c8b75fc9e40aedfd27d9..ed0a65c9d0fa19e8a439d473f052b2d6362998f1 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -508,7 +508,8 @@ kk_queue_probe(struct kk_queue *queue)
+                                            storage);
+    mtl_commit_options_add_feedback_handler(options, queue->feedback_callback,
+                                            submission);
+-   mtl_command_queue_commit(queue->mtl_handle, &command_buffer, 1, options);
++   kk_device_commit_to_queue(dev, queue->mtl_handle, &command_buffer, 1,
++                             options);
+    mtl_release(options);
+    probed = true;
+ 
+@@ -680,7 +681,8 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
+          }
+          mtl_commit_options_add_feedback_handler(
+             options, queue->feedback_callback, submission);
+-         mtl_command_queue_commit(queue->mtl_handle, cmds, count, options);
++         kk_device_commit_to_queue(dev, queue->mtl_handle, cmds, count,
++                                   options);
+          mtl_release(options);
+          if (recording)
+             kk_completed_recording_unref(recording);
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 6ae1f164327f924a1675ac28d68dfc0453c071ea..34a1c315eb79ed07db4d1ef8d620c2fe0c920545 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1083,6 +1083,43 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 60,
+     )
++    test(
++      'kosmickrisp_residency_release',
++      executable(
++        'test_kosmickrisp_residency_release',
++        files('tests/test_residency_release.m'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++          dependency('appleframeworks', modules : ['Foundation', 'Metal']),
++        ],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
++    # Queue commits against residency set writes on another thread, under
++    # the shader validation that walks the set's heaps in each commit.
++    test(
++      'kosmickrisp_residency_commit_race',
++      executable(
++        'test_kosmickrisp_residency_commit_race',
++        files('tests/test_residency_commit_race.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true', 'MTL_SHADER_VALIDATION=1'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_residency_commit_race.cpp b/src/kosmickrisp/vulkan/tests/test_residency_commit_race.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0417b201c397aeb5c2614d206039ff7eef138e0c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_residency_commit_race.cpp
+@@ -0,0 +1,257 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A queue commit reads the residency sets attached to the queue. Under
++ * Metal's GPU validation it walks every heap of the device set, and a heap
++ * another thread removed and released meanwhile was freed under that walk:
++ * KHR-GLES31.core.texture_cube_map_array.sampling ended its process in
++ * HeapUsageTable::processHeapEntry every time while Zink freed memory on one
++ * thread and submitted on another. The driver commits to the queue under the
++ * lock every write to the set holds.
++ *
++ * Here one thread submits small fills while another allocates and frees
++ * device memory, each allocation a heap of its own, with many more heaps
++ * resident for the commit to walk. The test runs with
++ * MTL_SHADER_VALIDATION=1; it passes when the process survives every
++ * submission and the last fill lands.
++ *
++ * usage: test_kosmickrisp_residency_commit_race [--submits N] [--heaps N] */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++#define VK_CHECK(expr)                                                         \
++   do {                                                                        \
++      VkResult vk_check_result = (expr);                                       \
++      require(vk_check_result == VK_SUCCESS, #expr, vk_check_result);          \
++   } while (0)
++
++int
++main(int argc, char **argv)
++{
++   uint32_t submits = 3000u, heaps = 256u;
++   for (int i = 1; i + 1 < argc; i += 2) {
++      if (!strcmp(argv[i], "--submits"))
++         submits = uint32_t(strtoul(argv[i + 1], nullptr, 0));
++      else if (!strcmp(argv[i], "--heaps"))
++         heaps = uint32_t(strtoul(argv[i + 1], nullptr, 0));
++   }
++
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "kosmickrisp_residency_commit_race";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   VK_CHECK(vkCreateInstance(&instance_info, nullptr, &instance));
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t physical_count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &physical_count, &physical);
++   require((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) &&
++              physical_count,
++           "physical device", enumerated);
++   uint32_t queue_count = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++   std::vector<VkQueueFamilyProperties> queues(queue_count);
++   vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
++                                            queues.data());
++   uint32_t family = 0;
++   while (family < queue_count &&
++          !(queues[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++      ++family;
++   require(family < queue_count, "graphics queue");
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info{
++      VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++   queue_info.queueFamilyIndex = family;
++   queue_info.queueCount = 1;
++   queue_info.pQueuePriorities = &priority;
++   VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++   device_info.queueCreateInfoCount = 1;
++   device_info.pQueueCreateInfos = &queue_info;
++   VkDevice device = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateDevice(physical, &device_info, nullptr, &device));
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkMapMemory);
++   LOAD_D(vkCreateCommandPool);
++   LOAD_D(vkDestroyCommandPool);
++   LOAD_D(vkResetCommandPool);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdFillBuffer);
++   LOAD_D(vkCreateFence);
++   LOAD_D(vkDestroyFence);
++   LOAD_D(vkWaitForFences);
++   LOAD_D(vkResetFences);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, family, 0, &queue);
++
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++   auto memory_type = [&](uint32_t bits, VkMemoryPropertyFlags flags) {
++      uint32_t type = 0;
++      while (type < memory_properties.memoryTypeCount &&
++             (!(bits & (1u << type)) ||
++              (memory_properties.memoryTypes[type].propertyFlags & flags) !=
++                 flags))
++         ++type;
++      require(type < memory_properties.memoryTypeCount, "memory type");
++      return type;
++   };
++
++   const VkDeviceSize size = 64u * 1024u;
++   VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++   buffer_info.size = size;
++   buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++   VkBuffer target = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateBuffer(device, &buffer_info, nullptr, &target));
++   VkMemoryRequirements requirements;
++   vkGetBufferMemoryRequirements(device, target, &requirements);
++   VkMemoryAllocateInfo target_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++   target_allocate.allocationSize = requirements.size;
++   target_allocate.memoryTypeIndex =
++      memory_type(requirements.memoryTypeBits,
++                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++   VkDeviceMemory target_memory = VK_NULL_HANDLE;
++   VK_CHECK(vkAllocateMemory(device, &target_allocate, nullptr, &target_memory));
++   VK_CHECK(vkBindBufferMemory(device, target, target_memory, 0));
++   void *mapped = nullptr;
++   VK_CHECK(vkMapMemory(device, target_memory, 0, VK_WHOLE_SIZE, 0, &mapped));
++
++   VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++   allocate.allocationSize = size;
++   allocate.memoryTypeIndex =
++      memory_type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++
++   /* Heaps that stay resident, so every commit has a set to walk. */
++   std::vector<VkDeviceMemory> resident(heaps);
++   for (VkDeviceMemory &memory : resident)
++      VK_CHECK(vkAllocateMemory(device, &allocate, nullptr, &memory));
++
++   std::atomic<bool> done{false};
++   std::atomic<uint32_t> churned{0};
++   std::thread churn([&] {
++      while (!done.load(std::memory_order_relaxed)) {
++         VkDeviceMemory memory;
++         VK_CHECK(vkAllocateMemory(device, &allocate, nullptr, &memory));
++         vkFreeMemory(device, memory, nullptr);
++         churned.fetch_add(1u, std::memory_order_relaxed);
++      }
++   });
++
++   /* A ring of command buffers, each refilled once its fence says its last
++    * submission finished. */
++   const uint32_t ring = 8u;
++   std::vector<VkCommandPool> pools(ring);
++   std::vector<VkCommandBuffer> commands(ring);
++   std::vector<VkFence> fences(ring);
++   VkFenceCreateInfo fence_info = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++   fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++   for (uint32_t i = 0; i < ring; i++) {
++      VkCommandPoolCreateInfo pool_info{
++         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = family;
++      VK_CHECK(vkCreateCommandPool(device, &pool_info, nullptr, &pools[i]));
++      VkCommandBufferAllocateInfo command_info{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      command_info.commandPool = pools[i];
++      command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      command_info.commandBufferCount = 1;
++      VK_CHECK(vkAllocateCommandBuffers(device, &command_info, &commands[i]));
++      VK_CHECK(vkCreateFence(device, &fence_info, nullptr, &fences[i]));
++   }
++
++   for (uint32_t s = 0; s < submits; s++) {
++      const uint32_t slot = s % ring;
++      VK_CHECK(vkWaitForFences(device, 1, &fences[slot], VK_TRUE,
++                               10ull * 1000000000ull));
++      VK_CHECK(vkResetFences(device, 1, &fences[slot]));
++      VK_CHECK(vkResetCommandPool(device, pools[slot], 0));
++      VkCommandBufferBeginInfo begin = {
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      VK_CHECK(vkBeginCommandBuffer(commands[slot], &begin));
++      vkCmdFillBuffer(commands[slot], target, 0, VK_WHOLE_SIZE, s);
++      VK_CHECK(vkEndCommandBuffer(commands[slot]));
++      VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
++      submit.commandBufferCount = 1;
++      submit.pCommandBuffers = &commands[slot];
++      VK_CHECK(vkQueueSubmit(queue, 1, &submit, fences[slot]));
++   }
++   VK_CHECK(vkQueueWaitIdle(queue));
++   done.store(true);
++   churn.join();
++
++   const uint32_t expected = submits - 1u;
++   const uint32_t *words = static_cast<const uint32_t *>(mapped);
++   for (VkDeviceSize i = 0; i < size / 4u; i++) {
++      if (words[i] != expected) {
++         fprintf(stderr, "word %llu is %u, not the last fill %u\n",
++                 (unsigned long long)i, words[i], expected);
++         return 1;
++      }
++   }
++   printf("%u submissions while %u heaps came and went beside %u resident "
++          "ones\n",
++          submits, churned.load(), heaps);
++
++   for (uint32_t i = 0; i < ring; i++) {
++      vkDestroyFence(device, fences[i], nullptr);
++      vkDestroyCommandPool(device, pools[i], nullptr);
++   }
++   for (VkDeviceMemory memory : resident)
++      vkFreeMemory(device, memory, nullptr);
++   vkDestroyBuffer(device, target, nullptr);
++   vkFreeMemory(device, target_memory, nullptr);
++   vkDestroyDevice(device, nullptr);
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_residency_release.m b/src/kosmickrisp/vulkan/tests/test_residency_release.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..54a447af48d187e140a918ff388f8d4e3bce6f0b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_residency_release.m
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A freed allocation must stop counting against the Metal device when
++ * vkFreeMemory returns, even after a submission has made it resident. The
++ * device residency set otherwise keeps a removed allocation alive until its
++ * next commit, which only the next submission performs.
++ */
++
++#define VK_NO_PROTOTYPES
++#include "kosmickrisp/vulkan/kk_device.h"
++#include <Metal/Metal.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++static const VkDeviceSize allocation_size = 64ull << 20;
++
++static uint64_t
++allocated_bytes(VkDevice device)
++{
++   struct kk_device *dev = kk_device_from_handle(device);
++   return [(id<MTLDevice>)dev->mtl_handle currentAllocatedSize];
++}
++
++int main(void)
++{
++   @autoreleasepool {
++      VkInstance instance = VK_NULL_HANDLE;
++      LOAD_I(vkCreateInstance);
++      VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                               .apiVersion = VK_API_VERSION_1_3};
++      VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++                                  .pApplicationInfo = &app};
++      CHECK(vkCreateInstance(&ici, NULL, &instance) == VK_SUCCESS);
++      LOAD_I(vkDestroyInstance);
++      LOAD_I(vkEnumeratePhysicalDevices);
++      LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++      LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++      LOAD_I(vkCreateDevice);
++      LOAD_I(vkGetDeviceProcAddr);
++      uint32_t count = 1;
++      VkPhysicalDevice physical;
++      CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++      CHECK(count == 1);
++      uint32_t family_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++      VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++      CHECK(families);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++      uint32_t family = 0;
++      while (family < family_count && !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         family++;
++      CHECK(family < family_count);
++      free(families);
++      float priority = 1;
++      VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority};
++      VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci};
++      VkDevice device;
++      CHECK(vkCreateDevice(physical, &dci, NULL, &device) == VK_SUCCESS);
++      LOAD_D(vkDestroyDevice); LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkAllocateMemory); LOAD_D(vkFreeMemory);
++      LOAD_D(vkQueueSubmit); LOAD_D(vkCreateFence); LOAD_D(vkWaitForFences);
++      LOAD_D(vkResetFences); LOAD_D(vkDestroyFence);
++      VkQueue queue;
++      vkGetDeviceQueue(device, family, 0, &queue);
++
++      VkPhysicalDeviceMemoryProperties properties;
++      vkGetPhysicalDeviceMemoryProperties(physical, &properties);
++      uint32_t type = 0;
++      while (type < properties.memoryTypeCount &&
++             !(properties.memoryTypes[type].propertyFlags &
++               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         type++;
++      CHECK(type < properties.memoryTypeCount);
++
++      VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++      VkFence fence;
++      CHECK(vkCreateFence(device, &fci, NULL, &fence) == VK_SUCCESS);
++      VkSubmitInfo empty = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
++
++      /* Each round allocates, lets a submission commit the allocation to the
++       * residency set, and frees it with no submission after the free. */
++      const uint64_t baseline = allocated_bytes(device);
++      for (unsigned round = 0; round < 4; round++) {
++         VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++            .allocationSize = allocation_size, .memoryTypeIndex = type};
++         VkDeviceMemory memory;
++         CHECK(vkAllocateMemory(device, &mai, NULL, &memory) == VK_SUCCESS);
++         CHECK(allocated_bytes(device) >= baseline + allocation_size);
++         CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
++         CHECK(vkQueueSubmit(queue, 1, &empty, fence) == VK_SUCCESS);
++         CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
++         vkFreeMemory(device, memory, NULL);
++         const uint64_t after_free = allocated_bytes(device);
++         if (after_free >= baseline + allocation_size) {
++            fprintf(stderr,
++                    "round %u: %llu bytes still allocated after freeing %llu "
++                    "(baseline %llu)\n",
++                    round, (unsigned long long)after_free,
++                    (unsigned long long)allocation_size,
++                    (unsigned long long)baseline);
++            abort();
++         }
++      }
++
++      vkDestroyFence(device, fence, NULL);
++      vkDestroyDevice(device, NULL);
++      vkDestroyInstance(instance, NULL);
++   }
++   return 0;
++}

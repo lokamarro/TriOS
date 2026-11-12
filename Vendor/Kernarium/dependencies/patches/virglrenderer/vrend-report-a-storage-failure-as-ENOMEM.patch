@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:28:25 +0900
+Subject: [PATCH] vrend: report a storage failure as ENOMEM
+
+vrend called glTexStorage, glTexImage and glBufferData for a new
+resource and never read the error queue, so a host driver with no room
+left the resource without storage and virgl_renderer_resource_create
+reported success. The guest drew with a texture that held nothing and
+was never told. Even a failure vrend did notice became EINVAL, which the
+device answers like a resource described wrongly.
+
+Read the error queue after the storage calls, having drained it first so
+that an error some earlier command left behind is not mistaken for a
+refusal. GL_OUT_OF_MEMORY is the one error that says the driver had no
+room: the texture or buffer is deleted and the creation fails with
+ENOMEM, which vrend_renderer_resource_create hands back through a new
+error argument and virgl_renderer_resource_create returns. An image
+imported over memory somebody else owns allocates nothing and is not
+checked.
+
+The two glGetError queries synchronize with a host driver that marshals
+its calls to a worker thread; a creation was already waiting for its
+answer at the device, which is the point of the change.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/virglrenderer.c        |   5 +-
+ src/vrend/vrend_renderer.c | 110 +++++++++++++++++++++++++++++++------
+ src/vrend/vrend_renderer.h |   6 +-
+ 3 files changed, 101 insertions(+), 20 deletions(-)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 168cd8a1755ded1861f0e4a3042d4e2f3f5799d2..8f7cc928f1656969b6c6f6b50574678d9dc5e23d 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -118,9 +118,10 @@ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resourc
+    vrend_args.last_level = args->last_level;
+    vrend_args.flags = args->flags;
+ 
+-   pipe_res = vrend_renderer_resource_create(&vrend_args, image);
++   int error;
++   pipe_res = vrend_renderer_resource_create(&vrend_args, image, &error);
+    if (!pipe_res)
+-      return EINVAL;
++      return error;
+ 
+    map_info = vrend_renderer_resource_get_map_info(pipe_res);
+    res = virgl_resource_create_from_pipe(args->handle, pipe_res, iov, num_iovs);
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4c12d45e31d84cc7aa4c15c702c0ab905a949263..0c841a82dc050cd57d1420d1633aed9c18dc5b73 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -474,6 +474,43 @@ static bool vrend_pin_host_pages(GLuint buffer, void *ptr, uint64_t size)
+    return false;
+ }
+ 
++/* Whether the host driver refused the storage that the GL calls since
++ * vrend_drain_gl_errors() asked for, draining the error queue. Only
++ * GL_OUT_OF_MEMORY says that the driver found no room: the object then has no
++ * storage, and the caller releases it and reports ENOMEM, so that the guest
++ * learns what its resource lacks. Any other error is warned about and left to
++ * the guest's own commands to meet.
++ *
++ * Draining first keeps an error that some earlier command left behind from
++ * being mistaken for a refusal. Both queries synchronize with a host driver
++ * that marshals its calls to a worker thread, which is the price of an answer.
++ */
++static void vrend_drain_gl_errors(void)
++{
++   while (glGetError() != GL_NO_ERROR)
++      ;
++}
++
++static bool vrend_storage_refused(const char *what)
++{
++   static bool reported;
++   bool refused = false;
++   GLenum error;
++
++   while ((error = glGetError()) != GL_NO_ERROR) {
++      if (error == GL_OUT_OF_MEMORY)
++         refused = true;
++      else
++         virgl_warn("%s raised GL error 0x%x\n", what, error);
++   }
++   /* Once is enough to say where a run's budget ended. */
++   if (refused && !reported) {
++      reported = true;
++      virgl_warn("the host driver has no room for %s\n", what);
++   }
++   return refused;
++}
++
+ 
+ struct vrend_linked_shader_program {
+    struct list_head head;
+@@ -8999,7 +9036,7 @@ static bool vrend_create_pinned_buffer_storage(struct vrend_resource *gr,
+    return true;
+ }
+ 
+-static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint32_t flags)
++static int vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint32_t flags)
+ {
+ 
+    GLbitfield buffer_storage_flags = 0;
+@@ -9019,6 +9056,7 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
+    gr->storage_bits |= VREND_STORAGE_GL_BUFFER;
+    glGenBuffersARB(1, &gr->gl_id);
+    glBindBufferARB(gr->target, gr->gl_id);
++   vrend_drain_gl_errors();
+ 
+    if (buffer_storage_flags) {
+       if (vrend_create_pinned_buffer_storage(gr, width)) {
+@@ -9038,13 +9076,13 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
+                                            GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
+          if (!bo) {
+             virgl_error("Failed to allocate emulated GL buffer backing storage");
+-            return;
++            return 0;
+          }
+ 
+          ret = virgl_gbm_export_fd(gbm->device, gbm_bo_get_handle(bo).u32, &fd);
+          if (ret || fd < 0) {
+             virgl_error("Failed to get file descriptor\n");
+-            return;
++            return 0;
+          }
+ 
+          glCreateMemoryObjectsEXT(1, &memobj);
+@@ -9058,7 +9096,7 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
+ #endif
+       else {
+          virgl_error("Missing buffer storage and interop extensions\n");
+-         return;
++         return 0;
+       }
+ 
+       /* Pinned host pages are ordinary mutable buffer storage. */
+@@ -9069,7 +9107,24 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
+    } else
+       glBufferData(gr->target, width, NULL, GL_STREAM_DRAW);
+ 
++   const bool refused = vrend_storage_refused("a buffer's storage");
+    glBindBufferARB(gr->target, 0);
++   if (refused) {
++      /* The buffer exists without storage: give it back. */
++      glDeleteBuffers(1, &gr->gl_id);
++      gr->gl_id = 0;
++      gr->size = 0;
++      gr->buffer_storage_flags = 0;
++      if (gr->host_shm) {
++         virgl_host_shm_free(gr->host_shm);
++         gr->host_shm = NULL;
++      }
++      gr->storage_bits &= ~(VREND_STORAGE_GL_BUFFER | VREND_STORAGE_GL_IMMUTABLE |
++                            VREND_STORAGE_GBM_BUFFER | VREND_STORAGE_GL_MEMOBJ |
++                            VREND_STORAGE_HOST_SHM);
++      return ENOMEM;
++   }
++   return 0;
+ }
+ 
+ static int
+@@ -9077,6 +9132,7 @@ vrend_resource_alloc_buffer(struct vrend_resource *gr, uint32_t flags)
+ {
+    const uint32_t bind = gr->base.bind;
+    const uint32_t size = gr->base.width0;
++   int ret = 0;
+ 
+    if (bind == VIRGL_BIND_CUSTOM) {
+       /* use iovec directly when attached */
+@@ -9088,25 +9144,25 @@ vrend_resource_alloc_buffer(struct vrend_resource *gr, uint32_t flags)
+      /* staging buffers only use guest memory -- nothing to do. */
+    } else if (bind == VIRGL_BIND_INDEX_BUFFER) {
+       gr->target = GL_ELEMENT_ARRAY_BUFFER_ARB;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind == VIRGL_BIND_STREAM_OUTPUT) {
+       gr->target = GL_TRANSFORM_FEEDBACK_BUFFER;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind == VIRGL_BIND_VERTEX_BUFFER) {
+       gr->target = GL_ARRAY_BUFFER_ARB;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind == VIRGL_BIND_CONSTANT_BUFFER) {
+       gr->target = GL_UNIFORM_BUFFER;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind == VIRGL_BIND_QUERY_BUFFER) {
+       gr->target = GL_QUERY_BUFFER;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind == VIRGL_BIND_COMMAND_ARGS) {
+       gr->target = GL_DRAW_INDIRECT_BUFFER;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind == 0 || bind == VIRGL_BIND_SHADER_BUFFER) {
+       gr->target = GL_ARRAY_BUFFER_ARB;
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else if (bind & VIRGL_BIND_SAMPLER_VIEW) {
+       /*
+     * On Desktop we use GL_ARB_texture_buffer_object on GLES we use
+@@ -9122,13 +9178,13 @@ vrend_resource_alloc_buffer(struct vrend_resource *gr, uint32_t flags)
+       } else {
+          gr->target = GL_PIXEL_PACK_BUFFER_ARB;
+       }
+-      vrend_create_buffer(gr, size, flags);
++      ret = vrend_create_buffer(gr, size, flags);
+    } else {
+       virgl_error("%s: Illegal buffer binding flags 0x%x\n", __func__, bind);
+       return -EINVAL;
+    }
+ 
+-   return 0;
++   return ret;
+ }
+ 
+ static inline void
+@@ -9432,6 +9488,7 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+ 
+    glGenTextures(1, &gr->gl_id);
+    glBindTexture(gr->target, gr->gl_id);
++   vrend_drain_gl_errors();
+ 
+    debug_texture(__func__, gr);
+ 
+@@ -9549,6 +9606,16 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+       }
+    }
+ 
++   /* An image names storage somebody else owns; anything else asked the host
++    * driver for it, which may have had no room. */
++   if (!image_oes && vrend_storage_refused("a texture's storage")) {
++      glBindTexture(gr->target, 0);
++      glDeleteTextures(1, &gr->gl_id);
++      gr->gl_id = 0;
++      gr->storage_bits &= ~(VREND_STORAGE_GL_TEXTURE | VREND_STORAGE_GL_IMMUTABLE);
++      return ENOMEM;
++   }
++
+    if (!format_can_texture_storage) {
+       glTexParameteri(gr->target, GL_TEXTURE_BASE_LEVEL, 0);
+       glTexParameteri(gr->target, GL_TEXTURE_MAX_LEVEL, pr->last_level);
+@@ -9632,11 +9699,15 @@ static void vrend_resource_zero_texture(struct vrend_resource *gr)
+ 
+ struct pipe_resource *
+ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args *args,
+-                               void *image_oes)
++                               void *image_oes,
++                               int *error)
+ {
+    struct vrend_resource *gr;
+    int ret;
+ 
++   if (error)
++      *error = EINVAL;
++
+    gr = vrend_resource_create(args);
+    if (!gr)
+       return NULL;
+@@ -9674,6 +9745,10 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    }
+ 
+    if (ret) {
++      /* A host driver that had no room is the one failure the guest can
++       * act on; every other one is a resource it described wrongly. */
++      if (error && (ret == ENOMEM || ret == -ENOMEM))
++         *error = ENOMEM;
+       FREE(gr->packed_yuv);
+       FREE(gr);
+       return NULL;
+@@ -9716,7 +9791,7 @@ static bool vrend_packed_yuv_make_planes(struct vrend_packed_yuv *yuv)
+       };
+ 
+       yuv->plane[plane] = (struct vrend_resource *)
+-         vrend_renderer_resource_create(&args, NULL);
++         vrend_renderer_resource_create(&args, NULL, NULL);
+       if (!yuv->plane[plane]) {
+          while (plane--)
+             vrend_resource_reference(&yuv->plane[plane], NULL);
+@@ -15021,9 +15096,10 @@ int vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob
+                                         const struct vrend_renderer_resource_create_args *args)
+ {
+    struct vrend_resource *res;
+-   res = (struct vrend_resource *)vrend_renderer_resource_create(args, NULL);
++   int error;
++   res = (struct vrend_resource *)vrend_renderer_resource_create(args, NULL, &error);
+    if (!res)
+-      return EINVAL;
++      return error;
+ 
+    res->blob_id = blob_id;
+    list_addtail(&res->head, &ctx->vrend_resources);
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index b520f319ba1c8062c0b0c3a042e0ae6cd725814e..b3b7ee7501169b405c1add95d915d8a644d6ae6d 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -352,9 +352,13 @@ struct vrend_renderer_resource_set_type_args {
+    uint32_t plane_offsets[VIRGL_GBM_MAX_PLANES];
+ };
+ 
++/* Returns NULL when the resource cannot be made. *error, when not NULL, then
++ * names why: ENOMEM when the host driver had no room for its storage, EINVAL
++ * for any other reason. */
+ struct pipe_resource *
+ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args *args,
+-                               void *image_eos);
++                               void *image_eos,
++                               int *error);
+ 
+ int vrend_create_surface(struct vrend_context *ctx, uint32_t handle,
+                          struct vrend_resource *res,

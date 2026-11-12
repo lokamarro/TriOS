@@ -1,0 +1,1274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 06:08:19 +0900
+Subject: [PATCH] kosmickrisp: complete the timeline signals a killed
+ submission owed
+
+Surviving a command queue failure is not enough on its own, because the
+failure also destroys work the driver has already promised. A timeline is an
+MTLSharedEvent and its signal is a queue-level operation ordered behind the
+submission that precedes it, so a submission Metal kills takes its own signal
+with it, and takes the signals of everything else it kills queued behind it.
+Nothing raises those events afterwards.
+
+The Vulkan fence therefore never signals and every waiter on it blocks
+forever. For this driver that reaches past the process: a guest waiting on the
+fence across the protocol stops too, and the host falls back on a fence escape
+hatch that spends a fixed timeout per abandoned event. Twelve Vulkan CTS cases
+that exceed an A15's command buffer limit produced nine reports and fourteen
+abandoned fences, and one case whose fence no escape covered sat unfinished for
+over ten minutes.
+
+So the queue keeps the debt. Every signal it enqueues is recorded with the
+serial of the submission it sits behind, and dropped again once the event
+reaches that value, which a completion proves for everything ordered ahead of
+it. A report then completes from the CPU whatever it destroyed: the signals at
+or below the failing submission's serial for a failure the queue survived, and
+all of them for one that lost the device, since a lost queue runs nothing
+further.
+
+A completion is not the only thing that drops a record. A submit that carries
+no command buffer commits nothing, so no completion follows it, and a guest
+that polls with fence- or semaphore-only submits would grow the list, and the
+events it retains, for as long as it drew nothing. Recording a signal
+therefore first drops every record whose event has arrived, which keeps the
+list to the signals still outstanding. A test makes a thousand signal-only
+submits and finds at most the last one still listed.
+
+Signals enqueued after the failing submission are left alone. That work is
+still running, and raising its timeline early would tell a waiter its results
+are ready while the GPU is still writing them; a failure that took those out as
+well arrives as its own report and makes its own signals good.
+
+A native value is set rather than advanced, by Metal as well as here, and
+nothing orders Metal's store against the queue's. An event that still has a
+signal to come from running work is therefore not raised at all, because
+Metal could deliver that signal between the read and the store and the store
+would move the timeline backwards; it is completed once the queue has
+reported everything it was given and nothing can signal it any more. Any
+other event is raised once, straight to the highest value owed on it, and
+only if it has not passed that value already, so the values written only
+ever move up.
+
+Carrying the serial needs the report to name one submission rather than the
+queue, so the commit feedback payload becomes per-submission: it holds the
+serial and a reference to the queue's shared feedback record, which already
+outlives the Vulkan device for exactly this reason. The native event is
+referenced rather than borrowed, and the reference is taken before the signal
+is enqueued, because the vk_sync that carried the signal can be destroyed as
+soon as the signal is delivered. vkQueueWaitIdle destroys its own the moment
+its wait returns, while the submit worker may still be inside the submit that
+enqueued it; a record taken after the enqueue retained an event that was
+already gone and crashed the device teardown that released it. A test holds
+the worker inside Metal's enqueue while the fence or semaphore it signaled is
+destroyed.
+
+Two things still go missing after that. Metal reports a failure against one
+submission, but the work it kills behind that submission does not always
+arrive as a report of its own, so a signal enqueued after the reported one
+can be destroyed with nothing naming it. A Vulkan CTS case on an A15 waited
+on value 18 of a timeline whose event stopped at 16 with a signal for 18
+already accepted, and the case never finished.
+
+The queue resolves the first of those for free. It processes what it is given
+in order, so a submission that completes also proves the queue went past every
+signal enqueued before it; one of those still short of its value was discarded
+rather than run. Once the queue has failed at least once, a completion
+therefore completes them, and on a queue that has never failed nothing
+changes.
+
+The second needs a bound, because a queue that is not running anything reports
+nothing at all, and then the only thing left that can notice is the caller
+waiting on the value. It holds the evidence: the queue accepted a signal for
+the value and has not delivered it. Waiting longer cannot help, since the
+signal is not coming, so past ten seconds the wait completes what the queue
+owes it and says so. That is two orders of magnitude over any submission that
+runs to completion on the tightest device this driver targets, whose GPU stops
+a command buffer after tens of milliseconds, and it costs nothing on a queue
+that has never failed.
+
+That bound is timed only by a caller waiting for a value to arrive. A caller
+asking whether the signal has been submitted is answered from what the queue
+has enqueued and never reaches the wait. What the bound times is the timeline
+standing still while it owes a signal, not one waiter's patience: the clock
+restarts only when the timeline advances, and every waiter behind the stall
+shares it. The renderer waits in slices of a few seconds, so a clock kept per
+call would never reach the bound, and a clock kept per value would be
+restarted by every waiter on another value of the same stalled timeline, so
+two such waiters would keep each other waiting forever. The clock has its own
+lock, and what it decides is acted on outside that lock, so it never nests
+inside the queue's.
+
+Waiting out that bound is the last resort and not the common case, because
+Metal reports every submission it is given exactly once. When the number of
+reports reaches the number of submissions the queue was handed, the queue is
+holding nothing it has not answered for, and any signal still short of its
+value has no submission left to deliver it, so it is completed there and then
+rather than ten seconds later. Both the report and the submission check for
+this, because a signal is enqueued after the submissions it follows and Metal
+can report one of those before the commit call returns: the report that
+empties the queue may run before the record it would have resolved exists, so
+whichever of the two happens second does the work.
+
+It matters at scale. A Vulkan CTS fraction on an A15 reported 776 timeouts in
+its first hour, and the bound alone left 155 of them to be waited out, which
+is 1550 of the 1877 seconds that hour spent past its first failure. A fraction
+paying that is not going to finish.
+---
+ src/kosmickrisp/vulkan/kk_queue.c             | 276 +++++++++++++++-
+ src/kosmickrisp/vulkan/kk_queue.h             |  40 +++
+ src/kosmickrisp/vulkan/kk_sync.c              |  89 ++++++
+ src/kosmickrisp/vulkan/kk_sync.h              |  11 +
+ src/kosmickrisp/vulkan/meson.build            |  37 +++
+ .../vulkan/tests/test_command_completion.m    |  31 +-
+ .../vulkan/tests/test_owed_signal_bound.c     | 125 ++++++++
+ .../vulkan/tests/test_signal_lifetime.m       | 299 ++++++++++++++++++
+ 8 files changed, 898 insertions(+), 10 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_owed_signal_bound.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_signal_lifetime.m
+
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 4a7026def9df81ec12bbb7678d56165c5c284d02..507b0b8e22f2e1bf30335d7abeee9a60441a0b04 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -21,35 +21,276 @@
+ 
+ #include <stdio.h>
+ 
++/* Drop every record Metal has already made good, so the list holds only
++ * signals still owed. */
++static void
++kk_queue_signals_prune_locked(struct kk_queue_feedback *feedback)
++{
++   struct kk_queue_signal *records = util_dynarray_begin(&feedback->signals);
++   uint32_t count =
++      util_dynarray_num_elements(&feedback->signals, struct kk_queue_signal);
++   uint32_t kept = 0u;
++
++   for (uint32_t i = 0u; i < count; ++i) {
++      if (mtl_shared_event_get_signaled_value(records[i].event) >=
++          records[i].value)
++         mtl_release(records[i].event);
++      else
++         records[kept++] = records[i];
++   }
++   feedback->signals.size = kept * sizeof(struct kk_queue_signal);
++}
++
++/* Metal discards a queue-level signal that sits behind a submission it kills,
++ * along with the killed submission's own signal. Nothing ever raises those
++ * events again, so every waiter on them - in this process, and through the
++ * guest protocol this driver serves, in another one - would block forever.
++ * Raise them here instead.
++ *
++ * Only signals ordered behind the failing submission are owed. Anything
++ * enqueued after it belongs to work the queue is still running, and raising
++ * that early would tell a waiter its results are ready while the GPU is still
++ * writing them. A failure that took those out too reports itself separately
++ * and makes its own signals good.
++ *
++ * A native event value is set rather than advanced, and Metal sets it too,
++ * with nothing ordering its store against this one. So an event is raised at
++ * most once per sweep, straight to the highest value owed on it, and not at
++ * all while it still has a signal to come from work that is still running:
++ * Metal can deliver that signal between the read and the store here, and the
++ * store would then move the timeline backwards. Such an event is left to the
++ * sweep that runs once the queue has reported everything it was given, when
++ * nothing on it can signal any more, or to the waiter's bound. A record whose
++ * event has already passed its value is not raised either. */
++static unsigned
++kk_queue_signals_make_good(struct kk_queue_feedback *feedback,
++                           uint64_t through_serial)
++{
++   unsigned made_good = 0u;
++
++   simple_mtx_lock(&feedback->signal_mutex);
++   kk_queue_signals_prune_locked(feedback);
++   struct kk_queue_signal *records = util_dynarray_begin(&feedback->signals);
++   uint32_t count =
++      util_dynarray_num_elements(&feedback->signals, struct kk_queue_signal);
++
++   for (uint32_t i = 0u; i < count; ++i) {
++      if (records[i].serial > through_serial)
++         continue;
++
++      /* Decide each event at its oldest owed record. */
++      bool decided = false, pending = false;
++      uint64_t owed = records[i].value;
++      for (uint32_t j = 0u; j < count && !decided && !pending; ++j) {
++         if (j == i || records[j].event != records[i].event)
++            continue;
++         if (records[j].serial > through_serial)
++            pending = true;
++         else if (j < i)
++            decided = true;
++         else
++            owed = MAX2(owed, records[j].value);
++      }
++      if (decided || pending)
++         continue;
++
++      const uint64_t reached =
++         mtl_shared_event_get_signaled_value(records[i].event);
++      if (reached >= owed)
++         continue;
++      mtl_shared_event_set_signaled_value(records[i].event, owed);
++      for (uint32_t j = i; j < count; ++j) {
++         if (records[j].event == records[i].event && records[j].value > reached)
++            ++made_good;
++      }
++   }
++   kk_queue_signals_prune_locked(feedback);
++   simple_mtx_unlock(&feedback->signal_mutex);
++
++   return made_good;
++}
++
++/* Metal reports a failure against one submission, but the work it kills
++ * behind that submission does not always arrive as a report of its own. A
++ * signal enqueued after the reported one can therefore go missing with
++ * nothing naming it, which leaves this the only way to find it: it is the
++ * value the queue accepted and has not delivered. */
++uint64_t
++kk_queue_complete_owed_signals(struct kk_queue *queue, mtl_shared_event *event)
++{
++   struct kk_queue_feedback *feedback = queue->feedback;
++   if (!feedback)
++      return 0u;
++
++   uint64_t owed = 0u;
++
++   simple_mtx_lock(&feedback->signal_mutex);
++   if (feedback->failures > 0u) {
++      util_dynarray_foreach(&feedback->signals, struct kk_queue_signal,
++                            record) {
++         if (record->event == event && record->value > owed)
++            owed = record->value;
++      }
++      if (owed > mtl_shared_event_get_signaled_value(event))
++         mtl_shared_event_set_signaled_value(event, owed);
++      else
++         owed = 0u;
++      kk_queue_signals_prune_locked(feedback);
++   }
++   simple_mtx_unlock(&feedback->signal_mutex);
++
++   return owed;
++}
++
++static void
++kk_queue_signals_retire(struct kk_queue_feedback *feedback)
++{
++   simple_mtx_lock(&feedback->signal_mutex);
++   kk_queue_signals_prune_locked(feedback);
++   simple_mtx_unlock(&feedback->signal_mutex);
++}
++
+ static void
+ kk_queue_feedback_unref(struct kk_queue_feedback *feedback)
+ {
+    if (p_atomic_dec_zero(&feedback->refcount)) {
++      util_dynarray_foreach(&feedback->signals, struct kk_queue_signal, record)
++         mtl_release(record->event);
++      util_dynarray_fini(&feedback->signals);
+       mtl_release(feedback->queue);
++      simple_mtx_destroy(&feedback->signal_mutex);
+       simple_mtx_destroy(&feedback->mutex);
+       free(feedback);
+    }
+ }
+ 
++/* Reserve the serial of the submission about to be committed. One queue
++ * submits from one thread, so the order these are handed out is the order
++ * Metal receives the work. */
++static uint64_t
++kk_queue_reserve_serial(struct kk_queue_feedback *feedback)
++{
++   simple_mtx_lock(&feedback->signal_mutex);
++   uint64_t serial = ++feedback->last_serial;
++   simple_mtx_unlock(&feedback->signal_mutex);
++   return serial;
++}
++
++/* Record a signal now enqueued behind every submission committed so far. A
++ * submit that commits nothing still enqueues its signals behind the previous
++ * submission, which is what the unchanged serial says.
++ *
++ * Such a submit also schedules no completion, and a completion is what prunes
++ * the list of a healthy queue, so a stream of signal-only submits would grow
++ * it, and the events it retains, without bound. Pruning here keeps it to the
++ * signals still outstanding. */
++static void
++kk_queue_record_signal(struct kk_queue_feedback *feedback,
++                       mtl_shared_event *event, uint64_t value)
++{
++   simple_mtx_lock(&feedback->signal_mutex);
++   kk_queue_signals_prune_locked(feedback);
++   struct kk_queue_signal *record =
++      util_dynarray_grow(&feedback->signals, struct kk_queue_signal, 1);
++   if (record) {
++      *record = (struct kk_queue_signal){
++         .event = mtl_retain(event),
++         .value = value,
++         .serial = feedback->last_serial,
++      };
++   }
++   simple_mtx_unlock(&feedback->signal_mutex);
++}
++
++/* Once every submission has reported there is nothing left to deliver a
++ * signal, whichever submission was carrying it, so anything still short of
++ * its value was discarded. This is what resolves the casualties a failure
++ * does not name, and it resolves them as the failure is reported rather than
++ * leaving a waiter to time them out: a queue that has gone quiet reports
++ * nothing further to act on.
++ *
++ * A signal is enqueued after the submissions it follows, and Metal can report
++ * one of those before the commit call even returns, so the report that empties
++ * the queue may run before the record it would have resolved exists. Both
++ * sides therefore check, and whichever happens second does the work. */
++static void
++kk_queue_resolve_if_drained(struct kk_queue_feedback *feedback)
++{
++   simple_mtx_lock(&feedback->signal_mutex);
++   bool drained = feedback->failures > 0u &&
++                  feedback->reported == feedback->last_serial;
++   simple_mtx_unlock(&feedback->signal_mutex);
++
++   if (drained)
++      kk_queue_signals_make_good(feedback, UINT64_MAX);
++}
++
++static struct kk_queue_submission *
++kk_queue_submission_new(struct kk_queue_feedback *feedback, uint64_t serial)
++{
++   struct kk_queue_submission *submission = malloc(sizeof(*submission));
++   if (!submission)
++      return NULL;
++
++   submission->feedback = kk_queue_feedback_ref(feedback);
++   submission->serial = serial;
++   return submission;
++}
++
+ static void
+ commit_callback(struct mtl_feedback_data *data)
+ {
+-   struct kk_queue_feedback *feedback = data->user_data;
++   struct kk_queue_submission *submission = data->user_data;
++   struct kk_queue_feedback *feedback = submission->feedback;
++
++   /* A serial is reserved immediately before its commit, so a submission the
++    * queue is still holding always keeps this below last_serial. */
++   simple_mtx_lock(&feedback->signal_mutex);
++   ++feedback->reported;
++   simple_mtx_unlock(&feedback->signal_mutex);
++
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+       char report[KK_QUEUE_ERROR_REPORT_SIZE];
+       kk_queue_error_describe(report, sizeof(report), data);
+       fprintf(stderr, "KosmicKrisp %s\n", report);
+ 
++      /* A lost queue owes every signal it still holds, because it runs
++       * nothing further. A survivable failure owes only the signals ordered
++       * behind the submission it names. */
++      bool lost = kk_queue_error_is_device_lost(data);
++      simple_mtx_lock(&feedback->signal_mutex);
++      ++feedback->failures;
++      simple_mtx_unlock(&feedback->signal_mutex);
++      unsigned made_good = kk_queue_signals_make_good(
++         feedback, lost ? UINT64_MAX : submission->serial);
++      if (made_good)
++         fprintf(stderr,
++                 "KosmicKrisp completed %u timeline signal%s the failed "
++                 "submission owed, so its waiters do not block forever\n",
++                 made_good, made_good == 1u ? "" : "s");
++
+       /* Device teardown clears this pointer under the same lock. Never carry
+        * a Vulkan pointer outside the lock into an asynchronous callback. */
+-      if (kk_queue_error_is_device_lost(data)) {
++      if (lost) {
+          simple_mtx_lock(&feedback->mutex);
+          if (feedback->device)
+             vk_device_set_lost(&feedback->device->vk, "Metal %s", report);
+          simple_mtx_unlock(&feedback->mutex);
+       }
++   } else if (p_atomic_read(&feedback->failures) > 0u) {
++      /* This queue processes what it is given in order, so a completion also
++       * proves it went past every signal enqueued before this submission.
++       * One of those still short of its value was discarded rather than run,
++       * which is how the work killed behind a reported failure gets resolved
++       * without a report of its own. */
++      kk_queue_signals_make_good(feedback, submission->serial - 1u);
++   } else {
++      /* A completion proves every signal ordered ahead of it has run. */
++      kk_queue_signals_retire(feedback);
+    }
+ 
++   kk_queue_resolve_if_drained(feedback);
++
+    if (feedback->submit_timing) {
+       /* These host-second timestamps cover the entire committed Metal batch.
+        * The immutable identifier remains usable after Vulkan device teardown. */
+@@ -58,6 +299,7 @@ commit_callback(struct mtl_feedback_data *data)
+               (void *)feedback->device_id, data->gpu_start, data->gpu_end,
+               (unsigned)data->error);
+    }
++   free(submission);
+    kk_queue_feedback_unref(feedback);
+ }
+ 
+@@ -190,12 +432,26 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+             return vk_queue_set_lost(&queue->vk,
+                                      "Failed to allocate Metal commit options");
+ 
++         /* One queue submits from one thread and nothing else reserves a
++          * serial, so this submission's number is still the one Metal is
++          * about to receive. A failure reported against it then names
++          * exactly the signals ordered behind it. */
++         struct kk_queue_submission *submission = kk_queue_submission_new(
++            queue->feedback, kk_queue_reserve_serial(queue->feedback));
++         if (!submission) {
++            mtl_release(options);
++            return vk_queue_set_lost(&queue->vk,
++                                     "Failed to allocate Metal submission feedback");
++         }
++
+          struct kk_completed_recording *recording = NULL;
+          if (cmd_buffer->one_time_submit) {
+             recording = kk_detach_completed_recording(cmd_buffer,
+                                                       queue->mtl_handle);
+             if (!recording) {
+                mtl_release(options);
++               kk_queue_feedback_unref(submission->feedback);
++               free(submission);
+                return vk_queue_set_lost(&queue->vk,
+                                         "Failed to allocate Metal completion storage");
+             }
+@@ -203,8 +459,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+                options, kk_completed_recording_callback, recording);
+          }
+          mtl_commit_options_add_feedback_handler(
+-            options, queue->feedback_callback,
+-            kk_queue_feedback_ref(queue->feedback));
++            options, queue->feedback_callback, submission);
+          mtl_command_queue_commit(queue->mtl_handle, cmds, count, options);
+          mtl_release(options);
+          if (recording)
+@@ -223,6 +478,12 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+       struct vk_sync_signal *signal = &submit->signals[i];
+       struct kk_sync_timeline *sync =
+          container_of(signal->sync, struct kk_sync_timeline, base);
++      /* Metal owes this value once it has the signal, and drops what it owes
++       * behind a submission it kills, so the queue keeps the debt until the
++       * event reaches it. The record takes its own reference to the event
++       * before the enqueue, for the reason below. */
++      kk_queue_record_signal(queue->feedback, sync->mtl_handle,
++                             signal->signal_value);
+       /* Later waits on this value are pending and need no CPU gating: any
+        * native work they order behind it comes from a later submission to
+        * this device's one queue, which runs only after this one has enqueued
+@@ -235,6 +496,11 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+                        signal->signal_value);
+    }
+ 
++   /* The records for this submit exist only now, so a report that emptied the
++    * queue while it was being built could not have resolved them. */
++   if (submit->signal_count)
++      kk_queue_resolve_if_drained(queue->feedback);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -278,6 +544,8 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+    }
+    queue->feedback->refcount = 1;
+    simple_mtx_init(&queue->feedback->mutex, mtx_plain);
++   simple_mtx_init(&queue->feedback->signal_mutex, mtx_plain);
++   util_dynarray_init(&queue->feedback->signals, NULL);
+    queue->feedback->device = dev;
+    queue->feedback->device_id = (uintptr_t)dev;
+    queue->feedback->submit_timing = KK_DEBUG(SUBMIT_TIMING);
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index f35020cb5adbcbbe7d92e0a9b95963824629eabb..ae0a65d8b2223d23eaaf1be9c6c18b0459f004a7 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -14,6 +14,17 @@
+ 
+ #include "vk_queue.h"
+ #include "util/simple_mtx.h"
++#include "util/u_dynarray.h"
++
++/* A timeline signal this queue handed to Metal, and the submission it is
++ * ordered behind. The native event is referenced, not borrowed, and the
++ * reference is taken before the signal is enqueued: the vk_sync that carried
++ * the signal can be destroyed as soon as the signal is delivered. */
++struct kk_queue_signal {
++   mtl_shared_event *event;
++   uint64_t value;
++   uint64_t serial;
++};
+ 
+ /* Feedback can run after Vulkan device teardown. Only access device while
+  * holding mutex; device_id is an immutable identifier for independent logs. */
+@@ -24,6 +35,28 @@ struct kk_queue_feedback {
+    mtl_command_queue *queue;
+    uintptr_t device_id;
+    bool submit_timing;
++   /* Signals Metal has not made good yet, oldest first, and the serial of the
++    * most recent submission. Guarded by signal_mutex, which is never held
++    * across mutex. */
++   simple_mtx_t signal_mutex;
++   uint64_t last_serial;
++   /* How many submissions have reported. Metal reports every submission it is
++    * given exactly once, so reaching last_serial means the queue holds
++    * nothing it has not answered for. */
++   uint64_t reported;
++   struct util_dynarray signals;
++   /* How many failures Metal has reported against this queue. A queue that
++    * has never failed owes nothing it has not delivered, so the recovery
++    * below stays out of the way until one does. */
++   uint32_t failures;
++};
++
++/* Per-submission feedback payload. Metal reports a failure against one
++ * submission, so the report has to carry that submission's serial to know
++ * which enqueued signals the failure destroyed. */
++struct kk_queue_submission {
++   struct kk_queue_feedback *feedback;
++   uint64_t serial;
+ };
+ 
+ static inline struct kk_queue_feedback *
+@@ -46,6 +79,13 @@ kk_queue_device(struct kk_queue *queue)
+    return (struct kk_device *)queue->vk.base.device;
+ }
+ 
++/* Complete every signal this queue handed to Metal for this event and has not
++ * seen delivered, and answer with the value the event now holds, or zero when
++ * the queue owed nothing. Only a queue that has already failed owes anything:
++ * see kk_queue.c for why a signal can go missing without a report naming it. */
++uint64_t kk_queue_complete_owed_signals(struct kk_queue *queue,
++                                        mtl_shared_event *event);
++
+ VkResult kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+                        const VkDeviceQueueCreateInfo *pCreateInfo,
+                        uint32_t index_in_family);
+diff --git a/src/kosmickrisp/vulkan/kk_sync.c b/src/kosmickrisp/vulkan/kk_sync.c
+index e0377497850cb629abde25478d077d1101528b33..2f8f5f8c79d08865c8c32ade36d906d428900614 100644
+--- a/src/kosmickrisp/vulkan/kk_sync.c
++++ b/src/kosmickrisp/vulkan/kk_sync.c
+@@ -11,8 +11,12 @@
+ 
+ #include "vk_util.h"
+ 
++#include "util/os_time.h"
+ #include "util/u_atomic.h"
+ 
++#include <inttypes.h>
++#include <stdio.h>
++
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
+ static VkResult
+@@ -26,6 +30,9 @@ kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
+    timeline->mtl_handle = mtl_new_shared_event(dev->mtl_handle);
+    mtl_shared_event_set_signaled_value(timeline->mtl_handle, initial_value);
+    timeline->pending_value = initial_value;
++   simple_mtx_init(&timeline->overdue_mutex, mtx_plain);
++   timeline->stalled_value = 0u;
++   timeline->overdue_since = 0u;
+    timeline->moved_from = NULL;
+ 
+    return VK_SUCCESS;
+@@ -36,9 +43,21 @@ kk_timeline_finish(struct vk_device *device, struct vk_sync *sync)
+ {
+    struct kk_sync_timeline *timeline =
+       container_of(sync, struct kk_sync_timeline, base);
++   simple_mtx_destroy(&timeline->overdue_mutex);
+    mtl_release(timeline->mtl_handle);
+ }
+ 
++/* Stop the timeline's stall clock. The payload a binary semaphore moves takes
++ * its value with it, so the time a waiter spent watching the old payload says
++ * nothing about the new one. */
++static void
++kk_timeline_stop_overdue_clock(struct kk_sync_timeline *timeline)
++{
++   simple_mtx_lock(&timeline->overdue_mutex);
++   timeline->overdue_since = 0u;
++   simple_mtx_unlock(&timeline->overdue_mutex);
++}
++
+ static VkResult
+ kk_timeline_signal(struct vk_device *device, struct vk_sync *sync,
+                    uint64_t value)
+@@ -83,6 +102,68 @@ kk_timeline_get_value(struct vk_device *device, struct vk_sync *sync,
+    return VK_SUCCESS;
+ }
+ 
++/* A failure can take a signal Metal had already accepted without any report
++ * naming it, and then take the rest of the queue with it, so that nothing
++ * completes and nothing else notices. A caller waiting on that value is the
++ * last thing left that can, because it is the one holding the evidence: the
++ * queue accepted a signal for the value and has not delivered it. Waiting
++ * longer cannot help, since the signal is not coming, so past this bound the
++ * wait completes what the queue owes it and says so.
++ *
++ * The bound is two orders of magnitude over any submission that runs to
++ * completion on the tightest device this driver targets, whose GPU stops a
++ * command buffer after tens of milliseconds, and it costs nothing at all on a
++ * queue that has never failed. */
++static const uint64_t kk_lost_signal_timeout_ns = 10ull * 1000000000ull;
++
++static void
++kk_timeline_recover_lost_signal(struct kk_device *dev,
++                                struct kk_sync_timeline *timeline,
++                                uint64_t wait_value)
++{
++   const uint64_t signaled =
++      mtl_shared_event_get_signaled_value(timeline->mtl_handle);
++   if (signaled >= wait_value)
++      return;
++
++   /* Only a value the queue took responsibility for can be owed. */
++   if (p_atomic_read(&timeline->pending_value) < wait_value || !dev->has_queue)
++      return;
++
++   /* The clock times the timeline, not a waiter: it measures how long the
++    * timeline has stood still while it owes a signal, and it restarts only
++    * when the timeline advances. Waiters on different values of one stalled
++    * timeline therefore share it instead of restarting each other's, and a
++    * waiter that arrives behind a stall inherits the time already spent in
++    * it. A waiter whose value has arrived leaves it alone, because the
++    * timeline standing still says nothing about that waiter. */
++   bool expired = false;
++   simple_mtx_lock(&timeline->overdue_mutex);
++   /* Read the time under the lock: another waiter may start the clock after
++    * an earlier reading, and the elapsed time must never go negative. */
++   const uint64_t now = os_time_get_nano();
++   if (timeline->overdue_since == 0u || timeline->stalled_value != signaled) {
++      timeline->stalled_value = signaled;
++      timeline->overdue_since = now;
++   } else if (now - timeline->overdue_since >= kk_lost_signal_timeout_ns) {
++      timeline->overdue_since = 0u;
++      expired = true;
++   }
++   simple_mtx_unlock(&timeline->overdue_mutex);
++   if (!expired)
++      return;
++
++   uint64_t completed =
++      kk_queue_complete_owed_signals(&dev->queue, timeline->mtl_handle);
++   if (completed) {
++      fprintf(stderr,
++              "KosmicKrisp completed a timeline signal the queue accepted and "
++              "never delivered: value %" PRIu64 ", waited on for %" PRIu64
++              " s\n",
++              completed, kk_lost_signal_timeout_ns / 1000000000ull);
++   }
++}
++
+ static VkResult
+ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
+                  uint64_t wait_value, enum vk_sync_wait_flags wait_flags,
+@@ -90,6 +171,7 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
+ {
+    struct kk_sync_timeline *timeline =
+       container_of(sync, struct kk_sync_timeline, base);
++   struct kk_device *dev = container_of(device, struct kk_device, vk);
+ 
+    for (;;) {
+       if (vk_device_is_lost_no_report(device))
+@@ -109,6 +191,11 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
+           p_atomic_read(&timeline->pending_value) >= wait_value)
+          return VK_SUCCESS;
+ 
++      /* Only a caller waiting for the value to arrive can time how long it
++       * has not arrived for. A caller asking whether the signal was submitted
++       * is answered above and never reaches this. */
++      kk_timeline_recover_lost_signal(dev, timeline, wait_value);
++
+       /* Metal takes relative milliseconds; Vulkan provides an absolute
+        * nanosecond deadline. Recompute after every pending-wait slice. */
+       uint64_t timeout_ms;
+@@ -153,6 +240,8 @@ kk_sync_binary_take_payload(struct vk_device *device, struct vk_sync *dst_sync,
+     * headers. Reset the recycled destination payload for future source use. */
+    SWAP(dst_timeline->mtl_handle, src_timeline->mtl_handle);
+    SWAP(dst_timeline->pending_value, src_timeline->pending_value);
++   kk_timeline_stop_overdue_clock(dst_timeline);
++   kk_timeline_stop_overdue_clock(src_timeline);
+    SWAP(dst->next_point, src->next_point);
+    return vk_sync_reset(device, src_sync);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_sync.h b/src/kosmickrisp/vulkan/kk_sync.h
+index ec5b69b396ba441e0df0228e1ee7ea8462041ded..8a32ee5240bb943452af8f73313900cf8d015474 100644
+--- a/src/kosmickrisp/vulkan/kk_sync.h
++++ b/src/kosmickrisp/vulkan/kk_sync.h
+@@ -11,6 +11,8 @@
+ 
+ #include "vk_sync.h"
+ 
++#include "util/simple_mtx.h"
++
+ struct kk_queue;
+ 
+ struct kk_sync_timeline {
+@@ -21,6 +23,15 @@ struct kk_sync_timeline {
+     * kk_timeline_mark_pending(). Any wait at or below it is pending in the
+     * common runtime's sense. */
+    uint64_t pending_value;
++   /* How long the timeline has stood still while it owes a waiter a signal
++    * the queue already accepted, so a signal that never arrives can be told
++    * from one that is merely slow: the value it stood at when the clock
++    * started, and when that was. Every waiter behind the stall shares this one
++    * clock, which restarts only when the timeline advances. overdue_since is
++    * zero while no clock runs. Both are guarded by overdue_mutex. */
++   simple_mtx_t overdue_mutex;
++   uint64_t stalled_value;
++   uint64_t overdue_since;
+    /* The permanent binary semaphore a temporary still has to take its
+     * payload from, once the submit worker reaches it; see
+     * kk_sync_binary_move(). Null everywhere else. */
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 28aa9f23a9ab108a2b155f7ce1eb9330cd5282e4..23bd1417e40406460a12a52372448509233224fb 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -871,6 +871,43 @@ if with_tests
+       ],
+       timeout : 90,
+     )
++    test(
++      'kosmickrisp_signal_lifetime',
++      executable(
++        'test_kosmickrisp_signal_lifetime',
++        files('tests/test_signal_lifetime.m'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          dependency('appleframeworks', modules : ['Foundation', 'Metal']),
++        ],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
++    test(
++      'kosmickrisp_owed_signal_bound',
++      executable(
++        'test_kosmickrisp_owed_signal_bound',
++        files('tests/test_owed_signal_bound.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir.partial_dependency(compile_args : true, includes : true, sources : true),
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_command_completion',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_completion.m b/src/kosmickrisp/vulkan/tests/test_command_completion.m
+index 64fe5be52a0f9eef421d96436cee089040af8520..66bf5fd313c15c11024f646f2f5be68a7d8ed707 100644
+--- a/src/kosmickrisp/vulkan/tests/test_command_completion.m
++++ b/src/kosmickrisp/vulkan/tests/test_command_completion.m
+@@ -102,6 +102,24 @@
+    return true;
+ }
+ 
++/* Synthetic reports still obey the production callback's payload and serial
++ * contract. The callback owns and releases both this allocation and its
++ * feedback reference. */
++static struct kk_queue_submission *
++synthetic_submission(struct kk_queue_feedback *feedback)
++{
++   struct kk_queue_submission *submission = malloc(sizeof(*submission));
++   CHECK(submission);
++
++   simple_mtx_lock(&feedback->signal_mutex);
++   uint64_t serial = ++feedback->last_serial;
++   simple_mtx_unlock(&feedback->signal_mutex);
++
++   *submission = (struct kk_queue_submission){
++      .feedback = kk_queue_feedback_ref(feedback), .serial = serial};
++   return submission;
++}
++
+ static void
+ run(bool one_time)
+ {
+@@ -249,13 +267,14 @@
+             /* Retain the real reporter context exactly as commit registration
+              * does. Synthetic feedback exercises late errors without a GPU hang. */
+             mtl_feedback_handler_callback callback = dev->queue.feedback_callback;
+-            struct kk_queue_feedback *late_success =
+-               kk_queue_feedback_ref(dev->queue.feedback);
+-            struct kk_queue_feedback *late_error =
+-               kk_queue_feedback_ref(dev->queue.feedback);
++            struct kk_queue_feedback *feedback = dev->queue.feedback;
++            struct kk_queue_submission *late_success =
++               synthetic_submission(feedback);
++            struct kk_queue_submission *late_error =
++               synthetic_submission(feedback);
+             if (!one_time) {
+                struct mtl_feedback_data live_error = {
+-                  .user_data = kk_queue_feedback_ref(dev->queue.feedback),
++                  .user_data = synthetic_submission(feedback),
+                   .error = MTL_COMMAND_QUEUE_ERROR_INTERNAL,
+                   .error_message = "synthetic feedback before Vulkan teardown"};
+                callback(&live_error);
+@@ -269,7 +288,7 @@
+             vkDestroyInstance(instance, NULL);
+             if (one_time)
+                CHECK(live_objects(objects) == objects.count);
+-            CHECK(late_error->device == NULL);
++            CHECK(feedback->device == NULL);
+             CHECK(live_objects(weak_queue) == 1);
+             struct mtl_feedback_data success = {.user_data = late_success,
+                .error = MTL_COMMAND_QUEUE_ERROR_NONE};
+diff --git a/src/kosmickrisp/vulkan/tests/test_owed_signal_bound.c b/src/kosmickrisp/vulkan/tests/test_owed_signal_bound.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f84ec379cc28bce08e1d250428757959cb480d76
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_owed_signal_bound.c
+@@ -0,0 +1,125 @@
++/* SPDX-License-Identifier: MIT */
++
++/* The queue keeps a record of every signal it hands to Metal until the event
++ * reaches its value, so it can raise the ones a failed submission destroys.
++ * A submit with no command buffers still enqueues its signals but commits
++ * nothing, so no completion prunes the list after it.  A guest that polls with
++ * fence- or semaphore-only submits must not grow the list, and the Metal
++ * events it retains, for as long as no command buffer completes. */
++
++#define VK_NO_PROTOTYPES
++#include "kk_device.h"
++#include "kk_queue.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++#define SIGNALS 1000u
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan12Features features = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++      .timelineSemaphore = VK_TRUE,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateSemaphore);
++   LOAD_D(vkDestroySemaphore);
++   LOAD_D(vkWaitSemaphores);
++   LOAD_D(vkQueueSubmit);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, 0, 0, &queue);
++
++   VkSemaphoreTypeCreateInfo semaphore_type = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++   };
++   VkSemaphoreCreateInfo semaphore_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++      .pNext = &semaphore_type,
++   };
++   VkSemaphore semaphore = VK_NULL_HANDLE;
++   CHECK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore) ==
++         VK_SUCCESS);
++
++   /* Signal-only submits, each waited for, so every event has reached its
++    * value by the time the next signal is recorded. */
++   for (uint64_t value = 1; value <= SIGNALS; value++) {
++      VkTimelineSemaphoreSubmitInfo timeline = {
++         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++         .signalSemaphoreValueCount = 1,
++         .pSignalSemaphoreValues = &value,
++      };
++      VkSubmitInfo submit = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .pNext = &timeline,
++         .signalSemaphoreCount = 1,
++         .pSignalSemaphores = &semaphore,
++      };
++      CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
++      VkSemaphoreWaitInfo wait = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++         .semaphoreCount = 1,
++         .pSemaphores = &semaphore,
++         .pValues = &value,
++      };
++      CHECK(vkWaitSemaphores(device, &wait, 10000000000ull) == VK_SUCCESS);
++   }
++
++   /* Only the last record can still be listed: nothing had pruned it yet. */
++   struct kk_queue_feedback *feedback =
++      kk_device_from_handle(device)->queue.feedback;
++   simple_mtx_lock(&feedback->signal_mutex);
++   unsigned listed =
++      util_dynarray_num_elements(&feedback->signals, struct kk_queue_signal);
++   simple_mtx_unlock(&feedback->signal_mutex);
++   fprintf(stderr, "%u owed-signal records after %u signal-only submits\n",
++           listed, SIGNALS);
++   CHECK(listed <= 1u);
++
++   vkDestroySemaphore(device, semaphore, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("signal-only submits keep only their outstanding signals\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_signal_lifetime.m b/src/kosmickrisp/vulkan/tests/test_signal_lifetime.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce20df8e1d3777075cbb5f19014cd3e27843650f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_signal_lifetime.m
+@@ -0,0 +1,299 @@
++/* SPDX-License-Identifier: MIT */
++
++/* Whoever sees a signal delivered may destroy the fence or semaphore that
++ * carried it at once: an application may destroy a fence it has read as
++ * signaled, and vkQueueWaitIdle destroys its own sync as soon as its wait
++ * returns. With the assisted submission worker, the worker can still be inside
++ * the driver's submit when that happens, so the driver must take everything it
++ * needs from a signal's sync before handing the signal to Metal.
++ *
++ * The window after the enqueue is a few instructions wide, so the test widens
++ * it. It interposes the Metal queue's signalEvent:value: to hold the submitting
++ * thread once Metal has the signal, and destroys each fence and semaphore as
++ * soon as it reads it signaled. Those objects come from an allocator that
++ * poisons freed memory and never hands it out again, so a driver that reads
++ * one after the enqueue dereferences a poisoned event pointer instead of stale
++ * data or a newer object that reused the memory. */
++
++#define VK_NO_PROTOTYPES
++#include "vk_queue.h"
++
++#include <Metal/Metal.h>
++#include <malloc/malloc.h>
++#include <objc/runtime.h>
++
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++/* How long an interposed signal holds the submitting thread once Metal has
++ * the signal: far longer than Metal takes to deliver a signal on an idle
++ * queue, so the destroy lands inside the hold. */
++static const uint64_t hold_ns = 20ull * 1000000ull;
++static const uint64_t observe_timeout_ns = 10ull * 1000000000ull;
++static const unsigned rounds = 8u;
++
++typedef void (*signal_event_fn)(id, SEL, id, uint64_t);
++static signal_event_fn original_signal_event;
++static atomic_bool hold_signals;
++static atomic_bool holding;
++static atomic_uint held;
++
++static uint64_t
++now_ns(void)
++{
++   return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++}
++
++static void
++held_signal_event(id queue, SEL selector, id event, uint64_t value)
++{
++   original_signal_event(queue, selector, event, value);
++   if (!atomic_load(&hold_signals))
++      return;
++   atomic_store(&holding, true);
++   atomic_fetch_add(&held, 1u);
++   struct timespec rest = {0, (long)hold_ns};
++   while (nanosleep(&rest, &rest) != 0)
++      ;
++   atomic_store(&holding, false);
++}
++
++/* The pattern is not an Objective-C tagged pointer, so retaining or releasing
++ * a poisoned event faults rather than being ignored. */
++static void *VKAPI_PTR
++quarantine_alloc(void *data, size_t size, size_t alignment,
++                 VkSystemAllocationScope scope)
++{
++   (void)data; (void)scope;
++   void *p = NULL;
++   if (posix_memalign(&p, alignment < sizeof(void *) ? sizeof(void *) : alignment,
++                      size) != 0)
++      return NULL;
++   return p;
++}
++
++static void VKAPI_PTR
++quarantine_free(void *data, void *p)
++{
++   (void)data;
++   if (p)
++      memset(p, 0x55, malloc_size(p));
++}
++
++static void *VKAPI_PTR
++quarantine_realloc(void *data, void *old, size_t size, size_t alignment,
++                   VkSystemAllocationScope scope)
++{
++   if (!size) {
++      quarantine_free(data, old);
++      return NULL;
++   }
++   void *p = quarantine_alloc(data, size, alignment, scope);
++   if (p && old) {
++      size_t kept = malloc_size(old);
++      memcpy(p, old, kept < size ? kept : size);
++      quarantine_free(data, old);
++   }
++   return p;
++}
++
++static const VkAllocationCallbacks quarantine = {
++   .pfnAllocation = quarantine_alloc,
++   .pfnReallocation = quarantine_realloc,
++   .pfnFree = quarantine_free,
++};
++
++static void
++interpose_queue_signal(void)
++{
++   @autoreleasepool {
++      id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
++      CHECK(mtl);
++      id<MTL4CommandQueue> probe = [mtl newMTL4CommandQueue];
++      CHECK(probe);
++      Method method = class_getInstanceMethod(object_getClass(probe),
++                                              @selector(signalEvent:value:));
++      CHECK(method);
++      original_signal_event = (signal_event_fn)method_getImplementation(method);
++      method_setImplementation(method, (IMP)held_signal_event);
++      [probe release];
++      [mtl release];
++   }
++}
++
++int
++main(void)
++{
++   setvbuf(stdout, NULL, _IONBF, 0);
++   interpose_queue_signal();
++
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .pApplicationName = "signal-lifetime",
++      .apiVersion = VK_API_VERSION_1_3,
++   };
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t physical_count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult result = vkEnumeratePhysicalDevices(instance, &physical_count,
++                                                &physical);
++   CHECK((result == VK_SUCCESS || result == VK_INCOMPLETE) && physical);
++
++   float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan12Features features12 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++      .timelineSemaphore = VK_TRUE,
++   };
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features12,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkCreateSemaphore);
++   LOAD_D(vkDestroySemaphore);
++   LOAD_D(vkSignalSemaphore);
++   LOAD_D(vkGetSemaphoreCounterValue);
++   LOAD_D(vkCreateFence);
++   LOAD_D(vkDestroyFence);
++   LOAD_D(vkGetFenceStatus);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, 0, 0, &queue);
++
++   VkSemaphoreTypeCreateInfo timeline_type = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++   };
++   VkSemaphoreCreateInfo timeline_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++      .pNext = &timeline_type,
++   };
++   VkPipelineStageFlags top = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++
++   /* A wait only the host can release turns the submission worker on, and it
++    * stays on for the life of the device. */
++   VkSemaphore gate = VK_NULL_HANDLE;
++   CHECK(vkCreateSemaphore(device, &timeline_info, NULL, &gate) == VK_SUCCESS);
++   uint64_t gate_value = 1;
++   VkTimelineSemaphoreSubmitInfo gate_values = {
++      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++      .waitSemaphoreValueCount = 1,
++      .pWaitSemaphoreValues = &gate_value,
++   };
++   VkSubmitInfo gated = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .pNext = &gate_values,
++      .waitSemaphoreCount = 1,
++      .pWaitSemaphores = &gate,
++      .pWaitDstStageMask = &top,
++   };
++   CHECK(vkQueueSubmit(queue, 1, &gated, VK_NULL_HANDLE) == VK_SUCCESS);
++   VkSemaphoreSignalInfo release = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
++      .semaphore = gate,
++      .value = 1,
++   };
++   CHECK(vkSignalSemaphore(device, &release) == VK_SUCCESS);
++   CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++   vkDestroySemaphore(device, gate, NULL);
++   {
++      VK_FROM_HANDLE(vk_queue, runtime_queue, queue);
++      CHECK(runtime_queue->submit.mode == VK_QUEUE_SUBMIT_MODE_THREADED);
++   }
++
++   atomic_store(&hold_signals, true);
++   unsigned inside = 0u;
++   for (unsigned round = 0u; round < rounds; ++round) {
++      /* A binary payload, which vkQueueWaitIdle's own sync also uses. */
++      VkFenceCreateInfo fence_info = {
++         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++      };
++      VkFence fence = VK_NULL_HANDLE;
++      CHECK(vkCreateFence(device, &fence_info, &quarantine, &fence) ==
++            VK_SUCCESS);
++      CHECK(vkQueueSubmit(queue, 0, NULL, fence) == VK_SUCCESS);
++      const uint64_t fence_deadline = now_ns() + observe_timeout_ns;
++      while ((result = vkGetFenceStatus(device, fence)) == VK_NOT_READY)
++         CHECK(now_ns() < fence_deadline);
++      CHECK(result == VK_SUCCESS);
++      vkDestroyFence(device, fence, &quarantine);
++      inside += atomic_load(&holding);
++      /* The worker reaches this submit only after leaving the last one. */
++      CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++
++      /* A timeline payload. */
++      VkSemaphore timeline = VK_NULL_HANDLE;
++      CHECK(vkCreateSemaphore(device, &timeline_info, &quarantine,
++                              &timeline) == VK_SUCCESS);
++      uint64_t signal_value = 1;
++      VkTimelineSemaphoreSubmitInfo signal_values = {
++         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++         .signalSemaphoreValueCount = 1,
++         .pSignalSemaphoreValues = &signal_value,
++      };
++      VkSubmitInfo signal = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .pNext = &signal_values,
++         .signalSemaphoreCount = 1,
++         .pSignalSemaphores = &timeline,
++      };
++      CHECK(vkQueueSubmit(queue, 1, &signal, VK_NULL_HANDLE) == VK_SUCCESS);
++      const uint64_t timeline_deadline = now_ns() + observe_timeout_ns;
++      uint64_t value = 0;
++      while (vkGetSemaphoreCounterValue(device, timeline, &value) ==
++                VK_SUCCESS &&
++             value < signal_value)
++         CHECK(now_ns() < timeline_deadline);
++      CHECK(value == signal_value);
++      vkDestroySemaphore(device, timeline, &quarantine);
++      inside += atomic_load(&holding);
++      CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++   }
++   atomic_store(&hold_signals, false);
++
++   /* Otherwise the interposer never ran, or no destroy landed inside a hold,
++    * and a pass would prove nothing. */
++   CHECK(atomic_load(&held) > 0u);
++   CHECK(inside > 0u);
++   printf("signal lifetime: %u of %u syncs destroyed while the submit worker "
++          "was still inside the submit that signaled them\n",
++          inside, 2u * rounds);
++
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   return 0;
++}

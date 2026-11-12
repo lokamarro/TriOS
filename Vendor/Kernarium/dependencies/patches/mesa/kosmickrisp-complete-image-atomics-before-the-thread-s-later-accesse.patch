@@ -1,0 +1,999 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:37:28 +0900
+Subject: [PATCH] kosmickrisp: complete image atomics before the thread's later
+ accesses
+
+Metal issues a texture atomic whose result the shader does not use
+without waiting for it, and the texture fence the driver places after
+every image atomic does not order it before the same thread's later
+accesses to the texel. A load that follows can return the value from
+before the atomic, and a store that follows can land before it. This
+is a defect in the MSL KosmicKrisp generates, which relies on that
+texture fence; a plain Metal program without Mesa reproduces it.
+
+KHR-GLES31.core.compute_shader.resource-image hit this through Zink in
+about one session in a hundred: its kernel zeroes a texel, adds the
+coordinate sum atomically, reads the texel back and copies it to a
+second image, and the copy held zero for one 8x4 block - one SIMD
+group - while the first image held the sum. The standalone kernel
+loses the same blocks in roughly one dispatch in 10,000 to 100,000 on
+an Apple7 GPU under macOS 27.0.1, more often on a busy GPU. A
+device-scope fence over device and texture memory removes the loss;
+the texture fence, a texture-only thread fence and texture barriers at
+threadgroup or SIMD-group scope do not.
+
+Atomics on one texel stay ordered among themselves and one fence
+completes all of a thread's earlier atomics, so the translation emits
+that fence as KK_WORKAROUND_20 only once an atomic may be outstanding,
+before the next image or global access, barrier or termination and at
+the end of the shader. A kernel of nothing but unused atomics runs
+1.8% longer, where a fence after every atomic cost 75%.
+
+kosmickrisp_image_atomic_order checks every texel of 64,000 dispatches
+each of the read and the overwrite shape, and with
+MESA_KK_DISABLE_WORKAROUNDS=20 its --expect-loss mode reproduces the
+loss. kosmickrisp_msl_image_atomic_order checks where the fence goes
+for straight-line code, a trailing atomic and atomics in a loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/drivers/kosmickrisp/workarounds.rst      |  46 +++
+ src/kosmickrisp/compiler/msl_private.h        |   2 +
+ src/kosmickrisp/compiler/nir_to_msl.c         |  82 +++++
+ src/kosmickrisp/vulkan/meson.build            |   2 +
+ .../image_atomic_order_shaders/read.comp      |  19 ++
+ .../image_atomic_order_shaders/read.comp.h    |  56 +++
+ .../image_atomic_order_shaders/write.comp     |  20 ++
+ .../image_atomic_order_shaders/write.comp.h   |  59 ++++
+ .../vulkan/tests/test_image_atomic_order.c    | 319 ++++++++++++++++++
+ .../tests/test_msl_image_atomic_order.c       | 188 +++++++++++
+ 10 files changed, 793 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp
+ create mode 100644 src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp
+ create mode 100644 src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_image_atomic_order.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_image_atomic_order.c
+
+diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
+index de77d672211eafd60665deccd1f9c8bbab741420..192eb59af49ec2b87c2e1b13f49a3ba9d9732cf5 100644
+--- a/docs/drivers/kosmickrisp/workarounds.rst
++++ b/docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,52 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_20
++----------------
++| macOS version: 27.0
++| Metal ticket: Not reported
++| Metal ticket status:
++| CTS test failure: ``KHR-GLES31.core.compute_shader.resource-image`` (through Zink)
++| Comments:
++
++A texture atomic whose result the shader does not use is issued without
++waiting for it, and nothing the driver placed after it orders it before the
++same thread's later accesses to the texel: neither the texture's ``fence()``,
++nor ``atomic_thread_fence`` over ``mem_texture`` alone at device scope, nor
++``threadgroup_barrier`` or ``simdgroup_barrier`` over ``mem_texture``. A read
++that follows such an atomic can return the value from before it, and a write
++that follows it can land first, so the atomic's effect survives the write.
++
++On an Apple7 GPU under macOS 27.0.1 (build 26A434), a kernel that writes zero
++to an ``r32uint`` texel, fences, adds the coordinate sum with
++``atomic_fetch_add``, fences again and reads the texel back reads zero for
++whole or partial 8x4 blocks of a 64x64 image - the 32 threads of a SIMD
++group - while the texel itself holds the sum. It happens in roughly one
++dispatch in 10,000 to 100,000, more often the busier the GPU is. Using the
++atomic's result removes the loss, and so does a fence over both
++``mem_device`` and ``mem_texture`` at device scope; that fence at thread or
++SIMD-group scope, or over ``mem_device`` or ``mem_threadgroup`` without
++``mem_texture``, does not.
++
++Atomics on one texel are ordered among themselves, and one such fence
++completes every atomic the thread issued before it. The workaround therefore
++emits ``atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture,
++memory_order_seq_cst, thread_scope_device)`` once an image atomic or atomic
++exchange may still be outstanding, just before the next image or global
++access, barrier or termination, and at the end of the shader. After a
++branch the fence is owed if either side owes it, and a loop whose body has
++an atomic owes it throughout. Interleaved on the same GPU, a
++kernel of 32 unused atomics per thread runs 1.8% longer (eager fences after
++every atomic: 75%; keeping every result: 67%), a luminance histogram 2.5%,
++and four atomics between arithmetic 6%; shaders without image atomics
++translate as before. ``kosmickrisp_image_atomic_order`` checks every texel
++of 128,000 dispatches of both shapes; with the workaround disabled,
++``--expect-loss`` and a larger iteration count reproduce the loss.
++``kosmickrisp_msl_image_atomic_order`` checks where the fence goes.
++
++| Log:
++| 2026-11-02: Workaround implemented
++
+ KK_WORKAROUND_19
+ ----------------
+ | macOS version: 27.0
+diff --git a/src/kosmickrisp/compiler/msl_private.h b/src/kosmickrisp/compiler/msl_private.h
+index ba7a292d87de9080797b3487eecfbbde368e39bc..7f9b87debb5679b795b88595b3cc98ef0e4a58de 100644
+--- a/src/kosmickrisp/compiler/msl_private.h
++++ b/src/kosmickrisp/compiler/msl_private.h
+@@ -25,6 +25,8 @@ struct nir_to_msl_ctx {
+    struct _mesa_string_buffer *text;
+    uint64_t disabled_workarounds;
+    bool uses_per_draw_data;
++   /* KK_WORKAROUND_20 */
++   bool image_atomics_unordered;
+    unsigned short indentlevel;
+    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
+    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 91ed11fad6f28cc5309d3153403f26cb8807bc16..8fa23b4077e5553c0071de0ca4466036c0e5c151 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -309,6 +309,65 @@ msl_emit_terminate(struct nir_to_msl_ctx *ctx)
+    P_IND(ctx, "return {};\n");
+ }
+ 
++/* KK_WORKAROUND_20 */
++static void
++msl_issue_image_atomic(struct nir_to_msl_ctx *ctx)
++{
++   if (!(ctx->disabled_workarounds & BITFIELD64_BIT(20)))
++      ctx->image_atomics_unordered = true;
++}
++
++/* KK_WORKAROUND_20 */
++static void
++msl_complete_image_atomics(struct nir_to_msl_ctx *ctx)
++{
++   if (!ctx->image_atomics_unordered)
++      return;
++
++   P_IND(ctx, "atomic_thread_fence(mem_flags::mem_device | "
++              "mem_flags::mem_texture, memory_order_seq_cst, "
++              "thread_scope::thread_scope_device);\n");
++   ctx->image_atomics_unordered = false;
++}
++
++/* KK_WORKAROUND_20 */
++static bool
++msl_intrinsic_needs_image_atomics_complete(nir_intrinsic_op op)
++{
++   switch (op) {
++   case nir_intrinsic_bindless_image_load:
++   case nir_intrinsic_bindless_image_store:
++   case nir_intrinsic_load_global:
++   case nir_intrinsic_store_global:
++   case nir_intrinsic_global_atomic:
++   case nir_intrinsic_global_atomic_swap:
++   case nir_intrinsic_barrier:
++   case nir_intrinsic_terminate:
++   case nir_intrinsic_terminate_if:
++   case nir_intrinsic_printf_abort:
++      return true;
++   default:
++      return false;
++   }
++}
++
++/* KK_WORKAROUND_20 */
++static bool
++msl_cf_node_has_image_atomic(nir_cf_node *node)
++{
++   nir_foreach_block_in_cf_node(block, node) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
++         if (op == nir_intrinsic_bindless_image_atomic ||
++             op == nir_intrinsic_bindless_image_atomic_swap)
++            return true;
++      }
++   }
++   return false;
++}
++
+ /* KK_WORKAROUND_17 */
+ static bool
+ msl_coherent_scalar_is_atomic(const char *scalar_type)
+@@ -1508,6 +1567,10 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+        instr->intrinsic == nir_intrinsic_load_barycentric_at_offset)
+       return;
+ 
++   /* KK_WORKAROUND_20 */
++   if (msl_intrinsic_needs_image_atomics_complete(instr->intrinsic))
++      msl_complete_image_atomics(ctx);
++
+    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
+    if (instrinsic_needs_dest_type(instr)) {
+       P_IND(ctx, "t%d = ", instr->def.index);
+@@ -2054,6 +2117,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P(ctx, ", ");
+       src_to_msl(ctx, &instr->src[3]);
+       P(ctx, ").x;\n");
++      msl_issue_image_atomic(ctx);
+       break;
+    case nir_intrinsic_bindless_image_atomic_swap: {
+       const char *type = msl_type_for_def(ctx->types, &instr->def);
+@@ -2066,6 +2130,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P(ctx, ", &ta%d, ", instr->def.index);
+       src_to_msl(ctx, &instr->src[4]);
+       P(ctx, "); %s t%d = ta%d.x;\n", type, instr->def.index, instr->def.index);
++      msl_issue_image_atomic(ctx);
+       break;
+    }
+    case nir_intrinsic_bindless_image_fence_kk: {
+@@ -2558,6 +2623,9 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
+    }
+    case nir_cf_node_if: {
+       nir_if *ifnode = nir_cf_node_as_if(node);
++      /* KK_WORKAROUND_20: each branch starts from the state before the if, and
++       * an atomic either branch leaves unordered follows the if. */
++      const bool unordered = ctx->image_atomics_unordered;
+       P_IND(ctx, "if (");
+       src_to_msl(ctx, &ifnode->condition);
+       P(ctx, ") {\n");
+@@ -2566,6 +2634,8 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
+          cf_node_to_metal(ctx, node);
+       }
+       ctx->indentlevel--;
++      const bool then_unordered = ctx->image_atomics_unordered;
++      ctx->image_atomics_unordered = unordered;
+       if (!nir_cf_list_is_empty_block(&ifnode->else_list)) {
+          P_IND(ctx, "} else {\n");
+          ctx->indentlevel++;
+@@ -2574,6 +2644,7 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
+          }
+          ctx->indentlevel--;
+       }
++      ctx->image_atomics_unordered |= then_unordered;
+       P_IND(ctx, "}\n");
+       break;
+    }
+@@ -2589,11 +2660,20 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
+                "; ++no_crash) {\n",
+                UINT64_MAX);
+       }
++      /* KK_WORKAROUND_20: an atomic anywhere in the body may precede every
++       * iteration's accesses and whatever follows the loop, and a break can
++       * leave before a fence the body emits. */
++      const bool unordered =
++         ctx->image_atomics_unordered ||
++         (!(ctx->disabled_workarounds & BITFIELD64_BIT(20)) &&
++          msl_cf_node_has_image_atomic(node));
++      ctx->image_atomics_unordered = unordered;
+       ctx->indentlevel++;
+       foreach_list_typed(nir_cf_node, node, node, &loop->body) {
+          cf_node_to_metal(ctx, node);
+       }
+       ctx->indentlevel--;
++      ctx->image_atomics_unordered = unordered;
+       P_IND(ctx, "}\n");
+       break;
+    }
+@@ -2938,6 +3018,8 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+    foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+       cf_node_to_metal(&ctx, node);
+    }
++   /* KK_WORKAROUND_20 */
++   msl_complete_image_atomics(&ctx);
+    emit_output_return(&ctx, shader);
+    ctx.indentlevel--;
+    P(&ctx, "}\n");
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 5875f020e09451dad4a2cd33f259c33329c8f1f8..f89a18924cf57552bc2e490cf68363c3251ee207 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -403,6 +403,7 @@ if with_tests
+     foreach kk_public_test : [
+       ['metal_objects_export', []],
+       ['texel_buffer_bounds', []],
++      ['image_atomic_order', []],
+       ['address_binding_planes', []],
+       ['drm_plane_offset', []],
+       ['undescribed_format', []],
+@@ -748,6 +749,7 @@ if with_tests
+     'msl_temporaries',
+     'msl_coherent_access',
+     'msl_compare_exchange',
++    'msl_image_atomic_order',
+     'subgroup_stages',
+   ]
+     test(
+diff --git a/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbf0492f9fcd29b072f03a639c23d9fb2934c496
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp
+@@ -0,0 +1,19 @@
++#version 450
++
++/* The shape of KHR-GLES31.core.compute_shader.resource-image: zero a texel,
++ * add its coordinate sum atomically without using the result, and copy what
++ * the texel then reads back into the second image. */
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(set = 0, binding = 0, r32ui) uniform coherent uimage2D sums;
++layout(set = 0, binding = 1, r32ui) uniform uimage2D copies;
++
++void main()
++{
++   ivec2 c = ivec2(gl_GlobalInvocationID.xy);
++   imageStore(sums, c, uvec4(0u));
++   memoryBarrierImage();
++   imageAtomicAdd(sums, c, uint(c.x + c.y));
++   memoryBarrierImage();
++   imageStore(copies, c, imageLoad(sums, c));
++}
+diff --git a/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp.h b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..87d025e80cd9f56046643b995ecb9d90dd095bb8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/read.comp.h
+@@ -0,0 +1,56 @@
++{0x07230203,0x00010600,0x000d000b,0x0000002d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000014,0x00000027,
++0x00060010,0x00000004,0x00000011,0x00000008,
++0x00000008,0x00000001,0x00040047,0x0000000d,
++0x0000000b,0x0000001c,0x00030047,0x00000014,
++0x00000017,0x00040047,0x00000014,0x00000021,
++0x00000000,0x00040047,0x00000014,0x00000022,
++0x00000000,0x00040047,0x00000027,0x00000021,
++0x00000001,0x00040047,0x00000027,0x00000022,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040017,0x00000007,
++0x00000006,0x00000002,0x00040015,0x0000000a,
++0x00000020,0x00000000,0x00040017,0x0000000b,
++0x0000000a,0x00000003,0x00040020,0x0000000c,
++0x00000001,0x0000000b,0x0004003b,0x0000000c,
++0x0000000d,0x00000001,0x00040017,0x0000000e,
++0x0000000a,0x00000002,0x00090019,0x00000012,
++0x0000000a,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000002,0x00000021,0x00040020,
++0x00000013,0x00000000,0x00000012,0x0004003b,
++0x00000013,0x00000014,0x00000000,0x00040017,
++0x00000017,0x0000000a,0x00000004,0x0004002b,
++0x0000000a,0x00000018,0x00000000,0x0007002c,
++0x00000017,0x00000019,0x00000018,0x00000018,
++0x00000018,0x00000018,0x0004002b,0x0000000a,
++0x0000001a,0x00000001,0x0004002b,0x0000000a,
++0x0000001b,0x00000808,0x00040020,0x00000024,
++0x0000000b,0x0000000a,0x0004003b,0x00000013,
++0x00000027,0x00000000,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x0000000b,0x0000000f,
++0x0000000d,0x0007004f,0x0000000e,0x00000010,
++0x0000000f,0x0000000f,0x00000000,0x00000001,
++0x0004007c,0x00000007,0x00000011,0x00000010,
++0x0004003d,0x00000012,0x00000015,0x00000014,
++0x00050063,0x00000015,0x00000011,0x00000019,
++0x00002000,0x000300e1,0x0000001a,0x0000001b,
++0x00050051,0x00000006,0x0000001f,0x00000011,
++0x00000000,0x00050051,0x00000006,0x00000021,
++0x00000011,0x00000001,0x00050080,0x00000006,
++0x00000022,0x0000001f,0x00000021,0x0004007c,
++0x0000000a,0x00000023,0x00000022,0x0006003c,
++0x00000024,0x00000025,0x00000014,0x00000011,
++0x00000018,0x000700ea,0x0000000a,0x00000026,
++0x00000025,0x0000001a,0x00000018,0x00000023,
++0x000300e1,0x0000001a,0x0000001b,0x0004003d,
++0x00000012,0x00000028,0x00000027,0x0004003d,
++0x00000012,0x0000002a,0x00000014,0x00060062,
++0x00000017,0x0000002c,0x0000002a,0x00000011,
++0x00002000,0x00050063,0x00000028,0x00000011,
++0x0000002c,0x00002000,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b51429cf82bdf4ff63c7cb6681a22161e7a05d8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp
+@@ -0,0 +1,20 @@
++#version 450
++
++/* Zero a texel, add to it atomically without using the result, then
++ * overwrite it: the texel must end up holding the value written last. */
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(set = 0, binding = 0, r32ui) uniform coherent uimage2D sums;
++layout(set = 0, binding = 1, r32ui) uniform uimage2D copies;
++
++void main()
++{
++   ivec2 c = ivec2(gl_GlobalInvocationID.xy);
++   uint sum = uint(c.x + c.y);
++   imageStore(sums, c, uvec4(0u));
++   memoryBarrierImage();
++   imageAtomicAdd(sums, c, 1000u);
++   memoryBarrierImage();
++   imageStore(sums, c, uvec4(sum));
++   imageStore(copies, c, uvec4(sum));
++}
+diff --git a/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp.h b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c294686fa6853dbf8ff124165b83f5afd9f5caf5
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/image_atomic_order_shaders/write.comp.h
+@@ -0,0 +1,59 @@
++{0x07230203,0x00010600,0x000d000b,0x00000030,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x0000001f,0x0000002e,
++0x00060010,0x00000004,0x00000011,0x00000008,
++0x00000008,0x00000001,0x00040047,0x0000000d,
++0x0000000b,0x0000001c,0x00030047,0x0000001f,
++0x00000017,0x00040047,0x0000001f,0x00000021,
++0x00000000,0x00040047,0x0000001f,0x00000022,
++0x00000000,0x00040047,0x0000002e,0x00000021,
++0x00000001,0x00040047,0x0000002e,0x00000022,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000001,0x00040017,0x00000007,
++0x00000006,0x00000002,0x00040015,0x0000000a,
++0x00000020,0x00000000,0x00040017,0x0000000b,
++0x0000000a,0x00000003,0x00040020,0x0000000c,
++0x00000001,0x0000000b,0x0004003b,0x0000000c,
++0x0000000d,0x00000001,0x00040017,0x0000000e,
++0x0000000a,0x00000002,0x0004002b,0x0000000a,
++0x00000014,0x00000000,0x0004002b,0x0000000a,
++0x00000018,0x00000001,0x00090019,0x0000001d,
++0x0000000a,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000002,0x00000021,0x00040020,
++0x0000001e,0x00000000,0x0000001d,0x0004003b,
++0x0000001e,0x0000001f,0x00000000,0x00040017,
++0x00000022,0x0000000a,0x00000004,0x0007002c,
++0x00000022,0x00000023,0x00000014,0x00000014,
++0x00000014,0x00000014,0x0004002b,0x0000000a,
++0x00000024,0x00000808,0x0004002b,0x0000000a,
++0x00000026,0x000003e8,0x00040020,0x00000027,
++0x0000000b,0x0000000a,0x0004003b,0x0000001e,
++0x0000002e,0x00000000,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x0000000b,0x0000000f,
++0x0000000d,0x0007004f,0x0000000e,0x00000010,
++0x0000000f,0x0000000f,0x00000000,0x00000001,
++0x0004007c,0x00000007,0x00000011,0x00000010,
++0x00050051,0x00000006,0x00000017,0x00000011,
++0x00000000,0x00050051,0x00000006,0x0000001a,
++0x00000011,0x00000001,0x00050080,0x00000006,
++0x0000001b,0x00000017,0x0000001a,0x0004007c,
++0x0000000a,0x0000001c,0x0000001b,0x0004003d,
++0x0000001d,0x00000020,0x0000001f,0x00050063,
++0x00000020,0x00000011,0x00000023,0x00002000,
++0x000300e1,0x00000018,0x00000024,0x0006003c,
++0x00000027,0x00000028,0x0000001f,0x00000011,
++0x00000014,0x000700ea,0x0000000a,0x00000029,
++0x00000028,0x00000018,0x00000014,0x00000026,
++0x000300e1,0x00000018,0x00000024,0x0004003d,
++0x0000001d,0x0000002a,0x0000001f,0x00070050,
++0x00000022,0x0000002d,0x0000001c,0x0000001c,
++0x0000001c,0x0000001c,0x00050063,0x0000002a,
++0x00000011,0x0000002d,0x00002000,0x0004003d,
++0x0000001d,0x0000002f,0x0000002e,0x00050063,
++0x0000002f,0x00000011,0x0000002d,0x00002000,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_image_atomic_order.c b/src/kosmickrisp/vulkan/tests/test_image_atomic_order.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8cdbd5ec07d7bdc651e22a90402cc6abe3ea9ca
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_image_atomic_order.c
+@@ -0,0 +1,319 @@
++/* SPDX-License-Identifier: MIT */
++
++/* An image atomic whose result a shader does not use must still be ordered
++ * before the same invocation's later accesses to that texel: a load that
++ * follows it has to return what the atomic left, and a store that follows it
++ * has to be the value the texel keeps.  Metal issues such an atomic without
++ * waiting for it, and the texture fence the driver places after it does not
++ * order it, so without KK_WORKAROUND_20 a load now and then returns the value
++ * from before the atomic and a later store now and then lands before it.  The
++ * loss hits a SIMD group at a time and is rare; it comes more often the
++ * busier the GPU is.
++ *
++ * Every dispatch here runs one of the two shapes over a 64x64 image pair, many
++ * dispatches to a command buffer, and every texel of every pair is checked.
++ * The test fails on any texel that is wrong.  With
++ * MESA_KK_DISABLE_WORKAROUNDS=20, `--expect-loss` makes it fail instead when
++ * no texel was lost, which is how it reproduces the defect. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "kk_test.h"
++
++static const uint32_t read_comp[] =
++#include "image_atomic_order_shaders/read.comp.h"
++   ;
++static const uint32_t write_comp[] =
++#include "image_atomic_order_shaders/write.comp.h"
++   ;
++
++#define SIZE         64u
++#define TEXELS       (SIZE * SIZE)
++#define PAIRS        64u
++#define ITERATIONS   2000u
++
++int
++main(int argc, char **argv)
++{
++   const bool expect_loss = argc > 1 && strcmp(argv[1], "--expect-loss") == 0;
++   const uint32_t iterations =
++      argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 0) : ITERATIONS;
++
++   struct kk_test_device t;
++   kk_test_create_instance(&t, NULL);
++   kk_test_create_device(&t, NULL, NULL, 0, NULL);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkCreateDescriptorSetLayout);
++   LOAD_D(vkDestroyDescriptorSetLayout);
++   LOAD_D(vkCreateComputePipelines);
++   LOAD_D(vkCreateDescriptorPool);
++   LOAD_D(vkDestroyDescriptorPool);
++   LOAD_D(vkAllocateDescriptorSets);
++   LOAD_D(vkUpdateDescriptorSets);
++   LOAD_D(vkCmdBindDescriptorSets);
++   LOAD_D(vkCmdDispatch);
++
++   /* Each pair: the image the atomic targets and the one its result is
++    * copied to. */
++   VkImage images[PAIRS][2];
++   VkDeviceMemory image_memory[PAIRS][2];
++   VkImageView views[PAIRS][2];
++   for (uint32_t p = 0; p < PAIRS; p++) {
++      for (uint32_t i = 0; i < 2; i++) {
++         VkImageCreateInfo info = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .imageType = VK_IMAGE_TYPE_2D,
++            .format = VK_FORMAT_R32_UINT,
++            .extent = {SIZE, SIZE, 1},
++            .mipLevels = 1,
++            .arrayLayers = 1,
++            .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_OPTIMAL,
++            .usage = VK_IMAGE_USAGE_STORAGE_BIT |
++                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++         };
++         VK_CHECK(vkCreateImage(device, &info, NULL, &images[p][i]));
++         image_memory[p][i] = kk_test_image_memory(
++            &t, images[p][i], VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++         views[p][i] = kk_test_image_view(&t, images[p][i],
++                                          VK_IMAGE_VIEW_TYPE_2D,
++                                          VK_FORMAT_R32_UINT,
++                                          VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
++      }
++   }
++
++   VkBuffer readback = VK_NULL_HANDLE;
++   VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++   void *mapped = NULL;
++   kk_test_buffer(&t, (VkDeviceSize)PAIRS * 2u * TEXELS * sizeof(uint32_t),
++                  VK_BUFFER_USAGE_TRANSFER_DST_BIT, KK_TEST_HOST_MEMORY,
++                  &readback, &readback_memory, &mapped);
++   const volatile uint32_t *words = mapped;
++
++   const VkDescriptorSetLayoutBinding bindings[] = {
++      {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
++       NULL},
++      {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
++       NULL},
++   };
++   VkDescriptorSetLayoutCreateInfo set_layout_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .bindingCount = 2,
++      .pBindings = bindings,
++   };
++   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateDescriptorSetLayout(device, &set_layout_info, NULL,
++                                        &set_layout));
++   VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1,
++      .pSetLayouts = &set_layout,
++   };
++   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
++   VK_CHECK(vkCreatePipelineLayout(device, &layout_info, NULL,
++                                   &pipeline_layout));
++
++   /* Shape 0 reads the texel after the atomic, shape 1 overwrites it. */
++   VkShaderModule modules[2] = {
++      kk_test_shader_module(&t, read_comp, sizeof(read_comp)),
++      kk_test_shader_module(&t, write_comp, sizeof(write_comp)),
++   };
++   VkPipeline pipelines[2];
++   for (uint32_t s = 0; s < 2; s++) {
++      VkComputePipelineCreateInfo pipeline_info = {
++         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++         .stage =
++            {
++               .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++               .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++               .module = modules[s],
++               .pName = "main",
++            },
++         .layout = pipeline_layout,
++      };
++      VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1,
++                                        &pipeline_info, NULL, &pipelines[s]));
++   }
++
++   const VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++                                           2u * PAIRS};
++   VkDescriptorPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++      .maxSets = PAIRS,
++      .poolSizeCount = 1,
++      .pPoolSizes = &pool_size,
++   };
++   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
++   VK_CHECK(vkCreateDescriptorPool(device, &pool_info, NULL,
++                                   &descriptor_pool));
++   VkDescriptorSet sets[PAIRS];
++   for (uint32_t p = 0; p < PAIRS; p++) {
++      VkDescriptorSetAllocateInfo set_info = {
++         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++         .descriptorPool = descriptor_pool,
++         .descriptorSetCount = 1,
++         .pSetLayouts = &set_layout,
++      };
++      VK_CHECK(vkAllocateDescriptorSets(device, &set_info, &sets[p]));
++      VkDescriptorImageInfo image_infos[2] = {
++         {VK_NULL_HANDLE, views[p][0], VK_IMAGE_LAYOUT_GENERAL},
++         {VK_NULL_HANDLE, views[p][1], VK_IMAGE_LAYOUT_GENERAL},
++      };
++      VkWriteDescriptorSet write = {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstSet = sets[p],
++         .dstBinding = 0,
++         .descriptorCount = 2,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++         .pImageInfo = image_infos,
++      };
++      vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
++   }
++
++   VkCommandPool command_pool = VK_NULL_HANDLE;
++   VkCommandBuffer command = VK_NULL_HANDLE;
++   kk_test_command_buffer(&t, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++                          &command_pool, &command);
++
++   const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                                          1};
++   uint64_t lost[2] = {0, 0}, lost_dispatches[2] = {0, 0};
++   for (uint32_t iteration = 0; iteration < iterations; iteration++) {
++      const uint32_t shape = iteration & 1u;
++      VkCommandBufferBeginInfo begin = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++      };
++      VK_CHECK(vkBeginCommandBuffer(command, &begin));
++
++      /* The previous iteration's copies, or nothing, come before the
++       * shader writes. */
++      VkImageMemoryBarrier to_shader[2 * PAIRS];
++      for (uint32_t p = 0; p < PAIRS; p++) {
++         for (uint32_t i = 0; i < 2; i++) {
++            to_shader[2 * p + i] = (VkImageMemoryBarrier){
++               .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++               .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++               .dstAccessMask =
++                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++               .oldLayout = iteration ? VK_IMAGE_LAYOUT_GENERAL
++                                      : VK_IMAGE_LAYOUT_UNDEFINED,
++               .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++               .image = images[p][i],
++               .subresourceRange = range,
++            };
++         }
++      }
++      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL,
++                           0, NULL, 2 * PAIRS, to_shader);
++
++      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
++                        pipelines[shape]);
++      for (uint32_t p = 0; p < PAIRS; p++) {
++         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
++                                 pipeline_layout, 0, 1, &sets[p], 0, NULL);
++         vkCmdDispatch(command, SIZE / 8u, SIZE / 8u, 1);
++      }
++
++      VkMemoryBarrier to_copy = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      };
++      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &to_copy, 0,
++                           NULL, 0, NULL);
++      for (uint32_t p = 0; p < PAIRS; p++) {
++         for (uint32_t i = 0; i < 2; i++) {
++            VkBufferImageCopy region = {
++               .bufferOffset =
++                  (VkDeviceSize)(2u * p + i) * TEXELS * sizeof(uint32_t),
++               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++               .imageExtent = {SIZE, SIZE, 1},
++            };
++            vkCmdCopyImageToBuffer(command, images[p][i],
++                                   VK_IMAGE_LAYOUT_GENERAL, readback, 1,
++                                   &region);
++         }
++      }
++      VkMemoryBarrier to_host = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++      };
++      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0,
++                           NULL, 0, NULL);
++      VK_CHECK(vkEndCommandBuffer(command));
++      VK_CHECK(kk_test_submit_and_wait(&t, command, 10ull * 1000000000ull));
++
++      for (uint32_t p = 0; p < PAIRS; p++) {
++         const volatile uint32_t *sums = words + (size_t)(2u * p) * TEXELS;
++         const volatile uint32_t *copies = sums + TEXELS;
++         uint32_t wrong = 0, first = 0;
++         for (uint32_t texel = 0; texel < TEXELS; texel++) {
++            const uint32_t sum = texel % SIZE + texel / SIZE;
++            if (sums[texel] != sum || copies[texel] != sum) {
++               if (!wrong)
++                  first = texel;
++               wrong++;
++            }
++         }
++         if (wrong) {
++            if (lost_dispatches[shape] < 8) {
++               fprintf(stderr,
++                       "iteration %u pair %u (%s): %u texel(s) wrong, first "
++                       "(%u,%u) holds %u and copied %u, sum %u\n",
++                       iteration, p, shape ? "write" : "read", wrong,
++                       first % SIZE, first / SIZE, sums[first], copies[first],
++                       first % SIZE + first / SIZE);
++            }
++            lost[shape] += wrong;
++            lost_dispatches[shape]++;
++         }
++      }
++   }
++
++   printf("%u dispatches of each shape: read lost %llu texel(s) in %llu, "
++          "write lost %llu texel(s) in %llu\n",
++          iterations / 2u * PAIRS, (unsigned long long)lost[0],
++          (unsigned long long)lost_dispatches[0], (unsigned long long)lost[1],
++          (unsigned long long)lost_dispatches[1]);
++   if (expect_loss)
++      CHECK(lost_dispatches[0] + lost_dispatches[1] > 0);
++   else
++      CHECK(lost_dispatches[0] + lost_dispatches[1] == 0);
++
++   vkDestroyCommandPool(device, command_pool, NULL);
++   vkDestroyDescriptorPool(device, descriptor_pool, NULL);
++   for (uint32_t s = 0; s < 2; s++) {
++      vkDestroyPipeline(device, pipelines[s], NULL);
++      vkDestroyShaderModule(device, modules[s], NULL);
++   }
++   vkDestroyPipelineLayout(device, pipeline_layout, NULL);
++   vkDestroyDescriptorSetLayout(device, set_layout, NULL);
++   vkDestroyBuffer(device, readback, NULL);
++   vkFreeMemory(device, readback_memory, NULL);
++   for (uint32_t p = 0; p < PAIRS; p++) {
++      for (uint32_t i = 0; i < 2; i++) {
++         vkDestroyImageView(device, views[p][i], NULL);
++         vkDestroyImage(device, images[p][i], NULL);
++         vkFreeMemory(device, image_memory[p][i], NULL);
++      }
++   }
++   kk_test_destroy(&t);
++   if (!expect_loss)
++      printf("an image atomic is ordered before the invocation's later "
++             "accesses to its texel\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_image_atomic_order.c b/src/kosmickrisp/vulkan/tests/test_msl_image_atomic_order.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8eee42eec04d415f5002f5801ab683f97164772c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_msl_image_atomic_order.c
+@@ -0,0 +1,188 @@
++/* SPDX-License-Identifier: MIT */
++
++/* Metal issues an image atomic whose result goes unused without waiting for
++ * it, and only a fence over device and texture memory at device scope orders
++ * it before the invocation's later accesses.  See KK_WORKAROUND_20.  The
++ * translation emits that fence once, before the first access that follows
++ * any number of atomics - an image or global access, a barrier or a
++ * termination - or at the end of the shader, and not between the atomics.
++ * Disabling the workaround emits no fence at all.
++ */
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "kk_test.h"
++
++#define FENCE                                                                  \
++   "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture, "     \
++   "memory_order_seq_cst, thread_scope::thread_scope_device);"
++
++enum shape {
++   /* An atomic and an exchange, then a load of the texel and a global store
++    * of what it read. */
++   SHAPE_STRAIGHT,
++   /* A histogram: the atomic is the last thing the kernel does. */
++   SHAPE_TAIL,
++   /* Atomics in a loop of unknown trip count, then a load. */
++   SHAPE_LOOP,
++};
++
++struct image {
++   nir_def *handle, *coord, *sample;
++};
++
++static void
++atomic_add(nir_builder *b, struct image *image, nir_def *value)
++{
++   nir_bindless_image_atomic(b, 32, image->handle, image->coord, image->sample,
++                             value, .image_dim = GLSL_SAMPLER_DIM_2D,
++                             .format = PIPE_FORMAT_R32_UINT,
++                             .access = ACCESS_COHERENT,
++                             .atomic_op = nir_atomic_op_iadd);
++}
++
++static void
++load_and_store(nir_builder *b, struct image *image)
++{
++   nir_def *loaded = nir_bindless_image_load(
++      b, 4, 32, image->handle, image->coord, image->sample, nir_imm_int(b, 0),
++      .image_dim = GLSL_SAMPLER_DIM_2D, .format = PIPE_FORMAT_R32_UINT,
++      .access = ACCESS_COHERENT, .dest_type = nir_type_uint32);
++   nir_store_global(b, nir_channel(b, loaded, 0), nir_imm_int64(b, 0x20000),
++                    .align_mul = 4);
++}
++
++static char *
++translate(enum shape shape, uint64_t disabled_workarounds)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_COMPUTE, &kk_nir_options, "msl image atomic order");
++   nir_shader *nir = b.shader;
++   nir->info.workgroup_size[0] = 1;
++   nir->info.workgroup_size[1] = 1;
++   nir->info.workgroup_size[2] = 1;
++
++   nir_def *id = nir_load_global_invocation_id(&b, 32);
++   struct image image = {
++      .handle = nir_load_texture_handle_kk(
++         &b, 1, 64, nir_imm_int64(&b, 0x10000), .dest_type = nir_type_uint32,
++         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
++         .access = ACCESS_COHERENT, .flags = MSL_ACCESS_READ_WRITE),
++      .coord = nir_vec4(&b, nir_channel(&b, id, 0), nir_channel(&b, id, 1),
++                        nir_imm_int(&b, 0), nir_imm_int(&b, 0)),
++      .sample = nir_imm_int(&b, 0),
++   };
++
++   switch (shape) {
++   case SHAPE_STRAIGHT:
++      atomic_add(&b, &image, nir_channel(&b, id, 0));
++      nir_bindless_image_atomic_swap(&b, 32, image.handle, image.coord,
++                                     image.sample, nir_imm_int(&b, 0),
++                                     nir_imm_int(&b, 1),
++                                     .image_dim = GLSL_SAMPLER_DIM_2D,
++                                     .format = PIPE_FORMAT_R32_UINT,
++                                     .access = ACCESS_COHERENT,
++                                     .atomic_op = nir_atomic_op_cmpxchg);
++      load_and_store(&b, &image);
++      break;
++   case SHAPE_TAIL:
++      atomic_add(&b, &image, nir_imm_int(&b, 1));
++      break;
++   case SHAPE_LOOP: {
++      nir_variable *index =
++         nir_local_variable_create(b.impl, glsl_uint_type(), "index");
++      nir_store_var(&b, index, nir_imm_int(&b, 0), 0x1);
++      nir_push_loop(&b);
++      {
++         nir_def *i = nir_load_var(&b, index);
++         nir_push_if(&b, nir_uge(&b, i, nir_channel(&b, id, 2)));
++         {
++            nir_jump(&b, nir_jump_break);
++         }
++         nir_pop_if(&b, NULL);
++         atomic_add(&b, &image, i);
++         nir_store_var(&b, index, nir_iadd_imm(&b, i, 1), 0x1);
++      }
++      nir_pop_loop(&b, NULL);
++      load_and_store(&b, &image);
++      break;
++   }
++   }
++
++   nir_validate_shader(nir, "msl image atomic order");
++   msl_optimize_nir(nir);
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   struct nir_to_msl_options options = {
++      .disabled_workarounds = disabled_workarounds,
++   };
++   char *msl = nir_to_msl(nir, &options);
++   CHECK(msl != NULL);
++   ralloc_free(nir);
++   return msl;
++}
++
++static unsigned
++count(const char *text, const char *needle)
++{
++   unsigned found = 0;
++   for (const char *at = strstr(text, needle); at != NULL;
++        at = strstr(at + 1, needle))
++      found++;
++   return found;
++}
++
++/* Where `needle` occurs, which it must, exactly once. */
++static const char *
++find_once(const char *text, const char *needle)
++{
++   CHECK(count(text, needle) == 1);
++   return strstr(text, needle);
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   /* One fence, after both atomics and before the load. */
++   char *straight = translate(SHAPE_STRAIGHT, 0);
++   const char *fence = find_once(straight, FENCE);
++   CHECK(find_once(straight, ".atomic_fetch_add(") < fence);
++   CHECK(find_once(straight, ".atomic_compare_exchange_weak(") < fence);
++   CHECK(fence < find_once(straight, ".read("));
++
++   /* The fence ends the kernel, after the atomic. */
++   char *tail = translate(SHAPE_TAIL, 0);
++   fence = find_once(tail, FENCE);
++   CHECK(find_once(tail, ".atomic_fetch_add(") < fence);
++   CHECK(strspn(fence + strlen(FENCE), " \n}") == strlen(fence + strlen(FENCE)));
++
++   /* Nothing inside the loop needs the atomics complete, so the one fence
++    * follows the loop and precedes the load. */
++   char *loop = translate(SHAPE_LOOP, 0);
++   fence = find_once(loop, FENCE);
++   CHECK(find_once(loop, ".atomic_fetch_add(") < fence);
++   CHECK(fence < find_once(loop, ".read("));
++
++   for (unsigned shape = SHAPE_STRAIGHT; shape <= SHAPE_LOOP; shape++) {
++      char *unordered = translate(shape, BITFIELD64_BIT(20));
++      CHECK(count(unordered, ".atomic_fetch_add(") == 1);
++      CHECK(count(unordered, "atomic_thread_fence") == 0);
++      ralloc_free(unordered);
++   }
++
++   printf("msl image atomic order PASS\n");
++   ralloc_free(straight);
++   ralloc_free(tail);
++   ralloc_free(loop);
++   glsl_type_singleton_decref();
++   return 0;
++}

@@ -1,0 +1,540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 14:00:13 +0900
+Subject: [PATCH] vrend: import a Venus Metal-heap blob from its heap, not its
+ name
+
+A Venus context that allocates a swapchain image's memory out of a Metal heap
+exports it as a shared-memory file of the right size that only names the
+heap: the renderer finds the heap again through that file's identity, and
+the file itself holds none of the pixels. The virgl import took it for an
+ordinary shared-memory blob, since that is the file type it carries, mapped
+it and sampled zeroes, so a Vulkan window under a compositor on Virgl was
+black.
+
+Import such a blob from the heap instead. The rows of a linear image or a
+buffer are the heap's own bytes, which a buffer placed over the whole
+shared-storage heap shows to the CPU; that mapping then takes the ordinary
+shared-memory import, aliased where the driver can and copied from before
+each read where it cannot. An optimal image's bytes are not rows, so its
+texture, which the exporter published for scanout, is read into pages the
+resource owns before each read. A blob whose heap cannot be found or read
+keeps the previous import.
+
+The guest names the imported resource's format itself, and nothing ties it
+to the format of the texture it views: those pages are sized for the guest's
+texel, while Metal writes each row at the texture's own and takes the stride
+on trust. So an optimal image is imported only where the two texel sizes
+agree, and every read is refused unless rows of the texture's own size fit
+the pages at that stride. The heap's mapping takes the shared-memory import's
+bound as well, since the rows the guest names there are the heap's bytes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/virgl_metal.h          |  36 +++++++
+ src/virgl_metal.m          | 127 ++++++++++++++++++++++
+ src/vrend/vrend_renderer.c | 210 +++++++++++++++++++++++++++++++------
+ src/vrend/vrend_renderer.h |   7 ++
+ 4 files changed, 346 insertions(+), 34 deletions(-)
+
+diff --git a/src/virgl_metal.h b/src/virgl_metal.h
+index e1894e4c988a40668fc31073517293d106566255..ef9f2336b5bc7f533254cd980cd27af0b6274135 100644
+--- a/src/virgl_metal.h
++++ b/src/virgl_metal.h
+@@ -5,6 +5,9 @@
+ #ifndef VIRGL_METAL_H
+ #define VIRGL_METAL_H
+ 
++#include <stdbool.h>
++#include <stdint.h>
++
+ /*
+  * An Apple host names a foreign resource with a Metal object -- a MTLHeap a
+  * Vulkan renderer exported, or a MTLTexture a presenter will scan out -- and
+@@ -16,4 +19,37 @@ void *virgl_metal_retain_object(void *object);
+ 
+ void virgl_metal_release_object(void *object);
+ 
++/*
++ * A blob a Venus context allocated out of a Metal heap keeps its bytes in
++ * that heap; the shared-memory file it travels as only names the heap. A
++ * placement heap with shared storage shows those bytes to the CPU through a
++ * buffer placed over all of it. Return that buffer, with one reference the
++ * caller releases, and its contents and length; NULL where the heap is not
++ * one the CPU can read.
++ */
++void *virgl_metal_heap_map(void *heap, void **contents, uint64_t *length);
++
++/* Whether a texture stores its first level as rows in a buffer, so that the
++ * bytes behind it read as an image without the GPU's help. */
++bool virgl_metal_texture_is_linear(void *texture);
++
++/* The bytes one texel of a texture's own pixel format occupies, or 0 for a
++ * format that is compressed, depth or stencil, or not one this knows. A
++ * reader of the texture's rows has to lay them out at this size, whatever
++ * format the reader itself names. */
++uint32_t virgl_metal_texture_texel_size(void *texture);
++
++/*
++ * Copy the top-left width x height texels of the first level of a texture the
++ * CPU can read into rows of bytes_per_row bytes, whatever its tiling. False
++ * where it cannot be read, and where rows of the texture's own texel size at
++ * that stride would not fit the destination_size bytes at destination.
++ */
++bool virgl_metal_texture_read(void *texture,
++                              void *destination,
++                              uint64_t destination_size,
++                              uint32_t bytes_per_row,
++                              uint32_t width,
++                              uint32_t height);
++
+ #endif /* VIRGL_METAL_H */
+diff --git a/src/virgl_metal.m b/src/virgl_metal.m
+index 214cc92fad41187f41186f01d6ae7c5d606a433e..0c2d1d5646b25388b74bfeecea4cacfe0cc8eca3 100644
+--- a/src/virgl_metal.m
++++ b/src/virgl_metal.m
+@@ -4,6 +4,7 @@
+  */
+ 
+ #import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
+ 
+ #include "virgl_metal.h"
+ 
+@@ -20,3 +21,129 @@ void virgl_metal_release_object(void *object)
+ 
+    [metal_object release];
+ }
++
++void *virgl_metal_heap_map(void *heap, void **contents, uint64_t *length)
++{
++   id<MTLHeap> metal_heap = (id<MTLHeap>)heap;
++
++   if (metal_heap.type != MTLHeapTypePlacement ||
++       metal_heap.storageMode != MTLStorageModeShared)
++      return NULL;
++
++   id<MTLBuffer> buffer = [metal_heap newBufferWithLength:metal_heap.size
++                                                  options:metal_heap.resourceOptions
++                                                   offset:0];
++   if (!buffer)
++      return NULL;
++
++   *contents = buffer.contents;
++   *length = buffer.length;
++   return buffer;
++}
++
++bool virgl_metal_texture_is_linear(void *texture)
++{
++   id<MTLTexture> metal_texture = (id<MTLTexture>)texture;
++
++   return metal_texture.buffer != nil;
++}
++
++uint32_t virgl_metal_texture_texel_size(void *texture)
++{
++   id<MTLTexture> metal_texture = (id<MTLTexture>)texture;
++
++   switch (metal_texture.pixelFormat) {
++   case MTLPixelFormatA8Unorm:
++   case MTLPixelFormatR8Unorm:
++   case MTLPixelFormatR8Unorm_sRGB:
++   case MTLPixelFormatR8Snorm:
++   case MTLPixelFormatR8Uint:
++   case MTLPixelFormatR8Sint:
++      return 1;
++   case MTLPixelFormatR16Unorm:
++   case MTLPixelFormatR16Snorm:
++   case MTLPixelFormatR16Uint:
++   case MTLPixelFormatR16Sint:
++   case MTLPixelFormatR16Float:
++   case MTLPixelFormatRG8Unorm:
++   case MTLPixelFormatRG8Unorm_sRGB:
++   case MTLPixelFormatRG8Snorm:
++   case MTLPixelFormatRG8Uint:
++   case MTLPixelFormatRG8Sint:
++   case MTLPixelFormatB5G6R5Unorm:
++   case MTLPixelFormatA1BGR5Unorm:
++   case MTLPixelFormatABGR4Unorm:
++   case MTLPixelFormatBGR5A1Unorm:
++      return 2;
++   case MTLPixelFormatR32Uint:
++   case MTLPixelFormatR32Sint:
++   case MTLPixelFormatR32Float:
++   case MTLPixelFormatRG16Unorm:
++   case MTLPixelFormatRG16Snorm:
++   case MTLPixelFormatRG16Uint:
++   case MTLPixelFormatRG16Sint:
++   case MTLPixelFormatRG16Float:
++   case MTLPixelFormatRGBA8Unorm:
++   case MTLPixelFormatRGBA8Unorm_sRGB:
++   case MTLPixelFormatRGBA8Snorm:
++   case MTLPixelFormatRGBA8Uint:
++   case MTLPixelFormatRGBA8Sint:
++   case MTLPixelFormatBGRA8Unorm:
++   case MTLPixelFormatBGRA8Unorm_sRGB:
++   case MTLPixelFormatRGB10A2Unorm:
++   case MTLPixelFormatRGB10A2Uint:
++   case MTLPixelFormatRG11B10Float:
++   case MTLPixelFormatRGB9E5Float:
++   case MTLPixelFormatBGR10A2Unorm:
++   case MTLPixelFormatBGR10_XR:
++   case MTLPixelFormatBGR10_XR_sRGB:
++      return 4;
++   case MTLPixelFormatRG32Uint:
++   case MTLPixelFormatRG32Sint:
++   case MTLPixelFormatRG32Float:
++   case MTLPixelFormatRGBA16Unorm:
++   case MTLPixelFormatRGBA16Snorm:
++   case MTLPixelFormatRGBA16Uint:
++   case MTLPixelFormatRGBA16Sint:
++   case MTLPixelFormatRGBA16Float:
++   case MTLPixelFormatBGRA10_XR:
++   case MTLPixelFormatBGRA10_XR_sRGB:
++      return 8;
++   case MTLPixelFormatRGBA32Uint:
++   case MTLPixelFormatRGBA32Sint:
++   case MTLPixelFormatRGBA32Float:
++      return 16;
++   default:
++      return 0;
++   }
++}
++
++bool virgl_metal_texture_read(void *texture,
++                              void *destination,
++                              uint64_t destination_size,
++                              uint32_t bytes_per_row,
++                              uint32_t width,
++                              uint32_t height)
++{
++   id<MTLTexture> metal_texture = (id<MTLTexture>)texture;
++
++   if (metal_texture.storageMode != MTLStorageModeShared ||
++       metal_texture.textureType != MTLTextureType2D ||
++       !width || !height ||
++       width > metal_texture.width || height > metal_texture.height)
++      return false;
++
++   /* Metal writes each row at the texture's own texel size, and takes the
++    * stride on trust: rows that do not fit are written past the end. */
++   const uint64_t row_size =
++      (uint64_t)width * virgl_metal_texture_texel_size(texture);
++   if (!row_size || bytes_per_row < row_size ||
++       (uint64_t)bytes_per_row * (height - 1) + row_size > destination_size)
++      return false;
++
++   [metal_texture getBytes:destination
++               bytesPerRow:bytes_per_row
++                fromRegion:MTLRegionMake2D(0, 0, width, height)
++               mipmapLevel:0];
++   return true;
++}
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 6bd8338ee52c4190839921dc077d344ed874c63b..63cb62d7cdeeb76a02868e3c22d54cda1b58fbbe 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -64,6 +64,9 @@
+ #include "virgl_hw.h"
+ #include "virgl_resource.h"
+ #include "virglrenderer.h"
++#ifdef ENABLE_METAL
++#include "virgl_metal.h"
++#endif
+ #include "virgl_protocol.h"
+ #include "virgl_fence.h"
+ #include "virtgpu_drm.h"
+@@ -9529,50 +9532,38 @@ static void *vrend_resource_alias_shm(struct vrend_resource *gr,
+                                             offset);
+ }
+ 
+-/* Map an exporter's shared-memory blob and give this resource a texture over
+- * it, aliasing the pages where the driver can and copying where it cannot. */
+-static int vrend_resource_import_shm(struct vrend_resource *gr,
+-                                     struct virgl_resource *res,
+-                                     uint32_t format,
+-                                     uint32_t stride,
+-                                     uint32_t offset)
++/* Give this resource a texture over an exporter's mapped bytes, aliasing the
++ * pages where the driver can and copying from them where it cannot. The
++ * caller keeps the mapping when this fails. */
++static int vrend_resource_attach_mapping(struct vrend_resource *gr,
++                                         void *map,
++                                         uint64_t size,
++                                         uint32_t format,
++                                         uint32_t stride,
++                                         uint32_t offset)
+ {
+-   void *map;
+-   int ret;
+-
+-   if (res->fd < 0 || !res->map_size)
+-      return EINVAL;
+-
+    const uint32_t blocksize = util_format_get_blocksize(format);
+    if (!stride)
+       stride = gr->base.width0 * blocksize;
+-   if (!vrend_shm_import_fits(res->map_size, offset, stride, gr->base.width0,
++   if (!vrend_shm_import_fits(size, offset, stride, gr->base.width0,
+                               gr->base.height0, blocksize)) {
+       virgl_error("%s: a %ux%u image of format %u at offset %u with stride %u "
+                   "does not fit the exporter's %" PRIu64 " byte segment\n",
+                   __func__, gr->base.width0, gr->base.height0, format, offset,
+-                  stride, (uint64_t)res->map_size);
+-      return EINVAL;
+-   }
+-
+-   map = mmap(NULL, res->map_size, PROT_READ, MAP_SHARED, res->fd, 0);
+-   if (map == MAP_FAILED) {
+-      virgl_error("%s: cannot map the exporter's %" PRIu64 " byte segment: %s\n",
+-                  __func__, (uint64_t)res->map_size, strerror(errno));
++                  stride, size);
+       return EINVAL;
+    }
+ 
+    /* Aliasing is the whole point: a texture over the exporter's own pages
+     * needs no refresh at all, so the presenting X server reads the guest's
+     * frame where the guest wrote it. */
+-   void *image = vrend_resource_alias_shm(gr, map, res->map_size, format,
+-                                          stride, offset);
++   void *image = vrend_resource_alias_shm(gr, map, size, format, stride,
++                                          offset);
+ 
+-   ret = vrend_resource_alloc_texture(gr, format, image);
++   int ret = vrend_resource_alloc_texture(gr, format, image);
+    if (ret) {
+       if (image)
+          virgl_egl_host_pointer_image_destroy(egl, image);
+-      munmap(map, res->map_size);
+       return ret;
+    }
+ 
+@@ -9581,7 +9572,7 @@ static int vrend_resource_import_shm(struct vrend_resource *gr,
+                  __func__, gr->base.width0, gr->base.height0);
+       gr->shm_import_image = image;
+       gr->shm_import_map = map;
+-      gr->shm_import_size = res->map_size;
++      gr->shm_import_size = size;
+       gr->shm_import_stride = stride;
+       gr->shm_import_offset = offset;
+       gr->shm_import_format = format;
+@@ -9598,15 +9589,140 @@ static int vrend_resource_import_shm(struct vrend_resource *gr,
+    /* Pinning the exporter's segment turns the refresh into a GPU-side copy of
+     * its own pages; an unpinnable segment falls back to a client-memory
+     * upload. This is the same pinning the export direction uses. */
+-   gr->shm_import_pbo = vrend_shm_pin_pbo(map, res->map_size);
++   gr->shm_import_pbo = vrend_shm_pin_pbo(map, size);
+ 
+    gr->shm_import_map = map;
+-   gr->shm_import_size = res->map_size;
++   gr->shm_import_size = size;
+    gr->shm_import_stride = stride;
+    gr->shm_import_offset = offset;
+    gr->shm_import_format = format;
+    return 0;
+ }
++
++/* Map an exporter's shared-memory blob and give this resource a texture over
++ * it. */
++static int vrend_resource_import_shm(struct vrend_resource *gr,
++                                     struct virgl_resource *res,
++                                     uint32_t format,
++                                     uint32_t stride,
++                                     uint32_t offset)
++{
++   if (res->fd < 0 || !res->map_size)
++      return EINVAL;
++
++   void *map = mmap(NULL, res->map_size, PROT_READ, MAP_SHARED, res->fd, 0);
++   if (map == MAP_FAILED) {
++      virgl_error("%s: cannot map the exporter's %" PRIu64 " byte segment: %s\n",
++                  __func__, (uint64_t)res->map_size, strerror(errno));
++      return EINVAL;
++   }
++
++   int ret = vrend_resource_attach_mapping(gr, map, res->map_size, format,
++                                           stride, offset);
++   if (ret)
++      munmap(map, res->map_size);
++   return ret;
++}
++
++/* An optimal image's bytes are not rows, so every refresh reads its texture
++ * into pages this resource owns, laid out at the texture's own width. */
++static int vrend_resource_import_native_texture(struct vrend_resource *gr,
++                                                void *texture,
++                                                uint32_t format)
++{
++   const uint32_t blocksize = util_format_get_blocksize(format);
++   const uint32_t stride = gr->base.width0 * blocksize;
++   const uint64_t page_size = (uint64_t)getpagesize();
++   const uint64_t size =
++      ((uint64_t)stride * gr->base.height0 + page_size - 1) & ~(page_size - 1);
++   if (!size)
++      return EINVAL;
++
++   void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
++                    -1, 0);
++   if (map == MAP_FAILED)
++      return ENOMEM;
++
++   int ret = vrend_resource_alloc_texture(gr, format, NULL);
++   if (ret) {
++      munmap(map, size);
++      return ret;
++   }
++
++   gr->native_import_texture = texture;
++   gr->shm_import_pbo = vrend_shm_pin_pbo(map, size);
++   gr->shm_import_map = map;
++   gr->shm_import_size = size;
++   gr->shm_import_stride = stride;
++   gr->shm_import_offset = 0;
++   gr->shm_import_format = format;
++   return 0;
++}
++
++/* A Venus context that allocated a blob out of a Metal heap exports it as a
++ * shared-memory file that only names the heap, so mapping the file shows none
++ * of the pixels. Read them where they are: the rows of a linear image or a
++ * buffer are the heap's own bytes, which import like any other segment, and
++ * an optimal image is read through the texture its exporter published.
++ * ENOTSUP leaves the caller to the file itself. */
++static int vrend_resource_import_native(struct vrend_resource *gr,
++                                        struct virgl_resource *res,
++                                        uint32_t format,
++                                        uint32_t stride,
++                                        uint32_t offset)
++{
++   enum virgl_resource_native_handle_type type;
++   void *heap = NULL;
++   const uint64_t id = virgl_resource_native_acquire(res->fd, &type, &heap);
++   if (!id)
++      return ENOTSUP;
++   if (type != VIRGL_RESOURCE_NATIVE_HANDLE_METAL_HEAP || !heap) {
++      virgl_resource_native_release(id);
++      return ENOTSUP;
++   }
++
++   int ret;
++   void *texture = virgl_resource_native_acquire_metal_texture(
++      id, offset, gr->base.width0, gr->base.height0);
++   if (texture && !virgl_metal_texture_is_linear(texture)) {
++      /* The guest names this resource's format itself, and the texture's
++       * rows are read at the texture's own texel size into pages sized for
++       * the guest's: the two have to agree. */
++      if (virgl_metal_texture_texel_size(texture) !=
++          util_format_get_blocksize(format)) {
++         virgl_error("%s: format %u cannot view a Metal texture of pixel "
++                     "size %u\n", __func__, format,
++                     virgl_metal_texture_texel_size(texture));
++         ret = EINVAL;
++      } else {
++         ret = vrend_resource_import_native_texture(gr, texture, format);
++      }
++      if (ret)
++         virgl_metal_release_object(texture);
++   } else {
++      if (texture)
++         virgl_metal_release_object(texture);
++      void *contents = NULL;
++      uint64_t length = 0;
++      void *buffer = virgl_metal_heap_map(heap, &contents, &length);
++      ret = buffer ? vrend_resource_attach_mapping(gr, contents, length,
++                                                   format, stride, offset)
++                   : ENOTSUP;
++      if (ret) {
++         if (buffer)
++            virgl_metal_release_object(buffer);
++      } else {
++         gr->native_import_buffer = buffer;
++      }
++   }
++
++   if (ret) {
++      virgl_resource_native_release(id);
++      return ret;
++   }
++   gr->native_import_id = id;
++   return 0;
++}
+ #endif
+ 
+ void vrend_resource_sync_shm_import(struct vrend_resource *res)
+@@ -9629,6 +9745,17 @@ void vrend_resource_sync_shm_import(struct vrend_resource *res)
+                               stride, width, height, blocksize))
+       return;
+ 
++#ifdef ENABLE_METAL
++   if (res->native_import_texture &&
++       !virgl_metal_texture_read(res->native_import_texture,
++                                 (char *)res->shm_import_map +
++                                    res->shm_import_offset,
++                                 res->shm_import_size -
++                                    res->shm_import_offset,
++                                 stride, width, height))
++      return;
++#endif
++
+    glBindTexture(res->target, res->gl_id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / blocksize);
+@@ -9658,9 +9785,18 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+    if (res->shm_export_dirty)
+       list_del(&res->shm_export_head);
+    /* A borrowed mapping belongs to this resource's own segment, which the
+-    * retire path below unmaps once the GPU is done with the pinned pages. */
+-   if (res->shm_import_map && !res->shm_import_borrowed)
++    * retire path below unmaps once the GPU is done with the pinned pages, and
++    * a Metal heap's mapping is the buffer released below. */
++   if (res->shm_import_map && !res->shm_import_borrowed &&
++       !res->native_import_buffer)
+       munmap(res->shm_import_map, res->shm_import_size);
++#ifdef ENABLE_METAL
++   if (res->native_import_buffer)
++      virgl_metal_release_object(res->native_import_buffer);
++   if (res->native_import_texture)
++      virgl_metal_release_object(res->native_import_texture);
++   virgl_resource_native_release(res->native_import_id);
++#endif
+ 
+    if (has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE)) {
+       glDeleteTextures(1, &res->gl_id);
+@@ -14412,9 +14548,15 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+             virgl_warn("%s: ignoring plane_count = %d and using the first one\n",
+                        __func__, args->plane_count);
+          }
+-         int ret = vrend_resource_import_shm(gr, res, args->format,
+-                                             args->plane_strides[0],
+-                                             args->plane_offsets[0]);
++         int ret = ENOTSUP;
++         if (res->native_resource_id)
++            ret = vrend_resource_import_native(gr, res, args->format,
++                                               args->plane_strides[0],
++                                               args->plane_offsets[0]);
++         if (ret == ENOTSUP)
++            ret = vrend_resource_import_shm(gr, res, args->format,
++                                            args->plane_strides[0],
++                                            args->plane_offsets[0]);
+          if (ret) {
+             FREE(gr);
+             return ret;
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 6bc0a60747e4580af7644810f42686f50ff4c365..e8cc02e843c9f056e09d3dadaba1d7f4131d4d1a 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -136,6 +136,13 @@ struct vrend_resource {
+     * segment -- the export direction -- so the teardown leaves it to the
+     * segment's owner instead of unmapping it twice. */
+    bool shm_import_borrowed;
++   /* A blob a Venus context allocated out of a Metal heap: the registry
++    * reference that keeps the heap alive, and either the buffer over the
++    * heap that shm_import_map points into or the optimal texture each
++    * refresh reads into this resource's own shm_import_map pages. */
++   uint64_t native_import_id;
++   void *native_import_buffer;
++   void *native_import_texture;
+ 
+    /* GL wrote this exported resource since its segment was last updated. */
+    bool shm_export_dirty;

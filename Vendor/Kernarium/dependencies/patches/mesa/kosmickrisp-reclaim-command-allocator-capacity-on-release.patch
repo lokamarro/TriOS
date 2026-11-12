@@ -1,0 +1,415 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 9 Sep 2026 02:34:30 +0900
+Subject: [PATCH] kosmickrisp: reclaim command allocator capacity on release
+
+Metal allocator reset retains its high-water capacity. Drop allocators after RELEASE_RESOURCES discards a recording, including INITIAL command buffers, and recreate them at Begin. Return cached pool storage on pool release and initialize and bound its BO accounting.
+
+Add native coverage for release, reset, recycling and trim, with real GPU fill readback after lazy allocator recreation.
+---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        |  38 ++-
+ src/kosmickrisp/vulkan/kk_cmd_pool.c          |  22 +-
+ src/kosmickrisp/vulkan/meson.build            |  22 ++
+ .../vulkan/tests/test_command_pool_release.m  | 223 ++++++++++++++++++
+ 4 files changed, 302 insertions(+), 3 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_command_pool_release.m
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index ce93d646e781664d7c0c479bb47631b2a5afef97..7bb009a0a617d744af8887dbe31d622028fef9c4 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -194,7 +194,8 @@ alloc_fail:
+ static void
+ kk_reset_encoder_state(struct kk_encoder_state *es)
+ {
+-   mtl_command_allocator_reset(es->allocator);
++   if (es->allocator)
++      mtl_command_allocator_reset(es->allocator);
+ }
+ 
+ void
+@@ -221,13 +222,23 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ 
+ static void
+ kk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+-                    UNUSED VkCommandBufferResetFlags flags)
++                    VkCommandBufferResetFlags flags)
+ {
+    struct kk_cmd_buffer *cmd =
+       container_of(vk_cmd_buffer, struct kk_cmd_buffer, vk);
+ 
+    vk_command_buffer_reset(&cmd->vk);
+    kk_reset_cmd_buffer_internal(cmd);
++   if (flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) {
++      /* Metal reset retains allocator high-water capacity. The recording has
++       * been discarded, so release the allocators and recreate them at Begin. */
++      struct kk_encoder_state *encoders[] = {&cmd->cmp[0], &cmd->gfx,
++                                             &cmd->cmp[1]};
++      for (unsigned i = 0; i < ARRAY_SIZE(encoders); i++) {
++         mtl_release(encoders[i]->allocator);
++         encoders[i]->allocator = NULL;
++      }
++   }
+    cmd->submitted = false;
+    cmd->one_time_submit = false;
+ }
+@@ -238,6 +249,17 @@ const struct vk_command_buffer_ops kk_cmd_buffer_ops = {
+    .destroy = kk_destroy_cmd_buffer,
+ };
+ 
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_ResetCommandBuffer(VkCommandBuffer commandBuffer,
++                      VkCommandBufferResetFlags flags)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++
++   /* INITIAL buffers can retain capacity from an earlier reset without release. */
++   kk_reset_cmd_buffer(&cmd->vk, flags);
++   return VK_SUCCESS;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+                       const VkCommandBufferBeginInfo *pBeginInfo)
+@@ -245,6 +267,18 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+ 
+    kk_reset_cmd_buffer(&cmd->vk, 0u);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_encoder_state *encoders[] = {&cmd->cmp[0], &cmd->gfx,
++                                          &cmd->cmp[1]};
++   for (unsigned i = 0; i < ARRAY_SIZE(encoders); i++) {
++      if (!encoders[i]->allocator)
++         encoders[i]->allocator = mtl_new_command_allocator(dev->mtl_handle);
++      if (!encoders[i]->allocator) {
++         kk_reset_cmd_buffer(&cmd->vk,
++                             VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
++         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      }
++   }
+    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+    cmd->one_time_submit =
+       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_pool.c b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+index 9962c952d9612ba18f409cf16e87ed97bf6990f3..e505acdf6e537df2696af29175c119482401bbfe 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_pool.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+@@ -11,6 +11,8 @@
+ #include "kk_entrypoints.h"
+ #include "kk_physical_device.h"
+ 
++#include "vk_common_entrypoints.h"
++
+ static VkResult
+ kk_cmd_bo_create(struct kk_cmd_pool *pool, struct kk_cmd_bo **bo_out)
+ {
+@@ -47,6 +49,7 @@ kk_cmd_pool_destroy_bos(struct kk_cmd_pool *pool)
+       kk_cmd_bo_destroy(pool, bo);
+ 
+    list_inithead(&pool->free_bos);
++   pool->num_free_bos = 0;
+ }
+ 
+ VkResult
+@@ -72,7 +75,7 @@ kk_cmd_pool_free_bo_list(struct kk_cmd_pool *pool, struct list_head *bos)
+ {
+    list_for_each_entry_safe(struct kk_cmd_bo, bo, bos, link) {
+       list_del(&bo->link);
+-      if (pool->num_free_bos > KK_CMD_POOL_BO_MAX) {
++      if (pool->num_free_bos >= KK_CMD_POOL_BO_MAX) {
+          kk_cmd_bo_destroy(pool, bo);
+       } else {
+          list_addtail(&bo->link, &pool->free_bos);
+@@ -103,6 +106,7 @@ kk_CreateCommandPool(VkDevice _device,
+    }
+ 
+    list_inithead(&pool->free_bos);
++   pool->num_free_bos = 0;
+ 
+    *pCmdPool = kk_cmd_pool_to_handle(pool);
+ 
+@@ -124,6 +128,22 @@ kk_DestroyCommandPool(VkDevice _device, VkCommandPool commandPool,
+    vk_free2(&device->vk.alloc, pAllocator, pool);
+ }
+ 
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_ResetCommandPool(VkDevice device, VkCommandPool commandPool,
++                    VkCommandPoolResetFlags flags)
++{
++   VK_FROM_HANDLE(kk_cmd_pool, pool, commandPool);
++   VkResult result = vk_common_ResetCommandPool(device, commandPool, flags);
++   if (result == VK_SUCCESS &&
++       (flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT)) {
++      /* Recycled buffers already released their Metal allocators at free.
++       * Also return their objects and the pool's cached upload BOs. */
++      vk_command_pool_trim(&pool->vk, 0);
++      kk_cmd_pool_destroy_bos(pool);
++   }
++   return result;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_TrimCommandPool(VkDevice device, VkCommandPool commandPool,
+                    VkCommandPoolTrimFlags flags)
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 97cfe19cf16e39d0e554aaca62fa9b3cc13da341..ee47b277137ebbf97140d36170ee567034fb4774 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -601,6 +601,28 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_command_pool_release',
++      executable(
++        'test_kosmickrisp_command_pool_release',
++        files('tests/test_command_pool_release.m'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++          dependency('appleframeworks', modules : ['Foundation', 'Metal']),
++        ],
++        link_with : libvulkan_kosmickrisp,
++        objc_args : ['-Wno-unused-function'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_pool_release.m b/src/kosmickrisp/vulkan/tests/test_command_pool_release.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..f92d7dfcd9344e4234b7ffcb205f442aabff01b5
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_command_pool_release.m
+@@ -0,0 +1,223 @@
++/* SPDX-License-Identifier: MIT */
++
++#define VK_NO_PROTOTYPES
++#include "kosmickrisp/vulkan/kk_cmd_buffer.h"
++#include "kosmickrisp/vulkan/kk_cmd_pool.h"
++#include <Metal/MTL4CommandAllocator.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++struct test_allocation {
++   void *base;
++   size_t size;
++};
++
++static void *VKAPI_PTR
++poison_alloc(void *data, size_t size, size_t alignment, VkSystemAllocationScope scope)
++{
++   (void)data; (void)scope;
++   alignment = MAX2(alignment, _Alignof(struct test_allocation));
++   void *base = malloc(size + alignment + sizeof(struct test_allocation));
++   if (!base)
++      return NULL;
++   uintptr_t address = ((uintptr_t)base + sizeof(struct test_allocation) + alignment - 1) & ~(alignment - 1);
++   struct test_allocation *header = (struct test_allocation *)address - 1;
++   *header = (struct test_allocation){base, size};
++   memset((void *)address, 0xa5, size);
++   return (void *)address;
++}
++
++static void VKAPI_PTR
++poison_free(void *data, void *p)
++{
++   (void)data;
++   if (p)
++      free(((struct test_allocation *)p - 1)->base);
++}
++
++static void *VKAPI_PTR
++poison_realloc(void *data, void *old, size_t size, size_t alignment,
++               VkSystemAllocationScope scope)
++{
++   if (!size) {
++      poison_free(data, old);
++      return NULL;
++   }
++   void *p = poison_alloc(data, size, alignment, scope);
++   if (p && old) {
++      memcpy(p, old, MIN2(size, ((struct test_allocation *)old - 1)->size));
++      poison_free(data, old);
++   }
++   return p;
++}
++
++static size_t
++allocator_bytes(VkCommandBuffer command)
++{
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
++   struct kk_encoder_state *es[] = {&cmd->cmp[0], &cmd->gfx, &cmd->cmp[1]};
++   size_t bytes = 0;
++   for (unsigned i = 0; i < ARRAY_SIZE(es); i++)
++      bytes += [(id<MTL4CommandAllocator>)es[i]->allocator allocatedSize];
++   return bytes;
++}
++
++static void
++check_released(VkCommandBuffer command)
++{
++   struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
++   CHECK(cmd->cmp[0].allocator == NULL);
++   CHECK(cmd->cmp[1].allocator == NULL);
++   CHECK(cmd->gfx.allocator == NULL);
++}
++
++static void
++check_pool_recycled_released(struct kk_cmd_pool *pool)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(pool->vk.free_command_buffers); i++) {
++      list_for_each_entry(struct vk_command_buffer, cmd,
++                          &pool->vk.free_command_buffers[i], pool_link)
++         check_released(vk_command_buffer_to_handle(cmd));
++   }
++}
++
++int main(void)
++{
++   @autoreleasepool {
++      VkInstance instance = VK_NULL_HANDLE;
++      LOAD_I(vkCreateInstance);
++      VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                              .apiVersion = VK_API_VERSION_1_3};
++      VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++                                  .pApplicationInfo = &app};
++      CHECK(vkCreateInstance(&ici, NULL, &instance) == VK_SUCCESS);
++      LOAD_I(vkDestroyInstance);
++      LOAD_I(vkEnumeratePhysicalDevices);
++      LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++      LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++      LOAD_I(vkCreateDevice);
++      LOAD_I(vkGetDeviceProcAddr);
++      uint32_t count = 1;
++      VkPhysicalDevice physical;
++      CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++      CHECK(count == 1);
++      uint32_t family_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++      VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
++      CHECK(families);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++      uint32_t family = 0;
++      while (family < family_count && !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         family++;
++      CHECK(family < family_count);
++      free(families);
++      float priority = 1;
++      VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority};
++      VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci};
++      VkDevice device;
++      CHECK(vkCreateDevice(physical, &dci, NULL, &device) == VK_SUCCESS);
++      LOAD_D(vkDestroyDevice); LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateCommandPool); LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers); LOAD_D(vkFreeCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer); LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkResetCommandBuffer); LOAD_D(vkResetCommandPool); LOAD_D(vkTrimCommandPool);
++      LOAD_D(vkCreateBuffer); LOAD_D(vkDestroyBuffer); LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory); LOAD_D(vkFreeMemory); LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory); LOAD_D(vkUnmapMemory); LOAD_D(vkCmdFillBuffer);
++      LOAD_D(vkQueueSubmit); LOAD_D(vkCreateFence); LOAD_D(vkWaitForFences); LOAD_D(vkDestroyFence);
++      VkQueue queue;
++      vkGetDeviceQueue(device, family, 0, &queue);
++      VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++         .size = 4096, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
++      VkBuffer buffer;
++      CHECK(vkCreateBuffer(device, &bci, NULL, &buffer) == VK_SUCCESS);
++      VkMemoryRequirements requirements;
++      vkGetBufferMemoryRequirements(device, buffer, &requirements);
++      VkPhysicalDeviceMemoryProperties properties;
++      vkGetPhysicalDeviceMemoryProperties(physical, &properties);
++      uint32_t type = 0;
++      const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++      while (type < properties.memoryTypeCount &&
++             (!(requirements.memoryTypeBits & (1u << type)) ||
++              (properties.memoryTypes[type].propertyFlags & required) != required))
++         type++;
++      CHECK(type < properties.memoryTypeCount);
++      VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++         .allocationSize = requirements.size, .memoryTypeIndex = type};
++      VkDeviceMemory memory;
++      CHECK(vkAllocateMemory(device, &mai, NULL, &memory) == VK_SUCCESS);
++      CHECK(vkBindBufferMemory(device, buffer, memory, 0) == VK_SUCCESS);
++      uint32_t *mapped;
++      CHECK(vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mapped) == VK_SUCCESS);
++      const VkAllocationCallbacks alloc = {.pfnAllocation = poison_alloc,
++         .pfnReallocation = poison_realloc, .pfnFree = poison_free};
++      VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = family};
++      VkCommandPool pool_handle;
++      CHECK(vkCreateCommandPool(device, &pci, &alloc, &pool_handle) == VK_SUCCESS);
++      struct kk_cmd_pool *pool = kk_cmd_pool_from_handle(pool_handle);
++      CHECK(pool->num_free_bos == 0);
++      VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++         .commandPool = pool_handle, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2};
++      VkCommandBuffer commands[2];
++      CHECK(vkAllocateCommandBuffers(device, &cai, commands) == VK_SUCCESS);
++      VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      const VkCommandBufferResetFlags release = VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
++      CHECK(vkResetCommandBuffer(commands[0], release) == VK_SUCCESS);
++      check_released(commands[0]);
++      for (unsigned round = 0; round < 3; round++) {
++         CHECK(vkBeginCommandBuffer(commands[0], &begin) == VK_SUCCESS);
++         vkCmdFillBuffer(commands[0], buffer, 0, 4096, 0x13579bdf);
++         CHECK(vkEndCommandBuffer(commands[0]) == VK_SUCCESS);
++         CHECK(allocator_bytes(commands[0]) > 0);
++         if (round == 0) {
++            CHECK(vkResetCommandBuffer(commands[0], 0) == VK_SUCCESS);
++            CHECK(allocator_bytes(commands[0]) > 0);
++            CHECK(vkResetCommandBuffer(commands[0], release) == VK_SUCCESS);
++            check_released(commands[0]);
++         } else if (round == 1) {
++            CHECK(vkResetCommandPool(device, pool_handle, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
++            check_released(commands[0]);
++            check_released(commands[1]);
++            CHECK(pool->num_free_bos == 0);
++         }
++      }
++      /* Trimming must preserve an active executable recording and its storage. */
++      vkFreeCommandBuffers(device, pool_handle, 1, &commands[1]);
++      check_pool_recycled_released(pool);
++      size_t recorded_bytes = allocator_bytes(commands[0]);
++      vkTrimCommandPool(device, pool_handle, 0);
++      CHECK(pool->num_free_bos == 0);
++      CHECK(allocator_bytes(commands[0]) == recorded_bytes);
++      memset(mapped, 0, 4096);
++      VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++      VkFence fence;
++      CHECK(vkCreateFence(device, &fci, NULL, &fence) == VK_SUCCESS);
++      VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .commandBufferCount = 1, .pCommandBuffers = &commands[0]};
++      CHECK(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
++      CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS);
++      for (unsigned i = 0; i < 1024; i++)
++         CHECK(mapped[i] == 0x13579bdf);
++      vkDestroyFence(device, fence, NULL);
++      vkFreeCommandBuffers(device, pool_handle, 1, &commands[0]);
++      check_pool_recycled_released(pool);
++      CHECK(vkResetCommandPool(device, pool_handle, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
++      CHECK(pool->num_free_bos == 0);
++      vkDestroyCommandPool(device, pool_handle, &alloc);
++      vkUnmapMemory(device, memory);
++      vkDestroyBuffer(device, buffer, NULL);
++      vkFreeMemory(device, memory, NULL);
++      vkDestroyDevice(device, NULL);
++      vkDestroyInstance(instance, NULL);
++   }
++   return 0;
++}

@@ -1,0 +1,558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:21:58 +0900
+Subject: [PATCH] um: hold a Darwin system suspend until a wake source fires
+
+A system suspend clears O_ASYNC on every descriptor that is not a wake
+source, so on a Linux host only a wake source's SIGIO ends the sleep in
+um_suspend_enter().  Darwin's SIGIO is the IRQ notification thread, and
+its os_clear_fd_async() cleared only O_NONBLOCK: every registered
+descriptor still woke the suspended CPU, and the first network packet,
+console byte or vhost-user backend request ended the suspend with no
+wake request.
+
+Make a descriptor's O_ASYNC its registration on the notification
+queue.  os_clear_fd_async() removes it and os_set_fd_async() adds it
+back with the descriptor's current events, so an edge that arrived
+meanwhile notifies at once; the dispatch queue keeps every edge, so
+nothing that arrives during the suspend is lost.
+
+A suspended descriptor stays nonblocking.  Darwin still reads a vhost-user
+backend's request socket while interrupts are suspended: a reply wait
+serves the backend's requests, and the irq_work that delivers what one
+recorded drains the socket again, until it would block.  With
+O_NONBLOCK cleared that read held the CPU in recvmsg() for as long as
+the backend kept sending, and the suspend never ended.
+
+A Darwin idle sleep also ends for host signals and for an edge the
+notification thread collected before the suspend cleared its
+descriptor.  As suspend-to-idle does, um_suspend_enter() now sleeps
+until a wake source has input or a wakeup is pending.
+
+A management-console wake that arrives before the suspend has stopped
+interrupts is answered at once and never reaches that sleep, so it used
+to leave the guest suspended until the next request.  The wake now
+reports a wakeup, which aborts a suspend at the PM core's next check
+from the moment that suspend began, file system sync included, whether
+the host or the guest started it, and um_suspend_enter() does not sleep
+after one.  A wake that arrives after the host asked for a suspend but
+before the suspend began counts until the request ends.  A guest that
+is not suspending only answers, and its next suspend discards the
+wakeup, so a host may send the wake whenever its user presses a power
+key.
+
+A wake source of the guest's own, such as an RTC alarm, that fires
+while a suspend the host asked for is being entered now ends that
+suspend too, with -EBUSY.  The host still wants the guest suspended,
+and may have stopped waiting for the reply, so a request whose suspend
+ended with -EBUSY enters it again, at most three more times, unless
+the host's own wake has arrived.
+---
+ arch/um/drivers/mconsole_kern.c    |  53 ++++++++-
+ arch/um/include/shared/kern_util.h |   1 +
+ arch/um/include/shared/os.h        |   4 +
+ arch/um/kernel/um_arch.c           |  30 +++++-
+ arch/um/os-Darwin/file.c           |  31 +++---
+ arch/um/os-Darwin/irq.c            | 168 +++++++++++++++++++++++------
+ 6 files changed, 239 insertions(+), 48 deletions(-)
+
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index 5abd0dfd66c7f1da714c1895760ada28ac1b2a74..5a0c3b28f9cfef9e38a5014c87efde6f510b7cc8 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/console.h>
+ #include <linux/ctype.h>
++#include <linux/delay.h>
+ #include <linux/string.h>
+ #include <linux/interrupt.h>
+ #include <linux/list.h>
+@@ -229,6 +230,8 @@ void mconsole_go(struct mc_request *req)
+ 
+ #ifdef CONFIG_SUSPEND
+ static struct mc_request *suspend_request;
++/* A wake arrived while the host's suspend request was in progress. */
++static bool suspend_woken;
+ 
+ void um_suspend_notify_entered(void)
+ {
+@@ -238,10 +241,27 @@ void um_suspend_notify_entered(void)
+ 		mconsole_reply(req, "suspended", 0, 0);
+ }
+ 
++int um_suspend_wake_requested(void)
++{
++	return READ_ONCE(suspend_woken);
++}
++
++/*
++ * The PM core gives a suspend up with -EBUSY when something gets in its way,
++ * typically a wake source of the guest's own, such as an RTC alarm, that
++ * fired while the suspend was being entered.  The host still wants the guest
++ * suspended, and a new suspend discards the wakeups signaled before it
++ * began, so the request enters it again, a few times at most.  The host's
++ * own wake ends the request instead, and so does any other failure.
++ */
++#define MCONSOLE_SUSPEND_RETRIES 3
++#define MCONSOLE_SUSPEND_RETRY_MS 50
++
+ void mconsole_suspend(struct mc_request *req)
+ {
+ 	struct mc_request *pending;
+ 	char response[64];
++	int retries = 0;
+ 	int error;
+ 
+ 	if (cmpxchg(&suspend_request, NULL, req) != NULL) {
+@@ -249,27 +269,58 @@ void mconsole_suspend(struct mc_request *req)
+ 		return;
+ 	}
+ 	error = pm_suspend(PM_SUSPEND_MEM);
++	while (error == -EBUSY && retries++ < MCONSOLE_SUSPEND_RETRIES &&
++	       !READ_ONCE(suspend_woken) && READ_ONCE(suspend_request) != NULL) {
++		msleep(MCONSOLE_SUSPEND_RETRY_MS);
++		if (READ_ONCE(suspend_woken))
++			break;
++		error = pm_suspend(PM_SUSPEND_MEM);
++	}
+ 	pending = xchg(&suspend_request, NULL);
++	WRITE_ONCE(suspend_woken, false);
+ 	if (pending == NULL)
+ 		return;
+ 	snprintf(response, sizeof(response), "Suspend failed: %d", error);
+ 	mconsole_reply(pending, response, 1, 0);
+ }
++
++void mconsole_wake(struct mc_request *req)
++{
++	/*
++	 * Until the suspend has stopped interrupts, this request is answered
++	 * here rather than left on the console to end the sleep.  It ends the
++	 * suspend anyway, whether the host or the guest started it: as a
++	 * wakeup, it aborts a suspend at the PM core's next check from the
++	 * moment that suspend began, file system sync included.  A suspend the
++	 * host asked for might not have begun yet, so it also does not sleep
++	 * after a wake that arrived since the request.  A guest that is not
++	 * suspending only answers: its next suspend discards the wakeup.
++	 */
++	if (READ_ONCE(suspend_request) != NULL)
++		WRITE_ONCE(suspend_woken, true);
++	pm_system_wakeup();
++	mconsole_reply(req, "running", 0, 0);
++}
+ #else
+ void um_suspend_notify_entered(void)
+ {
+ }
+ 
++int um_suspend_wake_requested(void)
++{
++	return 0;
++}
++
+ void mconsole_suspend(struct mc_request *req)
+ {
+ 	mconsole_reply(req, "System suspend is not configured", 1, 0);
+ }
+-#endif
+ 
+ void mconsole_wake(struct mc_request *req)
+ {
+ 	mconsole_reply(req, "running", 0, 0);
+ }
++#endif
+ 
+ void mconsole_stop(struct mc_request *req)
+ {
+diff --git a/arch/um/include/shared/kern_util.h b/arch/um/include/shared/kern_util.h
+index 57420503f97bf7e44596591f6fad1f4e21c1766b..738bb8a006bef0a46796d020c7b8a62635461dca 100644
+--- a/arch/um/include/shared/kern_util.h
++++ b/arch/um/include/shared/kern_util.h
+@@ -85,6 +85,7 @@ extern void fatal_sigsegv(void) __attribute__ ((noreturn));
+ 
+ void um_idle_sleep(void);
+ void um_suspend_notify_entered(void);
++int um_suspend_wake_requested(void);
+ 
+ void kasan_map_memory(void *start, size_t len);
+ 
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 7d8ca4414554983e5ebeb6ad61d6e3dfad8dfd10..43fbd97f093c987887068cdeb8850299e1e39c17 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -366,6 +366,10 @@ extern void os_set_ioignore(void);
+ extern void os_close_epoll_fd(void);
+ extern void um_irqs_suspend(void);
+ extern void um_irqs_resume(void);
++#ifdef UML_HOST_DARWIN
++extern int darwin_irq_set_notification(int fd, int notify);
++extern int os_irq_wake_pending(void);
++#endif
+ 
+ /* sigio.c */
+ extern int add_sigio_fd(int fd);
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+index 95fabf70e1ee8b0c4f4f0db0cba663664a8cf851..e426227f327d49d16d618709f21d6943dc58f54e 100644
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -734,6 +734,22 @@ void uml_pm_wake(void)
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
++/*
++ * Whether the suspend has to end: a wakeup is pending, the host woke a
++ * suspend it asked for before that suspend began, or, on Darwin, a wake
++ * source has input.
++ */
++static bool um_suspend_woken(void)
++{
++	if (um_suspend_wake_requested() || pm_wakeup_pending())
++		return true;
++#ifdef UML_HOST_DARWIN
++	return os_irq_wake_pending();
++#else
++	return false;
++#endif
++}
++
+ static int um_suspend_valid(suspend_state_t state)
+ {
+ 	return state == PM_SUSPEND_MEM;
+@@ -758,7 +774,19 @@ static int um_suspend_enter(suspend_state_t state)
+ 	 * up on something we actually want to wake up on. All
+ 	 * timing has also been suspended.
+ 	 */
+-	um_idle_sleep();
++#ifdef UML_HOST_DARWIN
++	/*
++	 * A Darwin idle sleep also ends for host signals and for edges the
++	 * IRQ notification thread collected before the suspend.  As
++	 * suspend-to-idle does, sleep until a wake source has input, which
++	 * also covers one that arrived before this point.
++	 */
++	while (!um_suspend_woken())
++		um_idle_sleep();
++#else
++	if (!um_suspend_woken())
++		um_idle_sleep();
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/arch/um/os-Darwin/file.c b/arch/um/os-Darwin/file.c
+index 2af88421f7a2d6d47b0462532f0ed7417af4b178..ba95a9351b2f20fa8c46ada584e065ba9da2ec50 100644
+--- a/arch/um/os-Darwin/file.c
++++ b/arch/um/os-Darwin/file.c
+@@ -289,22 +289,27 @@ int os_set_fd_async(int fd)
+ 
+ 	if (flags < 0)
+ 		return -errno;
+-	/* The Darwin IRQ backend polls its descriptor registry from the timer
+-	 * boundary.  F_SETOWN/O_ASYNC is both unnecessary and rejected by some
+-	 * terminal and pipe descriptors on macOS.
++	/* F_SETOWN/O_ASYNC is rejected by some terminal and pipe descriptors on
++	 * macOS.  The Darwin IRQ backend's notification thread stands in for
++	 * SIGIO instead; see darwin_irq_set_notification().
+ 	 */
+-	return darwin_uml_fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ?
+-		-errno : 0;
+-}
+-
++	if (darwin_uml_fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
++		return -errno;
++	return darwin_irq_set_notification(fd, 1);
++}
++
++/*
++ * A suspend only stops a descriptor's notifications: the descriptor stays
++ * nonblocking, as os_set_fd_async() left it.  Its readers drain it until it
++ * would block, and some still read it while interrupts are suspended: a
++ * vhost-user reply wait serves its backend's requests, and the irq_work that
++ * delivers what a reply wait recorded drains the request socket again.  A
++ * blocking descriptor would hold that CPU in the host's recvmsg() for as long
++ * as the backend kept sending.
++ */
+ int os_clear_fd_async(int fd)
+ {
+-	int flags = darwin_uml_fcntl(fd, F_GETFL, 0);
+-
+-	if (flags < 0)
+-		return -errno;
+-	return darwin_uml_fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0 ?
+-		-errno : 0;
++	return darwin_irq_set_notification(fd, 0);
+ }
+ 
+ int os_set_fd_block(int fd, int blocking)
+diff --git a/arch/um/os-Darwin/irq.c b/arch/um/os-Darwin/irq.c
+index 45aa9db0b03f72d597a8ee90a3e0b037d1f7fdb3..c73632a809ba6ebddc2362470315fbc10343cbf3 100644
+--- a/arch/um/os-Darwin/irq.c
++++ b/arch/um/os-Darwin/irq.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <errno.h>
++#include <poll.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <string.h>
+@@ -20,11 +21,15 @@ struct watched_fd {
+ 	int fd;
+ 	int events;
+ 	void *data;
++	/* Darwin's O_ASYNC: readiness also ends CPU0's idle wait. */
++	int notify;
+ };
+ 
+ static struct watched_fd watched[DARWIN_MAX_EVENTS];
+ static struct watched_fd triggered[DARWIN_MAX_EVENTS];
+ static int watched_count;
++/* Orders the registry against callers that hold no kernel IRQ lock. */
++static pthread_mutex_t watched_lock = PTHREAD_MUTEX_INITIALIZER;
+ static int notification_kqueue = -1;
+ static int dispatch_kqueue = -1;
+ static pthread_mutex_t idle_waiter_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -110,24 +115,102 @@ static int update_filter(int queue, int fd, short filter, int add, void *data)
+ 	return kevent(queue, &change, 1, NULL, 0, NULL) < 0 ? -errno : 0;
+ }
+ 
+-static int update_registration(int fd, int events, void *data)
++/* The dispatch queue keeps every registered edge, so nothing that arrives
++ * while a descriptor's notification is off is lost: CPU0 dispatches it at
++ * its next poll.  Only the notification queue follows `notify'.
++ */
++static int update_registration(int fd, int events, void *data, int notify)
+ {
+ 	int queues[] = { dispatch_kqueue, notification_kqueue };
+ 	unsigned int index;
+ 	int error;
+ 
+ 	for (index = 0; index < sizeof(queues) / sizeof(queues[0]); index++) {
++		int wanted = queues[index] == dispatch_kqueue || notify ?
++			events : 0;
++
+ 		error = update_filter(queues[index], fd, EVFILT_READ,
+-				      events & DARWIN_EVENT_READ, data);
++				      wanted & DARWIN_EVENT_READ, data);
+ 		if (error == 0)
+ 			error = update_filter(queues[index], fd, EVFILT_WRITE,
+-					      events & DARWIN_EVENT_WRITE, data);
++					      wanted & DARWIN_EVENT_WRITE, data);
+ 		if (error < 0)
+ 			return error;
+ 	}
+ 	return 0;
+ }
+ 
++/*
++ * Linux UML asks for SIGIO with O_ASYNC, and a system suspend clears it on
++ * every descriptor that is not a wake source, so that only a wake source
++ * interrupts the suspended CPU's sleep.  Darwin's SIGIO is the notification
++ * thread, so a descriptor's O_ASYNC is its registration on that thread's
++ * queue.  Clearing it removes the registration; setting it adds it back
++ * with the descriptor's current events, and an edge that is already ready
++ * then notifies at once.  A descriptor that has no registration yet gets
++ * one with notification on, as the IRQ core sets O_ASYNC before registering.
++ */
++int darwin_irq_set_notification(int fd, int notify)
++{
++	int index;
++	int error = 0;
++
++	pthread_mutex_lock(&watched_lock);
++	for (index = 0; index < watched_count; index++) {
++		struct watched_fd *entry = &watched[index];
++
++		if (entry->fd != fd)
++			continue;
++		if (entry->notify != notify) {
++			error = update_filter(notification_kqueue, fd,
++					      EVFILT_READ,
++					      notify ? entry->events &
++						DARWIN_EVENT_READ : 0,
++					      entry->data);
++			if (error == 0)
++				error = update_filter(notification_kqueue, fd,
++						      EVFILT_WRITE,
++						      notify ? entry->events &
++							DARWIN_EVENT_WRITE : 0,
++						      entry->data);
++		}
++		if (error == 0)
++			entry->notify = notify;
++		break;
++	}
++	pthread_mutex_unlock(&watched_lock);
++	return error;
++}
++
++/*
++ * True when a descriptor that still notifies, which during a system suspend
++ * means a wake source, has input waiting.  This is a level check: an idle
++ * sleep that ended for anything else, such as a host signal or an edge the
++ * notification thread collected before the suspend cleared its descriptor,
++ * finds nothing here.
++ */
++int os_irq_wake_pending(void)
++{
++	int index;
++	int pending = 0;
++
++	pthread_mutex_lock(&watched_lock);
++	for (index = 0; index < watched_count && !pending; index++) {
++		struct pollfd descriptor = {
++			.fd = watched[index].fd,
++			.events = POLLIN,
++		};
++
++		if (!watched[index].notify ||
++		    !(watched[index].events & DARWIN_EVENT_READ))
++			continue;
++		pending = poll(&descriptor, 1, 0) > 0 &&
++			(descriptor.revents & (POLLIN | POLLHUP | POLLERR));
++	}
++	pthread_mutex_unlock(&watched_lock);
++	return pending;
++}
++
+ void darwin_irq_idle_begin(sigset_t *previous_mask)
+ {
+ 	sigset_t block;
+@@ -204,10 +287,13 @@ int os_setup_epoll(void)
+ 		return error;
+ 	}
+ 	/* Preserve registrations made before the common IRQ layer starts. */
++	pthread_mutex_lock(&watched_lock);
+ 	for (index = 0; index < watched_count; index++) {
+ 		error = update_registration(watched[index].fd,
+-					    watched[index].events, watched[index].data);
++					    watched[index].events, watched[index].data,
++					    watched[index].notify);
+ 		if (error < 0) {
++			pthread_mutex_unlock(&watched_lock);
+ 			close(dispatch_kqueue);
+ 			dispatch_kqueue = -1;
+ 			close(notification_kqueue);
+@@ -215,6 +301,7 @@ int os_setup_epoll(void)
+ 			return error;
+ 		}
+ 	}
++	pthread_mutex_unlock(&watched_lock);
+ 	pthread_mutex_lock(&idle_waiter_lock);
+ 	notification_stopping = 0;
+ 	pthread_mutex_unlock(&idle_waiter_lock);
+@@ -255,61 +342,74 @@ int os_waiting_for_events_epoll(void)
+ 	return count;
+ }
+ 
+-int os_add_epoll_fd(int events, int fd, void *data)
+-{
+-	int result = os_mod_epoll_fd(events, fd, data);
+-
+-	if (result != -ENOENT)
+-		return result;
+-	if (watched_count >= DARWIN_MAX_EVENTS)
+-		return -ENOSPC;
+-	result = update_registration(fd, events, data);
+-	if (result < 0) {
+-		(void)update_registration(fd, 0, NULL);
+-		return result;
+-	}
+-	watched[watched_count++] = (struct watched_fd) {
+-		.fd = fd, .events = events, .data = data,
+-	};
+-	return 0;
+-}
+-
+-int os_mod_epoll_fd(int events, int fd, void *data)
++static int modify_watched(int events, int fd, void *data)
+ {
+ 	int index;
+ 
+ 	for (index = 0; index < watched_count; index++) {
+-		if (watched[index].fd == fd) {
+-			int result = update_registration(fd, events, data);
++		struct watched_fd *entry = &watched[index];
++
++		if (entry->fd == fd) {
++			int result = update_registration(fd, events, data,
++							 entry->notify);
+ 
+ 			if (result < 0) {
+-				(void)update_registration(fd, watched[index].events,
+-							  watched[index].data);
++				(void)update_registration(fd, entry->events,
++							  entry->data,
++							  entry->notify);
+ 				return result;
+ 			}
+-			watched[index].events = events;
+-			watched[index].data = data;
++			entry->events = events;
++			entry->data = data;
+ 			return 0;
+ 		}
+ 	}
+ 	return -ENOENT;
+ }
+ 
++int os_add_epoll_fd(int events, int fd, void *data)
++{
++	int result;
++
++	pthread_mutex_lock(&watched_lock);
++	result = modify_watched(events, fd, data);
++	if (result != -ENOENT)
++		goto out;
++	result = -ENOSPC;
++	if (watched_count >= DARWIN_MAX_EVENTS)
++		goto out;
++	result = update_registration(fd, events, data, 1);
++	if (result < 0) {
++		(void)update_registration(fd, 0, NULL, 0);
++		goto out;
++	}
++	watched[watched_count++] = (struct watched_fd) {
++		.fd = fd, .events = events, .data = data, .notify = 1,
++	};
++out:
++	pthread_mutex_unlock(&watched_lock);
++	return result;
++}
++
+ int os_del_epoll_fd(int fd)
+ {
+ 	int index;
++	int result = -ENOENT;
+ 
++	pthread_mutex_lock(&watched_lock);
+ 	for (index = 0; index < watched_count; index++) {
+ 		if (watched[index].fd == fd) {
+-			(void)update_registration(fd, 0, NULL);
++			(void)update_registration(fd, 0, NULL, 0);
+ 			memmove(&watched[index], &watched[index + 1],
+ 				(size_t)(watched_count - index - 1) *
+ 					sizeof(watched[0]));
+ 			watched_count--;
+-			return 0;
++			result = 0;
++			break;
+ 		}
+ 	}
+-	return -ENOENT;
++	pthread_mutex_unlock(&watched_lock);
++	return result;
+ }
+ 
+ void os_set_ioignore(void)
+@@ -322,7 +422,9 @@ void os_close_epoll_fd(void)
+ 	struct kevent stop_event;
+ 	int error;
+ 
++	pthread_mutex_lock(&watched_lock);
+ 	watched_count = 0;
++	pthread_mutex_unlock(&watched_lock);
+ 	if (notification_worker_joinable) {
+ 		pthread_mutex_lock(&idle_waiter_lock);
+ 		notification_stopping = 1;

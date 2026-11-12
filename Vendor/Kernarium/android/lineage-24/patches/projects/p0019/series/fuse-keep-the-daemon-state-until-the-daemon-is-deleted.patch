@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 22:28:35 +0000
+Subject: [PATCH] fuse: keep the daemon state until the daemon is deleted
+
+FuseDaemon::Start kept a pointer to a struct fuse on its own stack and
+relied on active to tell callers when the pointer was valid. The Java side
+calls into the daemon until FuseDaemon.run() deletes it, which happens
+after Start returned and the stack object was gone, and
+SetupPublicVolumeLevelDbInstance took the leveldb mutex without looking at
+active. A public volume that unmounts right after it mounts reaches that
+call once the session has ended, and bionic aborts on the destroyed mutex.
+
+Allocate the state in Start and free it with the daemon, so every call made
+before the daemon is deleted reads live memory. Have the public volume's
+leveldb setup return when the session is not active. The check runs under
+the mutex that the session's teardown takes before it closes the volume's
+connections, so no connection is opened that nobody closes.
+---
+ jni/FuseDaemon.cpp | 27 ++++++++++++++++++++-------
+ jni/FuseDaemon.h   |  3 ++-
+ 2 files changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/jni/FuseDaemon.cpp b/jni/FuseDaemon.cpp
+index 19e61d452835113bdabfbcb34334229b45889b86..5ac3716ad809408c64ee9eff84e28aa40651ad3d 100644
+--- a/jni/FuseDaemon.cpp
++++ b/jni/FuseDaemon.cpp
+@@ -2652,6 +2652,10 @@ void FuseDaemon::MarkPathAsDeletedAndInvalidateFuseDentry(const std::string& pat
+ FuseDaemon::FuseDaemon(JNIEnv* env, jobject mediaProvider) : mp(env, mediaProvider),
+                                                              active(false), fuse(nullptr) {}
+ 
++FuseDaemon::~FuseDaemon() {
++    delete fuse;
++}
++
+ bool FuseDaemon::IsStarted() const {
+     return active.load(std::memory_order_acquire);
+ }
+@@ -2737,14 +2741,15 @@ void FuseDaemon::Start(android::base::unique_fd fd, const std::string& path,
+         LOG(INFO) << "Not using FUSE BPF";
+     }
+ 
+-    struct fuse fuse_default(path, stat.st_ino, uncached_mode, bpf_enabled,
+-                             enable_parallel_fuse_dir_ops, std::move(bpf_fd),
+-                             supported_transcoding_relative_paths,
+-                             supported_uncached_relative_paths);
++    // The state outlives this method: the Java side calls into the daemon until it deletes it,
++    // which is after Start returns, and those calls read the state (the leveldb mutex above all).
++    // The destructor frees it.
++    fuse = new struct fuse(path, stat.st_ino, uncached_mode, bpf_enabled,
++                           enable_parallel_fuse_dir_ops, std::move(bpf_fd),
++                           supported_transcoding_relative_paths,
++                           supported_uncached_relative_paths);
++    struct fuse& fuse_default = *fuse;
+     fuse_default.mp = &mp;
+-    // fuse_default is stack allocated, but it's safe to save it as an instance variable because
+-    // this method blocks and FuseDaemon#active tells if we are currently blocking
+-    fuse = &fuse_default;
+ 
+     // Used by pf_read: redacted ranges are represented by zeroized ranges of bytes,
+     // so we mmap the maximum length of redacted ranges in the beginning and save memory allocations
+@@ -2891,6 +2896,14 @@ void FuseDaemon::SetupLevelDbInstances() {
+ void FuseDaemon::SetupPublicVolumeLevelDbInstance(const std::string& volume_name) {
+     // Setup leveldb instance for both external primary and internal volume.
+     fuse->level_db_mutex.lock();
++    // A public volume can unmount again before its backup is set up. The session closes its
++    // leveldb connections after clearing active and under this mutex, so a connection opened
++    // while active is still set is closed with the session, and none is opened after it.
++    if (!IsStarted()) {
++        fuse->level_db_mutex.unlock();
++        LOG(WARNING) << "FUSE daemon is inactive. Not setting up leveldb for " << volume_name;
++        return;
++    }
+     // Create level db instance for public volume
+     SetupLevelDbConnection(volume_name);
+     fuse->level_db_mutex.unlock();
+diff --git a/jni/FuseDaemon.h b/jni/FuseDaemon.h
+index 344c18e4c0dc1f88e28405e417bd31c515bca36c..13eb4ae0c7b81fe41c65d4420f9cc485a756cef8 100644
+--- a/jni/FuseDaemon.h
++++ b/jni/FuseDaemon.h
+@@ -35,7 +35,7 @@ class FuseDaemon final {
+   public:
+     FuseDaemon(JNIEnv* env, jobject mediaProvider);
+ 
+-    ~FuseDaemon() = default;
++    ~FuseDaemon();
+ 
+     /**
+      * Start the FUSE daemon loop that will handle filesystem calls.
+@@ -154,6 +154,7 @@ class FuseDaemon final {
+     void operator=(const FuseDaemon&) = delete;
+     MediaProviderWrapper mp;
+     std::atomic_bool active;
++    // Created by Start and owned by the daemon; null until then.
+     struct ::fuse* fuse;
+ };
+ 

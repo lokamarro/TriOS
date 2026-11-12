@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:13:07 +0900
+Subject: [PATCH] virtio_console: queue hvc output as a port buffer
+
+put_chars() queued a kmemdup() copy of the hvc output as the output
+queue's cookie and freed the copy as soon as __send_to_port() returned.
+The wait in __send_to_port() also ends when the queue breaks, as it
+does when a vhost-user backend goes away, and the queue then still
+holds the freed copy. remove_vqs() detaches every unused buffer of an
+output queue as a struct port_buffer and frees it with free_buf(),
+which read the freed copy as one: the guest crashed in free_buf() or
+freed the object a second time. The wait could also take back an
+earlier buffer the host finished first, which it neither freed nor
+told put_chars() about, so put_chars() freed its own copy while the
+host still had it.
+
+Queue hvc output as a port buffer, as every other output buffer is.
+The wait frees the buffer it takes back, a buffer the host has not used
+when the queue breaks stays queued for remove_vqs() to free, and
+put_chars() frees its buffer only when nothing was queued.
+---
+ drivers/char/virtio_console.c | 42 ++++++++++++++++++++++++++++-------
+ 1 file changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/char/virtio_console.c b/drivers/char/virtio_console.c
+index 76f934b5d84bea74277313f7e7fd584129bb6777..826b737b5f3aba04a7cb22b9a279acb1974eb752 100644
+--- a/drivers/char/virtio_console.c
++++ b/drivers/char/virtio_console.c
+@@ -598,6 +598,7 @@ static ssize_t __send_to_port(struct port *port, struct scatterlist *sg,
+ 			      void *data, bool nonblock)
+ {
+ 	struct virtqueue *out_vq;
++	struct port_buffer *used;
+ 	int err;
+ 	unsigned long flags;
+ 	unsigned int len;
+@@ -633,9 +634,17 @@ static ssize_t __send_to_port(struct port *port, struct scatterlist *sg,
+ 	 * we need to kmalloc a GFP_ATOMIC buffer each time the
+ 	 * console driver writes something out.
+ 	 */
+-	while (!virtqueue_get_buf(out_vq, &len)
++	while (!(used = virtqueue_get_buf(out_vq, &len))
+ 		&& !virtqueue_is_broken(out_vq))
+ 		cpu_relax();
++	/*
++	 * Only put_chars() waits here. Like every buffer on an output
++	 * queue, the one the wait takes back is a port buffer, and one the
++	 * host has not used when the queue broke stays queued for
++	 * remove_vqs() to free.
++	 */
++	if (used)
++		free_buf(used, false);
+ done:
+ 	spin_unlock_irqrestore(&port->outvq_lock, flags);
+ 
+@@ -1108,20 +1117,37 @@ static ssize_t put_chars(u32 vtermno, const u8 *buf, size_t count)
+ {
+ 	struct port *port;
+ 	struct scatterlist sg[1];
+-	void *data;
+-	int ret;
++	struct port_buffer *pbuf;
++	ssize_t ret;
+ 
+ 	port = find_port_by_vtermno(vtermno);
+ 	if (!port)
+ 		return -EPIPE;
++	if (!count)
++		return 0;
+ 
+-	data = kmemdup(buf, count, GFP_ATOMIC);
+-	if (!data)
++	/*
++	 * The output is queued as a port buffer, as every buffer on an
++	 * output queue is, because whoever takes it back frees it as one:
++	 * __send_to_port() once the host has used it, or remove_vqs() if
++	 * the queue broke first.
++	 */
++	pbuf = kzalloc(sizeof(*pbuf), GFP_ATOMIC);
++	if (!pbuf)
++		return -ENOMEM;
++	pbuf->buf = kmemdup(buf, count, GFP_ATOMIC);
++	if (!pbuf->buf) {
++		kfree(pbuf);
+ 		return -ENOMEM;
++	}
++	pbuf->size = count;
++	pbuf->len = count;
+ 
+-	sg_init_one(sg, data, count);
+-	ret = __send_to_port(port, sg, 1, count, data, false);
+-	kfree(data);
++	sg_init_one(sg, pbuf->buf, count);
++	ret = __send_to_port(port, sg, 1, count, pbuf, false);
++	/* Nothing was queued. */
++	if (!ret)
++		free_buf(pbuf, false);
+ 	return ret;
+ }
+ 

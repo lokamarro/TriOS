@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:43:13 +0900
+Subject: [PATCH] Embedding: a host can publish a store into guest code after
+ it lands
+
+A host that keeps translations of guest code learns of a store into
+that code at the store's TLB miss, which returns before the store is
+made: the generated code stores through the address the miss returns.
+A host that publishes the change there publishes it before the bytes
+land, and another thread that consumes the publication and translates
+the code again in between reads the old bytes, with nothing left to
+tell it they changed. A thread that patched two instructions of a
+function and then flagged that it was done left other threads running
+the first patch only.
+
+Two ways now let the host publish after the store has landed:
+
+- A store's TLB-miss call carries EMBEDDER_ACCESS_VALUE when the cold
+  path put its bytes in the bounce buffer first, as it always has for
+  the page-crossing case. The host completes the store from there,
+  publishes, and returns the bounce buffer, which the store's own code
+  then writes again.
+- A locked access has no bytes to hand over, so a host that sets
+  Embedder.PublishAfter at its miss has the cold path run the op on
+  the operand itself, as it runs it on the copy of an operand across a
+  16-byte granule, and make the COMMIT call, at which the host
+  publishes. The op stays one host atomic access.
+
+Neither adds an instruction to the path of a TLB hit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Source/Interface/Core/JIT/EmbedderMemory.cpp    | 13 +++++++++++--
+ FEXCore/Source/Interface/Core/JIT/JITClass.h        |  7 +++++--
+ FEXCore/include/FEXCore/Core/CoreState.h            | 11 +++++++++++
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+index c6e0d7bde3ae5626e669931a377b93550beeb491..ab60009bf2554263bd2ef232baf0bfbb08762e9e 100644
+--- a/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/EmbedderMemory.cpp
+@@ -54,6 +54,10 @@ ARMEmitter::Register Arm64JITCore::EmbedderTranslate(ARMEmitter::Register Addres
+ 
+   auto Site = fextl::make_unique<EmbedderColdSite>();
+   Site->Address = Address;
++  // The cold path puts a store's bytes in the bounce buffer before the call.
++  if (PreStore) {
++    Flags |= Core::EMBEDDER_ACCESS_VALUE;
++  }
+   Site->Info = Size | Flags | (static_cast<uint64_t>(EmbedderUnretired(false)) << Core::EMBEDDER_ACCESS_UNRETIRED_SHIFT);
+   Site->GuestRIP = EmbedderCurrentRIP;
+   Site->PreStore = std::move(PreStore);
+@@ -245,9 +249,13 @@ void Arm64JITCore::EmitEmbedderColdSites() {
+     if (Site->SplitOp) {
+       // For a locked operand across a 16-byte granule the host returns its
+       // bounce buffer, holding a copy of the operand, with its split-operand
+-      // lock held; any other address is the operand's own.
++      // lock held; any other address is the operand's own. With PublishAfter
++      // set the op runs on the operand's own address here, and the COMMIT
++      // call lets the host publish the change once it has landed.
+       (void)Bind(&SplitCheck);
+       ARMEmitter::ForwardLabel Split;
++      ldr(TMP2.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.PublishAfter));
++      (void)cbnz(ARMEmitter::Size::i32Bit, TMP2, &Split);
+       LoadConstant(ARMEmitter::Size::i64Bit, TMP2, BounceOffset);
+       add(ARMEmitter::Size::i64Bit, TMP2, STATE, TMP2);
+       sub(ARMEmitter::Size::i64Bit, TMP2, TMP1, TMP2);
+@@ -256,7 +264,8 @@ void Arm64JITCore::EmitEmbedderColdSites() {
+       (void)Bind(&Split);
+       Site->SplitOp(TMP1);
+       // The host writes the copy back and unlocks, which cannot fault: it
+-      // checked the operand for the store before handing out the copy.
++      // checked the operand for the store before handing out the copy. Or it
++      // publishes the change the op made to the operand itself.
+       str(TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, Embedder.MissSavedTMP4));
+       LoadConstant(ARMEmitter::Size::i64Bit, TMP2, Site->Info | Core::EMBEDDER_ACCESS_COMMIT);
+       adr_OrRestart(TMP3, &Site->Done);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 870b4966bd518a275cf2de05c6687915a90b2d2a..b60cd56b6694e16a5fe315296f672b3a531ae51b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -127,11 +127,14 @@ private:
+     uint64_t Info {};
+     uint64_t GuestRIP {};
+     // Emits the op's store with the given base register, so a store that
+-    // crosses a guest page can be completed by the host from the bounce buffer.
++    // crosses a guest page, or one the host must publish after it lands, can
++    // be completed by the host from the bounce buffer
++    // (EMBEDDER_ACCESS_VALUE).
+     std::function<void(ARMEmitter::Register)> PreStore;
+     // A locked access: emits the op with the given host address, here on the
+     // copy in the bounce buffer of an operand that crosses a 16-byte granule,
+-    // after which the code goes on at Done.
++    // or on the operand itself when the host publishes its change after it
++    // lands (Embedder.PublishAfter), after which the code goes on at Done.
+     std::function<void(ARMEmitter::Register)> SplitOp;
+     ARMEmitter::BackwardLabel Done;
+   };
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 91041396df5a925b4ca6c8cd2ccb60cad6190c66..617b47ffbf1f948da63ff6bff9f1cdb88f64db76 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -408,6 +408,12 @@ constexpr uint64_t EMBEDDER_ACCESS_GATHER = 1ULL << 13;
+ // A part of a wider operand, which the alignment check does not hold to its
+ // own size. The backend's own; the host ignores it.
+ constexpr uint64_t EMBEDDER_ACCESS_PART = 1ULL << 14;
++// A store whose bytes the cold path put in the bounce buffer before the
++// call. The host may complete it from there and return the bounce buffer,
++// which the store's own code then writes again: a host that publishes a
++// store into guest code completes it first, so it lands before the
++// publication.
++constexpr uint64_t EMBEDDER_ACCESS_VALUE = 1ULL << 15;
+ // Bits 32 and up: the instructions a fault at this access leaves unretired
+ // of those its unit charged the budget for.
+ constexpr uint32_t EMBEDDER_ACCESS_UNRETIRED_SHIFT = 32;
+@@ -718,6 +724,11 @@ struct CpuStateFrame {
+     // itself: the checks pass it, and so does the guard of an access they do
+     // not cover.
+     uint32_t SegmentBypass {};
++    // Set by the host for a locked access whose change it publishes after
++    // the access lands, as for a store into guest code: the cold path runs
++    // the op on the operand itself and then makes the COMMIT call, which
++    // publishes and clears this.
++    uint32_t PublishAfter {};
+     // Bounce buffer for an access that crosses a guest page, an ordered
+     // access across a 16-byte granule, and the copy of a locked operand
+     // across one.

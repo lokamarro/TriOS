@@ -1,0 +1,679 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 03:05:45 +0900
+Subject: [PATCH] kosmickrisp: compile the device library offline into a
+ metallib
+
+Creating a device built every program of the device library from its MSL.
+Metal's shader cache holds the results only after a process has compiled
+them once, so every cold start, and every start after the cache was
+evicted, paid a front-end compile of the whole library before the device
+existed: on an M-series Mac a cold vkCreateDevice took 1.85 s.
+
+kk_clc now also writes each program's MSL into one bundle, and Apple
+builds compile that bundle with the target platform's Metal toolchain into
+a metallib that the driver carries as data. Each kernel is named after its
+program index. Creating a device loads the library from that data and
+builds each pipeline from its compiled function, and still compiles a
+program's MSL if the build made no metallib or Metal refuses one of its
+functions. Other targets build no metallib.
+
+The 25 programs make a 209 KiB metallib. A cold vkCreateDevice now takes
+0.64 s, which is Metal's back-end compile to GPU code that only its shader
+cache can skip, and a warm one 3 ms instead of 5 ms. The process's Metal
+cache keeps 260 KiB instead of 792 KiB, since it no longer stores the
+compiled libraries. A device test checks that every program comes from the
+metallib.
+---
+ src/kosmickrisp/bridge/mtl_compiler.h         |   9 ++
+ src/kosmickrisp/bridge/mtl_compiler.m         |  24 +++-
+ src/kosmickrisp/bridge/stubs/mtl_compiler.c   |   6 +
+ src/kosmickrisp/clc/kk_clc.c                  |  24 +++-
+ src/kosmickrisp/libkk/kk_metallib.h           |  22 +++
+ src/kosmickrisp/libkk/kk_metallib.py          | 129 ++++++++++++++++++
+ src/kosmickrisp/libkk/meson.build             |  26 +++-
+ src/kosmickrisp/vulkan/kk_device.h            |   2 +
+ src/kosmickrisp/vulkan/kk_device_lib.c        |  74 ++++++++--
+ src/kosmickrisp/vulkan/meson.build            |  21 +++
+ .../tests/test_offline_device_library.c       | 101 ++++++++++++++
+ 11 files changed, 417 insertions(+), 21 deletions(-)
+ create mode 100644 src/kosmickrisp/libkk/kk_metallib.h
+ create mode 100755 src/kosmickrisp/libkk/kk_metallib.py
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_offline_device_library.c
+
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.h b/src/kosmickrisp/bridge/mtl_compiler.h
+index 3b645509c44c2588536fc613278cfcfa322fde3b..f13c03ce07bce0135e37281863eea442dd633989 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.h
++++ b/src/kosmickrisp/bridge/mtl_compiler.h
+@@ -11,6 +11,7 @@
+ 
+ #include <inttypes.h>
+ #include <stdbool.h>
++#include <stddef.h>
+ 
+ /* Bridge enums */
+ enum mtl_pixel_format;
+@@ -19,10 +20,18 @@ enum mtl_pixel_format;
+ mtl_compiler *mtl_new_compiler(mtl_device *device);
+ 
+ /* Library */
++/* The Metal Shading Language version mtl_new_library compiles for. The device
++ * library's offline build (libkk/kk_metallib.py) reads it from here. */
++#define MTL_COMPILER_LANGUAGE_MAJOR 3
++#define MTL_COMPILER_LANGUAGE_MINOR 2
+ mtl_library *
+ mtl_new_library(mtl_compiler *compiler, const char *src,
+                 enum mtl_math_mode math_mode,
+                 enum mtl_math_floating_point_functions math_fp_fns);
++/* A library compiled offline. The data must outlive the library, as static
++ * data does: Metal reads it without a copy. */
++mtl_library *mtl_new_library_with_data(mtl_device *device, const void *data,
++                                       size_t size);
+ mtl_function_descriptor *
+ mtl_new_library_function_descriptor(mtl_library *library,
+                                     const char *entry_point);
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_compiler.m
+index f0279d86cdb9ce39330c6a5dab61abd3bb37692a..5a93117556817116fb5284f67d3dfb7120f29722 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -47,7 +47,8 @@
+       /* TODO_KOSMICKRISP: MTLLanguageVersion4_0 causing vertex shader timeouts in
+        * dEQP-VK.spirv_assembly.instruction.graphics.float16.logical.opisnan_vector_vert
+        * on M1/2 */
+-      opts.languageVersion = MTLLanguageVersion3_2;
++      opts.languageVersion = (MTLLanguageVersion)(
++         (MTL_COMPILER_LANGUAGE_MAJOR << 16) | MTL_COMPILER_LANGUAGE_MINOR);
+       opts.mathMode = (MTLMathMode)math_mode;
+       opts.mathFloatingPointFunctions = (MTLMathFloatingPointFunctions)math_fp_fns;
+ 
+@@ -66,6 +67,27 @@
+    }
+ }
+ 
++mtl_library *
++mtl_new_library_with_data(mtl_device *device, const void *data, size_t size)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      /* An empty destructor makes Metal read the caller's data in place. */
++      dispatch_data_t blob = dispatch_data_create(
++         data, size, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{});
++
++      NSError *error;
++      id<MTLLibrary> lib = [dev newLibraryWithData:blob error:&error];
++      dispatch_release(blob);
++
++      if (lib == nil) {
++         fprintf(stderr, "Failed to load MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
++      }
++
++      return lib;
++   }
++}
++
+ mtl_function_descriptor *
+ mtl_new_library_function_descriptor(mtl_library *library, const char *entry_point)
+ {
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_compiler.c b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+index 4e5b3411927b467b6d2271f852fb81d5598ea7e2..f4f18a45af364c25d6d576052fc58e99df5594f0 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -24,6 +24,12 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
+    return NULL;
+ }
+ 
++mtl_library *
++mtl_new_library_with_data(mtl_device *device, const void *data, size_t size)
++{
++   return NULL;
++}
++
+ mtl_function_descriptor *
+ mtl_new_library_function_descriptor(mtl_library *library,
+                                     const char *entry_point)
+diff --git a/src/kosmickrisp/clc/kk_clc.c b/src/kosmickrisp/clc/kk_clc.c
+index 12bf85162697b03d62e52755e4bb04ec2ead1507..d2bd34371b19e0f12e4e49fba2e97c5e43d5db8e 100644
+--- a/src/kosmickrisp/clc/kk_clc.c
++++ b/src/kosmickrisp/clc/kk_clc.c
+@@ -186,6 +186,15 @@ print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
+    free(mem);
+ }
+ 
++/* Each program's MSL, prefixed by its program index and length, for the
++ * build to compile offline into the device library's metallib. */
++static void
++print_msl_bundle(FILE *fp, unsigned program, const char *msl)
++{
++   fprintf(fp, "//@kk-program %u %zu\n", program, strlen(msl));
++   fputs(msl, fp);
++}
++
+ static nir_def *
+ load_kernel_input(nir_builder *b, unsigned num_components, unsigned bit_size,
+                   unsigned offset_B)
+@@ -208,8 +217,10 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
+ int
+ main(int argc, char **argv)
+ {
+-   if (argc != 4) {
+-      fprintf(stderr, "Usage: %s [input spir-v] [output header] [output C]\n",
++   if (argc != 5) {
++      fprintf(stderr,
++              "Usage: %s [input spir-v] [output header] [output C] "
++              "[output MSL bundle]\n",
+               argv[0]);
+       return 1;
+    }
+@@ -217,6 +228,7 @@ main(int argc, char **argv)
+    const char *infile = argv[1];
+    const char *outh_file = argv[2];
+    const char *outc_file = argv[3];
++   const char *outmsl_file = argv[4];
+ 
+    void *mem_ctx = ralloc_context(NULL);
+ 
+@@ -239,6 +251,12 @@ main(int argc, char **argv)
+ 
+    FILE *fp_h = fopen(outh_file, "w");
+    FILE *fp_c = fopen(outc_file, "w");
++   FILE *fp_msl = fopen(outmsl_file, "w");
++   if (!fp_h || !fp_c || !fp_msl) {
++      fprintf(stderr, "Failed to open the outputs\n");
++      ralloc_free(mem_ctx);
++      return 1;
++   }
+    glsl_type_singleton_init_or_ref();
+ 
+    nir_precomp_print_header(fp_c, fp_h, "KosmicKrisp Contributors",
+@@ -314,6 +332,7 @@ main(int argc, char **argv)
+          struct nir_to_msl_options options = {};
+          const char *msl = nir_to_msl(s, &options);
+          print_shader(fp_c, libfunc->name, target, v, msl, s);
++         print_msl_bundle(fp_msl, nir_precomp_index(nir, libfunc) + v, msl);
+          ralloc_free((void *)msl);
+ 
+          ralloc_free(s);
+@@ -331,6 +350,7 @@ main(int argc, char **argv)
+    glsl_type_singleton_decref();
+    fclose(fp_c);
+    fclose(fp_h);
++   fclose(fp_msl);
+    ralloc_free(mem_ctx);
+    return 0;
+ }
+diff --git a/src/kosmickrisp/libkk/kk_metallib.h b/src/kosmickrisp/libkk/kk_metallib.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e108b9a565d976beb3764ca8cbff447b9aac1a6e
+--- /dev/null
++++ b/src/kosmickrisp/libkk/kk_metallib.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef KK_METALLIB_H
++#define KK_METALLIB_H 1
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* The device library compiled offline for the target platform, in which
++ * program i's kernel is named libkk_<i>. Only Apple builds carry it, and they
++ * define KK_HAVE_METALLIB; see kk_metallib.py. */
++#define KK_METALLIB_HIDDEN __attribute__((visibility("hidden")))
++
++/* The math the device library compiles with: at runtime when there is no
++ * offline library, and offline, where kk_metallib.py reads these two lines. */
++#define KK_DEVICE_LIB_MATH_MODE MTL_MATH_MODE_FAST
++#define KK_DEVICE_LIB_MATH_FP32_FUNCTIONS MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST
++
++extern KK_METALLIB_HIDDEN const unsigned libkk_metallib_programs;
++extern KK_METALLIB_HIDDEN const size_t libkk_metallib_size;
++extern KK_METALLIB_HIDDEN const uint8_t libkk_metallib[];
++
++#endif /* KK_METALLIB_H */
+diff --git a/src/kosmickrisp/libkk/kk_metallib.py b/src/kosmickrisp/libkk/kk_metallib.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..0da26e4a2b42b2e7b874587336b8ccf274da9d38
+--- /dev/null
++++ b/src/kosmickrisp/libkk/kk_metallib.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: MIT
++"""Compile the KosmicKrisp device library offline into one metallib.
++
++kk_clc writes every device library program's MSL into one bundle. This
++compiles each program with the Metal toolchain of the target platform, links
++them into a single metallib with each kernel renamed after its program index,
++and emits the metallib as a C array, so the driver loads compiled programs
++instead of compiling MSL when it creates a device.
++"""
++
++import argparse
++import os
++import re
++import subprocess
++import sys
++
++# KosmicKrisp is a Metal 4 driver, so both platforms start at version 26.
++PLATFORMS = {
++    'macos': ('macosx', 'air64-apple-macos26.0'),
++    'ios': ('iphoneos', 'air64-apple-ios26.0'),
++}
++
++HEADER = re.compile(rb'//@kk-program (\d+) (\d+)\n')
++ENTRYPOINT = 'kernel void main_entrypoint('
++
++
++def parse_bundle(path):
++    with open(path, 'rb') as f:
++        data = f.read()
++    programs = {}
++    pos = 0
++    while pos < len(data):
++        match = HEADER.match(data, pos)
++        if match is None:
++            sys.exit(f'{path}: malformed program header at byte {pos}')
++        index, length = int(match[1]), int(match[2])
++        source = data[match.end():match.end() + length]
++        if len(source) != length or index in programs:
++            sys.exit(f'{path}: malformed program {index}')
++        programs[index] = source.decode('ascii')
++        pos = match.end() + length
++    if sorted(programs) != list(range(len(programs))):
++        sys.exit(f'{path}: program indices are not contiguous')
++    return programs
++
++
++def define(path, name, value):
++    with open(path, encoding='ascii') as f:
++        match = re.search(rf'^#define {name} {value}$', f.read(), re.MULTILINE)
++    if match is None:
++        sys.exit(f'{path}: no #define {name} matching {value}')
++    return match[1]
++
++
++def metal_options(compiler_header, library_header):
++    """The options the driver compiles the device library's MSL with at
++    runtime, read from where it sets them: the language version from the
++    bridge's mtl_compiler.h and the math from kk_metallib.h."""
++    major = define(compiler_header, 'MTL_COMPILER_LANGUAGE_MAJOR', r'(\d+)')
++    minor = define(compiler_header, 'MTL_COMPILER_LANGUAGE_MINOR', r'(\d+)')
++    math = define(library_header, 'KK_DEVICE_LIB_MATH_MODE',
++                  r'MTL_MATH_MODE_(SAFE|RELAXED|FAST)')
++    fp32 = define(library_header, 'KK_DEVICE_LIB_MATH_FP32_FUNCTIONS',
++                  r'MTL_MATH_FLOATING_POINT_FUNCTIONS_(FAST|PRECISE)')
++    return [
++        f'-std=metal{major}.{minor}',
++        f'-fmetal-math-mode={math.lower()}',
++        f'-fmetal-math-fp32-functions={fp32.lower()}',
++    ]
++
++
++def run(command):
++    result = subprocess.run(command, stdout=subprocess.PIPE,
++                            stderr=subprocess.STDOUT, text=True)
++    if result.returncode != 0:
++        sys.exit(f'{" ".join(command)} failed:\n{result.stdout}')
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--platform', required=True, choices=sorted(PLATFORMS))
++    parser.add_argument('--private-dir', required=True)
++    parser.add_argument('--compiler-header', required=True)
++    parser.add_argument('--library-header', required=True)
++    parser.add_argument('bundle')
++    parser.add_argument('output')
++    args = parser.parse_args()
++
++    sdk, target = PLATFORMS[args.platform]
++    options = metal_options(args.compiler_header, args.library_header)
++    programs = parse_bundle(args.bundle)
++    os.makedirs(args.private_dir, exist_ok=True)
++
++    airs = []
++    for index, source in sorted(programs.items()):
++        if source.count(ENTRYPOINT) != 1:
++            sys.exit(f'program {index} does not declare one kernel entry point')
++        source = source.replace(ENTRYPOINT, f'kernel void libkk_{index}(')
++        metal = os.path.join(args.private_dir, f'libkk_{index}.metal')
++        air = os.path.join(args.private_dir, f'libkk_{index}.air')
++        with open(metal, 'w', encoding='ascii') as f:
++            f.write(source)
++        run(['xcrun', '-sdk', sdk, 'metal', '-c', '-target', target,
++             *options, '-o', air, metal])
++        airs.append(air)
++
++    metallib = os.path.join(args.private_dir, 'libkk.metallib')
++    run(['xcrun', '-sdk', sdk, 'metallib', '-o', metallib, *airs])
++    with open(metallib, 'rb') as f:
++        blob = f.read()
++
++    with open(args.output, 'w', encoding='ascii') as out:
++        out.write('/* Generated by kk_metallib.py from the device library. */\n\n')
++        out.write('#include "kk_metallib.h"\n\n')
++        out.write('KK_METALLIB_HIDDEN const unsigned libkk_metallib_programs = '
++                  f'{len(programs)};\n')
++        out.write('KK_METALLIB_HIDDEN const size_t libkk_metallib_size = '
++                  f'{len(blob)};\n')
++        out.write('KK_METALLIB_HIDDEN const uint8_t libkk_metallib[] '
++                  '__attribute__((aligned(16))) = {')
++        for offset in range(0, len(blob), 16):
++            chunk = blob[offset:offset + 16]
++            out.write('\n   ' + ''.join(f' 0x{byte:02x},' for byte in chunk))
++        out.write('\n};\n')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/kosmickrisp/libkk/meson.build b/src/kosmickrisp/libkk/meson.build
+index 236af5081351c89aa0748ac61dc69dbe092ccf8c..df3f8b487229017e145491cddb770de6933564f2 100644
+--- a/src/kosmickrisp/libkk/meson.build
++++ b/src/kosmickrisp/libkk/meson.build
+@@ -35,14 +35,33 @@ idep_libkk = declare_dependency(
+ 
+ libkk_shaders = custom_target(
+   input : libkk_spv,
+-  output : ['libkk_shaders.h', 'libkk_shaders.c'],
+-  command : [prog_kk_clc, libkk_spv, '@OUTPUT0@', '@OUTPUT1@']
++  output : ['libkk_shaders.h', 'libkk_shaders.c', 'libkk_shaders.msl'],
++  command : [prog_kk_clc, libkk_spv, '@OUTPUT0@', '@OUTPUT1@', '@OUTPUT2@']
+ )
+ 
++# On Apple platforms the device library is also compiled offline with the
++# target platform's Metal toolchain, so creating a device loads compiled
++# programs instead of compiling their MSL.
++libkk_metallib = []
++libkk_metallib_args = []
++if host_machine.system() == 'darwin'
++  libkk_metallib = custom_target(
++    input : [files('kk_metallib.py'), libkk_shaders[2],
++             files('../bridge/mtl_compiler.h', 'kk_metallib.h')],
++    output : 'libkk_metallib.c',
++    command : [prog_python, '@INPUT0@', '--platform', host_machine.subsystem(),
++               '--private-dir', '@PRIVATE_DIR@',
++               '--compiler-header', '@INPUT2@', '--library-header', '@INPUT3@',
++               '@INPUT1@', '@OUTPUT@'],
++  )
++  libkk_metallib_args = ['-DKK_HAVE_METALLIB=1']
++endif
++
+ # TODO_KOSMICKRISP We can get rid of this library once we remove the generated entrypoints for the trampoline
+ libkk_shaders_lib = static_library(
+   'libkk_shaders',
+-  sources : [libkk_shaders],
++  sources : [libkk_shaders[0], libkk_shaders[1], libkk_metallib],
++  include_directories : include_directories('.'),
+   link_with : [libpoly_nir],
+   dependencies : [idep_nir, idep_mesautil, idep_libpoly],
+ )
+@@ -50,5 +69,6 @@ libkk_shaders_lib = static_library(
+ idep_libkk_shaders_h = declare_dependency(
+   sources : [libkk_shaders[0]],
+   include_directories : include_directories('.'),
++  compile_args : libkk_metallib_args,
+   link_with : libkk_shaders_lib,
+ )
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 4be717b353bd93e44442ebd906502593cb36f6e0..69da569a5d8e0287165eb5e303a608406fba4c8d 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -93,6 +93,8 @@ struct kk_sampler_heap {
+ 
+ struct kk_precompiled_cache {
+    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
++   /* Programs built from the offline metallib rather than from their MSL. */
++   uint32_t offline_count;
+ };
+ 
+ /* Metal command allocators own the command storage an encoder writes into,
+diff --git a/src/kosmickrisp/vulkan/kk_device_lib.c b/src/kosmickrisp/vulkan/kk_device_lib.c
+index b7906019f9f140a266945357340e97ac7634240d..615babfc44f1c279d6a9a2c6621ab746d350fe63 100644
+--- a/src/kosmickrisp/vulkan/kk_device_lib.c
++++ b/src/kosmickrisp/vulkan/kk_device_lib.c
+@@ -11,39 +11,81 @@
+ #include "kosmickrisp/clc/kk_precompiled_shader.h"
+ 
+ #include "libkk_shaders.h"
++#include "kk_metallib.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
+ #include "nir/nir.h"
+ #include "nir/nir_builder.h"
+ 
++/* The device library compiled offline for this platform, if the build made
++ * one; see kk_metallib.py. Compiling the programs' MSL instead costs every
++ * process that creates a device a front-end compile until Metal's cache
++ * holds the result. */
++static mtl_library *
++open_offline_library(struct kk_device *dev)
++{
++#ifdef KK_HAVE_METALLIB
++   if (libkk_metallib_programs == LIBKK_NUM_PROGRAMS)
++      return mtl_new_library_with_data(dev->mtl_handle, libkk_metallib,
++                                       libkk_metallib_size);
++#endif
++   return NULL;
++}
++
++static mtl_compute_pipeline_state *
++build_program(struct kk_device *dev, mtl_library *library,
++              const char *entry_point, uint32_t local_size_threads)
++{
++   mtl_function_descriptor *function =
++      mtl_new_library_function_descriptor(library, entry_point);
++   mtl_compute_pipeline_state *pipeline = mtl_new_compute_pipeline_state(
++      dev->mtl_compiler_handle, function, local_size_threads);
++   mtl_release(function);
++   return pipeline;
++}
++
+ static VkResult
+ build_precompiled_shaders(struct kk_device *dev)
+ {
++   mtl_library *offline = open_offline_library(dev);
++   dev->precompiled_cache.offline_count = 0u;
++
+    uint32_t i = 0u;
+    for (; i < LIBKK_NUM_PROGRAMS; ++i) {
+       const uint32_t *bin = libkk_AppleSilicon[i];
+       const struct kk_precompiled_info *info = (void *)bin;
+       const char *msl = (const char *)bin + sizeof(*info);
+-
+-      mtl_library *library =
+-         mtl_new_library(dev->mtl_compiler_handle, msl, MTL_MATH_MODE_FAST,
+-                         MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+-      if (library == NULL)
+-         goto fail;
+-
+       struct kk_precompiled_shader *shader = &dev->precompiled_cache.shaders[i];
+-
+-      /* TODO_KOSMICKRISP Do not hardcode the entrypoint */
+-      mtl_function_descriptor *function =
+-         mtl_new_library_function_descriptor(library, "main_entrypoint");
+       uint32_t local_size_threads = info->workgroup_size[0] *
+                                     info->workgroup_size[1] *
+                                     info->workgroup_size[2];
+-      shader->pipeline = mtl_new_compute_pipeline_state(
+-         dev->mtl_compiler_handle, function, local_size_threads);
+-      mtl_release(function);
+-      mtl_release(library);
++
++      shader->pipeline = NULL;
++      if (offline) {
++         char entry_point[32];
++         snprintf(entry_point, sizeof(entry_point), "libkk_%u", i);
++         shader->pipeline =
++            build_program(dev, offline, entry_point, local_size_threads);
++         if (shader->pipeline)
++            dev->precompiled_cache.offline_count++;
++      }
++
++      /* Without the offline library, or if Metal refuses its program, the
++       * program's own MSL still builds it. */
++      if (!shader->pipeline) {
++         mtl_library *library =
++            mtl_new_library(dev->mtl_compiler_handle, msl,
++                            KK_DEVICE_LIB_MATH_MODE,
++                            KK_DEVICE_LIB_MATH_FP32_FUNCTIONS);
++         if (library == NULL)
++            goto fail;
++
++         /* TODO_KOSMICKRISP Do not hardcode the entrypoint */
++         shader->pipeline = build_program(dev, library, "main_entrypoint",
++                                          local_size_threads);
++         mtl_release(library);
++      }
+ 
+       if (!shader->pipeline)
+          goto fail;
+@@ -51,9 +93,11 @@ build_precompiled_shaders(struct kk_device *dev)
+       memcpy(&shader->info, info, sizeof(*info));
+    }
+ 
++   mtl_release(offline);
+    return VK_SUCCESS;
+ 
+ fail:
++   mtl_release(offline);
+    for (uint32_t j = 0u; j < i; ++j)
+       mtl_release(dev->precompiled_cache.shaders[j].pipeline);
+    return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index d6a12871b94c3ce125e733218a70d5ec5365c822..621cdc02cf11e720a6297a6178624838487791c4 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -1161,6 +1161,27 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 60,
+     )
++    test(
++      'kosmickrisp_offline_device_library',
++      executable(
++        'test_kosmickrisp_offline_device_library',
++        files('tests/test_offline_device_library.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++          dependency('appleframeworks', modules : ['Foundation', 'Metal']),
++        ],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_command_buffer_consolidation',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_offline_device_library.c b/src/kosmickrisp/vulkan/tests/test_offline_device_library.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c38c625e376b5df167b1763f5fa340c7fd2dc41f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_offline_device_library.c
+@@ -0,0 +1,101 @@
++/* SPDX-License-Identifier: MIT */
++/* The device library compiled offline must hold every program the driver
++ * dispatches, each named after its program index, and every one must build
++ * a compute pipeline. A missing or refused program silently falls back to
++ * compiling its MSL whenever a device is created, so device creation must
++ * also report that it built every program from the metallib.
++ */
++#define VK_NO_PROTOTYPES
++#include "kosmickrisp/vulkan/kk_device.h"
++
++#include "kk_metallib.h"
++#include "libkk_shaders.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++#define CHECK(x)                                                               \
++   do {                                                                        \
++      if (!(x)) {                                                              \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);               \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++
++static double
++now_ms(void)
++{
++   struct timespec t;
++   clock_gettime(CLOCK_MONOTONIC, &t);
++   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++int
++main(void)
++{
++#ifndef KK_HAVE_METALLIB
++   printf("this platform has no offline device library\n");
++   return 77;
++#else
++   CHECK(libkk_metallib_programs == LIBKK_NUM_PROGRAMS);
++   CHECK(libkk_metallib_size > 0);
++
++   PFN_vkCreateInstance vkCreateInstance =
++      (PFN_vkCreateInstance)vkGetInstanceProcAddr(NULL, "vkCreateInstance");
++   CHECK(vkCreateInstance);
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++                               .pApplicationInfo = &app};
++   VkInstance instance;
++   CHECK(vkCreateInstance(&ici, NULL, &instance) == VK_SUCCESS);
++   PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices =
++      (PFN_vkEnumeratePhysicalDevices)vkGetInstanceProcAddr(
++         instance, "vkEnumeratePhysicalDevices");
++   PFN_vkCreateDevice vkCreateDevice =
++      (PFN_vkCreateDevice)vkGetInstanceProcAddr(instance, "vkCreateDevice");
++   PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr =
++      (PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(instance,
++                                                     "vkGetDeviceProcAddr");
++   PFN_vkDestroyInstance vkDestroyInstance =
++      (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance,
++                                                   "vkDestroyInstance");
++   CHECK(vkEnumeratePhysicalDevices && vkCreateDevice && vkGetDeviceProcAddr &&
++         vkDestroyInstance);
++
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
++   CHECK(count == 1);
++   float priority = 1;
++   VkDeviceQueueCreateInfo qci = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority};
++   VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++                             .queueCreateInfoCount = 1,
++                             .pQueueCreateInfos = &qci};
++   VkDevice device;
++   double start = now_ms();
++   CHECK(vkCreateDevice(physical, &dci, NULL, &device) == VK_SUCCESS);
++   printf("vkCreateDevice took %.1f ms\n", now_ms() - start);
++   struct kk_device *dev = kk_device_from_handle(device);
++   /* Creating the device compiled no program's MSL: each program's kernel is
++    * in the metallib under its index and built its pipeline from there. */
++   CHECK(dev->precompiled_cache.offline_count == LIBKK_NUM_PROGRAMS);
++   printf("%u offline programs, %zu bytes\n", LIBKK_NUM_PROGRAMS,
++          libkk_metallib_size);
++   PFN_vkDestroyDevice vkDestroyDevice =
++      (PFN_vkDestroyDevice)vkGetDeviceProcAddr(device, "vkDestroyDevice");
++   CHECK(vkDestroyDevice);
++
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("offline device library ok\n");
++   return 0;
++#endif
++}

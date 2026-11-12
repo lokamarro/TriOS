@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 19:20:50 +0900
+Subject: [PATCH] util: make the last thread out the emulated barrier's serial
+ thread
+
+util_queue_finish queues one barrier job per worker, and the worker that
+util_barrier_wait reports as the serial thread destroys the barrier. Apple
+and Haiku have no pthread barriers, and Mesa's replacement reported every
+thread as the serial one, so every worker destroyed the barrier's mutex and
+condition variable while the others were still waking from it.
+
+On Darwin a destroyed mutex can still be re-locked from inside
+pthread_cond_wait, but pthread_mutex_unlock then fails and leaves it held,
+so the next worker to wake sleeps forever; a condition variable destroyed
+and initialised again under a sleeper loses its wake-up. Either way that
+worker never signals its fence and util_queue_finish never returns. Zink's
+screen teardown finishes the disk cache's queue, which grows to four
+threads under shader-cache traffic, and the emulator hung in it on exit
+after guest GL activity.
+
+Reporting the thread that completes the barrier would not be enough: it
+leaves while the threads it woke still need the mutex. Count the released
+waiters and report the last one to leave, so that exactly one thread per
+release is told it may destroy the barrier, and only once it is the last
+thread using it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/util/meson.build              |   1 +
+ src/util/tests/u_barrier_test.cpp | 119 ++++++++++++++++++++++++++++++
+ src/util/u_thread.c               |  18 ++++-
+ src/util/u_thread.h               |   6 ++
+ 4 files changed, 143 insertions(+), 1 deletion(-)
+ create mode 100644 src/util/tests/u_barrier_test.cpp
+
+diff --git a/src/util/meson.build b/src/util/meson.build
+index b11f0c4cc1c764afd06148996480919623ad3cdf..03b45b41fc089e120e4464d82e44423063e65a5d 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -490,6 +490,7 @@ if with_tests
+     'tests/string_buffer_test.cpp',
+     'tests/timespec_test.cpp',
+     'tests/u_atomic_test.cpp',
++    'tests/u_barrier_test.cpp',
+     'tests/u_shader_variant_cache_test.cpp',
+     'tests/u_call_once_test.cpp',
+     'tests/u_debug_stack_test.cpp',
+diff --git a/src/util/tests/u_barrier_test.cpp b/src/util/tests/u_barrier_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..706249ded1cc547201e9a2e89e1fe99190dcbdda
+--- /dev/null
++++ b/src/util/tests/u_barrier_test.cpp
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: MIT */
++
++/* util_queue_finish queues one barrier job per worker, and the worker that
++ * util_barrier_wait reports as the serial thread destroys the barrier. That
++ * is safe only if exactly one worker is told so, and only once the others
++ * have left: a mutex or condition variable destroyed under a worker that is
++ * still re-locking or waking strands it, and the finish waiting for that
++ * worker never returns. Apple and Haiku have no pthread barriers, so these
++ * check Mesa's own barrier there and pthread's everywhere else. */
++
++#include <gtest/gtest.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <thread>
++#include <vector>
++
++#include <unistd.h>
++
++#include "util/u_queue.h"
++#include "util/u_thread.h"
++
++namespace {
++
++/* Each worker waits on the barrier once per round and counts the rounds in
++ * which it was the serial thread. */
++unsigned
++count_serial_threads(unsigned num_threads, unsigned rounds)
++{
++   util_barrier barrier;
++   util_barrier_init(&barrier, num_threads);
++
++   std::atomic<unsigned> serial{0};
++   std::vector<std::thread> threads;
++   for (unsigned t = 0; t < num_threads; t++) {
++      threads.emplace_back([&] {
++         for (unsigned round = 0; round < rounds; round++) {
++            if (util_barrier_wait(&barrier))
++               serial++;
++         }
++      });
++   }
++   for (auto &thread : threads)
++      thread.join();
++
++   util_barrier_destroy(&barrier);
++   return serial.load();
++}
++
++void
++nop_job(void *job, void *gdata, int thread_index)
++{
++}
++
++/* A finish that stops returning cannot be recovered in-process: destroying
++ * the queue joins the stranded worker. This runs in a death-test child, which
++ * reports a stall by its exit status instead. */
++[[noreturn]] void
++finish_repeatedly(unsigned num_threads, unsigned finishes)
++{
++   std::atomic<unsigned> finished{0};
++   std::atomic<bool> done{false};
++   std::thread watchdog([&] {
++      unsigned seen = 0;
++      auto progress = std::chrono::steady_clock::now();
++      while (!done.load()) {
++         std::this_thread::sleep_for(std::chrono::milliseconds(10));
++         const auto now = std::chrono::steady_clock::now();
++         const unsigned count = finished.load();
++         if (count != seen) {
++            seen = count;
++            progress = now;
++         } else if (now - progress > std::chrono::seconds(10)) {
++            fprintf(stderr, "util_queue_finish stalled after %u finishes\n",
++                    count);
++            _exit(3);
++         }
++      }
++   });
++
++   struct util_queue queue;
++   if (!util_queue_init(&queue, "finish", 8, num_threads, 0, NULL))
++      _exit(2);
++   util_queue_adjust_num_threads(&queue, num_threads);
++   if (queue.num_threads != num_threads)
++      _exit(2);
++
++   static int job;
++   for (unsigned i = 0; i < finishes; i++) {
++      util_queue_add_job(&queue, &job, NULL, nop_job, NULL, 0);
++      util_queue_finish(&queue);
++      finished++;
++   }
++
++   done = true;
++   watchdog.join();
++   util_queue_destroy(&queue);
++   _exit(0);
++}
++
++} /* namespace */
++
++TEST(util_barrier, one_serial_thread_per_release)
++{
++   for (unsigned num_threads : {1u, 2u, 4u, 8u})
++      EXPECT_EQ(count_serial_threads(num_threads, 1000), 1000u)
++         << num_threads << " threads";
++}
++
++TEST(util_barrier, queue_finish_returns)
++{
++   GTEST_FLAG_SET(death_test_style, "threadsafe");
++   for (unsigned num_threads : {2u, 4u}) {
++      EXPECT_EXIT(finish_repeatedly(num_threads, 5000),
++                  ::testing::ExitedWithCode(0), "")
++         << num_threads << " threads";
++   }
++}
+diff --git a/src/util/u_thread.c b/src/util/u_thread.c
+index d1cf0858c618d5cbbf9e507bbfbf58372c3bfa84..aa83fd3f50b0c11802c1e404248b9b8ad9cd2567 100644
+--- a/src/util/u_thread.c
++++ b/src/util/u_thread.c
+@@ -219,6 +219,7 @@ void util_barrier_init(util_barrier *barrier, unsigned count)
+ {
+    barrier->count = count;
+    barrier->waiters = 0;
++   barrier->departing = 0;
+    barrier->sequence = 0;
+    (void) mtx_init(&barrier->mutex, mtx_plain);
+    cnd_init(&barrier->condvar);
+@@ -227,12 +228,21 @@ void util_barrier_init(util_barrier *barrier, unsigned count)
+ void util_barrier_destroy(util_barrier *barrier)
+ {
+    assert(barrier->waiters == 0);
++   assert(barrier->departing == 0);
+    mtx_destroy(&barrier->mutex);
+    cnd_destroy(&barrier->condvar);
+ }
+ 
++/* A released waiter still needs the mutex, and the condition variable it
++ * slept on, until it has re-locked the mutex and left. The serial thread is
++ * therefore the last one out, not the one that completes the barrier: a
++ * caller that destroys the barrier on true would otherwise destroy both under
++ * the threads still leaving.
++ */
+ bool util_barrier_wait(util_barrier *barrier)
+ {
++   bool serial;
++
+    mtx_lock(&barrier->mutex);
+ 
+    assert(barrier->waiters < barrier->count);
+@@ -244,15 +254,21 @@ bool util_barrier_wait(util_barrier *barrier)
+       do {
+          cnd_wait(&barrier->condvar, &barrier->mutex);
+       } while (sequence == barrier->sequence);
++
++      assert(barrier->departing > 0);
++      barrier->departing--;
++      serial = barrier->departing == 0;
+    } else {
+       barrier->waiters = 0;
++      barrier->departing += barrier->count - 1;
+       barrier->sequence++;
+       cnd_broadcast(&barrier->condvar);
++      serial = barrier->departing == 0;
+    }
+ 
+    mtx_unlock(&barrier->mutex);
+ 
+-   return true;
++   return serial;
+ }
+ 
+ #endif
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index 57ebdc51ba1a9f9a8decd7b5aae34c786e2b099e..f4bb8e6f009754133a1e951cbbae86632987cd43 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -125,6 +125,8 @@ typedef pthread_barrier_t util_barrier;
+ typedef struct {
+    unsigned count;
+    unsigned waiters;
++   /* Released waiters that have not yet left util_barrier_wait. */
++   unsigned departing;
+    uint64_t sequence;
+    mtx_t mutex;
+    cnd_t condvar;
+@@ -136,6 +138,10 @@ void util_barrier_init(util_barrier *barrier, unsigned count);
+ 
+ void util_barrier_destroy(util_barrier *barrier);
+ 
++/* Returns true for exactly one of the threads a release lets through. As
++ * with pthread_barrier_wait's serial thread, that thread may destroy the
++ * barrier as soon as the call returns, provided no thread waits on it again.
++ */
+ bool util_barrier_wait(util_barrier *barrier);
+ 
+ /*

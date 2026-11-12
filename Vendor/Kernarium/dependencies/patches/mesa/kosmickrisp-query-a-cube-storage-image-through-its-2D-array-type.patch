@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:20:01 +0900
+Subject: [PATCH] kosmickrisp: query a cube storage image through its 2D array
+ type
+
+A cube or cube map array storage image is a 2D array view of its image,
+and every load, store and atomic reads its descriptor through the 2D
+array type. Its size query read the same descriptor through the cube
+type the shader declared. Metal answers a query through the wrong
+texture type only by chance: on an M1 Ultra the hardware reads the 2D
+array's own fields, a cube map array's size included, which the
+division by six then turns into cubes. Under MTL_SHADER_VALIDATION=1
+every such query answers zero, and nothing reports it.
+
+The bounds check in front of every image atomic is such a size query,
+so under validation every atomic on a cube image was skipped and
+returned zero, and imageSize() returned zero:
+KHR-GLES31.core.shader_image_load_store.basic-allTargets-atomicFS,
+atomicVS and atomicCS failed on their cube image, and
+KHR-GLES31.core.texture_cube_map_array.texture_size_compute_sh read
+[0][0][0]. The size query now reads the descriptor through the 2D
+array type too, which answers the same values without validation and
+the right ones under it.
+
+kosmickrisp_validated_cube_storage runs atomics and size queries on a
+cube and a cube map array storage image under MTL_SHADER_VALIDATION=1
+and checks every result.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/kk_nir_lower_textures.c            |  10 +
+ src/kosmickrisp/vulkan/meson.build            |  16 ++
+ .../tests/test_validated_cube_storage.cpp     | 239 ++++++++++++++++++
+ .../validated_cube_storage_shaders/query.comp |  32 +++
+ .../query.comp.h                              | 113 +++++++++
+ 5 files changed, 410 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_validated_cube_storage.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp
+ create mode 100644 src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp.h
+
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_textures.c b/src/kosmickrisp/vulkan/kk_nir_lower_textures.c
+index b492059e869c2e95d39ca8b765633c402ae27a26..655d255398c672724261b8a14d4686aa4ae02787 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_textures.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_textures.c
+@@ -356,6 +356,8 @@ lower_1d_image_intrin(nir_builder *b, nir_intrinsic_instr *intrin)
+    nir_intrinsic_set_image_dim(intrin, GLSL_SAMPLER_DIM_2D);
+ }
+ 
++static void lower_cube_load_handle_to_2d_array(nir_def *handle);
++
+ static nir_def *
+ txs_for_image(nir_builder *b, nir_intrinsic_instr *intr,
+               unsigned num_components, unsigned bit_size, bool query_samples)
+@@ -366,6 +368,14 @@ txs_for_image(nir_builder *b, nir_intrinsic_instr *intr,
+    tex->dest_type = nir_type_uint32;
+    tex->sampler_dim = nir_intrinsic_image_dim(intr);
+ 
++   /* The descriptor of a cube storage image holds a 2D array view, which
++    * every access reads through the 2D array type, so its size query does
++    * too. Metal answers a query through a cube type only by chance, and its
++    * shader validation answers zero, which also failed the bounds check of
++    * every atomic. */
++   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
++      lower_cube_load_handle_to_2d_array(intr->src[0].ssa);
++
+    tex->src[0] =
+       nir_tex_src_for_ssa(nir_tex_src_texture_handle, intr->src[0].ssa);
+ 
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index e3cbdac7f260dde62ae07ad45d8044cabe467e6e..fa2af0b0d7cce746d6af30ca06f56ba835dc2982 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -363,6 +363,22 @@ if with_tests
+       env : kk_test_env + ['MTL_SHADER_VALIDATION=1'],
+       timeout : 120,
+     )
++    # Atomics and size queries on cube storage images, under the shader
++    # validation that answers zero to a query through the wrong type.
++    test(
++      'kosmickrisp_validated_cube_storage',
++      executable(
++        'test_kosmickrisp_validated_cube_storage',
++        files('tests/test_validated_cube_storage.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : kk_test_env + ['MTL_SHADER_VALIDATION=1'],
++      timeout : 120,
++    )
+     # Tests that link the driver library whole to reach its internals:
+     # tests/test_<name>.c.
+     foreach kk_internal_test : [
+diff --git a/src/kosmickrisp/vulkan/tests/test_validated_cube_storage.cpp b/src/kosmickrisp/vulkan/tests/test_validated_cube_storage.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ce5d811fe0a90285f83b13c909b8aa5f4918224
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_validated_cube_storage.cpp
+@@ -0,0 +1,239 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A cube storage image is a 2D array view of its image, and a shader has to
++ * read its descriptor through the 2D array type. Read through a cube type,
++ * a size query answers right only by chance, and under Metal's shader
++ * validation it answers zero, which also fails the bounds check in front of
++ * every image atomic: KHR-GLES31.core.shader_image_load_store's atomic cases
++ * and texture_cube_map_array.texture_size_compute_sh failed so. One compute
++ * invocation here runs atomics and size queries on a cube and a cube map
++ * array storage image, and every result must be right. The test runs with
++ * MTL_SHADER_VALIDATION=1.
++ *
++ * usage: test_kosmickrisp_validated_cube_storage */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "kk_test.h"
++
++static const uint32_t query_comp[] =
++#include "validated_cube_storage_shaders/query.comp.h"
++;
++
++int main(int argc, char **argv)
++{
++   (void)argv;
++   require(argc == 1, "unknown argument");
++   if (!getenv("MTL_SHADER_VALIDATION"))
++      std::printf("note: MTL_SHADER_VALIDATION is not set, so a query "
++                  "through the wrong type would still pass\n");
++
++   kk_test_device t;
++   kk_test_create_instance(&t, "validated-cube-storage");
++   VkPhysicalDeviceFeatures features{};
++   features.imageCubeArray = VK_TRUE;
++   kk_test_create_device(&t, nullptr, &features, 0, nullptr);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkCreateDescriptorSetLayout);
++   LOAD_D(vkDestroyDescriptorSetLayout);
++   LOAD_D(vkCreateDescriptorPool);
++   LOAD_D(vkDestroyDescriptorPool);
++   LOAD_D(vkAllocateDescriptorSets);
++   LOAD_D(vkUpdateDescriptorSets);
++   LOAD_D(vkCmdBindDescriptorSets);
++   LOAD_D(vkCreateComputePipelines);
++   LOAD_D(vkCmdDispatch);
++
++   const uint32_t words = 12u;
++   VkBuffer result_buffer;
++   VkDeviceMemory result_memory;
++   int32_t *result = nullptr;
++   kk_test_buffer(&t, words * sizeof(int32_t),
++                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, KK_TEST_HOST_MEMORY,
++                  &result_buffer, &result_memory,
++                  reinterpret_cast<void **>(&result));
++   for (uint32_t i = 0; i < words; ++i)
++      result[i] = -1;
++
++   /* A cube of 4x4 faces and a cube map array of two such cubes. */
++   const uint32_t layers[2] = {6u, 12u};
++   const VkImageViewType view_types[2] = {VK_IMAGE_VIEW_TYPE_CUBE,
++                                          VK_IMAGE_VIEW_TYPE_CUBE_ARRAY};
++   VkImage images[2];
++   VkDeviceMemory image_memory[2];
++   VkImageView views[2];
++   for (int i = 0; i < 2; ++i) {
++      VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
++      info.imageType = VK_IMAGE_TYPE_2D;
++      info.format = VK_FORMAT_R32_SINT;
++      info.extent = {4, 4, 1};
++      info.mipLevels = 1;
++      info.arrayLayers = layers[i];
++      info.samples = VK_SAMPLE_COUNT_1_BIT;
++      info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
++      VkResult r = vkCreateImage(device, &info, nullptr, &images[i]);
++      require(r == VK_SUCCESS, "create image", r);
++      image_memory[i] = kk_test_image_memory(
++         &t, images[i], VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      views[i] = kk_test_image_view(&t, images[i], view_types[i],
++                                    VK_FORMAT_R32_SINT,
++                                    VK_IMAGE_ASPECT_COLOR_BIT, 0, layers[i]);
++   }
++
++   VkDescriptorSetLayoutBinding bindings[3]{};
++   for (uint32_t i = 0; i < 3; ++i) {
++      bindings[i].binding = i;
++      bindings[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
++                                         : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++      bindings[i].descriptorCount = 1;
++      bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++   }
++   VkDescriptorSetLayoutCreateInfo set_layout_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++   set_layout_info.bindingCount = 3;
++   set_layout_info.pBindings = bindings;
++   VkDescriptorSetLayout set_layout;
++   VkResult r = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
++                                            &set_layout);
++   require(r == VK_SUCCESS, "create set layout", r);
++   const VkDescriptorPoolSize pool_sizes[2] = {
++      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
++      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
++   VkDescriptorPoolCreateInfo pool_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++   pool_info.maxSets = 1;
++   pool_info.poolSizeCount = 2;
++   pool_info.pPoolSizes = pool_sizes;
++   VkDescriptorPool descriptor_pool;
++   r = vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool);
++   require(r == VK_SUCCESS, "create descriptor pool", r);
++   VkDescriptorSetAllocateInfo set_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++   set_info.descriptorPool = descriptor_pool;
++   set_info.descriptorSetCount = 1;
++   set_info.pSetLayouts = &set_layout;
++   VkDescriptorSet set;
++   r = vkAllocateDescriptorSets(device, &set_info, &set);
++   require(r == VK_SUCCESS, "allocate descriptor set", r);
++   const VkDescriptorImageInfo image_infos[2] = {
++      {VK_NULL_HANDLE, views[0], VK_IMAGE_LAYOUT_GENERAL},
++      {VK_NULL_HANDLE, views[1], VK_IMAGE_LAYOUT_GENERAL}};
++   const VkDescriptorBufferInfo buffer_info{result_buffer, 0, VK_WHOLE_SIZE};
++   VkWriteDescriptorSet writes[3]{};
++   for (uint32_t i = 0; i < 3; ++i) {
++      writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++      writes[i].dstSet = set;
++      writes[i].dstBinding = i;
++      writes[i].descriptorCount = 1;
++      writes[i].descriptorType = bindings[i].descriptorType;
++      if (i < 2)
++         writes[i].pImageInfo = &image_infos[i];
++      else
++         writes[i].pBufferInfo = &buffer_info;
++   }
++   vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
++
++   VkPipelineLayoutCreateInfo layout_info{
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   layout_info.setLayoutCount = 1;
++   layout_info.pSetLayouts = &set_layout;
++   VkPipelineLayout layout;
++   r = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++   require(r == VK_SUCCESS, "create layout", r);
++   VkShaderModule module =
++      kk_test_shader_module(&t, query_comp, sizeof(query_comp));
++   VkComputePipelineCreateInfo pipeline_info{
++      VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++   pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++   pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++   pipeline_info.stage.module = module;
++   pipeline_info.stage.pName = "main";
++   pipeline_info.layout = layout;
++   VkPipeline pipeline;
++   r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                nullptr, &pipeline);
++   require(r == VK_SUCCESS, "create pipeline", r);
++
++   VkCommandPool pool;
++   VkCommandBuffer command;
++   kk_test_command_buffer(&t, 0, &pool, &command);
++   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++   r = vkBeginCommandBuffer(command, &begin);
++   require(r == VK_SUCCESS, "begin command", r);
++   VkImageMemoryBarrier barriers[2]{};
++   for (int i = 0; i < 2; ++i) {
++      barriers[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
++      barriers[i].dstAccessMask =
++         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++      barriers[i].image = images[i];
++      barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                                      VK_REMAINING_ARRAY_LAYERS};
++   }
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
++                        nullptr, 2, barriers);
++   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
++   vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
++                           1, &set, 0, nullptr);
++   vkCmdDispatch(command, 1, 1, 1);
++   VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++   to_host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++   to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, nullptr,
++                        0, nullptr);
++   r = vkEndCommandBuffer(command);
++   require(r == VK_SUCCESS, "end command", r);
++   r = kk_test_submit_and_wait(&t, command, 20ull * 1000 * 1000 * 1000);
++   require(r == VK_SUCCESS, "submit", r);
++
++   /* Each atomic returns what the one before it left: add 5 to 0, min 3
++    * against 5, add 0 to 3. The sizes count whole cubes. */
++   const int32_t expected[12] = {0, 5, 3, 0, 5, 3, 4, 4, 4, 4, 2, 1};
++   const char *const names[12] = {
++      "cube add",          "cube min",         "cube add 0",
++      "cube array add",    "cube array min",   "cube array add 0",
++      "cube width",        "cube height",      "cube array width",
++      "cube array height", "cube array cubes", "end of the shader"};
++   uint32_t wrong = 0;
++   for (uint32_t i = 0; i < words; ++i) {
++      if (result[i] != expected[i]) {
++         std::fprintf(stderr, "%s is %d, not %d\n", names[i], result[i],
++                      expected[i]);
++         ++wrong;
++      }
++   }
++   std::printf("validated cube storage: %u of %u results wrong\n", wrong,
++               words);
++   require(wrong == 0, "every atomic and size query on a cube image");
++
++   vkDestroyCommandPool(device, pool, nullptr);
++   vkDestroyPipeline(device, pipeline, nullptr);
++   vkDestroyShaderModule(device, module, nullptr);
++   vkDestroyPipelineLayout(device, layout, nullptr);
++   vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
++   vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
++   for (int i = 0; i < 2; ++i) {
++      vkDestroyImageView(device, views[i], nullptr);
++      vkDestroyImage(device, images[i], nullptr);
++      vkFreeMemory(device, image_memory[i], nullptr);
++   }
++   vkUnmapMemory(device, result_memory);
++   vkDestroyBuffer(device, result_buffer, nullptr);
++   vkFreeMemory(device, result_memory, nullptr);
++   kk_test_destroy(&t);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp b/src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0da32eace2b9734976a0523c6756786a7bc5b669
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp
+@@ -0,0 +1,32 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++
++/* Atomics and size queries on a cube and a cube map array storage image, the
++ * shape of KHR-GLES31.core.shader_image_load_store.basic-allTargets-atomicCS
++ * and KHR-GLES31.core.texture_cube_map_array.texture_size_compute_sh. */
++layout(local_size_x = 1) in;
++layout(set = 0, binding = 0, r32i) uniform coherent iimageCube cube;
++layout(set = 0, binding = 1, r32i) uniform coherent iimageCubeArray cube_array;
++layout(set = 0, binding = 2, std430) buffer Result {
++   int v[12];
++} result;
++
++void main(void)
++{
++   imageAtomicExchange(cube, ivec3(1, 1, 2), 0);
++   result.v[0] = imageAtomicAdd(cube, ivec3(1, 1, 2), 5);
++   result.v[1] = imageAtomicMin(cube, ivec3(1, 1, 2), 3);
++   result.v[2] = imageAtomicAdd(cube, ivec3(1, 1, 2), 0);
++   imageAtomicExchange(cube_array, ivec3(1, 1, 8), 0);
++   result.v[3] = imageAtomicAdd(cube_array, ivec3(1, 1, 8), 5);
++   result.v[4] = imageAtomicMin(cube_array, ivec3(1, 1, 8), 3);
++   result.v[5] = imageAtomicAdd(cube_array, ivec3(1, 1, 8), 0);
++   ivec2 cube_size = imageSize(cube);
++   ivec3 cube_array_size = imageSize(cube_array);
++   result.v[6] = cube_size.x;
++   result.v[7] = cube_size.y;
++   result.v[8] = cube_array_size.x;
++   result.v[9] = cube_array_size.y;
++   result.v[10] = cube_array_size.z;
++   result.v[11] = 1;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp.h b/src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..241873def151a1bbba7d72dc15c08fa6447556f5
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/validated_cube_storage_shaders/query.comp.h
+@@ -0,0 +1,113 @@
++{0x07230203,0x00010600,0x000d000b,0x00000057,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000022,0x00020011,0x00000032,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00000019,0x00000028,
++0x00060010,0x00000004,0x00000011,0x00000001,
++0x00000001,0x00000001,0x00030047,0x00000009,
++0x00000017,0x00040047,0x00000009,0x00000021,
++0x00000000,0x00040047,0x00000009,0x00000022,
++0x00000000,0x00040047,0x00000016,0x00000006,
++0x00000004,0x00030047,0x00000017,0x00000002,
++0x00050048,0x00000017,0x00000000,0x00000023,
++0x00000000,0x00040047,0x00000019,0x00000021,
++0x00000002,0x00040047,0x00000019,0x00000022,
++0x00000000,0x00030047,0x00000028,0x00000017,
++0x00040047,0x00000028,0x00000021,0x00000001,
++0x00040047,0x00000028,0x00000022,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x00090019,0x00000007,0x00000006,
++0x00000003,0x00000000,0x00000000,0x00000000,
++0x00000002,0x00000018,0x00040020,0x00000008,
++0x00000000,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000000,0x00040017,0x0000000a,
++0x00000006,0x00000003,0x0004002b,0x00000006,
++0x0000000b,0x00000001,0x0004002b,0x00000006,
++0x0000000c,0x00000002,0x0006002c,0x0000000a,
++0x0000000d,0x0000000b,0x0000000b,0x0000000c,
++0x0004002b,0x00000006,0x0000000e,0x00000000,
++0x00040015,0x0000000f,0x00000020,0x00000000,
++0x0004002b,0x0000000f,0x00000010,0x00000000,
++0x00040020,0x00000011,0x0000000b,0x00000006,
++0x0004002b,0x0000000f,0x00000013,0x00000001,
++0x0004002b,0x0000000f,0x00000015,0x0000000c,
++0x0004001c,0x00000016,0x00000006,0x00000015,
++0x0003001e,0x00000017,0x00000016,0x00040020,
++0x00000018,0x0000000c,0x00000017,0x0004003b,
++0x00000018,0x00000019,0x0000000c,0x0004002b,
++0x00000006,0x0000001a,0x00000005,0x00040020,
++0x0000001d,0x0000000c,0x00000006,0x0004002b,
++0x00000006,0x0000001f,0x00000003,0x00090019,
++0x00000026,0x00000006,0x00000003,0x00000000,
++0x00000001,0x00000000,0x00000002,0x00000018,
++0x00040020,0x00000027,0x00000000,0x00000026,
++0x0004003b,0x00000027,0x00000028,0x00000000,
++0x0004002b,0x00000006,0x00000029,0x00000008,
++0x0006002c,0x0000000a,0x0000002a,0x0000000b,
++0x0000000b,0x00000029,0x0004002b,0x00000006,
++0x00000030,0x00000004,0x00040017,0x00000037,
++0x00000006,0x00000002,0x0004002b,0x00000006,
++0x00000040,0x00000006,0x0004002b,0x00000006,
++0x00000045,0x00000007,0x0004002b,0x00000006,
++0x0000004c,0x00000009,0x0004002b,0x00000006,
++0x00000050,0x0000000a,0x0004002b,0x00000006,
++0x00000055,0x0000000b,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0006003c,0x00000011,0x00000012,
++0x00000009,0x0000000d,0x00000010,0x000700e5,
++0x00000006,0x00000014,0x00000012,0x00000013,
++0x00000010,0x0000000e,0x000700ea,0x00000006,
++0x0000001c,0x00000012,0x00000013,0x00000010,
++0x0000001a,0x00060041,0x0000001d,0x0000001e,
++0x00000019,0x0000000e,0x0000000e,0x0003003e,
++0x0000001e,0x0000001c,0x000700ec,0x00000006,
++0x00000021,0x00000012,0x00000013,0x00000010,
++0x0000001f,0x00060041,0x0000001d,0x00000022,
++0x00000019,0x0000000e,0x0000000b,0x0003003e,
++0x00000022,0x00000021,0x000700ea,0x00000006,
++0x00000024,0x00000012,0x00000013,0x00000010,
++0x0000000e,0x00060041,0x0000001d,0x00000025,
++0x00000019,0x0000000e,0x0000000c,0x0003003e,
++0x00000025,0x00000024,0x0006003c,0x00000011,
++0x0000002b,0x00000028,0x0000002a,0x00000010,
++0x000700e5,0x00000006,0x0000002c,0x0000002b,
++0x00000013,0x00000010,0x0000000e,0x000700ea,
++0x00000006,0x0000002e,0x0000002b,0x00000013,
++0x00000010,0x0000001a,0x00060041,0x0000001d,
++0x0000002f,0x00000019,0x0000000e,0x0000001f,
++0x0003003e,0x0000002f,0x0000002e,0x000700ec,
++0x00000006,0x00000032,0x0000002b,0x00000013,
++0x00000010,0x0000001f,0x00060041,0x0000001d,
++0x00000033,0x00000019,0x0000000e,0x00000030,
++0x0003003e,0x00000033,0x00000032,0x000700ea,
++0x00000006,0x00000035,0x0000002b,0x00000013,
++0x00000010,0x0000000e,0x00060041,0x0000001d,
++0x00000036,0x00000019,0x0000000e,0x0000001a,
++0x0003003e,0x00000036,0x00000035,0x0004003d,
++0x00000007,0x0000003a,0x00000009,0x00040068,
++0x00000037,0x0000003b,0x0000003a,0x0004003d,
++0x00000026,0x0000003e,0x00000028,0x00040068,
++0x0000000a,0x0000003f,0x0000003e,0x00050051,
++0x00000006,0x00000043,0x0000003b,0x00000000,
++0x00060041,0x0000001d,0x00000044,0x00000019,
++0x0000000e,0x00000040,0x0003003e,0x00000044,
++0x00000043,0x00050051,0x00000006,0x00000047,
++0x0000003b,0x00000001,0x00060041,0x0000001d,
++0x00000048,0x00000019,0x0000000e,0x00000045,
++0x0003003e,0x00000048,0x00000047,0x00050051,
++0x00000006,0x0000004a,0x0000003f,0x00000000,
++0x00060041,0x0000001d,0x0000004b,0x00000019,
++0x0000000e,0x00000029,0x0003003e,0x0000004b,
++0x0000004a,0x00050051,0x00000006,0x0000004e,
++0x0000003f,0x00000001,0x00060041,0x0000001d,
++0x0000004f,0x00000019,0x0000000e,0x0000004c,
++0x0003003e,0x0000004f,0x0000004e,0x00050051,
++0x00000006,0x00000053,0x0000003f,0x00000002,
++0x00060041,0x0000001d,0x00000054,0x00000019,
++0x0000000e,0x00000050,0x0003003e,0x00000054,
++0x00000053,0x00060041,0x0000001d,0x00000056,
++0x00000019,0x0000000e,0x00000055,0x0003003e,
++0x00000056,0x0000000b,0x000100fd,0x00010038}

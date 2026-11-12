@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:32:48 +0900
+Subject: [PATCH] x86: XSAVE and XRSTOR select components by RFBM
+
+RFBM, the requested-feature bitmap, is EAX masked by XCR0. XRSTOR
+loaded the x87, SSE and AVX components by XSTATE_BV alone: it ignored
+RFBM, so it restored a component it was not asked for and took a
+component's initial state from a clear XSTATE_BV bit even when RFBM did
+not select it; it loaded MXCSR only with the SSE component, where x86
+loads it whenever RFBM selects the SSE or the AVX component, and
+XSTATE_BV decides nothing about it. XSAVE replaced the whole XSTATE_BV
+qword with RFBM, where x86 sets the bits RFBM selects and leaves the
+others, and stored MXCSR with the SSE component in a context without
+AVX.
+
+XRSTOR now restores a component RFBM selects whose XSTATE_BV bit is
+set, puts it in its initial state when the bit is clear, and leaves one
+RFBM does not select alone. It loads MXCSR from the image whenever RFBM
+selects SSE or AVX. XSAVE ORs RFBM into XSTATE_BV and leaves the rest of
+the header. Without AVX, XCR0 has no bit 2 and RFBM does not either.
+
+Embedded, XRSTOR reads the legacy area and the header, and the AVX
+state only when RFBM selects it, before it loads any of them, and
+raises #GP(0) for a reserved bit in the image's MXCSR when RFBM selects
+SSE or AVX, before it changes anything.
+---
+ .../Core/OpcodeDispatcher/Vector.cpp          | 93 +++++++++++++------
+ 1 file changed, 67 insertions(+), 26 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index 3b609f25fe324633371aa58f9ea447285bf5840d..b6e974e3f48dab068174b40cf27c0425957545d8 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -3368,20 +3368,24 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
+ 
+   // We need to save MXCSR and MXCSR_MASK if either SSE or AVX are requested to be saved
+   {
+-    StoreIfFlagSet(1, [this, Op] { SaveMXCSRState(XSaveBase(Op)); }, 2);
++    StoreIfFlagSet(1, [this, Op] { SaveMXCSRState(XSaveBase(Op)); }, CTX->HostFeatures.SupportsAVX ? 2 : 1);
+   }
+ 
+   // Update XSTATE_BV region of the XSAVE header
+   {
+     Ref Base = XSaveBase(Op);
+ 
+-    // NOTE: We currently only support the first 3 bits (x87, SSE, and AVX)
++    // RFBM is EAX masked by XCR0, whose bits are the x87, SSE and, with AVX,
++    // AVX components.
+     Ref Mask = LoadGPRRegister(X86State::REG_RAX);
+-    Ref RequestedFeatures = _Bfe(OpSize, 3, 0, Mask);
++    Ref RequestedFeatures = _Bfe(OpSize, CTX->HostFeatures.SupportsAVX ? 3 : 2, 0, Mask);
+ 
+-    // XSTATE_BV section of the header is 8 bytes in size, but we only really
+-    // care about setting at most 3 bits in the first byte. We zero out the rest.
+-    _StoreMemGPR(OpSize::i64Bit, RequestedFeatures, Base, Constant(512), OpSize::i8Bit, MemOffsetType::SXTX, 1);
++    // XSTATE_BV section of the header is 8 bytes in size. XSAVE sets the bits
++    // RFBM selects and leaves the others, and the rest of the header, as it
++    // found them.
++    Ref StateBV = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
++    StateBV = _Or(OpSize::i64Bit, StateBV, RequestedFeatures);
++    _StoreMemGPR(OpSize::i64Bit, StateBV, Base, Constant(512), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+   }
+ }
+ 
+@@ -3541,24 +3545,51 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+   EmbedderRequireAlignment(Op, XSaveBase(Op), 64);
+   EmbedderAlignmentCheck(XSaveBase(Op), 1, true);
+   if (CTX->Embedded) {
+-    // The whole area, through the AVX state, is read before any of it is
+-    // loaded.
+-    _EmbedderProbe(XSaveBase(Op), CTX->HostFeatures.SupportsAVX ? 832 : 576);
++    // XRSTOR reads the legacy area and the header, and the AVX state when
++    // RFBM selects it, before it loads any of them or checks MXCSR. RFBM is
++    // EAX masked by XCR0, whose bits are the x87, SSE and, with AVX, AVX
++    // components.
++    Ref Base = XSaveBase(Op);
++    _EmbedderProbe(Base, 576);
++    if (CTX->HostFeatures.SupportsAVX) {
++      Ref AVXBytes = _Lshl(OpSize::i64Bit, _And(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RAX), Constant(4)), Constant(6));
++      _EmbedderProbe(Add(OpSize::i64Bit, _Add(OpSize::i64Bit, Base, AVXBytes), 575), 1);
++    }
++
++    // The image's MXCSR is checked, whatever XSTATE_BV says, whenever RFBM
++    // selects the SSE or the AVX component.
++    // The flags are the guest's, so this selects without setting them: bits
++    // 2:1 of RFBM as a number, plus 3, shifted right by 2.
++    Ref Selected = _Bfe(OpSize::i32Bit, CTX->HostFeatures.SupportsAVX ? 2 : 1, 1, LoadGPRRegister(X86State::REG_RAX));
++    if (CTX->HostFeatures.SupportsAVX) {
++      Selected = _Lshr(OpSize::i32Bit, _Add(OpSize::i32Bit, Selected, Constant(3)), Constant(2));
++    }
++    EmbedderCheckMXCSR(_LoadMemGPR(OpSize::i32Bit, Base, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1), Selected);
+   }
+ 
+-  // If a bit in our XSTATE_BV is set, then we restore from that region of the XSAVE area,
+-  // otherwise, if not set, then we need to set the relevant data the bit corresponds to
+-  // to it's defined initial configuration.
+-  const auto RestoreIfFlagSetOrDefault = [this, Op, OpSize](uint32_t BitIndex, auto restore_fn, auto default_fn, uint32_t FieldSize = 1) {
++  // RFBM selects the components XRSTOR loads. A selected component whose
++  // bit in XSTATE_BV is set is restored from the XSAVE area; one whose bit
++  // is clear takes its defined initial configuration; one RFBM does not
++  // select is left alone.
++  const auto RestoreIfSelected = [this, Op, OpSize](uint32_t BitIndex, auto restore_fn, auto default_fn) {
+     // Set up base address for the XSAVE region to restore from, and also read
+     // the XSTATE_BV bit flags out of the XSTATE header.
+     //
+     // Note: we rematerialize Base/Mask in each block to avoid crossblock
+     // liveness.
++    Ref RFBM = LoadGPRRegister(X86State::REG_RAX);
++    Ref Selected = _Bfe(OpSize, 1, BitIndex, RFBM);
++    auto SelectedJump = CondJump(Selected, CondClass::NEQ);
++
++    auto SelectedBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetTrueJumpTarget(SelectedJump, SelectedBlock);
++    SetCurrentCodeBlock(SelectedBlock);
++    StartNewBlock();
++
+     Ref Base = XSaveBase(Op);
+     Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+ 
+-    Ref BitFlag = _Bfe(OpSize, FieldSize, BitIndex, Mask);
++    Ref BitFlag = _Bfe(OpSize, 1, BitIndex, Mask);
+     auto CondJump_ = CondJump(BitFlag, CondClass::NEQ);
+ 
+     auto RestoreBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+@@ -3571,6 +3602,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+     auto ExitBlock = CreateNewCodeBlockAfter(DefaultBlock);
+     SetJumpTarget(RestoreExitJump, ExitBlock);
+     SetFalseJumpTarget(CondJump_, DefaultBlock);
++    SetFalseJumpTarget(SelectedJump, ExitBlock);
+     SetCurrentCodeBlock(DefaultBlock);
+     StartNewBlock();
+     { default_fn(); }
+@@ -3582,28 +3614,37 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+ 
+   // x87
+   {
+-    RestoreIfFlagSetOrDefault(0, [this, Op] { RestoreX87State(XSaveBase(Op)); }, [this, Op] { DefaultX87State(Op); });
++    RestoreIfSelected(0, [this, Op] { RestoreX87State(XSaveBase(Op)); }, [this, Op] { DefaultX87State(Op); });
+   }
+   // SSE
+   {
+-    RestoreIfFlagSetOrDefault(1, [this, Op] { RestoreSSEState(XSaveBase(Op)); }, [this] { DefaultSSEState(); });
++    RestoreIfSelected(1, [this, Op] { RestoreSSEState(XSaveBase(Op)); }, [this] { DefaultSSEState(); });
+   }
+   // AVX
+   if (CTX->HostFeatures.SupportsAVX) {
+-    RestoreIfFlagSetOrDefault(
++    RestoreIfSelected(
+       2, [this, Op] { std::invoke(RestoreAVXStateFunc, this, XSaveBase(Op)); }, [this] { std::invoke(DefaultAVXStateFunc, this); });
+   }
+ 
+   {
+-    // We need to restore the MXCSR if either SSE or AVX are requested to be saved
+-    RestoreIfFlagSetOrDefault(
+-      1,
+-      [this, Op] {
+-        Ref Base = XSaveBase(Op);
+-        Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Base, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
+-        RestoreMXCSRState(MXCSR);
+-      },
+-      [] { /* Intentionally do nothing*/ }, 2);
++    // MXCSR belongs to the SSE and the AVX components alike: XRSTOR loads it
++    // from the image when RFBM selects either, whatever XSTATE_BV says.
++    Ref RFBM = _Bfe(OpSize, CTX->HostFeatures.SupportsAVX ? 2 : 1, 1, LoadGPRRegister(X86State::REG_RAX));
++    auto SelectedJump = CondJump(RFBM, CondClass::NEQ);
++
++    auto LoadBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetTrueJumpTarget(SelectedJump, LoadBlock);
++    SetCurrentCodeBlock(LoadBlock);
++    StartNewBlock();
++    Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, XSaveBase(Op), Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
++    RestoreMXCSRState(MXCSR);
++    auto LoadExitJump = Jump();
++
++    auto ExitBlock = CreateNewCodeBlockAfter(LoadBlock);
++    SetJumpTarget(LoadExitJump, ExitBlock);
++    SetFalseJumpTarget(SelectedJump, ExitBlock);
++    SetCurrentCodeBlock(ExitBlock);
++    StartNewBlock();
+   }
+   EmbedderFPModeCheck(Op);
+ }

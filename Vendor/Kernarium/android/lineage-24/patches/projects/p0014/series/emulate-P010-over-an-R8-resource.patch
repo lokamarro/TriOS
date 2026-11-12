@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:16:18 +0900
+Subject: [PATCH] emulate P010 over an R8 resource
+
+A host that cannot sample P010 natively leaves the guest with no P010
+buffer: the combination is skipped at init, so an allocation for it fails
+with "Unsupported combination". An HEVC Main 10 encoder, a client of
+COLOR_FormatYUVP010 and a P010 camera or decoder output all need a buffer
+the CPU can access.
+
+NV12, NV21 and the planar 4:2:0 formats are already emulated as bytes in an
+R8 resource, each plane a sub-image the transfers can address. P010 has the
+NV12 layout with two-byte samples, so its byte image is twice as wide, and
+so are its transfer boxes. Add it to the emulated formats. As for the
+others, the emulation covers buffers the CPU accesses and is not offered for
+rendering or scanout.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ virtgpu_virgl.c | 39 ++++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/virtgpu_virgl.c b/virtgpu_virgl.c
+index f799aabcf78a4b5daa4c6ef72f0a3b615db4f48f..b018d51596531dd8dafee9ebd4081e61d2bb8486 100644
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -210,16 +210,19 @@ static void virgl_get_emulated_metadata(const struct bo *bo, struct bo_metadata
+ 	switch (bo->meta.format) {
+ 	case DRM_FORMAT_NV12:
+ 	case DRM_FORMAT_NV21:
+-		// Bi-planar
++	case DRM_FORMAT_P010:
++		// Bi-planar. A P010 sample takes two bytes, so a row of the byte image is twice as
++		// wide and the interleaved CbCr rows are as wide as the Y rows, as in NV12.
+ 		metadata->num_planes = 2;
+ 
+ 		y_plane_height = original_height;
+ 		c_plane_height = DIV_ROUND_UP(original_height, 2);
+ 
+-		// A chroma row holds a Cb and a Cr byte for each pair of pixels, so of an odd width it
+-		// is one byte longer than the luma row. The rows are therefore padded to the pitch the
++		// A chroma row holds a Cb and a Cr sample for each pair of pixels, so of an odd width it
++		// is one sample longer than the luma row. The rows are therefore padded to the pitch the
+ 		// host imports, which is also the first whole number of bytes that holds them.
+-		metadata->width = ALIGN(original_width, VIRGL_ROW_ALIGNMENT);
++		metadata->width = ALIGN(original_width * (bo->meta.format == DRM_FORMAT_P010 ? 2 : 1),
++					VIRGL_ROW_ALIGNMENT);
+ 		metadata->height = y_plane_height + c_plane_height;
+ 
+ 		// Y-plane (full resolution)
+@@ -328,31 +331,37 @@ static void virgl_get_emulated_transfers_params(const struct bo *bo,
+ 	switch (bo->meta.format) {
+ 	case DRM_FORMAT_NV12:
+ 	case DRM_FORMAT_NV21:
+-		// Bi-planar
++	case DRM_FORMAT_P010: {
++		// Bi-planar. The byte image of a P010 buffer has two bytes per sample.
++		const uint32_t bytes_per_sample = bo->meta.format == DRM_FORMAT_P010 ? 2 : 1;
++
+ 		xfer_params->xfers_needed = 2;
+ 
+ 		y_plane_height = bo->meta.height;
+ 		c_plane_height = DIV_ROUND_UP(bo->meta.height, 2);
+ 
+ 		// Y-plane (full resolution)
+-		xfer_params->xfer_boxes[0].x = transfer_box->x;
++		xfer_params->xfer_boxes[0].x = transfer_box->x * bytes_per_sample;
+ 		xfer_params->xfer_boxes[0].y = transfer_box->y;
+-		xfer_params->xfer_boxes[0].width = transfer_box->width;
++		xfer_params->xfer_boxes[0].width = transfer_box->width * bytes_per_sample;
+ 		xfer_params->xfer_boxes[0].height = transfer_box->height;
+ 
+ 		// CbCr-plane (half resolution, interleaved, placed below Y-plane): a row holds a
+ 		// Cb and a Cr sample for each pair of pixels, and there is one for each pair of rows
+ 		uint32_t chroma_x = transfer_box->x & ~1u;
+ 		uint32_t chroma_end = DIV_ROUND_UP(transfer_box->x + transfer_box->width, 2) * 2;
+-		if (chroma_end > ALIGN(bo->meta.width, VIRGL_ROW_ALIGNMENT))
+-			chroma_end = ALIGN(bo->meta.width, VIRGL_ROW_ALIGNMENT);
+-		xfer_params->xfer_boxes[1].x = chroma_x;
++		uint32_t padded_width =
++		    ALIGN(bo->meta.width * bytes_per_sample, VIRGL_ROW_ALIGNMENT) / bytes_per_sample;
++		if (chroma_end > padded_width)
++			chroma_end = padded_width;
++		xfer_params->xfer_boxes[1].x = chroma_x * bytes_per_sample;
+ 		xfer_params->xfer_boxes[1].y = y_plane_height + transfer_box->y / 2;
+-		xfer_params->xfer_boxes[1].width = chroma_end - chroma_x;
++		xfer_params->xfer_boxes[1].width = (chroma_end - chroma_x) * bytes_per_sample;
+ 		xfer_params->xfer_boxes[1].height =
+ 		    DIV_ROUND_UP(transfer_box->y + transfer_box->height, 2) - transfer_box->y / 2;
+ 
+ 		break;
++	}
+ 	case DRM_FORMAT_YVU420:
+ 	case DRM_FORMAT_YVU420_ANDROID:
+ 		// Tri-planar
+@@ -440,7 +449,8 @@ static bool virgl_supports_combination_through_emulation(struct driver *drv, uin
+ 		return false;
+ 
+ 	return drm_format == DRM_FORMAT_NV12 || drm_format == DRM_FORMAT_NV21 ||
+-	       drm_format == DRM_FORMAT_YVU420 || drm_format == DRM_FORMAT_YVU420_ANDROID;
++	       drm_format == DRM_FORMAT_P010 || drm_format == DRM_FORMAT_YVU420 ||
++	       drm_format == DRM_FORMAT_YVU420_ANDROID;
+ }
+ 
+ // Whether this buffer exists only as the bytes of an R8 image. The native test above only checks
+@@ -653,6 +663,8 @@ static uint32_t virgl_packed_yuv_flags(struct driver *drv, uint32_t drm_format,
+ 		layout = VIRGL_RESOURCE_FLAG_YUV_TRIPLANAR;
+ 		break;
+ 	default:
++		/* P010 is not tagged: its samples are two bytes, which the host's per-plane R8
++		 * textures cannot hold, and nothing samples it. */
+ 		return 0;
+ 	}
+ 
+@@ -891,7 +903,8 @@ static int virgl_init(struct driver *drv)
+ 	 * when not natively supported and instead handled by HWComposer. */
+ 	virgl_add_combination(drv, DRM_FORMAT_P010, &LINEAR_METADATA,
+ 			      BO_USE_SCANOUT | BO_USE_TEXTURE | BO_USE_SW_MASK |
+-				  BO_USE_CAMERA_READ | BO_USE_CAMERA_WRITE);
++				  BO_USE_CAMERA_READ | BO_USE_CAMERA_WRITE |
++				  BO_USE_HW_VIDEO_DECODER | BO_USE_HW_VIDEO_ENCODER);
+ 	/* Android VTS sensors hal tests require BO_USE_SENSOR_DIRECT_DATA. */
+ 	drv_modify_combination(drv, DRM_FORMAT_R8, &LINEAR_METADATA,
+ 			       BO_USE_CAMERA_READ | BO_USE_CAMERA_WRITE | BO_USE_HW_VIDEO_DECODER |

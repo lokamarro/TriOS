@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 02:36:58 +0900
+Subject: [PATCH] kosmickrisp: reinterpret a mismatched fragment output, do not
+ convert it
+
+A fragment output whose numeric type disagrees with its colour attachment
+cannot come from a SPIR-V module that declares them consistently, because
+SPIR-V requires the declaration to match. It comes from a shader that was
+translated from an interface which allowed the disagreement, and there the
+output register holds the bit pattern the attachment is meant to receive:
+Mesa's own blit and clear shaders declare a float output and move raw
+texels through it, because that is what TGSI outputs are. Hardware stores
+those bits.
+
+The pass instead inserted a numeric conversion, so the attachment received
+the magnitude of a bit pattern. glCopyImageSubData between two formats of
+one GL copy view class goes through Mesa's blitter with both sides viewed
+as R32G32B32A32_UINT, and every texel arrived converted: the float 2.0
+landed in the integer attachment as the integer 2, and an 8-bit integer
+copy arrived as zero because the source bits read as a denormal.
+
+Retype the store and let the backend reinterpret the value, which is also
+what the Metal output struct already expected.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../compiler/msl_nir_lower_common.c           | 76 +++++++------------
+ 1 file changed, 28 insertions(+), 48 deletions(-)
+
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_common.c b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+index d3b0aaff248a874ebd48f71c5981b1b5d15bfa50..d6186ee758bfd2c54b9689814f323e57da39dcc6 100644
+--- a/src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -41,6 +41,17 @@ msl_nir_fs_remove_depth_write(nir_builder *b, nir_intrinsic_instr *intrin,
+    return false;
+ }
+ 
++/* A fragment output whose type disagrees with its attachment only ever
++ * reaches Metal because the shader was translated from an interface that let
++ * the two disagree: SPIR-V demands a matching declaration, so a mismatch
++ * always comes from a shader whose output register carries the bit pattern
++ * the attachment is meant to receive. Mesa's own blit and clear shaders are
++ * exactly that -- a float output holding raw texels -- and hardware stores
++ * those bits. Reinterpret the value rather than converting it numerically:
++ * a numeric conversion writes the magnitude of a bit pattern, which lands
++ * the float 2.0 of a copy between two formats of one GL copy view class in
++ * an integer attachment as the integer 2.
++ */
+ static bool
+ fs_force_output_type(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+ {
+@@ -54,55 +65,24 @@ fs_force_output_type(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+    enum pipe_format *render_target_formats = (enum pipe_format *)data;
+    enum pipe_format format =
+       render_target_formats[io.location - FRAG_RESULT_DATA0];
++
++   nir_alu_type wanted;
++   if (util_format_is_float(format) || util_format_is_unorm(format))
++      wanted = nir_type_float;
++   else if (util_format_is_pure_sint(format))
++      wanted = nir_type_int;
++   else if (util_format_is_pure_uint(format))
++      wanted = nir_type_uint;
++   else
++      return false;
++
+    nir_alu_type type = nir_intrinsic_src_type(intrin);
+-   if (util_format_is_float(format) || util_format_is_unorm(format)) {
+-      if (type & nir_type_uint) {
+-         b->cursor = nir_before_instr(&intrin->instr);
+-         nir_def *value =
+-            nir_u2fN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
+-         nir_src_rewrite(&intrin->src[0], value);
+-         type ^= (nir_type_float | nir_type_uint);
+-         nir_intrinsic_set_src_type(intrin, type);
+-         return true;
+-      } else if (type & nir_type_int) {
+-         b->cursor = nir_before_instr(&intrin->instr);
+-         nir_def *value =
+-            nir_u2fN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
+-         nir_src_rewrite(&intrin->src[0], value);
+-         type ^= (nir_type_float | nir_type_int);
+-         nir_intrinsic_set_src_type(intrin, type);
+-         return true;
+-      }
+-   } else if (util_format_is_pure_sint(format)) {
+-      if (type & nir_type_uint) {
+-         type ^= (nir_type_uint | nir_type_int);
+-         nir_intrinsic_set_src_type(intrin, type);
+-         return true;
+-      } else if (type & nir_type_float) {
+-         b->cursor = nir_before_instr(&intrin->instr);
+-         nir_def *value =
+-            nir_f2uN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
+-         nir_src_rewrite(&intrin->src[0], value);
+-         type ^= (nir_type_float | nir_type_int);
+-         nir_intrinsic_set_src_type(intrin, type);
+-         return true;
+-      }
+-   } else if (util_format_is_pure_uint(format)) {
+-      if (type & nir_type_int) {
+-         type ^= (nir_type_int | nir_type_uint);
+-         nir_intrinsic_set_src_type(intrin, type);
+-         return true;
+-      } else if (type & nir_type_float) {
+-         b->cursor = nir_before_instr(&intrin->instr);
+-         nir_def *value =
+-            nir_f2uN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
+-         nir_src_rewrite(&intrin->src[0], value);
+-         type ^= (nir_type_float | nir_type_uint);
+-         nir_intrinsic_set_src_type(intrin, type);
+-         return true;
+-      }
+-   }
+-   return false;
++   if (nir_alu_type_get_base_type(type) == wanted)
++      return false;
++
++   nir_intrinsic_set_src_type(intrin,
++                              wanted | nir_alu_type_get_type_size(type));
++   return true;
+ }
+ 
+ bool

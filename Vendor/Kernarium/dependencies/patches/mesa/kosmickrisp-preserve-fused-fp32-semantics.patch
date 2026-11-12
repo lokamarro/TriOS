@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 18:52:26 +0900
+Subject: [PATCH] kosmickrisp: preserve fused fp32 semantics
+
+---
+ src/kosmickrisp/compiler/nir_to_msl.c | 133 +++++++++++++++++++++++++-
+ 1 file changed, 132 insertions(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 975c7237b61428dee0e47c80dc2ef2294674b6f1..dbeac584cb80354a0ff30d821bb9f17ba17f381f 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -32,6 +32,131 @@ get_entrypoint_name(nir_shader *shader)
+    return nir_shader_get_entrypoint(shader)->function->name;
+ }
+ 
++/* Only a 32-bit ffma calls kk_fma32, so a shader without one is translated
++ * without the helpers. */
++static bool
++msl_shader_has_fp32_ffma(nir_shader *shader)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_alu)
++               continue;
++            nir_alu_instr *alu = nir_instr_as_alu(instr);
++            if (alu->op == nir_op_ffma && alu->def.bit_size == 32)
++               return true;
++         }
++      }
++   }
++
++   return false;
++}
++
++static void
++emit_fp32_fma_helpers(struct nir_to_msl_ctx *ctx)
++{
++   P(ctx,
++     "static inline float kk_scale_up_24(float value)\n"
++     "{\n"
++     "   uint bits = as_type<uint>(value);\n"
++     "   uint sign = bits & 0x80000000u;\n"
++     "   uint magnitude = bits & 0x7fffffffu;\n"
++     "   uint exponent = magnitude >> 23;\n"
++     "   uint mantissa = magnitude & 0x007fffffu;\n"
++     "   if (exponent != 0u)\n"
++     "      return as_type<float>(bits + 0x0c000000u);\n"
++     "   if (mantissa == 0u)\n"
++     "      return value;\n"
++     "   uint shift = clz(mantissa) - 8u;\n"
++     "   uint scaled_exponent = 25u - shift;\n"
++     "   uint scaled_mantissa = (mantissa << shift) & 0x007fffffu;\n"
++     "   return as_type<float>(sign | (scaled_exponent << 23) |\n"
++     "                         scaled_mantissa);\n"
++     "}\n"
++     "\n"
++     "static inline float kk_fma32(float a, float b, float c)\n"
++     "{\n"
++     "   float native_result = precise::fma(a, b, c);\n"
++     "   uint native_magnitude =\n"
++     "      as_type<uint>(native_result) & 0x7fffffffu;\n"
++     "   if (native_magnitude >= 0x00800000u)\n"
++     "      return native_result;\n"
++     "\n"
++     "   uint a_bits = as_type<uint>(a);\n"
++     "   uint b_bits = as_type<uint>(b);\n"
++     "   uint a_magnitude = a_bits & 0x7fffffffu;\n"
++     "   uint b_magnitude = b_bits & 0x7fffffffu;\n"
++     "   uint c_magnitude = as_type<uint>(c) & 0x7fffffffu;\n"
++     "   if (c_magnitude >= 0x73800000u)\n"
++     "      return native_result;\n"
++     "\n"
++     "   float scaled_result;\n"
++     "   if (a_magnitude < 0x73800000u) {\n"
++     "      scaled_result = precise::fma(kk_scale_up_24(a), b,\n"
++     "                                   kk_scale_up_24(c));\n"
++     "   } else if (b_magnitude < 0x73800000u) {\n"
++     "      scaled_result = precise::fma(a, kk_scale_up_24(b),\n"
++     "                                   kk_scale_up_24(c));\n"
++     "   } else {\n"
++     "      return native_result;\n"
++     "   }\n"
++     "\n"
++     "   scaled_result *= 5.9604644775390625e-8f;\n"
++     "   uint scaled_magnitude =\n"
++     "      as_type<uint>(scaled_result) & 0x7fffffffu;\n"
++     "   if (scaled_magnitude >= 0x00800000u &&\n"
++     "       scaled_magnitude < 0x7f800000u)\n"
++     "      return scaled_result;\n"
++     "\n"
++     "   if (c_magnitude == 0u) {\n"
++     "      uint a_exponent = max(a_magnitude >> 23, 1u);\n"
++     "      uint b_exponent = max(b_magnitude >> 23, 1u);\n"
++     "      uint exponent_sum = a_exponent + b_exponent;\n"
++     "      if (exponent_sum >= 126u && exponent_sum <= 150u) {\n"
++     "         uint a_significand = (a_magnitude & 0x007fffffu) |\n"
++     "                              ((a_magnitude >> 23) != 0u\n"
++     "                                  ? 0x00800000u : 0u);\n"
++     "         uint b_significand = (b_magnitude & 0x007fffffu) |\n"
++     "                              ((b_magnitude >> 23) != 0u\n"
++     "                                  ? 0x00800000u : 0u);\n"
++     "         uint shift = 150u - exponent_sum;\n"
++     "         ulong product = ulong(a_significand) *\n"
++     "                         ulong(b_significand);\n"
++     "         ulong lower = ulong(0x00ffffffu) << shift;\n"
++     "         ulong upper = ulong(0x01000001u) << shift;\n"
++     "         if (product >= lower && product <= upper) {\n"
++     "            uint sign = (a_bits ^ b_bits) & 0x80000000u;\n"
++     "            return as_type<float>(sign | 0x00800000u);\n"
++     "         }\n"
++     "      }\n"
++     "   }\n"
++     "\n"
++     "   return native_result;\n"
++     "}\n"
++     "\n"
++     "static inline float2 kk_fma32(float2 a, float2 b, float2 c)\n"
++     "{\n"
++     "   return float2(kk_fma32(a.x, b.x, c.x),\n"
++     "                 kk_fma32(a.y, b.y, c.y));\n"
++     "}\n"
++     "\n"
++     "static inline float3 kk_fma32(float3 a, float3 b, float3 c)\n"
++     "{\n"
++     "   return float3(kk_fma32(a.x, b.x, c.x),\n"
++     "                 kk_fma32(a.y, b.y, c.y),\n"
++     "                 kk_fma32(a.z, b.z, c.z));\n"
++     "}\n"
++     "\n"
++     "static inline float4 kk_fma32(float4 a, float4 b, float4 c)\n"
++     "{\n"
++     "   return float4(kk_fma32(a.x, b.x, c.x),\n"
++     "                 kk_fma32(a.y, b.y, c.y),\n"
++     "                 kk_fma32(a.z, b.z, c.z),\n"
++     "                 kk_fma32(a.w, b.w, c.w));\n"
++     "}\n"
++     "\n");
++}
++
+ static const char *sysval_table[SYSTEM_VALUE_MAX] = {
+    [SYSTEM_VALUE_SUBGROUP_SIZE] =
+       "uint gl_SubGroupSize [[threads_per_simdgroup]]",
+@@ -456,7 +581,11 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+       alu_funclike_precise(ctx, instr, "floor");
+       break;
+    case nir_op_ffma:
+-      alu_funclike_precise(ctx, instr, "fma");
++      /* Metal can flush an intermediate fp32 denormal even when the fused
++       * result is normal.  kk_fma32 retries only that result range after exact
++       * power-of-two scaling. */
++      alu_funclike(ctx, instr,
++                   instr->def.bit_size == 32 ? "kk_fma32" : "fma");
+       break;
+    case nir_op_ffract:
+       /* Metal's fract returns values [0, 1] disregarding INFs and NANs */
+@@ -2465,6 +2594,8 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+       P(&ctx, "#include <metal_compute>\n");
+    P(&ctx, "#include <metal_stdlib>\n");
+    P(&ctx, "using namespace metal;\n");
++   if (msl_shader_has_fp32_ffma(shader))
++      emit_fp32_fma_helpers(&ctx);
+ 
+    msl_emit_io_blocks(&ctx, shader);
+    if (shader->info.stage == MESA_SHADER_FRAGMENT &&

@@ -1,0 +1,602 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:33:05 +0900
+Subject: [PATCH] v4l2: report the codec resources a decoder holds
+
+A hardware video decoder runs Android's codec availability tests, which
+read what the device has left from the store's resource capacity and from
+what every instance says it needs. The store reported the resources of
+the encoders only, and a decoder reported none, so the framework could
+not tell what a decoder took and the tests failed in their prerequisite.
+
+A decoder now reports one session and, when the product states a decode
+pixel rate, the pixel rate of its stream in real time, as the encoders
+do: it follows the frame rate, the operating rate and the priority the
+client sets, reports a change with its next output, and claims its pixel
+rate when it starts, failing the start where the device's is used up. The
+decoders have a pixel rate of their own, because the device sustains a
+different one than for the encoders: the store reports it from
+ro.vendor.v4l2_codec2.video_decode_pixel_rate, and the pixel rate budget
+and the claim are shared code that a component of either direction uses.
+
+The need follows the size of the pictures the device decodes, not the
+size the client configured: a stream that changes its size, as adaptive
+playback does, changes what the instance needs, and the framework learns
+of it with the next output.
+
+The picture size parameter is stepped by 2, the alignment the codec XML
+publishes, and the decoded size is rounded up to that, which leaves the size
+of any 4:2:0 stream as it is. A larger step rounds the 360 rows of a 480x360
+stream up to 368, and the framework, which reads the parameter again after a
+flush, reports a second output format change that the stream does not have.
+---
+ common/include/v4l2_codec2/common/Common.h    |  3 +-
+ components/ComponentStore.cpp                 | 15 +++-
+ components/DecodeComponent.cpp                | 41 ++++++++-
+ components/DecodeInterface.cpp                | 88 ++++++++++++++++++-
+ .../v4l2_codec2/components/ComponentStore.h   |  6 +-
+ .../v4l2_codec2/components/DecodeComponent.h  |  8 ++
+ .../v4l2_codec2/components/DecodeInterface.h  | 30 +++++++
+ .../v4l2_codec2/components/VideoResources.h   | 66 +++++++++++---
+ v4l2/V4L2ComponentStore.cpp                   | 10 ++-
+ v4l2/V4L2Device.cpp                           |  8 +-
+ v4l2/include/v4l2_codec2/v4l2/V4L2Device.h    |  6 +-
+ 11 files changed, 255 insertions(+), 26 deletions(-)
+
+diff --git a/common/include/v4l2_codec2/common/Common.h b/common/include/v4l2_codec2/common/Common.h
+index bd0051db8fb22a08b1c7c470e9e744438327101e..167828b1384fe1c61f2a9206c8d05f392e7219d0 100644
+--- a/common/include/v4l2_codec2/common/Common.h
++++ b/common/include/v4l2_codec2/common/Common.h
+@@ -73,7 +73,8 @@ struct SupportedCapabilities {
+     bool supportsHdr10 = false;
+ 
+     // The luma samples per second that the product states the device sustains for all its codec
+-    // instances together, 0 when it states none. A component reports the share its stream needs.
++    // instances of the direction together, 0 when it states none. A component reports the share
++    // its stream needs.
+     uint64_t pixelRateCapacity = 0;
+ };
+ 
+diff --git a/components/ComponentStore.cpp b/components/ComponentStore.cpp
+index 4e399032858a8410aa03ab337b4efec8dc877e0c..92faa0164ead23fb921bd7dd06b50a3de8e29a30 100644
+--- a/components/ComponentStore.cpp
++++ b/components/ComponentStore.cpp
+@@ -32,7 +32,7 @@ const uint32_t kComponentRank = 0x80;
+ class ComponentStore::ResourceInterface : public C2InterfaceHelper {
+ public:
+     ResourceInterface(std::shared_ptr<C2ReflectorHelper> reflector, uint32_t instances,
+-                      uint64_t pixelRate)
++                      uint64_t pixelRate, uint64_t decodePixelRate)
+           : C2InterfaceHelper(reflector) {
+         setDerivedInstance(this);
+ 
+@@ -49,6 +49,11 @@ public:
+             capacity.emplace_back(kVideoPixelRateResourceId, C2Config::CONST, pixelRate);
+             excluded.emplace_back(kVideoPixelRateResourceId, C2Config::CONST, 0);
+         }
++        if (decodePixelRate > 0) {
++            capacity.emplace_back(kVideoDecodePixelRateResourceId, C2Config::CONST,
++                                  decodePixelRate);
++            excluded.emplace_back(kVideoDecodePixelRateResourceId, C2Config::CONST, 0);
++        }
+ 
+         // Nothing but the product changes what the device has, so the capacity is read-only. No
+         // other client of the device is excluded.
+@@ -279,16 +284,18 @@ ComponentStore::Builder& ComponentStore::Builder::encoder(std::string name, Vide
+ }
+ 
+ ComponentStore::Builder& ComponentStore::Builder::resources(uint32_t instances,
+-                                                            uint64_t pixelRate) {
++                                                            uint64_t pixelRate,
++                                                            uint64_t decodePixelRate) {
+     mInstances = instances;
+     mPixelRate = pixelRate;
++    mDecodePixelRate = decodePixelRate;
+     return *this;
+ }
+ 
+ std::shared_ptr<ComponentStore> ComponentStore::Builder::build() && {
+-    if (mInstances > 0 || mPixelRate > 0) {
++    if (mInstances > 0 || mPixelRate > 0 || mDecodePixelRate > 0) {
+         mStore->mResources = std::make_shared<ResourceInterface>(mStore->mReflector, mInstances,
+-                                                                 mPixelRate);
++                                                                 mPixelRate, mDecodePixelRate);
+     }
+     return std::shared_ptr<ComponentStore>(std::move(mStore));
+ }
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index 91b51543ee69641efe888ce42f4e8eedbd072033..a428ce80628236b58204302899967be38c4eb758 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -155,8 +155,22 @@ c2_status_t DecodeComponent::start() {
+         return C2_BAD_STATE;
+     }
+ 
++    // The device decodes the real-time streams of its instances only up to the pixel rate it
++    // sustains, and the framework relies on a start to fail where the resources are used up.
++    const uint64_t pixelRate = mIntfImpl->getPixelRateNeeded();
++    if (!mPixelRate.claim(pixelRate, mIntfImpl->getPixelRateCapacity())) {
++        ALOGW("Not starting, the pixel rate %" PRIu64 " exceeds what the device has left",
++              pixelRate);
++        return C2_NO_MEMORY;
++    }
++    // The framework read the resources the instance needs when it configured the component.
++    mReportedPixelRateNeeded = pixelRate;
++    mDecodedWidth = 0;
++    mDecodedHeight = 0;
++
+     if (!mDecoderThread.Start()) {
+         ALOGE("Decoder thread failed to start.");
++        mPixelRate.release();
+         return C2_CORRUPTED;
+     }
+     mDecoderTaskRunner = mDecoderThread.task_runner();
+@@ -169,7 +183,11 @@ c2_status_t DecodeComponent::start() {
+                                         ::base::Unretained(&status), ::base::Unretained(&done)));
+     done.Wait();
+ 
+-    if (status == C2_OK) mComponentState.store(ComponentState::RUNNING);
++    if (status == C2_OK) {
++        mComponentState.store(ComponentState::RUNNING);
++    } else {
++        mPixelRate.release();
++    }
+     return status;
+ }
+ 
+@@ -241,6 +259,7 @@ c2_status_t DecodeComponent::stop() {
+         mDecoderThread.Stop();
+         mDecoderTaskRunner = nullptr;
+     }
++    mPixelRate.release();
+ 
+     mComponentState.store(ComponentState::STOPPED);
+     return C2_OK;
+@@ -277,6 +296,7 @@ c2_status_t DecodeComponent::release() {
+         mDecoderThread.Stop();
+         mDecoderTaskRunner = nullptr;
+     }
++    mPixelRate.release();
+ 
+     mComponentState.store(ComponentState::RELEASED);
+     return C2_OK;
+@@ -540,6 +560,16 @@ void DecodeComponent::onOutputFrameReady(std::unique_ptr<VideoFrame> frame) {
+     C2Work* work = it->second.get();
+ 
+     if (mFlushOutputToHost) frame->flushToHost();
++    // A stream that changes its size changes what the instance needs.
++    const Rect& visibleRect = frame->getVisibleRect();
++    const uint32_t decodedWidth = visibleRect.width();
++    const uint32_t decodedHeight = visibleRect.height();
++    if ((decodedWidth != mDecodedWidth || decodedHeight != mDecodedHeight) && decodedWidth > 0 &&
++        decodedHeight > 0) {
++        mDecodedWidth = decodedWidth;
++        mDecodedHeight = decodedHeight;
++        mIntfImpl->updatePictureSize(decodedWidth, decodedHeight);
++    }
+     C2ConstGraphicBlock constBlock = std::move(frame)->getGraphicBlock();
+     std::shared_ptr<C2Buffer> buffer = C2Buffer::CreateGraphicBuffer(std::move(constBlock));
+     if (mPendingColorAspectsChange &&
+@@ -552,6 +582,15 @@ void DecodeComponent::onOutputFrameReady(std::unique_ptr<VideoFrame> frame) {
+     }
+     work->worklets.front()->output.buffers.emplace_back(std::move(buffer));
+ 
++    // Tell the framework when the system resources the instance needs have changed, as they do when
++    // the client switches it between real time and not (the priority), or changes its rate.
++    const uint64_t pixelRateNeeded = mIntfImpl->getPixelRateNeeded();
++    if (pixelRateNeeded != mReportedPixelRateNeeded) {
++        work->worklets.front()->output.configUpdate.push_back(mIntfImpl->copyResourcesNeeded());
++        mReportedPixelRateNeeded = pixelRateNeeded;
++        mPixelRate.change(pixelRateNeeded);
++    }
++
+     // Check no-show frame by timestamps for VP8/VP9 cases before reporting the current work.
+     if (mIntfImpl->getVideoCodec() == VideoCodec::VP8 ||
+         mIntfImpl->getVideoCodec() == VideoCodec::VP9) {
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 0b07c7dc36f43cab498b6c0cf7679e928d70e99f..1735a98911d7451468550f9b2839b15c951f7f26 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -17,6 +17,7 @@
+ #include <media/stagefright/foundation/MediaDefs.h>
+ 
+ #include <v4l2_codec2/common/Common.h>
++#include <v4l2_codec2/components/VideoResources.h>
+ #include <v4l2_codec2/plugin_store/V4L2AllocatorId.h>
+ 
+ namespace android {
+@@ -84,6 +85,32 @@ C2R DecodeInterface::ProfileLevelSetter(bool /* mayBlock */,
+             .plus(info.F(info.v.level).validatePossible(info.v.level));
+ }
+ 
++// static
++C2R DecodeInterface::OperatingRateSetter(bool /* mayBlock */, C2P<C2OperatingRateTuning>& me) {
++    // A negative rate is invalid; no rate is zero.
++    if (me.v.value < 0) me.set().value = 0;
++    return C2R::Ok();
++}
++
++// static
++C2R DecodeInterface::ResourcesNeededSetter(bool /* mayBlock */, C2P<C2ResourcesNeededTuning>& me,
++                                           const C2P<C2StreamPictureSizeInfo::output>& size,
++                                           const C2P<C2StreamFrameRateInfo::output>& frameRate,
++                                           const C2P<C2OperatingRateTuning>& operatingRate,
++                                           const C2P<C2RealTimePriorityTuning>& priority) {
++    // The instance takes the session it holds, whatever it decodes, and the pixel rate of its stream
++    // if it runs in real time. A priority below 0 asks the device for best effort at the rate the
++    // client hints, so such an instance takes whatever the real-time ones leave, and none of the
++    // capacity. A client that gives an operating rate means to feed the frames at that rate.
++    const bool realTime = priority.v.value >= 0;
++    const float rate = operatingRate.v.value > 0 ? operatingRate.v.value : frameRate.v.value;
++    if (me.v.flexCount() > 1 && me.v.m.values[1].id == kVideoDecodePixelRateResourceId) {
++        me.set().m.values[1].amount =
++                realTime ? videoPixelRateNeeded(size.v.width, size.v.height, rate) : 0;
++    }
++    return C2R::Ok();
++}
++
+ // static
+ C2R DecodeInterface::SizeSetter(bool /* mayBlock */,
+                                 C2P<C2StreamPictureSizeInfo::output>& videoSize) {
+@@ -148,6 +175,10 @@ DecodeInterface::DecodeInterface(const std::string& name,
+     ALOGV("%s(%s)", __func__, name.c_str());
+ 
+     setDerivedInstance(this);
++    mPixelRateCapacity = caps.pixelRateCapacity;
++
++    // The system resources are a struct that the reflector does not know yet.
++    helper->addStructDescriptors<C2SystemResourceStruct>();
+ 
+     addParameter(DefineParam(mKind, C2_PARAMKEY_COMPONENT_KIND)
+                          .withConstValue(new C2ComponentKindSetting(C2Component::KIND_DECODER))
+@@ -373,12 +404,48 @@ DecodeInterface::DecodeInterface(const std::string& name,
+                          .withDefault(new C2StreamPictureSizeInfo::output(
+                                  0u, std::min(320, maxSize.width), std::min(240, maxSize.height)))
+                          .withFields({
+-                                 C2F(mSize, width).inRange(16, maxSize.width, 16),
+-                                 C2F(mSize, height).inRange(16, maxSize.height, 16),
++                                 C2F(mSize, width).inRange(16, maxSize.width, 2),
++                                 C2F(mSize, height).inRange(16, maxSize.height, 2),
+                          })
+                          .withSetter(SizeSetter)
+                          .build());
+ 
++    // The system resources of the instance, which the framework adds up with the capacity the store
++    // reports into the globally available resources. The pixel rate is among them only if the
++    // store has a pixel rate capacity to take it from.
++    addParameter(DefineParam(mFrameRate, C2_PARAMKEY_FRAME_RATE)
++                         .withDefault(new C2StreamFrameRateInfo::output(0u, 30.))
++                         .withFields({C2F(mFrameRate, value).greaterThan(0.)})
++                         .withSetter(Setter<decltype(*mFrameRate)>::StrictValueWithNoDeps)
++                         .build());
++
++    addParameter(DefineParam(mOperatingRate, C2_PARAMKEY_OPERATING_RATE)
++                         .withDefault(new C2OperatingRateTuning(0.f))
++                         .withFields({C2F(mOperatingRate, value).any()})
++                         .withSetter(OperatingRateSetter)
++                         .build());
++
++    addParameter(DefineParam(mRealTimePriority, C2_PARAMKEY_PRIORITY)
++                         .withDefault(new C2RealTimePriorityTuning(0))
++                         .withFields({C2F(mRealTimePriority, value).any()})
++                         .withSetter(Setter<decltype(*mRealTimePriority)>::NonStrictValueWithNoDeps)
++                         .build());
++
++    {
++        const std::vector<C2SystemResourceStruct> needed =
++                videoResourcesNeeded(320, 240, 0.f, true, caps.pixelRateCapacity > 0,
++                                     kVideoDecodePixelRateResourceId);
++        addParameter(DefineParam(mResourcesNeeded, C2_PARAMKEY_RESOURCES_NEEDED)
++                             .withDefault(C2ResourcesNeededTuning::AllocShared(needed.size(),
++                                                                               needed))
++                             .withFields({C2F(mResourcesNeeded, m.values[0].id).any(),
++                                          C2F(mResourcesNeeded, m.values[0].kind).any(),
++                                          C2F(mResourcesNeeded, m.values[0].amount).any()})
++                             .calculatedAs(ResourcesNeededSetter, mSize, mFrameRate, mOperatingRate,
++                                           mRealTimePriority)
++                             .build());
++    }
++
+     addParameter(
+             DefineParam(mMaxInputSize, C2_PARAMKEY_INPUT_MAX_BUFFER_SIZE)
+                     .withDefault(new C2StreamMaxBufferSizeInfo::input(0u, kInputBufferSizeFor1080p))
+@@ -483,6 +550,23 @@ DecodeInterface::DecodeInterface(const std::string& name,
+     }
+ }
+ 
++uint64_t DecodeInterface::getPixelRateNeeded() const {
++    Lock lock = this->lock();
++    for (size_t i = 0; i < mResourcesNeeded->flexCount(); ++i) {
++        const C2SystemResourceStruct& resource = mResourcesNeeded->m.values[i];
++        if (resource.id == kVideoDecodePixelRateResourceId) return resource.amount;
++    }
++    return 0;
++}
++
++c2_status_t DecodeInterface::updatePictureSize(uint32_t width, uint32_t height) {
++    constexpr uint32_t kStep = 2;
++    C2StreamPictureSizeInfo::output size(0u, (width + kStep - 1) / kStep * kStep,
++                                         (height + kStep - 1) / kStep * kStep);
++    std::vector<std::unique_ptr<C2SettingResult>> failures;
++    return config({&size}, C2_MAY_BLOCK, &failures);
++}
++
+ size_t DecodeInterface::getInputBufferSize() const {
+     return mMaxInputSize->value;
+ }
+diff --git a/components/include/v4l2_codec2/components/ComponentStore.h b/components/include/v4l2_codec2/components/ComponentStore.h
+index ae408c7f6bc32e6c38e631591ef333020cb17cf8..90b109d0541d8b898a631319e3c7737e307ecba7 100644
+--- a/components/include/v4l2_codec2/components/ComponentStore.h
++++ b/components/include/v4l2_codec2/components/ComponentStore.h
+@@ -89,8 +89,9 @@ public:
+     Builder& encoder(std::string name, VideoCodec codec, GetFactory factory);
+ 
+     // Sets the system resources the store reports: the codec sessions it serves at once and the
+-    // luma samples per second it codes, of all sessions together. A capacity of 0 is not reported.
+-    Builder& resources(uint32_t instances, uint64_t pixelRate);
++    // luma samples per second it encodes and decodes, of all sessions of the direction together. A
++    // capacity of 0 is not reported.
++    Builder& resources(uint32_t instances, uint64_t pixelRate, uint64_t decodePixelRate = 0);
+ 
+     std::shared_ptr<ComponentStore> build() &&;
+ 
+@@ -98,6 +99,7 @@ private:
+     std::unique_ptr<ComponentStore> mStore;
+     uint32_t mInstances = 0;
+     uint64_t mPixelRate = 0;
++    uint64_t mDecodePixelRate = 0;
+ };
+ 
+ }  // namespace android
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index 4d7ee46d6936fff761c86cc0fd44814014788bf9..23dd78cf4526a396ec80cfd662475d63892987a8 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -20,6 +20,7 @@
+ #include <v4l2_codec2/components/DecodeInterface.h>
+ #include <v4l2_codec2/components/VideoDecoder.h>
+ #include <v4l2_codec2/components/VideoFramePool.h>
++#include <v4l2_codec2/components/VideoResources.h>
+ 
+ namespace android {
+ 
+@@ -117,6 +118,13 @@ protected:
+     // Whether the decoded pictures go to a consumer that reads them with the GPU, which needs
+     // each one handed to the host first. Set with the frame pool, used on the decoder thread.
+     bool mFlushOutputToHost = false;
++    // The pixel rate the instance holds of the device's, from its start until it stops, and the
++    // pixel rate the framework last learned that the instance needs.
++    PixelRateClaim<VideoDecodePixelRateBudget> mPixelRate;
++    uint64_t mReportedPixelRateNeeded = 0;
++    // The size of the pictures last taken into account for it.
++    uint32_t mDecodedWidth = 0;
++    uint32_t mDecodedHeight = 0;
+     // The component state.
+     std::atomic<ComponentState> mComponentState{ComponentState::STOPPED};
+     // Whether we are currently draining the component. This is set when the component is processing
+diff --git a/components/include/v4l2_codec2/components/DecodeInterface.h b/components/include/v4l2_codec2/components/DecodeInterface.h
+index 77702d8502e5885bf55fb17056d48f574a7bb4ae..f7942a9f0d23b587df103ee81412c64abf307340 100644
+--- a/components/include/v4l2_codec2/components/DecodeInterface.h
++++ b/components/include/v4l2_codec2/components/DecodeInterface.h
+@@ -37,6 +37,18 @@ public:
+     static uint32_t getOutputDelay(VideoCodec codec);
+ 
+     size_t getInputBufferSize() const;
++    // Get the system resources that the configured instance needs, as the framework reads them: a
++    // copy of the parameter, and the pixel rate in it, for telling two states apart.
++    std::unique_ptr<C2Param> copyResourcesNeeded() const {
++        return C2Param::Copy(*mResourcesNeeded);
++    }
++    uint64_t getPixelRateNeeded() const;
++    // Take the size of the pictures the device decodes now, as the stream changes it, so that what
++    // the instance needs follows the stream and not the size the client configured. The size is
++    // rounded up to the step of the parameter, which a size of 4:2:0 pictures is a multiple of.
++    c2_status_t updatePictureSize(uint32_t width, uint32_t height);
++    // The pixel rate the device decodes, or 0 if the product does not say.
++    uint64_t getPixelRateCapacity() const { return mPixelRateCapacity; }
+     c2_status_t queryColorAspects(
+             std::shared_ptr<C2StreamColorAspectsInfo::output>* targetColorAspects);
+ 
+@@ -49,6 +61,14 @@ private:
+                                             C2P<C2StreamMaxBufferSizeInfo::input>& me,
+                                             const C2P<C2StreamPictureSizeInfo::output>& size);
+ 
++    static C2R OperatingRateSetter(bool mayBlock, C2P<C2OperatingRateTuning>& me);
++
++    static C2R ResourcesNeededSetter(bool mayBlock, C2P<C2ResourcesNeededTuning>& me,
++                                     const C2P<C2StreamPictureSizeInfo::output>& size,
++                                     const C2P<C2StreamFrameRateInfo::output>& frameRate,
++                                     const C2P<C2OperatingRateTuning>& operatingRate,
++                                     const C2P<C2RealTimePriorityTuning>& priority);
++
+     template <typename T>
+     static C2R DefaultColorAspectsSetter(bool mayBlock, C2P<T>& def);
+ 
+@@ -86,6 +106,16 @@ private:
+     std::shared_ptr<C2StreamProfileLevelInfo::input> mProfileLevel;
+     // Decoded video size for output.
+     std::shared_ptr<C2StreamPictureSizeInfo::output> mSize;
++    // The frame rate of the stream, which the client may state. It sets the pixel rate the instance
++    // needs when the client gives no operating rate.
++    std::shared_ptr<C2StreamFrameRateInfo::output> mFrameRate;
++    // The rate at which the client means to feed the decoder, 0 for none.
++    std::shared_ptr<C2OperatingRateTuning> mOperatingRate;
++    // Whether the stream runs in real time: a priority below 0 asks for best effort.
++    std::shared_ptr<C2RealTimePriorityTuning> mRealTimePriority;
++    // The system resources the instance needs for the configuration. Read-only.
++    std::shared_ptr<C2ResourcesNeededTuning> mResourcesNeeded;
++    uint64_t mPixelRateCapacity = 0;
+     // Maximum size of one input buffer.
+     std::shared_ptr<C2StreamMaxBufferSizeInfo::input> mMaxInputSize;
+     // The suggested usage of input buffer allocator ID.
+diff --git a/components/include/v4l2_codec2/components/VideoResources.h b/components/include/v4l2_codec2/components/VideoResources.h
+index 5b9d38bc0d407797e62d4b38169ca49532bdac1c..ce08f683adf6f80fce26ea79bf125d13e5811e8b 100644
+--- a/components/include/v4l2_codec2/components/VideoResources.h
++++ b/components/include/v4l2_codec2/components/VideoResources.h
+@@ -29,6 +29,9 @@ constexpr uint32_t kVideoInstancesResourceId = C2PlatformConfig::VENDOR_START;
+ // publishes is a share of the capacity that grows with the stream. An instance that does not run
+ // in real time claims none, as it takes whatever the real-time instances leave.
+ constexpr uint32_t kVideoPixelRateResourceId = C2PlatformConfig::VENDOR_START + 1;
++// Decode pixel rate: the same measure for the decoders, which the device sustains at a different
++// rate than the encoders, so the two directions have a capacity each.
++constexpr uint32_t kVideoDecodePixelRateResourceId = C2PlatformConfig::VENDOR_START + 2;
+ 
+ // The pixel rate a stream of |width| by |height| luma samples at |frameRate| frames per second
+ // needs.
+@@ -38,24 +41,27 @@ inline uint64_t videoPixelRateNeeded(uint32_t width, uint32_t height, float fram
+ 
+ // The resources one codec instance needs: a session and, if |withPixelRate| (the store has a pixel
+ // rate capacity), the pixel rate of the stream when it runs in real time or none when it does not.
+-inline std::vector<C2SystemResourceStruct> videoResourcesNeeded(uint32_t width, uint32_t height,
+-                                                                float frameRate, bool realTime,
+-                                                                bool withPixelRate) {
++// |pixelRateId| names the pixel rate of the instance's direction.
++inline std::vector<C2SystemResourceStruct> videoResourcesNeeded(
++        uint32_t width, uint32_t height, float frameRate, bool realTime, bool withPixelRate,
++        uint32_t pixelRateId = kVideoPixelRateResourceId) {
+     std::vector<C2SystemResourceStruct> needed;
+     needed.emplace_back(kVideoInstancesResourceId, C2Config::CONST, 1);
+     if (withPixelRate) {
+-        needed.emplace_back(kVideoPixelRateResourceId, C2Config::CONST,
++        needed.emplace_back(pixelRateId, C2Config::CONST,
+                             realTime ? videoPixelRateNeeded(width, height, frameRate) : 0);
+     }
+     return needed;
+ }
+ 
+-// The pixel rate the running instances have claimed. A component claims its pixel rate when it
+-// starts, keeps the claim up to date as the stream changes and gives it back when it stops, so the
+-// device refuses an instance its real-time streams would overload, as the framework expects of a
+-// codec that reports its resources. The claims are those of the process, as the capacity is the
+-// store's; all components that claim are in one library, which makes this one object.
+-class VideoPixelRateBudget {
++// The pixel rate the running instances of one direction have claimed. A component claims its pixel
++// rate when it starts, keeps the claim up to date as the stream changes and gives it back when it
++// stops, so the device refuses an instance its real-time streams would overload, as the framework
++// expects of a codec that reports its resources. The claims are those of the process, as the
++// capacity is the store's; all components that claim are in one library, which makes this one
++// object for each |Id|.
++template <uint32_t Id>
++class PixelRateBudget {
+ public:
+     // Claim |rate| of |capacity| (no bound if 0). The device serves one instance of any size it
+     // supports, so the claim is refused only if others hold some and the sum is over the capacity.
+@@ -82,6 +88,46 @@ private:
+     static inline uint64_t sClaimed = 0;
+ };
+ 
++using VideoPixelRateBudget = PixelRateBudget<kVideoPixelRateResourceId>;
++using VideoDecodePixelRateBudget = PixelRateBudget<kVideoDecodePixelRateResourceId>;
++
++// What one instance holds of a budget, from its start until it stops. The claim is given back with
++// the instance whichever way the instance ends.
++template <typename Budget>
++class PixelRateClaim {
++public:
++    PixelRateClaim() = default;
++    PixelRateClaim(const PixelRateClaim&) = delete;
++    PixelRateClaim& operator=(const PixelRateClaim&) = delete;
++    ~PixelRateClaim() { release(); }
++
++    // Takes |rate| of |capacity| if the budget allows; false if it does not.
++    bool claim(uint64_t rate, uint64_t capacity) {
++        if (!Budget::claim(rate, capacity)) return false;
++        mRate = rate;
++        mHeld = true;
++        return true;
++    }
++
++    // The instance needs |rate| from now on.
++    void change(uint64_t rate) {
++        if (!mHeld) return;
++        Budget::change(mRate, rate);
++        mRate = rate;
++    }
++
++    void release() {
++        if (!mHeld) return;
++        Budget::release(mRate);
++        mRate = 0;
++        mHeld = false;
++    }
++
++private:
++    uint64_t mRate = 0;
++    bool mHeld = false;
++};
++
+ }  // namespace android
+ 
+ #endif  // ANDROID_V4L2_CODEC2_COMPONENTS_VIDEO_RESOURCES_H
+diff --git a/v4l2/V4L2ComponentStore.cpp b/v4l2/V4L2ComponentStore.cpp
+index 3d5aa5f3c636e8e07d6991abb363eebf68aa6829..de9383e1274b490f921239e03a2586f599eab2d0 100644
+--- a/v4l2/V4L2ComponentStore.cpp
++++ b/v4l2/V4L2ComponentStore.cpp
+@@ -103,8 +103,9 @@ std::shared_ptr<C2ComponentStore> V4L2ComponentStore::Create() {
+                         &V4L2ComponentFactory::create);
+ 
+     // The store reports what the components enforce: the concurrent instance bounds, added up for
+-    // the codecs it offers, and the pixel rate the product states the device sustains. A bound the
+-    // product does not set leaves the instances unreported, as does a store that offers no codec.
++    // the codecs it offers, and the pixel rates the product states the device sustains in each
++    // direction. A bound the product does not set leaves the instances unreported, as does a store
++    // that offers no codec.
+     uint32_t instances = 0;
+     const int32_t encodeInstances =
+             property_get_int32("ro.vendor.v4l2_codec2.encode_concurrent_instances", -1);
+@@ -113,7 +114,10 @@ std::shared_ptr<C2ComponentStore> V4L2ComponentStore::Create() {
+     if (hasEncoder && encodeInstances > 0) instances += encodeInstances;
+     if (hasDecoder && decodeInstances > 0) instances += decodeInstances;
+     const int64_t pixelRate = property_get_int64("ro.vendor.v4l2_codec2.video_pixel_rate", 0);
+-    builder.resources(instances, (hasEncoder || hasDecoder) && pixelRate > 0 ? pixelRate : 0);
++    const int64_t decodePixelRate =
++            property_get_int64("ro.vendor.v4l2_codec2.video_decode_pixel_rate", 0);
++    builder.resources(instances, hasEncoder && pixelRate > 0 ? pixelRate : 0,
++                      hasDecoder && decodePixelRate > 0 ? decodePixelRate : 0);
+ 
+     store = std::shared_ptr<C2ComponentStore>(std::move(builder).build());
+     platformStore = store;
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index b820249287a32278d15d293f85ec4ddf8df79b28..d74af993fcb7338f2b94f11a9f9691389f426374 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -2508,6 +2508,12 @@ uint64_t V4L2Device::getPixelRateCapacity() {
+     return pixelRate > 0 ? static_cast<uint64_t>(pixelRate) : 0;
+ }
+ 
++// static
++uint64_t V4L2Device::getDecodePixelRateCapacity() {
++    const int64_t pixelRate = property_get_int64("ro.vendor.v4l2_codec2.video_decode_pixel_rate", 0);
++    return pixelRate > 0 ? static_cast<uint64_t>(pixelRate) : 0;
++}
++
+ // static
+ SupportedCapabilities V4L2Device::queryDecodingCapabilities(VideoCodec codec) {
+     SupportedCapabilities caps;
+@@ -2517,7 +2523,7 @@ SupportedCapabilities V4L2Device::queryDecodingCapabilities(VideoCodec codec) {
+     caps.supportedProfiles = V4L2Device::getSupportedProfiles(
+             V4L2Device::Type::kDecoder, {V4L2Device::videoCodecToPixFmt(codec)});
+     caps.defaultProfile = V4L2Device::getDefaultProfile(codec);
+-    caps.pixelRateCapacity = V4L2Device::getPixelRateCapacity();
++    caps.pixelRateCapacity = V4L2Device::getDecodePixelRateCapacity();
+ 
+     return caps;
+ }
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+index b8b0075fb007404d8ca42befdaefccdd302ce3af..0150c6e30f21815d125e1ac8d54f210936e0b0ce 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+@@ -436,9 +436,11 @@ public:
+     // Gets all capabilites of the encoder devices.
+     static SupportedCapabilities queryEncodingCapabilities(VideoCodec codec);
+ 
+-    // Gets the luma samples per second that the product states the devices sustain for all codec
+-    // instances together, 0 when it states none.
++    // Gets the luma samples per second that the product states the devices sustain for all
++    // encoder instances together, 0 when it states none.
+     static uint64_t getPixelRateCapacity();
++    // The same for the decoders, which the device sustains at a rate of their own.
++    static uint64_t getDecodePixelRateCapacity();
+ 
+     // Create and initialize an appropriate V4L2Device instance for the current platform, or return
+     // nullptr if not available.

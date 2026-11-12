@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:35:47 +0900
+Subject: [PATCH] Embedding: LSL and SIDT give what Linux gives user code
+
+LSL never read its operand and always cleared ZF, and SIDT stored the
+IDT of a host without UMIP. Under Linux on an x86 host with UMIP, user
+code's SIDT stores limit 0 and base 0xFFFFFFFFFFFF0000, and LSL reads
+the flat user code and data segments at GDT entries 4, 5 and 6, the
+per-CPU segment at entry 15, whose limit is the processor number RDPID
+reads, and the TLS entries the kernel installed, which the C libraries
+give a flat limit; any other selector clears ZF and leaves the
+destination. Embedded, FEXCore now gives those values, as the gadget
+engine does, and LSL reads its selector from memory. The host names
+the TLS entries in Embedder.SegmentPresent.
+---
+ .../Interface/Core/OpcodeDispatcher.cpp       | 45 ++++++++++++++++---
+ FEXCore/include/FEXCore/Core/CoreState.h      |  3 ++
+ 2 files changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 10919e0e094b61df9c804bfce9af6cbdf830de8c..a07fae1fe8d30b8cb45529cbf867327c5058a044 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3283,8 +3283,10 @@ void OpDispatchBuilder::SGDTOp(OpcodeArgs) {
+ void OpDispatchBuilder::SIDTOp(OpcodeArgs) {
+   auto DestAddress = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+ 
+-  // See SGDTOp, matches Linux in reported values
+-  uint64_t IDTAddress = 0xFFFFFE0000000000ULL;
++  // See SGDTOp, matches Linux in reported values. Embedded, the values
++  // Linux's UMIP emulation stores, as an x86 host with UMIP gives user
++  // code: limit 0 and base 0xFFFFFFFFFFFF0000.
++  uint64_t IDTAddress = CTX->Embedded ? 0xFFFFFFFFFFFF0000ULL : 0xFFFFFE0000000000ULL;
+   auto IDTStoreSize = OpSize::i64Bit;
+   if (!Is64BitMode) {
+     // Mask off upper bits if 32-bit result.
+@@ -3292,7 +3294,7 @@ void OpDispatchBuilder::SIDTOp(OpcodeArgs) {
+     IDTStoreSize = OpSize::i32Bit;
+   }
+ 
+-  _StoreMemGPRAutoTSO(OpSize::i16Bit, DestAddress, Constant(0xfff));
++  _StoreMemGPRAutoTSO(OpSize::i16Bit, DestAddress, Constant(CTX->Embedded ? 0 : 0xfff));
+   _StoreMemGPRAutoTSO(IDTStoreSize, AddressMode {.Base = DestAddress, .Offset = 2, .AddrSize = OpSize::i64Bit}, Constant(IDTAddress));
+ }
+ 
+@@ -5123,9 +5125,40 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+ }
+ 
+ void OpDispatchBuilder::LSLOp(OpcodeArgs) {
+-  // Emulate by always returning failure, this deviates from both Linux and Windows but
+-  // shouldn't be depended on by anything.
+-  SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0));
++  if (!CTX->Embedded) {
++    // Emulate by always returning failure, this deviates from both Linux and Windows but
++    // shouldn't be depended on by anything.
++    SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0));
++    return;
++  }
++
++  // Embedded, the GDT entries Linux gives user code that LSL can read: the
++  // flat 32-bit code, data and 64-bit code segments at entries 4, 5 and 6;
++  // the per-CPU segment at entry 15, whose limit is the processor number
++  // RDPID reads; and a TLS entry the host installed, which the C libraries
++  // give a flat limit. Any other selector, an LDT's included, reads as
++  // unusable: ZF clear and the destination as it was. The selector is read
++  // from memory too.
++  CalculateDeferredFlags();
++  Ref Selector = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
++  Ref Entry = _Bfe(OpSize::i32Bit, 13, 3, Selector);
++  Ref Present = _Or(OpSize::i32Bit, _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CpuStateFrame, Embedder.SegmentPresent)),
++                    Constant((1U << 4) | (1U << 5) | (1U << 6) | (1U << 15)));
++  // A shift takes its amount modulo 32, so an entry past 31 and an LDT
++  // selector are ruled out first.
++  Ref InGDT = Select01(OpSize::i32Bit, CondClass::EQ, _And(OpSize::i32Bit, Selector, Constant(0xFF04)), Constant(0));
++  Ref Valid = _And(OpSize::i32Bit, InGDT, _And(OpSize::i32Bit, _Lshr(OpSize::i32Bit, Present, Entry), Constant(1)));
++  Ref Limit = _Select(OpSize::i64Bit, OpSize::i32Bit, CondClass::EQ, Entry, Constant(15), _ProcessorID(), Constant(0xFFFFFFFF));
++
++  const auto Register = Op->Dest.Data.GPR.GPR;
++  Ref Old = LoadGPRRegister(Register);
++  Ref New {};
++  switch (OpSizeFromDst(Op)) {
++  case OpSize::i16Bit: New = _Bfi(OpSize::i64Bit, 16, 0, Old, Limit); break;
++  default: New = _Bfe(OpSize::i64Bit, 32, 0, Limit); break;
++  }
++  StoreGPRRegister(Register, _Select(OpSize::i64Bit, OpSize::i32Bit, CondClass::NEQ, Valid, Constant(0), New, Old));
++  SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Valid);
+ }
+ 
+ void OpDispatchBuilder::INTOp(OpcodeArgs) {
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index e4b2acca7e62d8c1325a2d892042a0ac0175687e..711e11a6487602b54ee4d4a0c7d2f2a368a86acc 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -698,6 +698,9 @@ struct CpuStateFrame {
+     // SS or DS, gives base 0, and no selector load faults. The host fills it
+     // from the descriptors its kernel installed before each dispatch.
+     uint32_t SegmentBases[32] {};
++    // Bit n: GDT entry n holds a TLS descriptor the host's kernel
++    // installed, whose limit LSL reads as flat.
++    uint32_t SegmentPresent {};
+     // Bounce buffer for an access that crosses a guest page, an ordered
+     // access across a 16-byte granule, and the copy of a locked operand
+     // across one.

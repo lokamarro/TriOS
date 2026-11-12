@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:14:54 +0900
+Subject: [PATCH] arm64: keep an x86-64 task's CS and SS through its signals
+
+A 64-bit task can run 32-bit code, as Wine's WoW64 does with CS 0x23,
+so its signal frame records the code and stack selectors it ran with
+rather than the flat 64-bit ones. UC_STRICT_RESTORE_SS is set only for
+a signal that interrupted 64-bit code.
+
+rt_sigreturn() takes the frame's CS and SS with RPL 3, as x86-64 Linux
+does before it returns by IRET; the Darwin host checks both as it
+enters the task and delivers the fault IRET would raise for a selector
+it cannot load. A frame without UC_STRICT_RESTORE_SS that returns to
+64-bit code with an SS that is no writable DPL-3 data segment of the
+GDT or the LDT gets the flat SS, as force_valid_ss() gives it.
+---
+ arch/arm64/um/ldt.c    | 26 ++++++++++++++++++++++++++
+ arch/arm64/um/signal.c | 41 ++++++++++++++++++++++++++++++-----------
+ arch/arm64/um/x86_32.h |  4 ++++
+ 3 files changed, 60 insertions(+), 11 deletions(-)
+
+diff --git a/arch/arm64/um/ldt.c b/arch/arm64/um/ldt.c
+index e4eda41e0416698b81be7c6df6d04c537406d019..258d800eb22e428d8d7e99f7481d9a455b2cbce6 100644
+--- a/arch/arm64/um/ldt.c
++++ b/arch/arm64/um/ldt.c
+@@ -159,6 +159,32 @@ SYSCALL_DEFINE3(modify_ldt, int, func, void __user *, ptr,
+ 	return (unsigned int)result;
+ }
+ 
++bool uml_x86_writable_data_selector(struct task_struct *task, u16 selector)
++{
++	const struct uml_x86_32_user_desc *tls;
++	unsigned int index = selector >> 3;
++	u64 *table;
++	u64 type;
++
++	if (!(selector & 4)) {
++		/* GDT_ENTRY_DEFAULT_USER_DS and the TLS entries 12 to 14. */
++		if (index == 5)
++			return true;
++		if (index < 12 || index > 14)
++			return false;
++		tls = (const void *)task->thread.regs.regs.compat_tls[index - 12];
++		return tls->contents <= 1 && !tls->read_exec_only &&
++			!tls->seg_not_present && tls->seg_32bit;
++	}
++	table = smp_load_acquire(&task->mm->context.x86_ldt);
++	if (table == NULL)
++		return false;
++	/* S, P and DPL 3 with a writable data type, accessed or not and
++	 * expand-down or not. */
++	type = READ_ONCE(table[index]) >> 40;
++	return (type & 0xfa) == 0xf2;
++}
++
+ unsigned long current_x86_ldt(void)
+ {
+ 	struct mm_struct *mm = current->mm;
+diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
+index 0707bdfd0051e48c6eb91afcd6d2d7dd31d17bc0..d5b4dca002aa063374e4ba27b0c25e02050f0841 100644
+--- a/arch/arm64/um/signal.c
++++ b/arch/arm64/um/signal.c
+@@ -12,6 +12,7 @@
+ #include <asm/elf.h>
+ #include <asm/ptrace.h>
+ #include <frame_kern.h>
++#include "x86_32.h"
+ #include "x86_fpstate.h"
+ #include "x86_syscall_abi.h"
+ 
+@@ -780,8 +781,10 @@ save_x86_64_mcontext(struct uml_x86_64_sigcontext __user *context,
+ 	state.sp = UPT_X86_64(guest, UML_X86_64_RSP);
+ 	state.ip = UPT_X86_64_RIP(guest);
+ 	state.flags = UPT_X86_64_RFLAGS(guest);
+-	state.cs = UML_X86_64_USER_CS;
+-	state.ss = UML_X86_64_USER_SS;
++	/* The code and stack selectors the task ran with: 0x23 when the
++	 * signal interrupted 32-bit code, as Wine's WoW64 runs it. */
++	state.cs = upt_x86_64_segment_selector(guest, 1);
++	state.ss = upt_x86_64_segment_selector(guest, 2);
+ 	state.err = guest->faultinfo.error_code;
+ 	state.trapno = guest->faultinfo.trap_no;
+ 	state.oldmask = oldmask;
+@@ -790,9 +793,18 @@ save_x86_64_mcontext(struct uml_x86_64_sigcontext __user *context,
+ 	return copy_to_user(context, &state, sizeof(state));
+ }
+ 
++/*
++ * x86-64 Linux returns to the frame's CS and SS, with RPL 3, by IRET, which
++ * faults for a selector it cannot load: the Darwin host checks both as it
++ * enters the task and delivers that fault.  A frame without
++ * UC_STRICT_RESTORE_SS, from a signal that interrupted 32-bit code, has its
++ * SS replaced by the flat one when it returns to 64-bit code with an SS
++ * that is no writable data segment, as force_valid_ss() does.
++ */
+ static int
+ restore_x86_64_mcontext(struct pt_regs *regs,
+-			struct uml_x86_64_sigcontext __user *context)
++			struct uml_x86_64_sigcontext __user *context,
++			unsigned long uc_flags)
+ {
+ 	struct uml_x86_64_sigcontext state;
+ 	struct uml_pt_regs *guest = &regs->regs;
+@@ -820,11 +832,14 @@ restore_x86_64_mcontext(struct pt_regs *regs,
+ 	UPT_X86_64_RFLAGS(guest) =
+ 		(flags & ~UML_X86_RFLAGS_RESTORE_MASK) |
+ 		(state.flags & UML_X86_RFLAGS_RESTORE_MASK) | 2;
+-	if ((state.cs | 3) != UML_X86_64_USER_CS ||
+-	    (state.ss | 3) != UML_X86_64_USER_SS)
+-		return 1;
+-	upt_x86_64_set_segment_selector(guest, 1, state.cs | 3);
+-	upt_x86_64_set_segment_selector(guest, 2, state.ss | 3);
++	state.cs |= 3;
++	state.ss |= 3;
++	if (!(uc_flags & UML_X86_64_UC_STRICT_RESTORE_SS) &&
++	    state.cs == UML_X86_64_USER_CS &&
++	    !uml_x86_writable_data_selector(current, state.ss))
++		state.ss = UML_X86_64_USER_SS;
++	upt_x86_64_set_segment_selector(guest, 1, state.cs);
++	upt_x86_64_set_segment_selector(guest, 2, state.ss);
+ 	if (restore_x86_64_fpstate(regs, state.fpstate,
+ 				    UML_X86_64_XSTATE_FRAME_SIZE))
+ 		return 1;
+@@ -868,7 +883,9 @@ static int setup_x86_64_signal_stack(unsigned long stack_top,
+ 	error |= put_user(restorer, &frame->pretcode);
+ 	error |= put_user(UML_X86_64_UC_FP_XSTATE |
+ 			  UML_X86_64_UC_SIGCONTEXT_SS |
+-			  UML_X86_64_UC_STRICT_RESTORE_SS,
++			  (upt_x86_64_segment_selector(&regs->regs, 1) ==
++			   UML_X86_64_USER_CS ?
++			   UML_X86_64_UC_STRICT_RESTORE_SS : 0),
+ 			  &frame->uc.uc_flags);
+ 	error |= put_user(0, &frame->uc.uc_link);
+ 	error |= __save_altstack(&frame->uc.uc_stack,
+@@ -915,15 +932,17 @@ SYSCALL_DEFINE0(rt_sigreturn)
+ 	struct pt_regs *regs = current_pt_regs();
+ 	struct uml_x86_64_rt_sigframe __user *frame;
+ 	unsigned long sp = UPT_X86_64(&regs->regs, UML_X86_64_RSP);
++	unsigned long uc_flags;
+ 	sigset_t set;
+ 
+ 	frame = (void __user *)(sp - sizeof(unsigned long));
+ 	if (!access_ok(frame, sizeof(*frame)))
+ 		goto bad_frame;
+-	if (copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
++	if (copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)) ||
++	    get_user(uc_flags, &frame->uc.uc_flags))
+ 		goto bad_frame;
+ 	set_current_blocked(&set);
+-	if (restore_x86_64_mcontext(regs, &frame->uc.uc_mcontext))
++	if (restore_x86_64_mcontext(regs, &frame->uc.uc_mcontext, uc_flags))
+ 		goto bad_frame;
+ 	if (restore_altstack(&frame->uc.uc_stack))
+ 		goto bad_frame;
+diff --git a/arch/arm64/um/x86_32.h b/arch/arm64/um/x86_32.h
+index 5fd66e09ae77f23741aa5ef124c93e1f9b64026c..abb6944418e71a5910f3a6ff709b14ca7c1c6fd1 100644
+--- a/arch/arm64/um/x86_32.h
++++ b/arch/arm64/um/x86_32.h
+@@ -23,4 +23,8 @@ struct uml_x86_32_user_desc {
+ 
+ int uml_x86_32_set_task_tls(struct task_struct *task, unsigned long descriptor);
+ 
++/* Whether a stack selector names a present, writable DPL-3 data segment
++ * of the task's GDT (the flat one or a TLS entry) or its mm's LDT. */
++bool uml_x86_writable_data_selector(struct task_struct *task, u16 selector);
++
+ #endif

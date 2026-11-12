@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 08:14:02 +0900
+Subject: [PATCH] vrend: recover the byte offset a texture buffer view was
+ given
+
+A texture buffer view crosses the protocol as a first and last element, so
+the guest divides its byte offset by the texel size on the way out. GL only
+requires that offset to be a multiple of the alignment the host advertised,
+not of the texel size, so an rgb32 view the guest legally offsets by the
+host's own 16 bytes arrives as element 1. Multiplying back gives byte 12,
+which is not 16-byte aligned, and glTexBufferRange answers GL_INVALID_VALUE:
+KHR-GL46.direct_state_access.textures_buffer_rgb32ui lost its sampler view
+and drew from nothing.
+
+The lost bytes are recoverable on this side. The guest's offset is a
+multiple of the alignment this host advertised, and when that alignment is
+at least the texel size a texel is too narrow to contain two multiples of
+it, so the element names exactly one possible offset. Use it, and keep the
+element's own byte offset when it is not unique.
+
+Advertising a coarser alignment instead would also make every legal offset
+a whole number of texels, but only at a value no power of two can take
+(48 is the least common multiple of the buffer texel sizes), and callers
+that pick a fixed offset of their own then fail validation in the guest:
+KHR-GL46.shader_image_size.advanced-nonMS-* ask for byte 256.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_renderer.c | 48 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 2a95dd698b606e98104908c017e9d16cc032c52a..eab47ccf447bf0cb3fd7f1675cae9aeb4c597948 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -379,6 +379,7 @@ struct global_renderer_state {
+ 
+    uint32_t max_draw_buffers;
+    uint32_t max_texture_buffer_size;
++   uint32_t texture_buffer_offset_alignment;
+    uint32_t max_texture_2d_size;
+    uint32_t max_texture_3d_size;
+    uint32_t max_texture_cube_size;
+@@ -3702,6 +3703,31 @@ static GLenum vrend_get_arb_format(enum virgl_formats format)
+    }
+ }
+ 
++/* The protocol carries a texture buffer view's range in whole texels, while GL
++ * only requires the guest's byte offset to be a multiple of the alignment this
++ * host advertised. An offset that is not also a multiple of the texel size is
++ * therefore truncated on the way out, and turning the element back into bytes
++ * gives an offset the host itself may refuse: an rgb32 view the guest offset
++ * by 16 bytes arrives as element 1, which is byte 12.
++ *
++ * The lost bytes are recoverable whenever the advertised alignment is at least
++ * the texel size, because the guest's offset is a multiple of that alignment
++ * and a texel is then too narrow to hold two of them. Recover it when it is
++ * unique and keep the element's own byte offset otherwise.
++ */
++static unsigned vrend_tbo_view_offset(unsigned first_element, unsigned blocksize)
++{
++   const unsigned alignment = vrend_state.texture_buffer_offset_alignment;
++   const unsigned start = first_element * blocksize;
++
++   if (blocksize == 0 || alignment <= 1 || alignment < blocksize ||
++       start % alignment == 0)
++      return start;
++
++   const unsigned aligned = (start / alignment + 1) * alignment;
++   return aligned < start + blocksize ? aligned : start;
++}
++
+ void vrend_set_single_sampler_view(struct vrend_context *ctx,
+                                    uint32_t shader_type,
+                                    uint32_t index,
+@@ -3795,15 +3821,15 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
+          }
+ 
+          if (has_feature(feat_texture_buffer_range)) {
+-            unsigned offset = view->u.buf.first_element;
+-            unsigned size = view->u.buf.last_element - view->u.buf.first_element + 1;
+-            int blsize = util_format_get_blocksize(view->format);
+-
+-            if (offset + size > vrend_state.max_texture_buffer_size)
+-               size = vrend_state.max_texture_buffer_size - offset;
+-            offset *= blsize;
+-            size *= blsize;
+-            glTexBufferRange(GL_TEXTURE_BUFFER, internalformat, view->texture->gl_id, offset, size);
++            const unsigned first = view->u.buf.first_element;
++            unsigned count = view->u.buf.last_element - first + 1;
++            const unsigned blsize = util_format_get_blocksize(view->format);
++
++            if (first + count > vrend_state.max_texture_buffer_size)
++               count = vrend_state.max_texture_buffer_size - first;
++
++            glTexBufferRange(GL_TEXTURE_BUFFER, internalformat, view->texture->gl_id,
++                             vrend_tbo_view_offset(first, blsize), count * blsize);
+          } else
+             glTexBuffer(GL_TEXTURE_BUFFER, internalformat, view->texture->gl_id);
+       }
+@@ -7736,6 +7762,10 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+    glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,
+                  (GLint*)&vrend_state.max_texture_units);
+ 
++   if (has_feature(feat_texture_buffer_range))
++      glGetIntegerv(GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT,
++                    (GLint*)&vrend_state.texture_buffer_offset_alignment);
++
+    /* Mesa clamps this value to 8 anyway, so just make sure that this side
+     * doesn't exceed the number to be on the save side when using 8-bit masks
+     * for the color buffers */

@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 10:44:24 +0900
+Subject: [PATCH] drm/virtio: transfer a 3D resource around CPU access through
+ its dma-buf
+
+The guest pages behind a classic 3D resource are a copy of the host's
+storage that changes only on an explicit TRANSFER_FROM_HOST_3D or
+TRANSFER_TO_HOST_3D, which guest Mesa issues for its own maps and never
+for a dma-buf. A buffer exported as a dma-buf and mapped by another
+user, such as a VA-API encoder reading a GPU-rendered frame or Chromium
+uploading a CPU frame for the GPU, never saw the other side's writes:
+the frame read as zeros, or the GPU sampled stale storage.
+
+begin_cpu_access now waits for the buffer's write fences, then
+transfers level 0 from the host and waits for the transfer.
+end_cpu_access with a write direction transfers level 0 to the host.
+The exporter waits for the fences itself because the dma-buf core runs
+its hook before the core's own reservation wait, and the control queue
+orders the transfer after a writer only when the writer is a virgl
+context, not after a Venus ring or another device. RESOURCE_CREATE
+records the level 0 box of a single-sampled 2D or rectangle virgl
+texture as transferable. Blobs, 2D resources and every other shape
+keep their behaviour, so Android is unaffected: its minigbm locks with
+its own transfers and does not call DMA_BUF_IOCTL_SYNC, and its
+GPU-only buffers are blobs.
+
+Cost: each DMA_BUF_IOCTL_SYNC on such a buffer is now a synchronous
+round trip that copies the whole level, and a write end adds a second
+one. The sync ioctl carries no range, so a user that needs only part
+of a frame cannot ask for less. A dirty flag that skips the copy from
+the host when no GPU work touched the resource since the last transfer
+is the next step if a per-frame reader needs it.
+
+Lost-write hazard: a begin refreshes the guest pages from the host, so
+a guest write that no transfer has taken to the host is lost. That
+covers writes through an mmap made without a SYNC bracket, and a
+producer's direct writes whose transfer is still queued in an
+unflushed virgl command buffer. Both are protocol violations (CPU
+access must be bracketed, and a producer flushes before it hands a
+buffer over), but this change turns the second from a stale read into
+a corrupted frame.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.h   |  7 ++
+ drivers/gpu/drm/virtio/virtgpu_ioctl.c | 14 ++++
+ drivers/gpu/drm/virtio/virtgpu_prime.c | 88 ++++++++++++++++++++++++++
+ 3 files changed, 109 insertions(+)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 60efab16c485afaa0f2b6aab2499e318c7f4092a..123d40174886823dd0994e892be6f3d71c4f1c13 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -118,6 +118,13 @@ struct virtio_gpu_object {
+ 	bool host3d_blob, guest_blob;
+ 	uint32_t blob_mem, blob_flags;
+ 
++	/*
++	 * Level 0 of a classic 3D resource that a dma-buf can map: a single
++	 * 2D image whose guest pages hold a copy of the host's storage.
++	 */
++	bool cpu_transfer;
++	struct drm_virtgpu_3d_box cpu_transfer_box;
++
+ 	int uuid_state;
+ 	uuid_t uuid;
+ };
+diff --git a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+index 86777a7d41d8ffef394991afe29d2ab22db5a47c..d619ee042590d48b26f0c82ab2a258b98c3dde23 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+@@ -178,6 +178,20 @@ static int virtio_gpu_resource_create_ioctl(struct drm_device *dev, void *data,
+ 		return ret;
+ 	obj = &qobj->base.base;
+ 
++	/*
++	 * A single-sampled 2D or rectangle texture is the shape every
++	 * dma-buf consumer maps. Record its level 0 so CPU access through a
++	 * dma-buf can move it between the host's storage and the guest pages.
++	 * Gallium's PIPE_TEXTURE_2D is 2 and PIPE_TEXTURE_RECT is 5.
++	 */
++	if (params.virgl && (rc->target == 2 || rc->target == 5) &&
++	    rc->depth <= 1 && rc->array_size <= 1 && rc->nr_samples <= 1) {
++		qobj->cpu_transfer = true;
++		qobj->cpu_transfer_box = (struct drm_virtgpu_3d_box) {
++			.w = rc->width, .h = rc->height, .d = 1,
++		};
++	}
++
+ 	ret = drm_gem_handle_create(file, obj, &handle);
+ 	if (ret) {
+ 		drm_gem_object_put(obj);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_prime.c b/drivers/gpu/drm/virtio/virtgpu_prime.c
+index 0a99e656b6667c146f953a171c8bbe01823f7f20..7f69e658d652af78f38d0f53ec1b2fe0f8a47d95 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_prime.c
++++ b/drivers/gpu/drm/virtio/virtgpu_prime.c
+@@ -104,12 +104,100 @@ static void virtgpu_gem_unmap_dma_buf(struct dma_buf_attachment *attach,
+ 	drm_gem_unmap_dma_buf(attach, sgt, dir);
+ }
+ 
++/*
++ * The guest pages behind a classic 3D resource are a copy of its host
++ * storage that changes only on an explicit transfer, which guest Mesa issues
++ * for its own maps and never for a dma-buf. Bring the pages up to date when
++ * a CPU user starts accessing the buffer through its dma-buf, and hand its
++ * writes back to the host when it finishes, so a GPU-rendered frame reaches
++ * an encoder that maps it and a CPU-written frame reaches the GPU. The
++ * transfer runs on no context, which the host serves from the resource alone.
++ */
++static int virtgpu_dma_buf_transfer(struct dma_buf *buf, bool to_host)
++{
++	struct drm_gem_object *obj = buf->priv;
++	struct virtio_gpu_object *bo = gem_to_virtio_gpu_obj(obj);
++	struct virtio_gpu_device *vgdev = obj->dev->dev_private;
++	struct drm_virtgpu_3d_box box = bo->cpu_transfer_box;
++	struct virtio_gpu_object_array *objs;
++	struct virtio_gpu_fence *fence;
++	int ret;
++
++	if (!bo->cpu_transfer || !vgdev->has_virgl_3d)
++		return 0;
++
++	objs = virtio_gpu_array_alloc(1);
++	if (!objs)
++		return -ENOMEM;
++	virtio_gpu_array_add_obj(objs, obj);
++
++	ret = virtio_gpu_array_lock_resv(objs);
++	if (ret) {
++		virtio_gpu_array_put_free(objs);
++		return ret;
++	}
++
++	fence = virtio_gpu_fence_alloc(vgdev, vgdev->fence_drv.context, 0);
++	if (!fence) {
++		virtio_gpu_array_unlock_resv(objs);
++		virtio_gpu_array_put_free(objs);
++		return -ENOMEM;
++	}
++
++	if (to_host)
++		virtio_gpu_cmd_transfer_to_host_3d(vgdev, 0, 0, 0, 0, 0, &box,
++						   objs, fence);
++	else
++		virtio_gpu_cmd_transfer_from_host_3d(vgdev, 0, 0, 0, 0, 0, &box,
++						     objs, fence);
++	virtio_gpu_notify(vgdev);
++
++	ret = dma_fence_wait(&fence->f, true);
++	dma_fence_put(&fence->f);
++	return ret;
++}
++
++static int virtgpu_dma_buf_begin_cpu_access(struct dma_buf *buf,
++					    enum dma_data_direction dir)
++{
++	struct virtio_gpu_object *bo = gem_to_virtio_gpu_obj(buf->priv);
++	long ret;
++
++	if (!bo->cpu_transfer)
++		return 0;
++
++	/*
++	 * The dma-buf core waits for the buffer's fences only after this hook,
++	 * and the control queue orders the transfer after a writer only when
++	 * that writer is a virgl context. Wait for every writer, such as a
++	 * Venus ring or another device, before the host reads its storage.
++	 */
++	ret = dma_resv_wait_timeout(buf->resv, DMA_RESV_USAGE_WRITE, true,
++				    MAX_SCHEDULE_TIMEOUT);
++	if (ret < 0)
++		return ret;
++
++	/* A write may cover part of the buffer, so every access starts from
++	 * the host's content. */
++	return virtgpu_dma_buf_transfer(buf, false);
++}
++
++static int virtgpu_dma_buf_end_cpu_access(struct dma_buf *buf,
++					  enum dma_data_direction dir)
++{
++	if (dir == DMA_FROM_DEVICE)
++		return 0;
++	return virtgpu_dma_buf_transfer(buf, true);
++}
++
+ static const struct virtio_dma_buf_ops virtgpu_dmabuf_ops =  {
+ 	.ops = {
+ 		.attach = virtio_dma_buf_attach,
+ 		.detach = drm_gem_map_detach,
+ 		.map_dma_buf = virtgpu_gem_map_dma_buf,
+ 		.unmap_dma_buf = virtgpu_gem_unmap_dma_buf,
++		.begin_cpu_access = virtgpu_dma_buf_begin_cpu_access,
++		.end_cpu_access = virtgpu_dma_buf_end_cpu_access,
+ 		.release = drm_gem_dmabuf_release,
+ 		.mmap = drm_gem_dmabuf_mmap,
+ 		.vmap = drm_gem_dmabuf_vmap,

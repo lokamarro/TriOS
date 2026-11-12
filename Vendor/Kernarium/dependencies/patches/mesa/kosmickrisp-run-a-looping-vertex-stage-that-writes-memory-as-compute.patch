@@ -1,0 +1,1845 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:08:30 +0900
+Subject: [PATCH] kosmickrisp: run a looping vertex stage that writes memory as
+ compute
+
+An Apple GPU kills a Metal vertex function invocation that runs for
+longer than about 10 ms and reports a timeout; what the invocation had
+not yet done is lost. The limit is per invocation: a million short
+vertices in one 200 ms draw are not killed, a one-thread compute
+dispatch runs 700 ms and a fragment invocation 90 ms, on an Apple7 GPU
+under macOS 27.0.1.
+
+KHR-GLES31.core.texture_cube_map_array.image_op_vertex_sh and
+image_op_tessellation_evaluation_sh run one invocation that copies a
+whole cube map array image texel by texel and land just past the
+limit. Without validation the kill comes after the copy and the cases
+pass; under Metal validation, or on a busy GPU, the copy is cut short
+and the queue faults.
+
+As KK_WORKAROUND_21, the stage that would be the Metal vertex function,
+the vertex shader or a tessellation pipeline's evaluation shader, runs
+as compute through the transform feedback pass-through with nothing to
+capture when it writes memory anywhere and contains a loop. A store
+free stage that loops past the limit loses only its draw's rasterized
+output, which no realistic shader approaches; routing every looping
+stage would put ordinary shaders on the slower path. Geometry shader
+and transform feedback pipelines already run the stage as compute.
+
+The routed draws of one pass do not wait for each other, as Metal
+vertex functions do not, and pin no geometry heap: a barrier before
+each draw's dispatch cost about 5 us per draw, and the heap reset a
+command buffer of its own per pass. About 0.12 ms per pass segment,
+0.3 us per draw and 1 ns per vertex remain on an M1 Ultra.
+
+kosmickrisp_vertex_compute_routing checks the decision.
+kosmickrisp_long_vertex_invocation runs a 50 ms vertex and a 100 ms
+tessellation evaluation invocation to completion, and with
+MESA_KK_DISABLE_WORKAROUNDS=21 its --expect-loss mode shows them cut
+short. kosmickrisp_vertex_compute_draws checks the stores and tiles of
+64 routed draws in one pass. MESA_KK_DEBUG=vertex_compute reports each
+stage the workaround routes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/drivers/kosmickrisp/workarounds.rst      |  55 ++++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  20 +-
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   3 +
+ src/kosmickrisp/vulkan/kk_shader.c            |  77 ++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |   8 +
+ src/kosmickrisp/vulkan/meson.build            |   9 +
+ .../tests/long_vertex_shaders/color.frag      |   8 +
+ .../tests/long_vertex_shaders/color.frag.h    |  18 ++
+ .../tests/long_vertex_shaders/patch.tesc      |  12 +
+ .../tests/long_vertex_shaders/patch.tesc.h    |  75 +++++
+ .../tests/long_vertex_shaders/patch.vert      |   7 +
+ .../tests/long_vertex_shaders/patch.vert.h    |  42 +++
+ .../tests/long_vertex_shaders/store_loop.tese |  28 ++
+ .../long_vertex_shaders/store_loop.tese.h     | 128 ++++++++
+ .../tests/long_vertex_shaders/store_loop.vert |  25 ++
+ .../long_vertex_shaders/store_loop.vert.h     |  92 ++++++
+ .../tests/test_long_vertex_invocation.cpp     | 286 +++++++++++++++++
+ .../tests/test_vertex_compute_draws.cpp       | 299 ++++++++++++++++++
+ .../tests/test_vertex_compute_routing.c       | 112 +++++++
+ .../vertex_compute_draws_shaders/tile.frag    |  10 +
+ .../vertex_compute_draws_shaders/tile.frag.h  |  26 ++
+ .../vertex_compute_draws_shaders/tile.vert    |  31 ++
+ .../vertex_compute_draws_shaders/tile.vert.h  | 122 +++++++
+ 24 files changed, 1483 insertions(+), 11 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_long_vertex_invocation.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_vertex_compute_draws.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_vertex_compute_routing.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert.h
+
+diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
+index 192eb59af49ec2b87c2e1b13f49a3ba9d9732cf5..a8b3f1679d83653368123f42600ff5e7e449634c 100644
+--- a/docs/drivers/kosmickrisp/workarounds.rst
++++ b/docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,61 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_21
++----------------
++| macOS version: 27.0
++| Metal ticket: Not reported
++| Metal ticket status:
++| CTS test failure: ``KHR-GLES31.core.texture_cube_map_array.image_op_vertex_sh``,
++  ``image_op_tessellation_evaluation_sh`` (through Zink)
++| Comments:
++
++The GPU kills a vertex function invocation that runs for longer than about
++10 ms and reports the submission as a timeout
++(``kIOGPUCommandBufferCallbackErrorHang``); whatever the invocation had not
++yet done is lost, and the command queue rejects every later submission. The
++limit is time per invocation: a single vertex invocation that copies a
++texture array texel by texel survives at 6 ms, is killed in some runs at
++9-11 ms and in every run from 18 ms, whatever the mix of loads, stores and
++fences, and with rasterization disabled; a million short vertices taking
++200 ms in one draw are not killed. The same loop in a one-thread compute
++dispatch runs 700 ms, and a fragment invocation 90 ms, on an Apple7 GPU
++under macOS 27.0.1 (build 26A434). The CTS cases above run one vertex or
++tessellation evaluation invocation that copies a whole cube map array image
++and land just past the limit: the kill comes after the copy and the case
++passes, but anything that slows the shader, such as Metal's shader
++validation, makes it fail.
++
++The workaround runs the stage that would be the Metal vertex function - the
++vertex shader, or the tessellation evaluation shader of a tessellation
++pipeline - as compute when it writes memory (an image or buffer store or
++atomic) anywhere and contains a loop, using the transform feedback
++pass-through with nothing to capture: the stage writes its outputs to memory
++from a compute dispatch and a generated vertex function rasterizes them.
++Pipelines with a geometry shader or transform feedback already run the stage
++as compute. A stage without a loop cannot run long enough to matter, and a
++stage that writes no memory is left alone: it loses nothing but the draw's
++rasterized output, which no realistic shader approaches the limit for, while
++routing every looping vertex shader would put ordinary shaders on the slower
++path. The criterion misses a stage that writes no memory but loops past the
++limit, and one that writes memory from straight-line code that long.
++
++The draws of a routed stage in one pass do not wait for each other, as Metal
++vertex functions of consecutive draws do not, and pin no geometry heap: a
++barrier before each draw's dispatch cost about 5 us per draw, and the heap
++reset a command buffer of its own after every pass. What remains, on an M1
++Ultra, is about 0.12 ms for each pass segment with routed draws, 0.3 us per
++draw and 1 ns per vertex. ``kosmickrisp_vertex_compute_routing`` checks the
++decision; ``kosmickrisp_long_vertex_invocation`` runs a 50 ms vertex and a
++100 ms tessellation evaluation invocation to completion, and with the
++workaround disabled ``--expect-loss`` shows them cut short;
++``kosmickrisp_vertex_compute_draws`` checks the stores and the rasterized
++output of 64 routed draws in one pass. ``MESA_KK_DEBUG=vertex_compute``
++reports every stage the workaround applies to.
++
++| Log:
++| 2026-11-02: Workaround implemented
++
+ KK_WORKAROUND_20
+ ----------------
+ | macOS version: 27.0
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 4964ac330cb5bf5a7e53a43d69d69e07a9ad2d64..a798117a8a057a1d85c23c3c36df60756281ced9 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -3631,8 +3631,16 @@ kk_launch_transform_feedback(struct kk_cmd_buffer *cmd,
+       vs->pipeline.gfx.pre_render[tes ? 2 : 0];
+    struct mtl_size vs_local_size = {64, 1, 1};
+ 
+-   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+-                                    MTL_STAGE_DISPATCH);
++   /* A stage KK_WORKAROUND_21 put here waits for nothing earlier in the
++    * encoder, so consecutive draws' stages overlap as Metal vertex functions
++    * would. What the GPU prepares for its draw comes from precompiled
++    * kernels, which end with a barrier; its records are a fresh allocation;
++    * and the application orders its own memory between draws with a
++    * pipeline barrier, which ends the pass. A barrier per draw serialized
++    * the draws at about 5 us each on an M1 Ultra. */
++   if (!vs->info.vs.vertex_compute)
++      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
++                                       MTL_STAGE_DISPATCH);
+    mtl_compute_set_pipeline_state(enc, vs_pipeline);
+    if (indirect) {
+       uint64_t grid_addr =
+@@ -3995,9 +4003,13 @@ kk_draw_flushed(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+        requires_unroll_restart(cmd, data) || rewrite_direct_provoking ||
+        (discard_adjacency && !emulate_line_raster));
+    /* Every stage the driver emulates, and every unroll, allocates from the
+-    * device heap. */
++    * device heap. A stage KK_WORKAROUND_21 runs as compute writes its records
++    * to the pool, and an indirect draw of it pins the heap where its setup
++    * reserves; pinning it here queued a heap reset, in a command buffer of
++    * its own after the pass, for every pass. */
+    const bool needs_heap = requires_unroll || tess || emulate_geometry ||
+-                           emulate_transform_feedback ||
++                           (emulate_transform_feedback &&
++                            !vs->info.vs.vertex_compute) ||
+                            emulate_line_raster || emulate_polygon_points ||
+                            materialize_line_raster;
+    if (requires_unroll) {
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 65ab042575d453620727cbb71bec861e53f6b329..edd1b881f803fb8077d312e29ed0f1135e6fd152 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -14,6 +14,7 @@ const struct debug_named_value flags[] = {
+    {"submit_timing", KK_DEBUG_SUBMIT_TIMING},
+    {"no_metal_blend", KK_DEBUG_NO_METAL_BLEND},
+    {"no_metal_vertex_fetch", KK_DEBUG_NO_METAL_VERTEX_FETCH},
++   {"vertex_compute", KK_DEBUG_VERTEX_COMPUTE},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index cb572c11c52ba8b3ee23e9bb69bd78bd5ad7cd5f..76564e8aede311576535f39219757f2e33f093d2 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -23,6 +23,9 @@ enum kk_debug {
+     * Metal's own vertex descriptor could fetch.  The companion of
+     * no_metal_blend, for the same two reasons. */
+    KK_DEBUG_NO_METAL_VERTEX_FETCH = 1ull << 5,
++   /* Report each vertex or tessellation evaluation stage the driver runs as
++    * compute under KK_WORKAROUND_21, so a workload's count can be read. */
++   KK_DEBUG_VERTEX_COMPUTE = 1ull << 6,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 0c7f83164d674f34a3394e8010f1b39a9681d34d..830f3ad872204d5d0bc7907d770e39adda9e15da 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -3920,6 +3920,7 @@ kk_create_tes_transform_feedback_raster(
+    }
+ 
+    const struct nir_xfb_info *xfb = tes->xfb_info;
++   const unsigned xfb_outputs = xfb ? xfb->output_count : 0;
+    const unsigned vertices_per_primitive = mesa_vertices_per_prim(primitive);
+    nir_def *input_primitives = kk_load_xfb_geometry_param(
+       &b, gp, offsetof(struct poly_geometry_params, grid[0]), 32);
+@@ -3929,7 +3930,7 @@ kk_create_tes_transform_feedback_raster(
+    nir_def *capacity = kk_load_xfb_geometry_param(
+       &b, gp, offsetof(struct poly_geometry_params, xfb_verts[0]), 32);
+    nir_push_if(&b, nir_ult(&b, index, capacity));
+-   for (unsigned i = 0; i < xfb->output_count; ++i) {
++   for (unsigned i = 0; i < xfb_outputs; ++i) {
+       const nir_xfb_output_info output = xfb->outputs[i];
+       if (xfb->buffer_to_stream[output.buffer] != 0)
+          continue;
+@@ -3968,14 +3969,14 @@ kk_create_transform_feedback_passthrough(
+    const nir_shader *vs, enum mesa_prim primitive,
+    struct poly_gs_info *gs_info, nir_shader **pre_gs_out)
+ {
+-   assert(vs->xfb_info && vs->xfb_info->output_count);
++   const uint16_t xfb_outputs = vs->xfb_info ? vs->xfb_info->output_count : 0;
+ 
+    struct kk_polygon_point_output outputs[NUM_TOTAL_VARYING_SLOTS] = {0};
+    nir_shader_intrinsics_pass((nir_shader *)vs,
+                               kk_collect_polygon_point_output,
+                               nir_metadata_all, outputs);
+ 
+-   size_t key_size = poly_passthrough_gs_key_size(vs->xfb_info->output_count);
++   size_t key_size = poly_passthrough_gs_key_size(xfb_outputs);
+    struct poly_passthrough_gs_key *key = alloca(key_size);
+    memset(key, 0, key_size);
+ 
+@@ -3991,10 +3992,11 @@ kk_create_transform_feedback_passthrough(
+          output->type != nir_type_invalid ? output->type : nir_type_uint32;
+    }
+ 
+-   typed_memcpy(key->xfb_stride, vs->info.xfb_stride,
+-                ARRAY_SIZE(key->xfb_stride));
+-   memcpy(&key->xfb_info, vs->xfb_info,
+-          nir_xfb_info_size(vs->xfb_info->output_count));
++   if (xfb_outputs) {
++      typed_memcpy(key->xfb_stride, vs->info.xfb_stride,
++                   ARRAY_SIZE(key->xfb_stride));
++      memcpy(&key->xfb_info, vs->xfb_info, nir_xfb_info_size(xfb_outputs));
++   }
+ 
+    nir_builder builder = nir_builder_init_simple_shader(
+       MESA_SHADER_GEOMETRY, vs->options, "transform_feedback_passthrough");
+@@ -4860,6 +4862,48 @@ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+    return state;
+ }
+ 
++static bool
++kk_cf_list_has_loop(struct exec_list *list)
++{
++   foreach_list_typed(nir_cf_node, node, node, list) {
++      if (node->type == nir_cf_node_loop)
++         return true;
++      if (node->type == nir_cf_node_if) {
++         nir_if *nif = nir_cf_node_as_if(node);
++         if (kk_cf_list_has_loop(&nif->then_list) ||
++             kk_cf_list_has_loop(&nif->else_list))
++            return true;
++      }
++   }
++   return false;
++}
++
++/* KK_WORKAROUND_21 */
++bool
++kk_vertex_stage_runs_as_compute(const nir_shader *nir,
++                                uint64_t disabled_workarounds)
++{
++   if (disabled_workarounds & BITFIELD64_BIT(21))
++      return false;
++   if (nir->info.stage != MESA_SHADER_VERTEX &&
++       nir->info.stage != MESA_SHADER_TESS_EVAL)
++      return false;
++
++   bool loops = false, writes = false;
++   nir_foreach_function_impl(impl, (nir_shader *)nir) {
++      loops |= kk_cf_list_has_loop(&impl->body);
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_intrinsic_writes_external_memory(
++                   nir_instr_as_intrinsic(instr)))
++               writes = true;
++         }
++      }
++   }
++   return loops && writes;
++}
++
+ static VkResult
+ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                           struct vk_shader_compile_info *infos,
+@@ -4980,6 +5024,9 @@ kk_precompile_library_stages(struct kk_device *dev, uint32_t shader_count,
+          return;
+       if (infos[i].nir->xfb_info != NULL)
+          return;
++      if (kk_vertex_stage_runs_as_compute(infos[i].nir,
++                                          dev->disabled_workarounds))
++         return;
+       if (infos[i].stage == MESA_SHADER_VERTEX) {
+          attribs_read = container_of(deferred[i], struct kk_shader, vk)
+                            ->info.vs.attribs_read;
+@@ -5193,6 +5240,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+    /* Determine if the pipeline contains tessellation stages */
+    bool tess = false;
+    bool transform_feedback_emulation = false;
++   bool vertex_compute = false;
+    uint32_t geometry_shader = UINT32_MAX;
+    uint32_t tess_eval_shader = UINT32_MAX;
+    for (uint32_t i = 0u; i < shader_count; ++i) {
+@@ -5215,6 +5263,20 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+       const nir_shader *producer = infos[xfb_shader].nir;
+       transform_feedback_emulation = producer->xfb_info &&
+                                      producer->xfb_info->output_count > 0;
++      /* KK_WORKAROUND_21: the transform feedback pass-through, with nothing
++       * to capture, runs the stage as compute and rasterizes its records. */
++      if (!transform_feedback_emulation && state != NULL &&
++          kk_vertex_stage_runs_as_compute(producer,
++                                          dev->disabled_workarounds)) {
++         transform_feedback_emulation = true;
++         vertex_compute = true;
++         if (KK_DEBUG(VERTEX_COMPUTE))
++            fprintf(stderr, "KosmicKrisp runs the %s stage as compute "
++                            "(KK_WORKAROUND_21)\n",
++                    producer->info.stage == MESA_SHADER_TESS_EVAL
++                       ? "tessellation evaluation"
++                       : "vertex");
++      }
+    }
+ 
+    const enum mesa_prim line_raster_prim =
+@@ -5690,6 +5752,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+ 
+       if (i == 0 && transform_feedback_emulation) {
+          shaders[i]->info.vs.transform_feedback_emulation = true;
++         shaders[i]->info.vs.vertex_compute = vertex_compute;
+          shaders[i]->info.vs.transform_feedback = transform_feedback_info;
+       }
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 0fe1e8a99b062c08deddf8dff0b84e0ffbcb51ed..4817cc67bcc102a09ada72ff4f43402de31c33d2 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -99,6 +99,8 @@ struct kk_shader_info {
+          enum mesa_prim line_raster_prim;
+          uint64_t line_raster_outputs;
+          bool transform_feedback_emulation;
++         /* KK_WORKAROUND_21 put the stage there, with nothing to capture. */
++         bool vertex_compute;
+          bool geometry_shader_emulation;
+          /* The emulated geometry shader writes the layer, so its raster
+           * draw selects one. KK_WORKAROUND_18 needs to know. */
+@@ -292,6 +294,12 @@ nir_def *kk_nir_load_root(struct nir_builder *b, unsigned num_components,
+                           unsigned bit_size, nir_def *offset, unsigned align);
+ 
+ bool kk_nir_lower_poly(struct nir_shader *nir, bool pipeline_statistics);
++
++/* Whether the stage that would run as the Metal vertex function writes memory
++ * from a shader that contains a loop, so that the driver runs it as compute
++ * instead. See KK_WORKAROUND_21. */
++bool kk_vertex_stage_runs_as_compute(const struct nir_shader *nir,
++                                     uint64_t disabled_workarounds);
+ bool kk_nir_lower_null_images(nir_shader *nir);
+ 
+ bool kk_nir_lower_custom_border(nir_shader *nir);
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index f89a18924cf57552bc2e490cf68363c3251ee207..90bdafc435572cdd6530b2a3e555f0b6276e3da0 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -303,6 +303,14 @@ if with_tests
+         ['tes_sampler_indexing', []],
+         ['tes_sampler_dynamic_indexing', ['dynamic']],
+       ]],
++      ['long_vertex_invocation', [
++        ['long_vertex_invocation', ['vertex']],
++        ['long_vertex_invocation_discard', ['discard']],
++        ['long_tess_eval_invocation', ['tess']],
++      ]],
++      ['vertex_compute_draws', [
++        ['vertex_compute_draws', []],
++      ]],
+     ]
+       kk_case_test_executable = executable(
+         'test_kosmickrisp_' + kk_case_test[0],
+@@ -348,6 +356,7 @@ if with_tests
+       ['maintenance10_resolve', 120],
+       ['image_compression_chain', 60],
+       ['integer_point_target', 120],
++      ['vertex_compute_routing', 60],
+     ]
+       test(
+         'kosmickrisp_' + kk_internal_test[0],
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..4633318265bc67a17915754d0c22ea06f1b2e028
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag
+@@ -0,0 +1,8 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++layout(location = 0) out vec4 color;
++
++void main(void)
++{
++   color = vec4(1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag.h b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ffecbd4162f83eea23189a908e3ee1c24b6d077
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/color.frag.h
+@@ -0,0 +1,18 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000c,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00030010,0x00000004,
++0x00000007,0x00040047,0x00000009,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00030016,0x00000006,
++0x00000020,0x00040017,0x00000007,0x00000006,
++0x00000004,0x00040020,0x00000008,0x00000003,
++0x00000007,0x0004003b,0x00000008,0x00000009,
++0x00000003,0x0004002b,0x00000006,0x0000000a,
++0x3f800000,0x0007002c,0x00000007,0x0000000b,
++0x0000000a,0x0000000a,0x0000000a,0x0000000a,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0003003e,
++0x00000009,0x0000000b,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd7bb285ee4973d9e04361a6e13fb6aedcb34015
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc
+@@ -0,0 +1,12 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++layout(vertices = 3) out;
++
++void main(void)
++{
++   gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
++   gl_TessLevelOuter[0] = 1.0;
++   gl_TessLevelOuter[1] = 1.0;
++   gl_TessLevelOuter[2] = 1.0;
++   gl_TessLevelInner[0] = 1.0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc.h b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ee0ca81b80ec2728ce1113b157a537f9ee8f897
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.tesc.h
+@@ -0,0 +1,75 @@
++{0x07230203,0x00010600,0x000d000b,0x00000030,
++0x00000000,0x00020011,0x00000003,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x000a000f,0x00000001,0x00000004,0x6e69616d,
++0x00000000,0x0000000f,0x00000012,0x00000019,
++0x00000023,0x0000002e,0x00040010,0x00000004,
++0x0000001a,0x00000003,0x00030047,0x0000000b,
++0x00000002,0x00050048,0x0000000b,0x00000000,
++0x0000000b,0x00000000,0x00050048,0x0000000b,
++0x00000001,0x0000000b,0x00000001,0x00050048,
++0x0000000b,0x00000002,0x0000000b,0x00000003,
++0x00050048,0x0000000b,0x00000003,0x0000000b,
++0x00000004,0x00040047,0x00000012,0x0000000b,
++0x00000008,0x00030047,0x00000015,0x00000002,
++0x00050048,0x00000015,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x00000015,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x00000015,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x00000015,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000023,0x0000000b,0x0000000b,
++0x00030047,0x00000023,0x0000000f,0x00040047,
++0x0000002e,0x0000000b,0x0000000c,0x00030047,
++0x0000002e,0x0000000f,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000001,0x0004001c,0x0000000a,
++0x00000006,0x00000009,0x0006001e,0x0000000b,
++0x00000007,0x00000006,0x0000000a,0x0000000a,
++0x0004002b,0x00000008,0x0000000c,0x00000003,
++0x0004001c,0x0000000d,0x0000000b,0x0000000c,
++0x00040020,0x0000000e,0x00000003,0x0000000d,
++0x0004003b,0x0000000e,0x0000000f,0x00000003,
++0x00040015,0x00000010,0x00000020,0x00000001,
++0x00040020,0x00000011,0x00000001,0x00000010,
++0x0004003b,0x00000011,0x00000012,0x00000001,
++0x0004002b,0x00000010,0x00000014,0x00000000,
++0x0006001e,0x00000015,0x00000007,0x00000006,
++0x0000000a,0x0000000a,0x0004002b,0x00000008,
++0x00000016,0x00000020,0x0004001c,0x00000017,
++0x00000015,0x00000016,0x00040020,0x00000018,
++0x00000001,0x00000017,0x0004003b,0x00000018,
++0x00000019,0x00000001,0x00040020,0x0000001b,
++0x00000001,0x00000007,0x00040020,0x0000001e,
++0x00000003,0x00000007,0x0004002b,0x00000008,
++0x00000020,0x00000004,0x0004001c,0x00000021,
++0x00000006,0x00000020,0x00040020,0x00000022,
++0x00000003,0x00000021,0x0004003b,0x00000022,
++0x00000023,0x00000003,0x0004002b,0x00000006,
++0x00000024,0x3f800000,0x00040020,0x00000025,
++0x00000003,0x00000006,0x0004002b,0x00000010,
++0x00000027,0x00000001,0x0004002b,0x00000010,
++0x00000029,0x00000002,0x0004002b,0x00000008,
++0x0000002b,0x00000002,0x0004001c,0x0000002c,
++0x00000006,0x0000002b,0x00040020,0x0000002d,
++0x00000003,0x0000002c,0x0004003b,0x0000002d,
++0x0000002e,0x00000003,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000010,0x00000013,
++0x00000012,0x00060041,0x0000001b,0x0000001c,
++0x00000019,0x00000013,0x00000014,0x0004003d,
++0x00000007,0x0000001d,0x0000001c,0x00060041,
++0x0000001e,0x0000001f,0x0000000f,0x00000013,
++0x00000014,0x0003003e,0x0000001f,0x0000001d,
++0x00050041,0x00000025,0x00000026,0x00000023,
++0x00000014,0x0003003e,0x00000026,0x00000024,
++0x00050041,0x00000025,0x00000028,0x00000023,
++0x00000027,0x0003003e,0x00000028,0x00000024,
++0x00050041,0x00000025,0x0000002a,0x00000023,
++0x00000029,0x0003003e,0x0000002a,0x00000024,
++0x00050041,0x00000025,0x0000002f,0x0000002e,
++0x00000014,0x0003003e,0x0000002f,0x00000024,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef89c9ac1b045e4750c018e556530e14f9eda6b8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert
+@@ -0,0 +1,7 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++void main(void)
++{
++   gl_Position = vec4(float(gl_VertexIndex & 1), float(gl_VertexIndex >> 1),
++                      0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert.h b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..618d315e026037cd2e58e238b5f376ca7c27573e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/patch.vert.h
+@@ -0,0 +1,42 @@
++{0x07230203,0x00010600,0x000d000b,0x0000001e,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000011,0x00030047,
++0x0000000b,0x00000002,0x00050048,0x0000000b,
++0x00000000,0x0000000b,0x00000000,0x00050048,
++0x0000000b,0x00000001,0x0000000b,0x00000001,
++0x00050048,0x0000000b,0x00000002,0x0000000b,
++0x00000003,0x00050048,0x0000000b,0x00000003,
++0x0000000b,0x00000004,0x00040047,0x00000011,
++0x0000000b,0x0000002a,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000001,0x0004001c,0x0000000a,
++0x00000006,0x00000009,0x0006001e,0x0000000b,
++0x00000007,0x00000006,0x0000000a,0x0000000a,
++0x00040020,0x0000000c,0x00000003,0x0000000b,
++0x0004003b,0x0000000c,0x0000000d,0x00000003,
++0x00040015,0x0000000e,0x00000020,0x00000001,
++0x0004002b,0x0000000e,0x0000000f,0x00000000,
++0x00040020,0x00000010,0x00000001,0x0000000e,
++0x0004003b,0x00000010,0x00000011,0x00000001,
++0x0004002b,0x0000000e,0x00000013,0x00000001,
++0x0004002b,0x00000006,0x00000019,0x00000000,
++0x0004002b,0x00000006,0x0000001a,0x3f800000,
++0x00040020,0x0000001c,0x00000003,0x00000007,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x0000000e,0x00000012,0x00000011,0x000500c7,
++0x0000000e,0x00000014,0x00000012,0x00000013,
++0x0004006f,0x00000006,0x00000015,0x00000014,
++0x000500c3,0x0000000e,0x00000017,0x00000012,
++0x00000013,0x0004006f,0x00000006,0x00000018,
++0x00000017,0x00070050,0x00000007,0x0000001b,
++0x00000015,0x00000018,0x00000019,0x0000001a,
++0x00050041,0x0000001c,0x0000001d,0x0000000d,
++0x0000000f,0x0003003e,0x0000001d,0x0000001b,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese
+new file mode 100644
+index 0000000000000000000000000000000000000000..b06804101df83ea0d6afd8c6c4c620b1c756b65e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese
+@@ -0,0 +1,28 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++#extension GL_EXT_buffer_reference : require
++layout(triangles, point_mode) in;
++
++/* The vertex shader's chain, run by the one evaluation at the patch's first
++ * corner. */
++layout(buffer_reference, std430) coherent buffer Words {
++   uint w[];
++};
++
++layout(push_constant) uniform Params {
++   Words words;
++   uint count;
++   uint mask;
++} pc;
++
++void main(void)
++{
++   if (gl_TessCoord.x == 1.0) {
++      for (uint i = 0u; i < pc.count; ++i)
++         pc.words.w[(i + 1u) & pc.mask] = pc.words.w[i & pc.mask] + 1u;
++   }
++   gl_Position = gl_TessCoord.x * gl_in[0].gl_Position +
++                 gl_TessCoord.y * gl_in[1].gl_Position +
++                 gl_TessCoord.z * gl_in[2].gl_Position;
++   gl_PointSize = 1.0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese.h b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..74aca1850cb4d3536696bdc920aa0c0cf9d2776c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.tese.h
+@@ -0,0 +1,128 @@
++{0x07230203,0x00010600,0x000d000b,0x00000062,
++0x00000000,0x00020011,0x00000003,0x00020011,
++0x00000017,0x00020011,0x000014e3,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x000014e4,0x00000001,
++0x0009000f,0x00000002,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00000021,0x00000044,
++0x0000004b,0x00030010,0x00000004,0x00000016,
++0x00030010,0x00000004,0x00000001,0x00030010,
++0x00000004,0x00000005,0x00030010,0x00000004,
++0x0000000a,0x00040047,0x00000009,0x0000000b,
++0x0000000d,0x00030047,0x0000001d,0x00000002,
++0x00050048,0x0000001d,0x00000000,0x00000023,
++0x00000000,0x00050048,0x0000001d,0x00000001,
++0x00000023,0x00000008,0x00050048,0x0000001d,
++0x00000002,0x00000023,0x0000000c,0x00040047,
++0x0000001e,0x00000006,0x00000004,0x00030047,
++0x0000001f,0x00000002,0x00040048,0x0000001f,
++0x00000000,0x00000017,0x00050048,0x0000001f,
++0x00000000,0x00000023,0x00000000,0x00030047,
++0x00000042,0x00000002,0x00050048,0x00000042,
++0x00000000,0x0000000b,0x00000000,0x00050048,
++0x00000042,0x00000001,0x0000000b,0x00000001,
++0x00050048,0x00000042,0x00000002,0x0000000b,
++0x00000003,0x00050048,0x00000042,0x00000003,
++0x0000000b,0x00000004,0x00030047,0x00000047,
++0x00000002,0x00050048,0x00000047,0x00000000,
++0x0000000b,0x00000000,0x00050048,0x00000047,
++0x00000001,0x0000000b,0x00000001,0x00050048,
++0x00000047,0x00000002,0x0000000b,0x00000003,
++0x00050048,0x00000047,0x00000003,0x0000000b,
++0x00000004,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00030016,0x00000006,
++0x00000020,0x00040017,0x00000007,0x00000006,
++0x00000003,0x00040020,0x00000008,0x00000001,
++0x00000007,0x0004003b,0x00000008,0x00000009,
++0x00000001,0x00040015,0x0000000a,0x00000020,
++0x00000000,0x0004002b,0x0000000a,0x0000000b,
++0x00000000,0x00040020,0x0000000c,0x00000001,
++0x00000006,0x0004002b,0x00000006,0x0000000f,
++0x3f800000,0x00020014,0x00000010,0x00030027,
++0x0000001c,0x000014e5,0x0005001e,0x0000001d,
++0x0000001c,0x0000000a,0x0000000a,0x0003001d,
++0x0000001e,0x0000000a,0x0003001e,0x0000001f,
++0x0000001e,0x00040020,0x0000001c,0x000014e5,
++0x0000001f,0x00040020,0x00000020,0x00000009,
++0x0000001d,0x0004003b,0x00000020,0x00000021,
++0x00000009,0x00040015,0x00000022,0x00000020,
++0x00000001,0x0004002b,0x00000022,0x00000023,
++0x00000001,0x00040020,0x00000024,0x00000009,
++0x0000000a,0x0004002b,0x00000022,0x00000028,
++0x00000000,0x00040020,0x00000029,0x00000009,
++0x0000001c,0x0004002b,0x0000000a,0x0000002d,
++0x00000001,0x0004002b,0x00000022,0x0000002f,
++0x00000002,0x00040020,0x00000039,0x000014e5,
++0x0000000a,0x00040017,0x00000040,0x00000006,
++0x00000004,0x0004001c,0x00000041,0x00000006,
++0x0000002d,0x0006001e,0x00000042,0x00000040,
++0x00000006,0x00000041,0x00000041,0x00040020,
++0x00000043,0x00000003,0x00000042,0x0004003b,
++0x00000043,0x00000044,0x00000003,0x0006001e,
++0x00000047,0x00000040,0x00000006,0x00000041,
++0x00000041,0x0004002b,0x0000000a,0x00000048,
++0x00000020,0x0004001c,0x00000049,0x00000047,
++0x00000048,0x00040020,0x0000004a,0x00000001,
++0x00000049,0x0004003b,0x0000004a,0x0000004b,
++0x00000001,0x00040020,0x0000004c,0x00000001,
++0x00000040,0x0004002b,0x0000000a,0x00000056,
++0x00000002,0x00040020,0x0000005d,0x00000003,
++0x00000040,0x00040020,0x0000005f,0x00000003,
++0x00000006,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x00050041,0x0000000c,0x0000000d,0x00000009,
++0x0000000b,0x0004003d,0x00000006,0x0000000e,
++0x0000000d,0x000500b4,0x00000010,0x00000011,
++0x0000000e,0x0000000f,0x000300f7,0x00000013,
++0x00000000,0x000400fa,0x00000011,0x00000012,
++0x00000013,0x000200f8,0x00000012,0x000200f9,
++0x00000016,0x000200f8,0x00000016,0x000700f5,
++0x0000000a,0x00000061,0x0000000b,0x00000012,
++0x0000003f,0x00000017,0x00050041,0x00000024,
++0x00000025,0x00000021,0x00000023,0x0004003d,
++0x0000000a,0x00000026,0x00000025,0x000500b0,
++0x00000010,0x00000027,0x00000061,0x00000026,
++0x000400f6,0x00000018,0x00000017,0x00000000,
++0x000400fa,0x00000027,0x00000017,0x00000018,
++0x000200f8,0x00000017,0x00050041,0x00000029,
++0x0000002a,0x00000021,0x00000028,0x0004003d,
++0x0000001c,0x0000002b,0x0000002a,0x00050080,
++0x0000000a,0x0000002e,0x00000061,0x0000002d,
++0x00050041,0x00000024,0x00000030,0x00000021,
++0x0000002f,0x0004003d,0x0000000a,0x00000031,
++0x00000030,0x000500c7,0x0000000a,0x00000032,
++0x0000002e,0x00000031,0x000500c7,0x0000000a,
++0x00000038,0x00000061,0x00000031,0x00060041,
++0x00000039,0x0000003a,0x0000002b,0x00000028,
++0x00000038,0x0006003d,0x0000000a,0x0000003b,
++0x0000003a,0x00000002,0x00000004,0x00050080,
++0x0000000a,0x0000003c,0x0000003b,0x0000002d,
++0x00060041,0x00000039,0x0000003d,0x0000002b,
++0x00000028,0x00000032,0x0005003e,0x0000003d,
++0x0000003c,0x00000002,0x00000004,0x00050080,
++0x0000000a,0x0000003f,0x00000061,0x00000023,
++0x000200f9,0x00000016,0x000200f8,0x00000018,
++0x000200f9,0x00000013,0x000200f8,0x00000013,
++0x00060041,0x0000004c,0x0000004d,0x0000004b,
++0x00000028,0x00000028,0x0004003d,0x00000040,
++0x0000004e,0x0000004d,0x0005008e,0x00000040,
++0x0000004f,0x0000004e,0x0000000e,0x00050041,
++0x0000000c,0x00000050,0x00000009,0x0000002d,
++0x0004003d,0x00000006,0x00000051,0x00000050,
++0x00060041,0x0000004c,0x00000052,0x0000004b,
++0x00000023,0x00000028,0x0004003d,0x00000040,
++0x00000053,0x00000052,0x0005008e,0x00000040,
++0x00000054,0x00000053,0x00000051,0x00050081,
++0x00000040,0x00000055,0x0000004f,0x00000054,
++0x00050041,0x0000000c,0x00000057,0x00000009,
++0x00000056,0x0004003d,0x00000006,0x00000058,
++0x00000057,0x00060041,0x0000004c,0x00000059,
++0x0000004b,0x0000002f,0x00000028,0x0004003d,
++0x00000040,0x0000005a,0x00000059,0x0005008e,
++0x00000040,0x0000005b,0x0000005a,0x00000058,
++0x00050081,0x00000040,0x0000005c,0x00000055,
++0x0000005b,0x00050041,0x0000005d,0x0000005e,
++0x00000044,0x00000028,0x0003003e,0x0000005e,
++0x0000005c,0x00050041,0x0000005f,0x00000060,
++0x00000044,0x00000023,0x0003003e,0x00000060,
++0x0000000f,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f30b44ed59cced2f602c43a0a0c638a7411972b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert
+@@ -0,0 +1,25 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++#extension GL_EXT_buffer_reference : require
++
++/* One invocation runs a chain of dependent device-memory updates for as long
++ * as the push constant asks: each word is one more than the word before it. */
++layout(buffer_reference, std430) coherent buffer Words {
++   uint w[];
++};
++
++layout(push_constant) uniform Params {
++   Words words;
++   uint count;
++   uint mask;
++} pc;
++
++void main(void)
++{
++   if (gl_VertexIndex == 0) {
++      for (uint i = 0u; i < pc.count; ++i)
++         pc.words.w[(i + 1u) & pc.mask] = pc.words.w[i & pc.mask] + 1u;
++   }
++   gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
++   gl_PointSize = 1.0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert.h b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..20a8b5bf153d3e76b26875cd3543433fb11e4c86
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/long_vertex_shaders/store_loop.vert.h
+@@ -0,0 +1,92 @@
++{0x07230203,0x00010600,0x000d000b,0x00000049,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x000014e3,0x0006000b,0x00000001,0x4c534c47,
++0x6474732e,0x3035342e,0x00000000,0x0003000e,
++0x000014e4,0x00000001,0x0008000f,0x00000000,
++0x00000004,0x6e69616d,0x00000000,0x00000008,
++0x0000001e,0x00000040,0x00040047,0x00000008,
++0x0000000b,0x0000002a,0x00030047,0x0000001a,
++0x00000002,0x00050048,0x0000001a,0x00000000,
++0x00000023,0x00000000,0x00050048,0x0000001a,
++0x00000001,0x00000023,0x00000008,0x00050048,
++0x0000001a,0x00000002,0x00000023,0x0000000c,
++0x00040047,0x0000001b,0x00000006,0x00000004,
++0x00030047,0x0000001c,0x00000002,0x00040048,
++0x0000001c,0x00000000,0x00000017,0x00050048,
++0x0000001c,0x00000000,0x00000023,0x00000000,
++0x00030047,0x0000003e,0x00000002,0x00050048,
++0x0000003e,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x0000003e,0x00000001,0x0000000b,
++0x00000001,0x00050048,0x0000003e,0x00000002,
++0x0000000b,0x00000003,0x00050048,0x0000003e,
++0x00000003,0x0000000b,0x00000004,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00040015,0x00000006,0x00000020,0x00000001,
++0x00040020,0x00000007,0x00000001,0x00000006,
++0x0004003b,0x00000007,0x00000008,0x00000001,
++0x0004002b,0x00000006,0x0000000a,0x00000000,
++0x00020014,0x0000000b,0x00040015,0x0000000f,
++0x00000020,0x00000000,0x0004002b,0x0000000f,
++0x00000012,0x00000000,0x00030027,0x00000019,
++0x000014e5,0x0005001e,0x0000001a,0x00000019,
++0x0000000f,0x0000000f,0x0003001d,0x0000001b,
++0x0000000f,0x0003001e,0x0000001c,0x0000001b,
++0x00040020,0x00000019,0x000014e5,0x0000001c,
++0x00040020,0x0000001d,0x00000009,0x0000001a,
++0x0004003b,0x0000001d,0x0000001e,0x00000009,
++0x0004002b,0x00000006,0x0000001f,0x00000001,
++0x00040020,0x00000020,0x00000009,0x0000000f,
++0x00040020,0x00000024,0x00000009,0x00000019,
++0x0004002b,0x0000000f,0x00000028,0x00000001,
++0x0004002b,0x00000006,0x0000002a,0x00000002,
++0x00040020,0x00000034,0x000014e5,0x0000000f,
++0x00030016,0x0000003b,0x00000020,0x00040017,
++0x0000003c,0x0000003b,0x00000004,0x0004001c,
++0x0000003d,0x0000003b,0x00000028,0x0006001e,
++0x0000003e,0x0000003c,0x0000003b,0x0000003d,
++0x0000003d,0x00040020,0x0000003f,0x00000003,
++0x0000003e,0x0004003b,0x0000003f,0x00000040,
++0x00000003,0x0004002b,0x0000003b,0x00000041,
++0x00000000,0x0004002b,0x0000003b,0x00000042,
++0x3f800000,0x0007002c,0x0000003c,0x00000043,
++0x00000041,0x00000041,0x00000041,0x00000042,
++0x00040020,0x00000044,0x00000003,0x0000003c,
++0x00040020,0x00000046,0x00000003,0x0000003b,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0004003d,
++0x00000006,0x00000009,0x00000008,0x000500aa,
++0x0000000b,0x0000000c,0x00000009,0x0000000a,
++0x000300f7,0x0000000e,0x00000000,0x000400fa,
++0x0000000c,0x0000000d,0x0000000e,0x000200f8,
++0x0000000d,0x000200f9,0x00000013,0x000200f8,
++0x00000013,0x000700f5,0x0000000f,0x00000048,
++0x00000012,0x0000000d,0x0000003a,0x00000014,
++0x00050041,0x00000020,0x00000021,0x0000001e,
++0x0000001f,0x0004003d,0x0000000f,0x00000022,
++0x00000021,0x000500b0,0x0000000b,0x00000023,
++0x00000048,0x00000022,0x000400f6,0x00000015,
++0x00000014,0x00000000,0x000400fa,0x00000023,
++0x00000014,0x00000015,0x000200f8,0x00000014,
++0x00050041,0x00000024,0x00000025,0x0000001e,
++0x0000000a,0x0004003d,0x00000019,0x00000026,
++0x00000025,0x00050080,0x0000000f,0x00000029,
++0x00000048,0x00000028,0x00050041,0x00000020,
++0x0000002b,0x0000001e,0x0000002a,0x0004003d,
++0x0000000f,0x0000002c,0x0000002b,0x000500c7,
++0x0000000f,0x0000002d,0x00000029,0x0000002c,
++0x000500c7,0x0000000f,0x00000033,0x00000048,
++0x0000002c,0x00060041,0x00000034,0x00000035,
++0x00000026,0x0000000a,0x00000033,0x0006003d,
++0x0000000f,0x00000036,0x00000035,0x00000002,
++0x00000004,0x00050080,0x0000000f,0x00000037,
++0x00000036,0x00000028,0x00060041,0x00000034,
++0x00000038,0x00000026,0x0000000a,0x0000002d,
++0x0005003e,0x00000038,0x00000037,0x00000002,
++0x00000004,0x00050080,0x0000000f,0x0000003a,
++0x00000048,0x0000001f,0x000200f9,0x00000013,
++0x000200f8,0x00000015,0x000200f9,0x0000000e,
++0x000200f8,0x0000000e,0x00050041,0x00000044,
++0x00000045,0x00000040,0x0000000a,0x0003003e,
++0x00000045,0x00000043,0x00050041,0x00000046,
++0x00000047,0x00000040,0x0000001f,0x0003003e,
++0x00000047,0x00000042,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_long_vertex_invocation.cpp b/src/kosmickrisp/vulkan/tests/test_long_vertex_invocation.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..69892e9c0436b3df40ee8b4dd0a689d799e70236
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_long_vertex_invocation.cpp
+@@ -0,0 +1,286 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* An Apple GPU kills a Metal vertex function invocation that runs for longer
++ * than about 10 ms, and reports the kill as a timeout; a compute thread runs
++ * for far longer.  See KK_WORKAROUND_21.  One vertex or tessellation
++ * evaluation invocation here runs a chain of dependent device-memory updates
++ * for well past that limit, and every word of the chain must land.
++ *
++ * usage: test_kosmickrisp_long_vertex_invocation vertex|discard|tess
++ *        [--count N] [--expect-loss]
++ * vertex draws one point, discard draws it with the rasterizer discarded and
++ * tess has the tessellation evaluation stage run the chain.  --expect-loss,
++ * with MESA_KK_DISABLE_WORKAROUNDS=21, instead requires the chain to be cut
++ * short or the submission to fail, which shows the limit the workaround
++ * avoids. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#include "kk_test.h"
++
++static const uint32_t store_loop_vert[] =
++#include "long_vertex_shaders/store_loop.vert.h"
++;
++static const uint32_t patch_vert[] =
++#include "long_vertex_shaders/patch.vert.h"
++;
++static const uint32_t patch_tesc[] =
++#include "long_vertex_shaders/patch.tesc.h"
++;
++static const uint32_t store_loop_tese[] =
++#include "long_vertex_shaders/store_loop.tese.h"
++;
++static const uint32_t color_frag[] =
++#include "long_vertex_shaders/color.frag.h"
++;
++
++struct params {
++   VkDeviceAddress words;
++   uint32_t count;
++   uint32_t mask;
++};
++
++int main(int argc, char **argv)
++{
++   require(argc >= 2, "usage: vertex|discard|tess [--count N] [--expect-loss]");
++   const std::string shape = argv[1];
++   const bool tess = shape == "tess";
++   const bool discard = shape == "discard";
++   require(tess || discard || shape == "vertex", "unknown shape");
++   /* About 50 ms of dependent updates on an M1 Ultra, five times the limit. */
++   uint32_t count = 1u << 17;
++   bool expect_loss = false;
++   for (int i = 2; i < argc; ++i) {
++      if (!strcmp(argv[i], "--count") && i + 1 < argc)
++         count = uint32_t(strtoul(argv[++i], nullptr, 0));
++      else if (!strcmp(argv[i], "--expect-loss"))
++         expect_loss = true;
++      else
++         require(false, "unknown argument");
++   }
++
++   kk_test_device t;
++   kk_test_create_instance(&t, "long-vertex-invocation");
++   VkPhysicalDeviceVulkan12Features features12{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++   features12.bufferDeviceAddress = VK_TRUE;
++   VkPhysicalDeviceVulkan13Features features13{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++   features13.pNext = &features12;
++   features13.dynamicRendering = VK_TRUE;
++   VkPhysicalDeviceFeatures features{};
++   features.vertexPipelineStoresAndAtomics = VK_TRUE;
++   features.tessellationShader = VK_TRUE;
++   features.shaderTessellationAndGeometryPointSize = VK_TRUE;
++   kk_test_create_device(&t, &features13, &features, 0, nullptr);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkGetBufferDeviceAddress);
++
++   constexpr uint32_t words = 4096;
++   VkBuffer buffer = VK_NULL_HANDLE;
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   uint32_t *mapped = nullptr;
++   VkMemoryAllocateFlagsInfo address_flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
++   address_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
++   VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++   buffer_info.size = words * sizeof(uint32_t);
++   buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++   VkResult result = vkCreateBuffer(device, &buffer_info, nullptr, &buffer);
++   require(result == VK_SUCCESS, "create buffer", result);
++   VkMemoryRequirements requirements{};
++   vkGetBufferMemoryRequirements(device, buffer, &requirements);
++   VkMemoryAllocateInfo memory_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++   memory_info.pNext = &address_flags;
++   memory_info.allocationSize = requirements.size;
++   memory_info.memoryTypeIndex =
++      kk_test_memory_type(&t, requirements.memoryTypeBits, KK_TEST_HOST_MEMORY);
++   result = vkAllocateMemory(device, &memory_info, nullptr, &memory);
++   require(result == VK_SUCCESS, "allocate buffer", result);
++   result = vkBindBufferMemory(device, buffer, memory, 0);
++   require(result == VK_SUCCESS, "bind buffer", result);
++   result = vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0,
++                        reinterpret_cast<void **>(&mapped));
++   require(result == VK_SUCCESS, "map buffer", result);
++   memset(mapped, 0, words * sizeof(uint32_t));
++   VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++   address_info.buffer = buffer;
++   const params push{vkGetBufferDeviceAddress(device, &address_info), count,
++                     words - 1u};
++
++   VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++   image_info.imageType = VK_IMAGE_TYPE_2D;
++   image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++   image_info.extent = {8, 8, 1};
++   image_info.mipLevels = 1;
++   image_info.arrayLayers = 1;
++   image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++   image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++   VkImage image = VK_NULL_HANDLE;
++   result = vkCreateImage(device, &image_info, nullptr, &image);
++   require(result == VK_SUCCESS, "create image", result);
++   VkDeviceMemory image_memory =
++      kk_test_image_memory(&t, image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++   VkImageView view = kk_test_image_view(&t, image, VK_IMAGE_VIEW_TYPE_2D,
++                                         VK_FORMAT_R8G8B8A8_UNORM,
++                                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
++
++   const VkShaderStageFlags push_stages =
++      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
++   const VkPushConstantRange push_range{push_stages, 0, sizeof(params)};
++   VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   layout_info.pushConstantRangeCount = 1;
++   layout_info.pPushConstantRanges = &push_range;
++   VkPipelineLayout layout = VK_NULL_HANDLE;
++   result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++   require(result == VK_SUCCESS, "create layout", result);
++
++   VkShaderModule modules[4]{};
++   VkPipelineShaderStageCreateInfo stages[4]{};
++   uint32_t stage_count = 0;
++   auto add_stage = [&](VkShaderStageFlagBits stage, const uint32_t *code,
++                        size_t size) {
++      modules[stage_count] = kk_test_shader_module(&t, code, size);
++      stages[stage_count] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++      stages[stage_count].stage = stage;
++      stages[stage_count].module = modules[stage_count];
++      stages[stage_count].pName = "main";
++      ++stage_count;
++   };
++   if (tess) {
++      add_stage(VK_SHADER_STAGE_VERTEX_BIT, patch_vert, sizeof(patch_vert));
++      add_stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, patch_tesc,
++                sizeof(patch_tesc));
++      add_stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, store_loop_tese,
++                sizeof(store_loop_tese));
++   } else {
++      add_stage(VK_SHADER_STAGE_VERTEX_BIT, store_loop_vert,
++                sizeof(store_loop_vert));
++   }
++   add_stage(VK_SHADER_STAGE_FRAGMENT_BIT, color_frag, sizeof(color_frag));
++
++   VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++   VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++   ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
++                      : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++   VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
++   ts.patchControlPoints = 3;
++   VkViewport viewport{0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f};
++   VkRect2D scissor{{0, 0}, {8, 8}};
++   VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++   vp.viewportCount = 1;
++   vp.pViewports = &viewport;
++   vp.scissorCount = 1;
++   vp.pScissors = &scissor;
++   VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++   rs.rasterizerDiscardEnable = discard ? VK_TRUE : VK_FALSE;
++   rs.lineWidth = 1.0f;
++   VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++   ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++   VkPipelineColorBlendAttachmentState blend_attachment{};
++   blend_attachment.colorWriteMask = 0xf;
++   VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++   blend.attachmentCount = 1;
++   blend.pAttachments = &blend_attachment;
++   const VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
++   VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++   rendering.colorAttachmentCount = 1;
++   rendering.pColorAttachmentFormats = &color_format;
++   VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++   pipeline_info.pNext = &rendering;
++   pipeline_info.stageCount = stage_count;
++   pipeline_info.pStages = stages;
++   pipeline_info.pVertexInputState = &vi;
++   pipeline_info.pInputAssemblyState = &ia;
++   pipeline_info.pTessellationState = tess ? &ts : nullptr;
++   pipeline_info.pViewportState = &vp;
++   pipeline_info.pRasterizationState = &rs;
++   pipeline_info.pMultisampleState = &ms;
++   pipeline_info.pColorBlendState = &blend;
++   pipeline_info.layout = layout;
++   VkPipeline pipeline = VK_NULL_HANDLE;
++   result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
++                                      nullptr, &pipeline);
++   require(result == VK_SUCCESS, "create pipeline", result);
++
++   VkCommandPool pool = VK_NULL_HANDLE;
++   VkCommandBuffer command = VK_NULL_HANDLE;
++   kk_test_command_buffer(&t, 0, &pool, &command);
++   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++   result = vkBeginCommandBuffer(command, &begin);
++   require(result == VK_SUCCESS, "begin command", result);
++   VkImageMemoryBarrier to_attachment{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++   to_attachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++   to_attachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++   to_attachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   to_attachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++   to_attachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++   to_attachment.image = image;
++   to_attachment.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                        nullptr, 0, nullptr, 1, &to_attachment);
++   VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++   color.imageView = view;
++   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++   VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
++   render.renderArea.extent = {8, 8};
++   render.layerCount = 1;
++   render.colorAttachmentCount = 1;
++   render.pColorAttachments = &color;
++   vkCmdBeginRendering(command, &render);
++   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++   vkCmdPushConstants(command, layout, push_stages, 0, sizeof(push), &push);
++   vkCmdDraw(command, tess ? 3 : 1, 1, 0, 0);
++   vkCmdEndRendering(command);
++   VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++   to_host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++   to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
++                        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, nullptr,
++                        0, nullptr);
++   result = vkEndCommandBuffer(command);
++   require(result == VK_SUCCESS, "end command", result);
++
++   const auto start = std::chrono::steady_clock::now();
++   result = kk_test_submit_and_wait(&t, command, 20ull * 1000 * 1000 * 1000);
++   const double wait_ms = std::chrono::duration<double, std::milli>(
++                        std::chrono::steady_clock::now() - start).count();
++   const uint32_t last = mapped[count & (words - 1u)];
++   const uint32_t before = mapped[(count - 1u) & (words - 1u)];
++   const bool complete = result == VK_SUCCESS && last == count &&
++                         before == count - 1u;
++   std::printf("%s: count=%u wait=%d %.1f ms last word %u (want %u) %s\n",
++               shape.c_str(), count, result, wait_ms, last, count,
++               complete ? "complete" : "cut short");
++   if (expect_loss)
++      require(!complete, "expected the GPU to cut the chain short");
++   else
++      require(complete, "every update of the chain landed");
++
++   vkDestroyCommandPool(device, pool, nullptr);
++   vkDestroyPipeline(device, pipeline, nullptr);
++   for (uint32_t i = 0; i < stage_count; ++i)
++      vkDestroyShaderModule(device, modules[i], nullptr);
++   vkDestroyPipelineLayout(device, layout, nullptr);
++   vkDestroyImageView(device, view, nullptr);
++   vkDestroyImage(device, image, nullptr);
++   vkFreeMemory(device, image_memory, nullptr);
++   vkUnmapMemory(device, memory);
++   vkDestroyBuffer(device, buffer, nullptr);
++   vkFreeMemory(device, memory, nullptr);
++   kk_test_destroy(&t);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_vertex_compute_draws.cpp b/src/kosmickrisp/vulkan/tests/test_vertex_compute_draws.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ecc5c60a026a66b4de8af14fb1e0e9511e2d258d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_vertex_compute_draws.cpp
+@@ -0,0 +1,299 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Many draws of a vertex stage the driver runs as compute (KK_WORKAROUND_21)
++ * in one pass. The stages of consecutive draws may overlap, so each draw must
++ * still rasterize its own records and every store must land. Draw d covers
++ * tile d of an 8x8 grid, writes one word per vertex and colors its tile
++ * d + 1; the pass is submitted repeatedly with the words and the target
++ * cleared in between.
++ *
++ * usage: test_kosmickrisp_vertex_compute_draws [--count N] [--rounds N] */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "kk_test.h"
++
++static const uint32_t tile_vert[] =
++#include "vertex_compute_draws_shaders/tile.vert.h"
++;
++static const uint32_t tile_frag[] =
++#include "vertex_compute_draws_shaders/tile.frag.h"
++;
++
++struct params {
++   VkDeviceAddress words;
++   uint32_t count;
++};
++
++int main(int argc, char **argv)
++{
++   uint32_t count = 4u, rounds = 50u;
++   for (int i = 1; i < argc; ++i) {
++      if (!strcmp(argv[i], "--count") && i + 1 < argc)
++         count = uint32_t(strtoul(argv[++i], nullptr, 0));
++      else if (!strcmp(argv[i], "--rounds") && i + 1 < argc)
++         rounds = uint32_t(strtoul(argv[++i], nullptr, 0));
++      else
++         require(false, "unknown argument");
++   }
++   require(count > 0u, "--count must be positive");
++
++   kk_test_device t;
++   kk_test_create_instance(&t, "vertex-compute-draws");
++   VkPhysicalDeviceVulkan12Features features12{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++   features12.bufferDeviceAddress = VK_TRUE;
++   VkPhysicalDeviceVulkan13Features features13{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++   features13.pNext = &features12;
++   features13.dynamicRendering = VK_TRUE;
++   VkPhysicalDeviceFeatures features{};
++   features.vertexPipelineStoresAndAtomics = VK_TRUE;
++   kk_test_create_device(&t, &features13, &features, 0, nullptr);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkGetBufferDeviceAddress);
++   LOAD_D(vkCmdFillBuffer);
++
++   constexpr uint32_t tiles = 64u, vertices = 6u, size = 64u;
++   constexpr uint32_t words = tiles * vertices;
++   VkBuffer buffer = VK_NULL_HANDLE;
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   uint32_t *mapped = nullptr;
++   VkMemoryAllocateFlagsInfo address_flags{
++      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
++   address_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
++   VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++   buffer_info.size = words * sizeof(uint32_t);
++   buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                       VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++   VkResult result = vkCreateBuffer(device, &buffer_info, nullptr, &buffer);
++   require(result == VK_SUCCESS, "create buffer", result);
++   VkMemoryRequirements requirements{};
++   vkGetBufferMemoryRequirements(device, buffer, &requirements);
++   VkMemoryAllocateInfo memory_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++   memory_info.pNext = &address_flags;
++   memory_info.allocationSize = requirements.size;
++   memory_info.memoryTypeIndex = kk_test_memory_type(
++      &t, requirements.memoryTypeBits, KK_TEST_HOST_MEMORY);
++   result = vkAllocateMemory(device, &memory_info, nullptr, &memory);
++   require(result == VK_SUCCESS, "allocate buffer", result);
++   result = vkBindBufferMemory(device, buffer, memory, 0);
++   require(result == VK_SUCCESS, "bind buffer", result);
++   result = vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0,
++                        reinterpret_cast<void **>(&mapped));
++   require(result == VK_SUCCESS, "map buffer", result);
++   VkBufferDeviceAddressInfo address_info{
++      VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++   address_info.buffer = buffer;
++   const params push{vkGetBufferDeviceAddress(device, &address_info), count};
++
++   VkBuffer readback = VK_NULL_HANDLE;
++   VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++   uint32_t *pixels = nullptr;
++   kk_test_buffer(&t, size * size * sizeof(uint32_t),
++                  VK_BUFFER_USAGE_TRANSFER_DST_BIT, KK_TEST_HOST_MEMORY,
++                  &readback, &readback_memory,
++                  reinterpret_cast<void **>(&pixels));
++
++   const VkFormat color_format = VK_FORMAT_R32_UINT;
++   VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++   image_info.imageType = VK_IMAGE_TYPE_2D;
++   image_info.format = color_format;
++   image_info.extent = {size, size, 1};
++   image_info.mipLevels = 1;
++   image_info.arrayLayers = 1;
++   image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++   image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++   VkImage image = VK_NULL_HANDLE;
++   result = vkCreateImage(device, &image_info, nullptr, &image);
++   require(result == VK_SUCCESS, "create image", result);
++   VkDeviceMemory image_memory =
++      kk_test_image_memory(&t, image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++   VkImageView view = kk_test_image_view(&t, image, VK_IMAGE_VIEW_TYPE_2D,
++                                         color_format,
++                                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
++
++   const VkPushConstantRange push_range{VK_SHADER_STAGE_VERTEX_BIT, 0,
++                                        sizeof(params)};
++   VkPipelineLayoutCreateInfo layout_info{
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   layout_info.pushConstantRangeCount = 1;
++   layout_info.pPushConstantRanges = &push_range;
++   VkPipelineLayout layout = VK_NULL_HANDLE;
++   result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++   require(result == VK_SUCCESS, "create layout", result);
++
++   VkShaderModule vs = kk_test_shader_module(&t, tile_vert, sizeof(tile_vert));
++   VkShaderModule fs = kk_test_shader_module(&t, tile_frag, sizeof(tile_frag));
++   VkPipelineShaderStageCreateInfo stages[2]{
++      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
++      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
++   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++   stages[0].module = vs;
++   stages[0].pName = "main";
++   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++   stages[1].module = fs;
++   stages[1].pName = "main";
++   VkPipelineVertexInputStateCreateInfo vi{
++      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++   VkPipelineInputAssemblyStateCreateInfo ia{
++      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++   ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++   VkViewport viewport{0.0f, 0.0f, float(size), float(size), 0.0f, 1.0f};
++   VkRect2D scissor{{0, 0}, {size, size}};
++   VkPipelineViewportStateCreateInfo vp{
++      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++   vp.viewportCount = 1;
++   vp.pViewports = &viewport;
++   vp.scissorCount = 1;
++   vp.pScissors = &scissor;
++   VkPipelineRasterizationStateCreateInfo rs{
++      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++   rs.lineWidth = 1.0f;
++   VkPipelineMultisampleStateCreateInfo ms{
++      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++   ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++   VkPipelineColorBlendAttachmentState blend_attachment{};
++   blend_attachment.colorWriteMask = 0xf;
++   VkPipelineColorBlendStateCreateInfo blend{
++      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++   blend.attachmentCount = 1;
++   blend.pAttachments = &blend_attachment;
++   VkPipelineRenderingCreateInfo rendering{
++      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++   rendering.colorAttachmentCount = 1;
++   rendering.pColorAttachmentFormats = &color_format;
++   VkGraphicsPipelineCreateInfo pipeline_info{
++      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++   pipeline_info.pNext = &rendering;
++   pipeline_info.stageCount = 2;
++   pipeline_info.pStages = stages;
++   pipeline_info.pVertexInputState = &vi;
++   pipeline_info.pInputAssemblyState = &ia;
++   pipeline_info.pViewportState = &vp;
++   pipeline_info.pRasterizationState = &rs;
++   pipeline_info.pMultisampleState = &ms;
++   pipeline_info.pColorBlendState = &blend;
++   pipeline_info.layout = layout;
++   VkPipeline pipeline = VK_NULL_HANDLE;
++   result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                      &pipeline_info, nullptr, &pipeline);
++   require(result == VK_SUCCESS, "create pipeline", result);
++
++   VkCommandPool pool = VK_NULL_HANDLE;
++   VkCommandBuffer command = VK_NULL_HANDLE;
++   kk_test_command_buffer(&t, 0, &pool, &command);
++   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++   result = vkBeginCommandBuffer(command, &begin);
++   require(result == VK_SUCCESS, "begin command", result);
++   vkCmdFillBuffer(command, buffer, 0, VK_WHOLE_SIZE, 0u);
++   VkMemoryBarrier to_vertex{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++   to_vertex.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++   to_vertex.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++   VkImageMemoryBarrier to_attachment{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++   to_attachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++   to_attachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++   to_attachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   to_attachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++   to_attachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++   to_attachment.image = image;
++   to_attachment.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                        0, 1, &to_vertex, 0, nullptr, 1, &to_attachment);
++   VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++   color.imageView = view;
++   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++   VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
++   render.renderArea.extent = {size, size};
++   render.layerCount = 1;
++   render.colorAttachmentCount = 1;
++   render.pColorAttachments = &color;
++   vkCmdBeginRendering(command, &render);
++   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++   vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
++                      sizeof(push), &push);
++   for (uint32_t d = 0; d < tiles; ++d)
++      vkCmdDraw(command, vertices, 1, 0, d);
++   vkCmdEndRendering(command);
++   VkImageMemoryBarrier to_copy = to_attachment;
++   to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++   to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++   to_copy.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                        nullptr, 1, &to_copy);
++   VkBufferImageCopy copy{};
++   copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++   copy.imageExtent = {size, size, 1};
++   vkCmdCopyImageToBuffer(command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                          readback, 1, &copy);
++   VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++   to_host.srcAccessMask =
++      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++   to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++   vkCmdPipelineBarrier(command,
++                        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
++                           VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, nullptr,
++                        0, nullptr);
++   result = vkEndCommandBuffer(command);
++   require(result == VK_SUCCESS, "end command", result);
++
++   uint32_t bad_words = 0, bad_tiles = 0;
++   for (uint32_t round = 0; round < rounds; ++round) {
++      memset(pixels, 0xff, size * size * sizeof(uint32_t));
++      result = kk_test_submit_and_wait(&t, command, 10ull * 1000 * 1000 * 1000);
++      require(result == VK_SUCCESS, "submit", result);
++      for (uint32_t d = 0; d < tiles; ++d) {
++         for (uint32_t v = 0; v < vertices; ++v) {
++            const uint32_t want = d * 16u + v + count - 1u;
++            if (mapped[d * vertices + v] != want && bad_words++ < 8)
++               std::fprintf(stderr, "round %u draw %u vertex %u: word %u, want %u\n",
++                            round, d, v, mapped[d * vertices + v], want);
++         }
++         /* The tile's center pixel. */
++         const uint32_t tile = size / 8u;
++         const uint32_t x = (d % 8u) * tile + tile / 2u;
++         const uint32_t y = (d / 8u) * tile + tile / 2u;
++         if (pixels[y * size + x] != d + 1u && bad_tiles++ < 8)
++            std::fprintf(stderr, "round %u tile %u: color %u, want %u\n", round,
++                         d, pixels[y * size + x], d + 1u);
++      }
++   }
++   std::printf("vertex compute draws: %u rounds of %u draws, %u bad words, "
++               "%u bad tiles\n",
++               rounds, tiles, bad_words, bad_tiles);
++   require(bad_words == 0 && bad_tiles == 0,
++           "every draw stored its words and rasterized its own tile");
++
++   vkDestroyCommandPool(device, pool, nullptr);
++   vkDestroyPipeline(device, pipeline, nullptr);
++   vkDestroyShaderModule(device, vs, nullptr);
++   vkDestroyShaderModule(device, fs, nullptr);
++   vkDestroyPipelineLayout(device, layout, nullptr);
++   vkDestroyImageView(device, view, nullptr);
++   vkDestroyImage(device, image, nullptr);
++   vkFreeMemory(device, image_memory, nullptr);
++   vkUnmapMemory(device, readback_memory);
++   vkDestroyBuffer(device, readback, nullptr);
++   vkFreeMemory(device, readback_memory, nullptr);
++   vkUnmapMemory(device, memory);
++   vkDestroyBuffer(device, buffer, nullptr);
++   vkFreeMemory(device, memory, nullptr);
++   kk_test_destroy(&t);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_vertex_compute_routing.c b/src/kosmickrisp/vulkan/tests/test_vertex_compute_routing.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..23605364502af32f0c21c88449fb9845071fe78b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_vertex_compute_routing.c
+@@ -0,0 +1,112 @@
++/* SPDX-License-Identifier: MIT */
++
++/* Which stages the driver runs as compute so that one long invocation is not
++ * killed as a Metal vertex function: a vertex or tessellation evaluation
++ * stage that writes memory anywhere and contains a loop.  See
++ * KK_WORKAROUND_21. */
++
++#include "kosmickrisp/vulkan/kk_shader.h"
++
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++
++#include "kk_test.h"
++
++enum body {
++   /* The store inside a loop. */
++   STORE_IN_LOOP,
++   /* A loop that only computes an output. */
++   LOOP_ONLY,
++   /* A store and no loop. */
++   STORE_ONLY,
++   /* A loop inside an if, and an image store after it. */
++   LOOP_IN_IF_IMAGE_STORE_AFTER,
++   /* An SSBO store inside a loop. */
++   SSBO_STORE_IN_LOOP,
++};
++
++static nir_shader *
++build(mesa_shader_stage stage, enum body body)
++{
++   nir_builder b =
++      nir_builder_init_simple_shader(stage, &kk_nir_options, "routing");
++   nir_variable *index =
++      nir_local_variable_create(b.impl, glsl_uint_type(), "index");
++   nir_store_var(&b, index, nir_imm_int(&b, 0), 0x1);
++   nir_def *count = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
++                                           .base = 0, .range = 4);
++   nir_def *address = nir_imm_int64(&b, 0x10000);
++
++   if (body == LOOP_IN_IF_IMAGE_STORE_AFTER)
++      nir_push_if(&b, nir_ine_imm(&b, count, 0));
++   if (body != STORE_ONLY) {
++      nir_push_loop(&b);
++      {
++         nir_def *i = nir_load_var(&b, index);
++         nir_push_if(&b, nir_uge(&b, i, count));
++         nir_jump(&b, nir_jump_break);
++         nir_pop_if(&b, NULL);
++         if (body == STORE_IN_LOOP)
++            nir_store_global(&b, i, address, .align_mul = 4);
++         if (body == SSBO_STORE_IN_LOOP)
++            nir_store_ssbo(&b, i, nir_imm_int(&b, 0), nir_imul_imm(&b, i, 4),
++                           .align_mul = 4);
++         nir_store_var(&b, index, nir_iadd_imm(&b, i, 1), 0x1);
++      }
++      nir_pop_loop(&b, NULL);
++   }
++   if (body == LOOP_IN_IF_IMAGE_STORE_AFTER) {
++      nir_pop_if(&b, NULL);
++      nir_def *handle = nir_imm_int64(&b, 0x20000);
++      nir_bindless_image_store(
++         &b, handle, nir_imm_ivec4(&b, 0, 0, 0, 0), nir_imm_int(&b, 0),
++         nir_imm_ivec4(&b, 1, 1, 1, 1), nir_imm_int(&b, 0),
++         .image_dim = GLSL_SAMPLER_DIM_2D, .format = PIPE_FORMAT_R32_UINT,
++         .src_type = nir_type_uint32);
++   }
++   if (body == STORE_ONLY)
++      nir_store_global(&b, count, address, .align_mul = 4);
++   return b.shader;
++}
++
++static bool
++routed(mesa_shader_stage stage, enum body body, uint64_t disabled)
++{
++   nir_shader *nir = build(stage, body);
++   bool result = kk_vertex_stage_runs_as_compute(nir, disabled);
++   ralloc_free(nir);
++   return result;
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   CHECK(routed(MESA_SHADER_VERTEX, STORE_IN_LOOP, 0));
++   CHECK(routed(MESA_SHADER_VERTEX, LOOP_IN_IF_IMAGE_STORE_AFTER, 0));
++   CHECK(routed(MESA_SHADER_VERTEX, SSBO_STORE_IN_LOOP, 0));
++   CHECK(routed(MESA_SHADER_TESS_EVAL, STORE_IN_LOOP, 0));
++   CHECK(routed(MESA_SHADER_TESS_EVAL, SSBO_STORE_IN_LOOP, 0));
++
++   /* No side effect to lose, or no loop to run long. */
++   CHECK(!routed(MESA_SHADER_VERTEX, LOOP_ONLY, 0));
++   CHECK(!routed(MESA_SHADER_VERTEX, STORE_ONLY, 0));
++   CHECK(!routed(MESA_SHADER_TESS_EVAL, LOOP_ONLY, 0));
++
++   /* Stages that never run as the Metal vertex function. */
++   CHECK(!routed(MESA_SHADER_FRAGMENT, STORE_IN_LOOP, 0));
++   CHECK(!routed(MESA_SHADER_TESS_CTRL, STORE_IN_LOOP, 0));
++   CHECK(!routed(MESA_SHADER_GEOMETRY, STORE_IN_LOOP, 0));
++   CHECK(!routed(MESA_SHADER_COMPUTE, STORE_IN_LOOP, 0));
++
++   /* MESA_KK_DISABLE_WORKAROUNDS=21 leaves every stage where it was. */
++   CHECK(!routed(MESA_SHADER_VERTEX, STORE_IN_LOOP, BITFIELD64_BIT(21)));
++   CHECK(!routed(MESA_SHADER_TESS_EVAL, STORE_IN_LOOP, BITFIELD64_BIT(21)));
++
++   printf("vertex compute routing PASS\n");
++   glsl_type_singleton_decref();
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d27cebea7b949dc34de6cdf44aed508741f6e43
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag
+@@ -0,0 +1,10 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++
++layout(location = 0) flat in uint tile;
++layout(location = 0) out uvec4 color;
++
++void main(void)
++{
++   color = uvec4(tile + 1u, 0u, 0u, 1u);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag.h b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9ba089cb26a9a76fbaf1975f7d6c7399d3bc97b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.frag.h
+@@ -0,0 +1,26 @@
++{0x07230203,0x00010600,0x000d000b,0x00000011,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000b,0x00030010,
++0x00000004,0x00000007,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00030047,0x0000000b,
++0x0000000e,0x00040047,0x0000000b,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000000,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000006,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x0004002b,0x00000006,
++0x0000000d,0x00000001,0x0004002b,0x00000006,
++0x0000000f,0x00000000,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000006,0x0000000c,
++0x0000000b,0x00050080,0x00000006,0x0000000e,
++0x0000000c,0x0000000d,0x00070050,0x00000007,
++0x00000010,0x0000000e,0x0000000f,0x0000000f,
++0x0000000d,0x0003003e,0x00000009,0x00000010,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..b737af982e39966de7a9e9b23b003afa6596aede
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert
+@@ -0,0 +1,31 @@
++#version 450
++/* SPDX-License-Identifier: MIT */
++#extension GL_EXT_buffer_reference : require
++
++/* Draw d, named by its first instance, covers tile d of an 8x8 grid, and each
++ * of its six vertices writes a word of its own in a loop, so the driver runs
++ * the stage as compute (KK_WORKAROUND_21). */
++layout(buffer_reference, std430) buffer Words {
++   uint w[];
++};
++
++layout(push_constant) uniform Params {
++   Words words;
++   uint count;
++} pc;
++
++layout(location = 0) flat out uint tile;
++
++const vec2 corners[6] = vec2[](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
++                               vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
++
++void main(void)
++{
++   uint d = uint(gl_InstanceIndex);
++   uint v = uint(gl_VertexIndex);
++   for (uint i = 0u; i < pc.count; ++i)
++      pc.words.w[d * 6u + v] = d * 16u + v + i;
++   vec2 p = (vec2(d % 8u, d / 8u) + corners[v]) / 8.0;
++   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++   tile = d;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert.h b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..10df68a0c9b1755fb6e12656c7b0f5d483bd1b5b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/vertex_compute_draws_shaders/tile.vert.h
+@@ -0,0 +1,122 @@
++{0x07230203,0x00010600,0x000d000b,0x0000006e,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x000014e3,0x0006000b,0x00000001,0x4c534c47,
++0x6474732e,0x3035342e,0x00000000,0x0003000e,
++0x000014e4,0x00000001,0x000a000f,0x00000000,
++0x00000004,0x6e69616d,0x00000000,0x0000000b,
++0x0000000f,0x0000001f,0x0000005c,0x00000068,
++0x00040047,0x0000000b,0x0000000b,0x0000002b,
++0x00040047,0x0000000f,0x0000000b,0x0000002a,
++0x00030047,0x0000001b,0x00000002,0x00050048,
++0x0000001b,0x00000000,0x00000023,0x00000000,
++0x00050048,0x0000001b,0x00000001,0x00000023,
++0x00000008,0x00040047,0x0000001c,0x00000006,
++0x00000004,0x00030047,0x0000001d,0x00000002,
++0x00050048,0x0000001d,0x00000000,0x00000023,
++0x00000000,0x00030047,0x00000050,0x00000018,
++0x00030047,0x0000005a,0x00000002,0x00050048,
++0x0000005a,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x0000005a,0x00000001,0x0000000b,
++0x00000001,0x00050048,0x0000005a,0x00000002,
++0x0000000b,0x00000003,0x00050048,0x0000005a,
++0x00000003,0x0000000b,0x00000004,0x00030047,
++0x00000068,0x0000000e,0x00040047,0x00000068,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00040015,
++0x00000006,0x00000020,0x00000000,0x00040015,
++0x00000009,0x00000020,0x00000001,0x00040020,
++0x0000000a,0x00000001,0x00000009,0x0004003b,
++0x0000000a,0x0000000b,0x00000001,0x0004003b,
++0x0000000a,0x0000000f,0x00000001,0x0004002b,
++0x00000006,0x00000013,0x00000000,0x00030027,
++0x0000001a,0x000014e5,0x0004001e,0x0000001b,
++0x0000001a,0x00000006,0x0003001d,0x0000001c,
++0x00000006,0x0003001e,0x0000001d,0x0000001c,
++0x00040020,0x0000001a,0x000014e5,0x0000001d,
++0x00040020,0x0000001e,0x00000009,0x0000001b,
++0x0004003b,0x0000001e,0x0000001f,0x00000009,
++0x0004002b,0x00000009,0x00000020,0x00000001,
++0x00040020,0x00000021,0x00000009,0x00000006,
++0x00020014,0x00000024,0x0004002b,0x00000009,
++0x00000026,0x00000000,0x00040020,0x00000027,
++0x00000009,0x0000001a,0x0004002b,0x00000006,
++0x0000002b,0x00000006,0x0004002b,0x00000006,
++0x00000030,0x00000010,0x00040020,0x00000036,
++0x000014e5,0x00000006,0x00030016,0x0000003a,
++0x00000020,0x00040017,0x0000003b,0x0000003a,
++0x00000002,0x00040020,0x0000003c,0x00000007,
++0x0000003b,0x0004002b,0x00000006,0x0000003f,
++0x00000008,0x0004001c,0x00000046,0x0000003b,
++0x0000002b,0x0004002b,0x0000003a,0x00000047,
++0x00000000,0x0005002c,0x0000003b,0x00000048,
++0x00000047,0x00000047,0x0004002b,0x0000003a,
++0x00000049,0x3f800000,0x0005002c,0x0000003b,
++0x0000004a,0x00000049,0x00000047,0x0005002c,
++0x0000003b,0x0000004b,0x00000047,0x00000049,
++0x0005002c,0x0000003b,0x0000004c,0x00000049,
++0x00000049,0x0009002c,0x00000046,0x0000004d,
++0x00000048,0x0000004a,0x0000004b,0x0000004a,
++0x0000004c,0x0000004b,0x00040020,0x0000004f,
++0x00000007,0x00000046,0x00040017,0x00000057,
++0x0000003a,0x00000004,0x0004002b,0x00000006,
++0x00000058,0x00000001,0x0004001c,0x00000059,
++0x0000003a,0x00000058,0x0006001e,0x0000005a,
++0x00000057,0x0000003a,0x00000059,0x00000059,
++0x00040020,0x0000005b,0x00000003,0x0000005a,
++0x0004003b,0x0000005b,0x0000005c,0x00000003,
++0x0004002b,0x0000003a,0x0000005e,0x40000000,
++0x00040020,0x00000065,0x00000003,0x00000057,
++0x00040020,0x00000067,0x00000003,0x00000006,
++0x0004003b,0x00000067,0x00000068,0x00000003,
++0x0004002b,0x0000003a,0x0000006c,0x3e000000,
++0x0005002c,0x0000003b,0x0000006d,0x0000006c,
++0x0000006c,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0005003b,0x0000004f,0x00000050,0x00000007,
++0x0000004d,0x0004003d,0x00000009,0x0000000c,
++0x0000000b,0x0004007c,0x00000006,0x0000000d,
++0x0000000c,0x0004003d,0x00000009,0x00000010,
++0x0000000f,0x0004007c,0x00000006,0x00000011,
++0x00000010,0x000200f9,0x00000014,0x000200f8,
++0x00000014,0x000700f5,0x00000006,0x0000006a,
++0x00000013,0x00000005,0x00000039,0x00000015,
++0x00050041,0x00000021,0x00000022,0x0000001f,
++0x00000020,0x0004003d,0x00000006,0x00000023,
++0x00000022,0x000500b0,0x00000024,0x00000025,
++0x0000006a,0x00000023,0x000400f6,0x00000016,
++0x00000015,0x00000000,0x000400fa,0x00000025,
++0x00000015,0x00000016,0x000200f8,0x00000015,
++0x00050041,0x00000027,0x00000028,0x0000001f,
++0x00000026,0x0004003d,0x0000001a,0x00000029,
++0x00000028,0x00050084,0x00000006,0x0000002c,
++0x0000000d,0x0000002b,0x00050080,0x00000006,
++0x0000002e,0x0000002c,0x00000011,0x00050084,
++0x00000006,0x00000031,0x0000000d,0x00000030,
++0x00050080,0x00000006,0x00000033,0x00000031,
++0x00000011,0x00050080,0x00000006,0x00000035,
++0x00000033,0x0000006a,0x00060041,0x00000036,
++0x00000037,0x00000029,0x00000026,0x0000002e,
++0x0005003e,0x00000037,0x00000035,0x00000002,
++0x00000004,0x00050080,0x00000006,0x00000039,
++0x0000006a,0x00000020,0x000200f9,0x00000014,
++0x000200f8,0x00000016,0x00050089,0x00000006,
++0x00000040,0x0000000d,0x0000003f,0x00040070,
++0x0000003a,0x00000041,0x00000040,0x00050086,
++0x00000006,0x00000043,0x0000000d,0x0000003f,
++0x00040070,0x0000003a,0x00000044,0x00000043,
++0x00050050,0x0000003b,0x00000045,0x00000041,
++0x00000044,0x00050041,0x0000003c,0x00000051,
++0x00000050,0x00000011,0x0004003d,0x0000003b,
++0x00000052,0x00000051,0x00050081,0x0000003b,
++0x00000053,0x00000045,0x00000052,0x00050085,
++0x0000003b,0x00000056,0x00000053,0x0000006d,
++0x0005008e,0x0000003b,0x0000005f,0x00000056,
++0x0000005e,0x00050083,0x0000003b,0x00000061,
++0x0000005f,0x0000004c,0x00050051,0x0000003a,
++0x00000062,0x00000061,0x00000000,0x00050051,
++0x0000003a,0x00000063,0x00000061,0x00000001,
++0x00070050,0x00000057,0x00000064,0x00000062,
++0x00000063,0x00000047,0x00000049,0x00050041,
++0x00000065,0x00000066,0x0000005c,0x00000026,
++0x0003003e,0x00000066,0x00000064,0x0003003e,
++0x00000068,0x0000000d,0x000100fd,0x00010038}

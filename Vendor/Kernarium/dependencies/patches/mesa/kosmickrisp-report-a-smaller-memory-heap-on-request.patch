@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 04:56:07 +0900
+Subject: [PATCH] kosmickrisp: report a smaller memory heap on request
+
+kk_get_sysmem_heap_size() reports all of the system's memory as the one
+memory heap: 64 GiB on a Mac Studio and 4 GiB on an iPad mini 6.  What the
+host and the applications above it size from the heap follows the machine.
+Zink's cache of freed buffers was an eighth of it, 8 GiB against 512 MiB; the
+memory budget of the heap differs in the same direction; and an application
+that sizes its caches from the heap sees a different number on each.  A
+measurement taken on the Mac for a guest that runs on the iPad then differs
+for reasons that have nothing to do with the guest.
+
+MESA_KK_SYSMEM_HEAP_MIB replaces the heap size with a number of MiB, so a
+measurement run on the Mac can report the 4096 the iPad does.  Only a whole
+number from 1 up to the system's memory is honoured; an empty, zero,
+negative, trailing-garbage or overflowing value, and a value larger than the
+system's memory, which would claim memory the machine does not have, keep the
+system's memory, as MESA_KK_HEAP_SIZE_MIB ignores a value it cannot use.
+Unset, nothing changes.
+
+VK_EXT_memory_budget now reports every heap's budget as at most the heap's
+size, as the specification requires of it; the budget the heap computes from
+Metal's recommended working set and the system's use can exceed a heap that
+was reported smaller.
+
+tests/test_sysmem_heap_override.c creates an instance for each setting and
+checks the heap size against the system's memory, the budget of every heap
+against its size, and the values that are ignored.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_physical_device.c   |  24 +++-
+ src/kosmickrisp/vulkan/meson.build            |   1 +
+ .../vulkan/tests/test_sysmem_heap_override.c  | 113 ++++++++++++++++++
+ 3 files changed, 137 insertions(+), 1 deletion(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_sysmem_heap_override.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index b8132353702e9af3ae4020679ba71755bef6e825..b97f3e616386dd8f89f9d34b322e6c554f4c6487 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -26,6 +26,9 @@
+ #include "vk_drm_syncobj.h"
+ #include "vk_shader_module.h"
+ 
++#include <errno.h>
++#include <stdlib.h>
++
+ static uint32_t
+ kk_get_vk_version()
+ {
+@@ -1056,6 +1059,12 @@ kk_physical_device_free_disk_cache(struct kk_physical_device *pdev)
+ #endif
+ }
+ 
++/* The heap is the system's memory, and MESA_KK_SYSMEM_HEAP_MIB reports less
++ * of it.  What an application, or Zink beneath it, sizes from the heap then
++ * follows the setting instead of the machine: a Mac with 64 GiB and an iPad
++ * with 4 GiB run the same guest alike when both report 4096.  Only a whole
++ * number of MiB from 1 up to the physical memory is honoured; anything else,
++ * a larger heap included, keeps the system's memory. */
+ static uint64_t
+ kk_get_sysmem_heap_size(void)
+ {
+@@ -1064,6 +1073,16 @@ kk_get_sysmem_heap_size(void)
+    if (!os_get_total_physical_memory(&sysmem_size_B))
+       return 0;
+ 
++   const char *override = getenv("MESA_KK_SYSMEM_HEAP_MIB");
++   if (override != NULL && override[0] != '\0') {
++      char *end = NULL;
++      errno = 0;
++      const unsigned long long requested_MiB = strtoull(override, &end, 10);
++      if (errno == 0 && *end == '\0' && override[0] != '-' &&
++          requested_MiB >= 1 && requested_MiB <= (sysmem_size_B >> 20))
++         return (uint64_t)requested_MiB << 20;
++   }
++
+    return sysmem_size_B;
+ }
+ 
+@@ -1338,7 +1357,10 @@ kk_GetPhysicalDeviceMemoryProperties2(
+ 
+          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
+             const struct kk_memory_heap *heap = &pdev->mem_heaps[i];
+-            p->heapBudget[i] = heap->budget ? heap->budget(pdev) : 0;
++            /* A budget is at most its heap, whatever the heap is reported
++             * as. */
++            p->heapBudget[i] =
++               heap->budget ? MIN2(heap->budget(pdev), heap->size) : 0;
+             p->heapUsage[i] = heap->used ? heap->used(pdev) : 0;
+          }
+ 
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 4e1365f48c3881ef42f66fa9d07d1a0f9677f07f..8fed05bdee0170c34c0a18b281bd5630df373801 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -404,6 +404,7 @@ if with_tests
+       ['address_binding_planes', []],
+       ['drm_plane_offset', []],
+       ['undescribed_format', []],
++      ['sysmem_heap_override', []],
+       ['query_pool_lifetime', ['NSZombieEnabled=YES']],
+     ]
+       test(
+diff --git a/src/kosmickrisp/vulkan/tests/test_sysmem_heap_override.c b/src/kosmickrisp/vulkan/tests/test_sysmem_heap_override.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..83f5f5c05f17634d08441366bebd787017ae974a
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_sysmem_heap_override.c
+@@ -0,0 +1,113 @@
++/* SPDX-License-Identifier: MIT */
++
++/* The one memory heap the driver reports is the system's physical memory, and
++ * MESA_KK_SYSMEM_HEAP_MIB reports less of it, so that what Zink and an
++ * application size from the heap is the same on a Mac with 64 GiB and an iPad
++ * with 4 GiB.  The setting is read when the physical device is created, so each
++ * case creates an instance of its own.  Every heap's budget stays at most its
++ * size, which the Vulkan specification requires and a smaller heap makes
++ * likely to matter.  A value that is not a whole number of MiB from 1 up to
++ * the physical memory is ignored, as are an empty one and an overflowing one:
++ * a larger heap would claim memory the machine does not have. */
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/sysctl.h>
++
++#include "kk_test.h"
++
++static uint64_t
++physical_memory(void)
++{
++   uint64_t bytes = 0;
++   size_t length = sizeof(bytes);
++   CHECK(sysctlbyname("hw.memsize", &bytes, &length, NULL, 0) == 0);
++   return bytes;
++}
++
++/* The size of the first heap, after checking every heap's budget against its
++ * own. */
++static uint64_t
++reported_heap(const char *setting)
++{
++   if (setting != NULL)
++      setenv("MESA_KK_SYSMEM_HEAP_MIB", setting, 1);
++   else
++      unsetenv("MESA_KK_SYSMEM_HEAP_MIB");
++
++   struct kk_test_device t;
++   kk_test_create_instance(&t, NULL);
++   CHECK(t.memory.memoryHeapCount >= 1);
++
++   PFN_vkGetPhysicalDeviceMemoryProperties2 get_memory_properties2 =
++      (PFN_vkGetPhysicalDeviceMemoryProperties2)kk_test_instance_proc(
++         &t, "vkGetPhysicalDeviceMemoryProperties2");
++   VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
++   VkPhysicalDeviceMemoryProperties2 properties = {
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
++   properties.pNext = &budget;
++   get_memory_properties2(t.physical, &properties);
++
++   CHECK(properties.memoryProperties.memoryHeapCount ==
++         t.memory.memoryHeapCount);
++   for (uint32_t i = 0; i < t.memory.memoryHeapCount; i++) {
++      CHECK(properties.memoryProperties.memoryHeaps[i].size ==
++            t.memory.memoryHeaps[i].size);
++      CHECK(budget.heapBudget[i] <= t.memory.memoryHeaps[i].size);
++   }
++
++   const uint64_t size = t.memory.memoryHeaps[0].size;
++   fprintf(stderr, "MESA_KK_SYSMEM_HEAP_MIB=%s: heap %llu MiB, budget %llu MiB\n",
++           setting ? setting : "(unset)", (unsigned long long)(size >> 20),
++           (unsigned long long)(budget.heapBudget[0] >> 20));
++   kk_test_destroy(&t);
++   return size;
++}
++
++int
++main(void)
++{
++   const uint64_t physical = physical_memory();
++   const uint64_t physical_MiB = physical >> 20;
++
++   /* Without the setting the heap is the physical memory. */
++   CHECK(reported_heap(NULL) == physical);
++
++   /* The sizes a measurement run sets, and the edges of what is honoured. */
++   CHECK(reported_heap("1") == (1ull << 20));
++   if (physical_MiB >= 4096)
++      CHECK(reported_heap("4096") == (4096ull << 20));
++   char edge[32];
++   snprintf(edge, sizeof(edge), "%llu", (unsigned long long)physical_MiB);
++   CHECK(reported_heap(edge) == (physical_MiB << 20));
++   snprintf(edge, sizeof(edge), "%llu", (unsigned long long)(physical_MiB - 1));
++   CHECK(reported_heap(edge) == ((physical_MiB - 1) << 20));
++
++   /* Anything else keeps the physical memory. */
++   snprintf(edge, sizeof(edge), "%llu", (unsigned long long)(physical_MiB + 1));
++   static const char *const ignored[] = {
++      "",
++      "0",
++      "-4096",
++      "+",
++      "abc",
++      "4096abc",
++      "4096 ",
++      " -1",
++      "1099511627776",
++      /* 2^44 MiB is 2^64 bytes, which wraps to zero. */
++      "17592186044416",
++      "99999999999999999999999",
++   };
++   for (unsigned i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++)
++      CHECK(reported_heap(ignored[i]) == physical);
++   CHECK(reported_heap(edge) == physical);
++
++   unsetenv("MESA_KK_SYSMEM_HEAP_MIB");
++   printf("the reported heap follows MESA_KK_SYSMEM_HEAP_MIB and no budget exceeds it\n");
++   return 0;
++}

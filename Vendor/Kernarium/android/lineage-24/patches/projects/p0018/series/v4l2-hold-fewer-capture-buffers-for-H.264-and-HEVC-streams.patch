@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:40:18 +0000
+Subject: [PATCH] v4l2: hold fewer capture buffers for H.264 and HEVC streams
+
+The decoder told the framework to keep 16 frames in flight for an H.264 or
+HEVC stream, which the framework turns into 20 capture buffers. At 4K a
+capture buffer is 11.87 MiB in the guest and again on the host, so a stream
+held 237 MiB on each side. 16 is the deepest reordering a stream can have,
+and suits a decoder that keeps the pictures it reorders in its capture
+buffers. This device reorders on the host, and its capture buffers hold no
+pictures that wait for their display order.
+
+The framework stops queuing work once the works that wait for an output, with
+their input released, reach the pipeline delay plus the output delay plus 4,
+and the host releases a picture once more than the stream's reorder depth R of
+them wait, so a stream stalls only when R exceeds the sum of the two delays
+by more than 3. R is at most 16, so a sum of 13 stalls no stream. Only a work
+that is done can tell the framework another delay, and a stream that needs the
+whole limit completes none before it has it, so the sum is set for every
+stream at the start rather than lowered for a stream that reorders little.
+
+The framework sizes the capture buffer queue from the output delay and the
+input buffer queue from the pipeline delay, each plus 4, and reads both once,
+in one query, when it starts. A capture buffer costs 23.7 MiB at 4K (the
+guest's and the host's picture), 5.9 MiB at 1080p, and an input block 4 and 2
+MiB, so the sum of 13 is split by the picture size the client configures. A
+picture above 1920x1088 takes 4 and 9: 8 capture buffers, not 14, and 13
+input slots, not 7. At 4K that is 142 MiB less for the pictures and 24 MiB
+more for the input blocks. A picture of that size or less takes 8 and 5: 12
+capture buffers and 9 input slots. On an iPad guest of 2 vCPUs a 60 fps
+1080p stream decoded 10 to 13 percent fewer frames with 8 capture buffers
+than with 14 while the guest was busy (the first minutes after a boot, or a busy loop
+beside the player), and 12 decoded as many as 14. At 1080p that holds 15.8
+MiB more than 4 and 9 would and 7.9 MiB less than the old 10 and 3. The stall
+limit stays the 17 works it was for every size.
+
+Only the configured size decides. The picture size the device states for the
+stream from its SPS changes neither the buffers the framework has sized nor
+the limit, so a stream configured at 1080p whose SPS declares 4K keeps its 12
+capture buffers, and one configured at 4K whose SPS declares 1080p keeps its
+8; neither can stall. The V4L2 capture queue is sized from the delay the
+instance reports.
+
+The delays are a pure function of the size in DecodeDelays.h, which the
+tests of the outer repository compile and run.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ README.md                                     |  9 ++
+ components/DecodeInterface.cpp                | 90 +++++++++++++++----
+ .../v4l2_codec2/components/DecodeDelays.h     | 68 ++++++++++++++
+ .../v4l2_codec2/components/DecodeInterface.h  | 18 +++-
+ v4l2/V4L2ComponentFactory.cpp                 |  7 +-
+ v4l2/V4L2DecodeComponent.cpp                  |  7 +-
+ 6 files changed, 175 insertions(+), 24 deletions(-)
+ create mode 100644 components/include/v4l2_codec2/components/DecodeDelays.h
+
+diff --git a/README.md b/README.md
+index 2192544d390053520b6dc2daad5ffd128090100d..13cdf745c36132570fe5c7c31e27529afc79e460 100644
+--- a/README.md
++++ b/README.md
+@@ -437,6 +437,15 @@ component reads the largest such size from the device and sizes its input blocks
+ from the picture size up to it (1 MiB to 16 MiB), and copies a block that a
+ client of the block model sized smaller into a pool block.
+ 
++### Output and Pipeline Delays
++
++The output and pipeline delays of an H.264 or HEVC stream add up to 13 frames,
++and the picture size the client configures decides the split (*DecodeDelays.h*).
++The framework reads them once when it starts, so the size the device later states
++for the stream (its SPS) changes neither: a stream configured at 1080p whose SPS
++declares 4K keeps the 12 capture buffers it was sized for, and one configured at
++4K whose SPS declares 1080p keeps 8.
++
+ ### Picture Size
+ 
+ *C2_PARAMKEY_PICTURE_SIZE* takes any even width and height from 16 up and
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index d2b322b00edd8f59c95e25e5cee85338e452a6d7..81fa9f0935efebc48f6909450ca5ef0f461463a8 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -132,6 +132,20 @@ C2R DecodeInterface::SizeSetter(bool /* mayBlock */,
+             .plus(videoSize.F(videoSize.v.height).validatePossible(videoSize.v.height));
+ }
+ 
++// static
++C2R DecodeInterface::OutputDelaySetter(bool /* mayBlock */, C2P<C2PortDelayTuning::output>& me,
++                                       const C2P<C2StreamPictureSizeInfo::output>& size) {
++    me.set().value = getReorderingDelays(size.v.width, size.v.height).output;
++    return C2R::Ok();
++}
++
++// static
++C2R DecodeInterface::PipelineDelaySetter(bool /* mayBlock */, C2P<C2PipelineDelayTuning>& me,
++                                         const C2P<C2StreamPictureSizeInfo::output>& size) {
++    me.set().value = getReorderingDelays(size.v.width, size.v.height).pipeline;
++    return C2R::Ok();
++}
++
+ C2R DecodeInterface::InputSizeSetter(bool /* mayBlock */,
+                                      C2P<C2StreamMaxBufferSizeInfo::input>& inputSize,
+                                      const C2P<C2StreamPictureSizeInfo::output>& size,
+@@ -392,22 +406,6 @@ DecodeInterface::DecodeInterface(const std::string& name,
+                          .withFields({C2F(mOutputMemoryUsage, value).any()})
+                          .withSetter(Setter<decltype(*mOutputMemoryUsage)>::NonStrictValueWithNoDeps)
+                          .build());
+-    addParameter(
+-            DefineParam(mOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
+-                    .withConstValue(new C2PortDelayTuning::output(getOutputDelay(*mVideoCodec)))
+-                    .build());
+-
+-    // This value is set according to the relation between kNumInputBuffers = 16 and the current
+-    // codec2 framework implementation. Specifically, this generally limits the framework to using
+-    // <= 16 input buffers, although certain timing of events can result in a few more input buffers
+-    // being allocated but rarely used. This lets us avoid remapping v4l2 input buffers and DMA
+-    // buffers in the common case. We could go up to 4 here, to limit the framework to
+-    // simultaneously enqueuing 16 input buffers, but there doesn't seem to be much of an a
+-    // performance improvement from that.
+-    addParameter(DefineParam(mPipelineDelay, C2_PARAMKEY_PIPELINE_DELAY)
+-                         .withConstValue(new C2PipelineDelayTuning(3))
+-                         .build());
+-
+     addParameter(DefineParam(mInputMediaType, C2_PARAMKEY_INPUT_MEDIA_TYPE)
+                          .withConstValue(AllocSharedString<C2PortMediaTypeSetting::input>(
+                                  inputMime.c_str()))
+@@ -431,6 +429,48 @@ DecodeInterface::DecodeInterface(const std::string& name,
+                          .withSetter(SizeSetter)
+                          .build());
+ 
++    // H.264 and HEVC split a fixed sum of the two delays by the picture size the client
++    // configures (DecodeDelays.h). The framework reads the delays once, with a single query, when
++    // it starts, and the other codecs have constants.
++    if (*mVideoCodec == VideoCodec::H264 || *mVideoCodec == VideoCodec::HEVC) {
++        addParameter(DefineParam(mOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
++                             .withDefault(new C2PortDelayTuning::output(
++                                     getOutputDelay(*mVideoCodec, 0, 0)))
++                             .withFields({C2F(mOutputDelay, value)
++                                                  .inRange(0, kReorderingDelaySum)})
++                             .calculatedAs(OutputDelaySetter, mSize)
++                             .build());
++    } else {
++        addParameter(DefineParam(mOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
++                             .withConstValue(new C2PortDelayTuning::output(
++                                     getOutputDelay(*mVideoCodec, 0, 0)))
++                             .build());
++    }
++
++    // This value is set according to the relation between kNumInputBuffers = 16 and the current
++    // codec2 framework implementation. Specifically, this generally limits the framework to using
++    // <= 16 input buffers, although certain timing of events can result in a few more input buffers
++    // being allocated but rarely used. This lets us avoid remapping v4l2 input buffers and DMA
++    // buffers in the common case. We could go up to 4 here, to limit the framework to
++    // simultaneously enqueuing 16 input buffers, but there doesn't seem to be much of an a
++    // performance improvement from that. H.264 and HEVC take more, which with their output delay
++    // gives the stall limit of kReorderingDelaySum: at most 13 inputs wait for the device, which
++    // has 16 buffers for them.
++    if (*mVideoCodec == VideoCodec::H264 || *mVideoCodec == VideoCodec::HEVC) {
++        addParameter(DefineParam(mPipelineDelay, C2_PARAMKEY_PIPELINE_DELAY)
++                             .withDefault(new C2PipelineDelayTuning(
++                                     getPipelineDelay(*mVideoCodec, 0, 0)))
++                             .withFields({C2F(mPipelineDelay, value)
++                                                  .inRange(0, kReorderingDelaySum)})
++                             .calculatedAs(PipelineDelaySetter, mSize)
++                             .build());
++    } else {
++        addParameter(DefineParam(mPipelineDelay, C2_PARAMKEY_PIPELINE_DELAY)
++                             .withConstValue(new C2PipelineDelayTuning(
++                                     getPipelineDelay(*mVideoCodec, 0, 0)))
++                             .build());
++    }
++
+     // The system resources of the instance, which the framework adds up with the capacity the store
+     // reports into the globally available resources. The pixel rate is among them only if the
+     // store has a pixel rate capacity to take it from.
+@@ -626,16 +666,28 @@ c2_status_t DecodeInterface::queryColorAspects(
+     return status;
+ }
+ 
+-uint32_t DecodeInterface::getOutputDelay(VideoCodec codec) {
++uint32_t DecodeInterface::getPipelineDelay(VideoCodec codec, uint32_t width, uint32_t height) {
++    switch (codec) {
++    case VideoCodec::H264:
++    case VideoCodec::HEVC:
++        return getReorderingDelays(width, height).pipeline;
++    case VideoCodec::VP8:
++    case VideoCodec::VP9:
++    case VideoCodec::AV1:
++        return kBasePipelineDelay;
++    }
++}
++
++uint32_t DecodeInterface::getOutputDelay(VideoCodec codec, uint32_t width, uint32_t height) {
+     switch (codec) {
+     case VideoCodec::H264:
+         // Due to frame reordering an H264 decoder might need multiple additional input frames to be
+         // queued before being able to output the associated decoded buffers. We need to tell the
+         // codec2 framework that it should not stop queuing new work items until the maximum number
+         // of frame reordering is reached, to avoid stalling the decoder.
+-        return 16;
++        return getReorderingDelays(width, height).output;
+     case VideoCodec::HEVC:
+-        return 16;
++        return getReorderingDelays(width, height).output;
+     case VideoCodec::VP8:
+         // The decoder might held a few frames as a reference for decoding. Since Android T
+         // the Codec2 is more prone to timeout the component if one is not producing frames. This
+diff --git a/components/include/v4l2_codec2/components/DecodeDelays.h b/components/include/v4l2_codec2/components/DecodeDelays.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c85aaf6ff515b3083fe4169280455c3ebc192a23
+--- /dev/null
++++ b/components/include/v4l2_codec2/components/DecodeDelays.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Android Open Source Project
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef ANDROID_V4L2_CODEC2_COMPONENTS_DECODE_DELAYS_H
++#define ANDROID_V4L2_CODEC2_COMPONENTS_DECODE_DELAYS_H
++
++#include <cstdint>
++
++namespace android {
++
++// The output and pipeline delays of H.264 and HEVC, in frames. The codec2 framework sizes the
++// capture buffer queue from the output delay and the input buffer queue from the pipeline delay
++// (and the input delay, which is 0), each plus 4 of its own for smooth playback.
++//
++// A decoder that keeps the pictures it reorders in its capture buffers needs 16, the deepest
++// reordering a stream can have, as its output delay. This device reorders on the host, and its
++// capture buffers hold no pictures that wait for their display order, so the delays only keep the
++// framework feeding the decoder until the host releases a picture. The framework stops queuing
++// work once the works that wait for an output, with their input already released, reach the
++// pipeline delay plus the output delay plus 4, and the host releases a picture once more than the
++// stream's reorder depth R of them wait, so it needs R + 1 works queued: no stream stalls while
++// R <= the pipeline delay + the output delay + 3. R is at most 16 (the HEVC limit,
++// sps_max_num_reorder_pics, is 15; an H.264 stream without a bitstream restriction can reach 16),
++// which a sum of 13 covers. Only a work that is done can tell the framework another delay, and a
++// stream that needs the whole limit completes none before it has it, so the sum is the same for
++// every stream and set at the start.
++struct DecodeDelays {
++    uint32_t output;
++    uint32_t pipeline;
++};
++
++constexpr uint32_t kReorderingDelaySum = 13;
++
++// What the sum is spent on depends on what a capture buffer costs. A picture is held in the guest
++// and again on the host, so a capture buffer costs 23.7 MiB at 4K, 5.9 MiB at 1080p and 2.6 MiB at
++// 720p, where an input block costs 4, 2 and 1 MiB.
++//
++// A picture above 1080p takes an output delay of 4: 8 capture buffers and 13 input slots, 142 MiB
++// less than 14 capture buffers and 7 input slots at 4K. A 60 fps stream at 1080p or below is
++// bound by how many pictures the decoder can have in flight when the guest is busy (a 2 vCPU
++// guest, the minutes after a boot): 8 capture buffers decoded 10 to 13 percent fewer frames
++// there than 14 and 12 decoded as many as 14, so those pictures take an output delay of 8: 12
++// capture buffers and 9 input slots.
++constexpr DecodeDelays kLargePictureDelays = {4, 9};
++constexpr DecodeDelays kSmallPictureDelays = {8, 5};
++static_assert(kLargePictureDelays.output + kLargePictureDelays.pipeline == kReorderingDelaySum,
++              "a large picture must keep the stall limit");
++static_assert(kSmallPictureDelays.output + kSmallPictureDelays.pipeline == kReorderingDelaySum,
++              "a small picture must keep the stall limit");
++
++// The largest picture, in luma samples, that takes the small split: 1920x1088, the coded size of
++// 1080p.
++constexpr uint64_t kSmallPictureMaxLumaSamples = 1920ull * 1088ull;
++
++// The delays of an H.264 or HEVC stream configured for a picture of this size. Only the size the
++// client configures decides: the framework reads the delays once when it starts, and the picture
++// size the device later states for the stream changes neither the buffers it has sized nor the
++// limit, whichever side of the line it falls on.
++constexpr DecodeDelays getReorderingDelays(uint32_t width, uint32_t height) {
++    return static_cast<uint64_t>(width) * height <= kSmallPictureMaxLumaSamples
++                   ? kSmallPictureDelays
++                   : kLargePictureDelays;
++}
++
++}  // namespace android
++
++#endif  // ANDROID_V4L2_CODEC2_COMPONENTS_DECODE_DELAYS_H
+diff --git a/components/include/v4l2_codec2/components/DecodeInterface.h b/components/include/v4l2_codec2/components/DecodeInterface.h
+index 338b4b10746981103b7763ff0c431ac48e33387d..db1feeedab1311ceca2b7a8e29e7d27cd769008b 100644
+--- a/components/include/v4l2_codec2/components/DecodeInterface.h
++++ b/components/include/v4l2_codec2/components/DecodeInterface.h
+@@ -14,6 +14,7 @@
+ 
+ #include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/common/VideoTypes.h>
++#include <v4l2_codec2/components/DecodeDelays.h>
+ 
+ namespace android {
+ 
+@@ -43,7 +44,18 @@ public:
+     // Surface which no video encoder reads gets 8-bit YUV 4:2:0, since the host cannot show P010.
+     HalPixelFormat getOutputPixelFormat() const;
+ 
+-    static uint32_t getOutputDelay(VideoCodec codec);
++    // The output delay of a codec for a stream configured for a picture of this size: the frames
++    // that the framework adds its own 4 to for the capture buffer queue. The size matters only to
++    // H.264 and HEVC, which split a fixed sum with the pipeline delay by it (DecodeDelays.h).
++    static uint32_t getOutputDelay(VideoCodec codec, uint32_t width, uint32_t height);
++    // The pipeline delay of a codec: the frames the framework keeps in flight besides the output
++    // delay and its own 4. kBasePipelineDelay unless the codec reorders in the device (H.264 and
++    // HEVC), where the stall limit is the sum of the two.
++    static constexpr uint32_t kBasePipelineDelay = 3;
++    static uint32_t getPipelineDelay(VideoCodec codec, uint32_t width, uint32_t height);
++    // The output delay the instance reports to the framework, which the picture size it is
++    // configured for decides.
++    uint32_t getConfiguredOutputDelay() const { return mOutputDelay->value; }
+ 
+     // The size of the coded buffers the decoder asks the device for, which an input block is at
+     // least as large as when it is queued: the maximum input size, which follows the picture size
+@@ -72,6 +84,10 @@ private:
+     // Configurable parameter setters.
+     static C2R ProfileLevelSetter(bool mayBlock, C2P<C2StreamProfileLevelInfo::input>& info);
+     static C2R SizeSetter(bool mayBlock, C2P<C2StreamPictureSizeInfo::output>& videoSize);
++    static C2R OutputDelaySetter(bool mayBlock, C2P<C2PortDelayTuning::output>& me,
++                                 const C2P<C2StreamPictureSizeInfo::output>& size);
++    static C2R PipelineDelaySetter(bool mayBlock, C2P<C2PipelineDelayTuning>& me,
++                                   const C2P<C2StreamPictureSizeInfo::output>& size);
+     static C2R InputSizeSetter(bool mayBlock, C2P<C2StreamMaxBufferSizeInfo::input>& inputSize,
+                                const C2P<C2StreamPictureSizeInfo::output>& size,
+                                const C2P<C2V4l2InputBlockSizeSetting>& inputBlockSize);
+diff --git a/v4l2/V4L2ComponentFactory.cpp b/v4l2/V4L2ComponentFactory.cpp
+index 4493a22daeef46d526e65c1814a2c8206720fac3..00446a9ab9e7dba5fcc941d5677512a64a73a02f 100644
+--- a/v4l2/V4L2ComponentFactory.cpp
++++ b/v4l2/V4L2ComponentFactory.cpp
+@@ -54,7 +54,12 @@ V4L2ComponentFactory::V4L2ComponentFactory(const std::string& componentName, boo
+     constexpr nsecs_t kMinFrameIntervalNs = 1000000000ull / 60;
+     uint32_t delayCount = 0;
+     for (auto c : kAllCodecs) {
+-        delayCount = std::max(delayCount, DecodeInterface::getOutputDelay(c));
++        // The frames a decoder can hold back: the output delay and the pipeline delay beyond the
++        // base one, which the interval has always been based on. The sum of the two does not
++        // depend on the picture size.
++        delayCount = std::max(delayCount, DecodeInterface::getOutputDelay(c, 0, 0) +
++                                                  DecodeInterface::getPipelineDelay(c, 0, 0) -
++                                                  DecodeInterface::kBasePipelineDelay);
+     }
+     utils::InputBufferManager::setNotificationInterval(delayCount * kMinFrameIntervalNs / 2);
+ }
+diff --git a/v4l2/V4L2DecodeComponent.cpp b/v4l2/V4L2DecodeComponent.cpp
+index 3835e0fbc7e5b390a6aa1f3ab7ec2b6f0f8249aa..88ae407a4eaf9e3f00cc9ac1d4129fc0c88f2694 100644
+--- a/v4l2/V4L2DecodeComponent.cpp
++++ b/v4l2/V4L2DecodeComponent.cpp
+@@ -22,7 +22,7 @@ namespace {
+ // input buffers, CCodec may timeout due to waiting for a available output buffer.
+ // This function returns the minimum number of output buffers to prevent the buffers from being
+ // exhausted before CCBC pauses sending input buffers.
+-size_t getMinNumOutputBuffers(VideoCodec codec) {
++size_t getMinNumOutputBuffers(uint32_t outputDelay) {
+     // The constant values copied from CCodecBufferChannel.cpp.
+     // (b/184020290): Check the value still sync when seeing error message from CCodec:
+     // "previous call to queue exceeded timeout".
+@@ -35,7 +35,7 @@ size_t getMinNumOutputBuffers(VideoCodec codec) {
+     // - MediaCodec output slots: output delay + kSmoothnessFactor
+     // - Surface: kRenderingDepth
+     // - Component: kExtraNumOutputBuffersForDecoder
+-    return DecodeInterface::getOutputDelay(codec) + kSmoothnessFactor + kRenderingDepth +
++    return outputDelay + kSmoothnessFactor + kRenderingDepth +
+            kExtraNumOutputBuffersForDecoder;
+ }
+ }  // namespace
+@@ -96,7 +96,8 @@ void V4L2DecodeComponent::startTask(c2_status_t* status, ::base::WaitableEvent*
+     }
+     const size_t inputBufferSize = mIntfImpl->getInputBufferSize();
+     const ui::Size pictureSize = mIntfImpl->getPictureSize();
+-    const size_t minNumOutputBuffers = getMinNumOutputBuffers(*codec);
++    const size_t minNumOutputBuffers =
++            getMinNumOutputBuffers(mIntfImpl->getConfiguredOutputDelay());
+ 
+     // ::base::Unretained(this) is safe here because |mDecoder| is always destroyed before
+     // |mDecoderThread| is stopped, so |*this| is always valid during |mDecoder|'s lifetime.

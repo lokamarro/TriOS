@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 20:44:48 +0900
+Subject: [PATCH] kosmickrisp: use wide buffer accesses where NIR proves the
+ alignment
+
+Every global load and store is emitted through MSL's packed vector types.
+Packed is the safe default -- it aliases a scalar array, so any alignment
+works -- but it also costs the shader one access per component, because the
+compiler cannot assume the address is aligned enough for a wide one.
+
+NIR already carries the alignment it proved for each access. Where that
+alignment covers the unpacked vector, emit the unpacked type and let one
+access cover the whole vector. Two- and four-component vectors only: an
+unpacked three-component vector occupies four lanes, so a wide access would
+read or write past the value.
+
+A wide load covers at most sixteen bytes. Apple's GPU backend compiler
+cannot legalize a wider one: a four-component 64-bit load aborts the Metal
+compiler service with "unable to legalize instruction" on the <4 x s64> value
+the load produces, and vkCreateGraphicsPipelines answers
+VK_ERROR_INVALID_SHADER_NV. A load that wide is emitted as two wide halves
+instead, which keeps the proven alignment and costs two accesses rather than
+the eight a packed four-component 64-bit vector would.
+
+This matters most in a loop over a storage buffer, which is where a shader
+spends its time. dEQP-VK.spirv_assembly.type.vec4.i64 loops over arrays of
+i64vec4, whose std430 alignment is the full 32 bytes.
+---
+ src/kosmickrisp/compiler/nir_to_msl.c | 160 +++++++++++++++++++-------
+ 1 file changed, 119 insertions(+), 41 deletions(-)
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 943bdf2d4d8aeb9f4f4d7d60745a111fe03dc1dd..c9696a3a1e39c095624822797e6c74b179e758cd 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1109,14 +1109,76 @@ image_coord_swizzle(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+    texture_src_coord_swizzle(ctx, &instr->src[1], comps, is_cube, is_array);
+ }
+ 
++/* MSL's unpacked vector types carry their natural alignment, so one access
++ * covers the whole vector; the packed forms alias a scalar array and cost an
++ * access per component.  Packed is the safe default because a shader address
++ * is only as aligned as NIR can prove, so ask NIR.  A three-component vector
++ * stays packed whatever the alignment: unpacked occupies four lanes, and a
++ * wide access would read or write the fourth.
++ */
++static bool
++msl_access_is_wide(unsigned bit_size, unsigned component_count, unsigned align)
++{
++   if (bit_size < 8u || (component_count != 2u && component_count != 4u))
++      return false;
++   return align >= (bit_size / 8u) * component_count;
++}
++
++/* Apple's GPU backend compiler cannot legalize a load of a vector wider than
++ * sixteen bytes.  A four-component 64-bit load aborts the Metal compiler
++ * service outright -- "unable to legalize instruction" on the <4 x s64> the
++ * load produces -- and the pipeline that needed it never builds.  Only the
++ * load side fails; the matching store compiles, and so does a four-component
++ * 64-bit load the shader never feeds into a subgroup reduction, so the
++ * boundary below is the access width rather than the shape that exposes it.
++ *
++ * Halving it keeps both the proven alignment and most of the saving: the
++ * access becomes two wide halves instead of the eight a packed vector would
++ * cost.
++ */
++#define MSL_WIDE_ACCESS_MAX_BYTES 16u
++
++static bool
++msl_wide_load_is_halved(unsigned bit_size, unsigned component_count, bool wide)
++{
++   return wide && (bit_size / 8u) * component_count > MSL_WIDE_ACCESS_MAX_BYTES;
++}
++
++/* How a global access of `value` - the loaded def or the stored source - is
++ * emitted: wide when NIR proves the alignment, and, for a load, halved when
++ * wide is more than the backend can legalize. */
++static void
++msl_access_shape(nir_intrinsic_instr *instr, const nir_def *value, bool *wide,
++                 bool *halved)
++{
++   *wide = msl_access_is_wide(value->bit_size, value->num_components,
++                              nir_intrinsic_align(instr));
++   *halved =
++      msl_wide_load_is_halved(value->bit_size, value->num_components, *wide);
++}
++
++/* "ulong4" names its own half as "ulong2": only the widths this file ever
++ * calls wide reach here, and those spell their component count last.
++ */
++static void
++msl_half_vector_type(const char *type, char *out, size_t size)
++{
++   size_t length = strlen(type);
++
++   assert(length > 0u && length + 1u <= size && type[length - 1u] == '4');
++   memcpy(out, type, length);
++   out[length - 1u] = '2';
++   out[length] = '\0';
++}
++
+ /* Non-packed types have stricter alignment requirements that packed types.
+  * This helps us build a packed format for storage.
+  */
+ static void
+ src_to_packed(struct nir_to_msl_ctx *ctx, nir_src *src, const char *type,
+-              uint32_t component_count)
++              uint32_t component_count, bool wide)
+ {
+-   if (component_count == 1) {
++   if (component_count == 1 || wide) {
+       P(ctx, "%s(", type);
+    } else {
+       P(ctx, "packed_%s(", type);
+@@ -1125,42 +1187,50 @@ src_to_packed(struct nir_to_msl_ctx *ctx, nir_src *src, const char *type,
+    P(ctx, ")");
+ }
+ 
+-/* Non-packed types have stricter alignment requirements that packed types.
+- * This helps us cast the pointer to a packed type and then it builds the
+- * non-packed type for Metal usage.
+- */
++/* The address a global access reads: the base, plus the byte offset if the
++ * intrinsic has one. */
+ static void
+-src_to_packed_load(struct nir_to_msl_ctx *ctx, nir_src *src,
+-                   const char *addressing, const char *type,
+-                   uint32_t component_count)
++src_to_load_address(struct nir_to_msl_ctx *ctx, nir_src *src, nir_src *offset)
+ {
+-   if (component_count == 1) {
+-      P(ctx, "*(%s %s*)(", addressing, type);
+-   } else {
+-      P(ctx, "%s(*(%s packed_%s*)", type, addressing, type);
+-   }
+    src_to_msl(ctx, src);
+-   P(ctx, ")");
++   if (offset) {
++      P(ctx, " + ");
++      src_to_msl(ctx, offset);
++   }
+ }
+ 
+ /* Non-packed types have stricter alignment requirements that packed types.
+  * This helps us cast the pointer to a packed type and then it builds the
+- * non-packed type for Metal usage.
++ * non-packed type for Metal usage. `offset` may be NULL. A base plus offset is
++ * bracketed where the cast has to take in the sum, and a lone base where the
++ * half's byte offset is added to it.
+  */
+ static void
+-src_to_packed_load_offset(struct nir_to_msl_ctx *ctx, nir_src *src,
+-                          nir_src *offset, const char *addressing,
+-                          const char *type, uint32_t component_count)
++src_to_packed_load(struct nir_to_msl_ctx *ctx, nir_src *src, nir_src *offset,
++                   const char *addressing, const char *type,
++                   uint32_t component_count, bool wide, bool halved)
+ {
++   if (halved) {
++      char half[32];
++
++      msl_half_vector_type(type, half, sizeof(half));
++      P(ctx, "%s(*(%s %s*)(", type, addressing, half);
++      src_to_load_address(ctx, src, offset);
++      P(ctx, "), *(%s %s*)(%s", addressing, half, offset ? "" : "(");
++      src_to_load_address(ctx, src, offset);
++      P(ctx, "%s + %uu))", offset ? "" : ")", MSL_WIDE_ACCESS_MAX_BYTES);
++      return;
++   }
++   const char *bracket = offset ? "(" : "";
+    if (component_count == 1) {
+-      P(ctx, "*(%s %s*)((", addressing, type);
++      P(ctx, "*(%s %s*)(%s", addressing, type, bracket);
++   } else if (wide) {
++      P(ctx, "(*(%s %s*)%s", addressing, type, bracket);
+    } else {
+-      P(ctx, "%s(*(%s packed_%s*)(", type, addressing, type);
++      P(ctx, "%s(*(%s packed_%s*)%s", type, addressing, type, bracket);
+    }
+-   src_to_msl(ctx, src);
+-   P(ctx, " + ");
+-   src_to_msl(ctx, offset);
+-   P(ctx, "))");
++   src_to_load_address(ctx, src, offset);
++   P(ctx, "%s)", offset ? ")" : "");
+ }
+ 
+ /* KK_WORKAROUND_17 */
+@@ -1224,9 +1294,9 @@ src_to_coherent_store(struct nir_to_msl_ctx *ctx, nir_src *address,
+ static void
+ src_to_packed_store(struct nir_to_msl_ctx *ctx, nir_src *src,
+                     const char *addressing, const char *type,
+-                    uint32_t num_components)
++                    uint32_t num_components, bool wide)
+ {
+-   if (num_components == 1) {
++   if (num_components == 1 || wide) {
+       P_IND(ctx, "(*(%s %s*)", addressing, type);
+    } else {
+       P_IND(ctx, "(*(%s packed_%s*)", addressing, type);
+@@ -1669,16 +1739,20 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+                               type, instr->def.num_components);
+          P(ctx, ";\n");
+       } else {
+-         src_to_packed_load(ctx, &instr->src[0], addressing, type,
+-                            instr->def.num_components);
++         bool wide, halved;
++         msl_access_shape(instr, &instr->def, &wide, &halved);
++         src_to_packed_load(ctx, &instr->src[0], NULL, addressing, type,
++                            instr->def.num_components, wide, halved);
+          P(ctx, ";\n");
+       }
+       break;
+    }
+    case nir_intrinsic_load_global_constant: {
+-      src_to_packed_load(ctx, &instr->src[0], "constant",
++      bool wide, halved;
++      msl_access_shape(instr, &instr->def, &wide, &halved);
++      src_to_packed_load(ctx, &instr->src[0], NULL, "constant",
+                          msl_type_for_def(ctx->types, &instr->def),
+-                         instr->def.num_components);
++                         instr->def.num_components, wide, halved);
+       P(ctx, ";\n");
+       break;
+    }
+@@ -1687,9 +1761,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P(ctx, " < ");
+       src_to_msl(ctx, &instr->src[2]);
+       P(ctx, " ? ");
+-      src_to_packed_load_offset(ctx, &instr->src[0], &instr->src[1], "constant",
+-                                msl_type_for_def(ctx->types, &instr->def),
+-                                instr->def.num_components);
++      bool wide, halved;
++      msl_access_shape(instr, &instr->def, &wide, &halved);
++      src_to_packed_load(ctx, &instr->src[0], &instr->src[1], "constant",
++                         msl_type_for_def(ctx->types, &instr->def),
++                         instr->def.num_components, wide, halved);
+       P(ctx, " : 0;\n");
+       break;
+    }
+@@ -1713,10 +1789,10 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+          src_to_msl(ctx, &instr->src[1]);
+          P(ctx, ", memory_order_relaxed);\n");
+       } else {
+-         src_to_packed_load_offset(ctx, &instr->src[0], &instr->src[1],
+-                                   addressing,
+-                                   msl_type_for_def(ctx->types, &instr->def),
+-                                   instr->def.num_components);
++         bool wide, halved;
++         msl_access_shape(instr, &instr->def, &wide, &halved);
++         src_to_packed_load(ctx, &instr->src[0], &instr->src[1], addressing,
++                            type, instr->def.num_components, wide, halved);
+       }
+       P(ctx, ";\n");
+       break;
+@@ -1748,7 +1824,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+          src_to_msl(ctx, &instr->src[1]);
+          P(ctx, ", ")
+          src_to_packed(ctx, &instr->src[0], type,
+-                       instr->src[0].ssa->num_components);
++                       instr->src[0].ssa->num_components, false);
+          P(ctx, ", memory_order_relaxed);\n");
+       } else if (msl_coherent_access_is_atomic(ctx->disabled_workarounds,
+                                                ctx->types, instr)) {
+@@ -1759,13 +1835,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+             nir_intrinsic_write_mask(instr),
+             instr->src[0].ssa->num_components);
+       } else {
++         bool wide, halved;
++         msl_access_shape(instr, instr->src[0].ssa, &wide, &halved);
+          src_to_packed_store(ctx, &instr->src[1], addressing, type,
+-                             instr->src[0].ssa->num_components);
++                             instr->src[0].ssa->num_components, wide);
+          writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                           instr->num_components);
+          P(ctx, " = ")
+          src_to_packed(ctx, &instr->src[0], type,
+-                       instr->src[0].ssa->num_components);
++                       instr->src[0].ssa->num_components, wide);
+          writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                           instr->num_components);
+          P(ctx, ";\n");

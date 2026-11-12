@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 14:08:31 +0900
+Subject: [PATCH] uml: raise irq work locally instead of at the tick
+
+UML never implemented arch_irq_work_raise(), so the generic weak stub left
+queued work waiting for the next timer tick.  That is not just slow, it breaks
+callers that expect a raise to be serviced before their next allocation.
+
+bpf_mem_alloc prefills exactly one element per CPU once the unit size exceeds
+256 bytes and refills the rest from irq_work.  A non-preallocated BPF hash map
+with a value larger than a couple of hundred bytes therefore accepts one insert
+per CPU per tick: every burst fails with -ENOMEM after the first element.
+Android's ConnectivityService hits this immediately, because PermissionMonitor
+fills a 1024-byte-value BPF_F_NO_PREALLOC uid permission chunk map in a loop
+and dies with "Failed to update uid permission chunk map", crash-looping
+system_server.
+
+Publish a local IPI vector from arch_irq_work_raise() and run irq_work_run()
+when it is dispatched.  os_raise_local_ipi() only sets the pending bit: the
+carrier raising the vector is the carrier that consumes it, so it needs neither
+the wake pipe nor a Darwin signal, and it is safe to call with signals blocked.
+It deliberately does not bump guest_ipi_sequences, because a local vector is
+always raised from kernel code rather than while the CPU runs a translated
+guest block.
+
+arch_irq_work_has_interrupt() stays false so the timer tick keeps its existing
+backstop drain of the raised list; this change only makes the raise arrive much
+sooner.
+
+A local vector has no wake edge, so the idle wait must not block on one.
+os_send_ipi() writes the idle wake pipe only when it takes the target's
+pending mask from zero to non-zero and sends no signal to a target it finds
+marked idle.  The tick's irq_work_tick() backstop can run work which an
+earlier callback of the same timer interrupt raised, leaving the local bit set
+with nothing queued, so NO_HZ may stop the tick and the CPU would block with a
+non-zero mask and absorb every later remote vector.  The idle wait reads the
+mask after publishing the idle state and polls instead of blocking.
+---
+ arch/um/include/shared/os.h  |  1 +
+ arch/um/kernel/smp.c         | 25 +++++++++++++++++++++++++
+ arch/um/os-Darwin/internal.h |  2 ++
+ arch/um/os-Darwin/smp.c      | 36 ++++++++++++++++++++++++++++++++++++
+ arch/um/os-Darwin/time.c     |  8 ++++++++
+ 5 files changed, 72 insertions(+)
+
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index fdf83b9b617ca7df5dbe2065fc69d5fc2a3f750d..adfebfa05c59914c8d4622bceea47d9e42c8840c 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -398,6 +398,7 @@ void __attribute__((noreturn)) os_restart_secondary(void *stack,
+ 						     jmp_buf *switch_buf);
+ #endif
+ int os_send_ipi(int cpu, int vector);
++void os_raise_local_ipi(int vector);
+ void os_local_ipi_enable(void);
+ void os_local_ipi_disable(void);
+ #else
+diff --git a/arch/um/kernel/smp.c b/arch/um/kernel/smp.c
+index cc0c6c58a384ebdf37713d4fa7e09deef3b505a5..afbd7c2728430ab2119ba07251b8a7b6838877a6 100644
+--- a/arch/um/kernel/smp.c
++++ b/arch/um/kernel/smp.c
+@@ -18,6 +18,7 @@
+ #include <linux/cpuhotplug.h>
+ #include <linux/context_tracking_irq.h>
+ #include <linux/hardirq.h>
++#include <linux/irq_work.h>
+ #include <linux/smp.h>
+ #include <linux/smp-internal.h>
+ #include <init.h>
+@@ -31,8 +32,28 @@ enum {
+ 	UML_IPI_CALL_SINGLE,
+ 	UML_IPI_CALL,
+ 	UML_IPI_STOP,
++	UML_IPI_IRQ_WORK,
+ };
+ 
++#ifdef CONFIG_IRQ_WORK
++/*
++ * UML has no asynchronous self-interrupt, so the generic weak stub leaves
++ * queued work waiting for the next timer tick.  That is not merely slow, it is
++ * a correctness problem for callers that expect the raise to be serviced before
++ * their next allocation: bpf_mem_alloc prefills exactly one element per CPU
++ * once the unit size exceeds 256 bytes and refills the rest from irq_work, so a
++ * tick-rate refill makes every burst of inserts into a non-preallocated BPF
++ * hash map fail with -ENOMEM after the first one.  Publish a local vector
++ * instead.  The IRQ-enabled boundary this carrier already reaches drains it
++ * long before the tick, while arch_irq_work_has_interrupt() stays false so the
++ * tick keeps its existing backstop drain of the raised list.
++ */
++void arch_irq_work_raise(void)
++{
++	os_raise_local_ipi(UML_IPI_IRQ_WORK);
++}
++#endif
++
+ void arch_smp_send_reschedule(int cpu)
+ {
+ 	os_send_ipi(cpu, UML_IPI_RES);
+@@ -94,6 +115,10 @@ static void ipi_handler(int vector, struct uml_pt_regs *regs)
+ 			pause();
+ 		break;
+ 
++	case UML_IPI_IRQ_WORK:
++		irq_work_run();
++		break;
++
+ 	default:
+ 		pr_err("CPU#%d received unknown IPI (vector=%d)!\n", cpu, vector);
+ 		break;
+diff --git a/arch/um/os-Darwin/internal.h b/arch/um/os-Darwin/internal.h
+index 9dbe6b1c19ca3346259fa7644945d0578b57b4e9..a0e9c51ed4c481306e887f48b2102226c3dddfae 100644
+--- a/arch/um/os-Darwin/internal.h
++++ b/arch/um/os-Darwin/internal.h
+@@ -24,6 +24,7 @@ void __attribute__((noreturn)) darwin_exit_cpu_carrier(void);
+ void darwin_ipi_poll(void);
+ int darwin_ipi_idle_fd(void);
+ void darwin_ipi_idle_begin(void);
++int darwin_ipi_idle_pending(void);
+ void darwin_ipi_idle_end(void);
+ void darwin_ipi_idle_drain(void);
+ unsigned int darwin_ipi_guest_snapshot(const unsigned int **sequence);
+@@ -57,6 +58,7 @@ static inline void __attribute__((noreturn)) darwin_exit_cpu_carrier(void)
+ static inline void darwin_ipi_poll(void) { }
+ static inline int darwin_ipi_idle_fd(void) { return -1; }
+ static inline void darwin_ipi_idle_begin(void) { }
++static inline int darwin_ipi_idle_pending(void) { return 0; }
+ static inline void darwin_ipi_idle_end(void) { }
+ static inline void darwin_ipi_idle_drain(void) { }
+ static inline unsigned int darwin_ipi_guest_snapshot(
+diff --git a/arch/um/os-Darwin/smp.c b/arch/um/os-Darwin/smp.c
+index b54e7ca5983b799ba352c13a0ba8bfb8a55d4713..a35a5a4dcb5e790a81c572ad6965605cefddf9a8 100644
+--- a/arch/um/os-Darwin/smp.c
++++ b/arch/um/os-Darwin/smp.c
+@@ -194,6 +194,24 @@ static void drain_ipis(void)
+ 	um_set_signals(previous);
+ }
+ 
++/*
++ * A self-directed vector needs neither the wake pipe nor a Darwin signal: the
++ * carrier publishing it is the carrier that will consume it, and it reaches an
++ * IRQ-enabled boundary on its own.  Publishing the pending bit alone therefore
++ * keeps this path safe to call with signals blocked.  It deliberately does not
++ * bump guest_ipi_sequences: a local vector is always raised from kernel code,
++ * never while this CPU executes a translated guest block, so forcing those
++ * blocks to exit would only cost hot-path work with nothing to deliver.
++ */
++void os_raise_local_ipi(int vector)
++{
++	int cpu = uml_curr_cpu();
++
++	if (cpu < 0 || cpu >= uml_ncpus || vector < 0 || vector >= 32)
++		return;
++	__atomic_fetch_or(&pending_ipis[cpu], 1U << vector, __ATOMIC_RELEASE);
++}
++
+ void darwin_ipi_poll(void)
+ {
+ 	int cpu;
+@@ -240,6 +258,24 @@ void darwin_ipi_idle_begin(void)
+ 	__atomic_store_n(&ipi_idle_waiting[uml_curr_cpu()], 1, __ATOMIC_RELEASE);
+ }
+ 
++/*
++ * os_send_ipi() writes the wake pipe only when it makes the pending mask
++ * non-zero, and sends no signal to a CPU it finds marked idle.  A bit which is
++ * already set when the idle wait starts therefore has no pipe edge behind it:
++ * os_raise_local_ipi() never writes one.  The tick's irq_work_tick() backstop
++ * can run work raised earlier in the same timer interrupt, which leaves the
++ * local bit set with nothing queued and so lets NO_HZ stop the tick.  Blocking
++ * on top of such a bit absorbs every later remote vector without a wake: a
++ * reschedule sent to this CPU then waits for an unrelated timer while its task
++ * stays runnable.  The idle path reads the mask after publishing the idle state
++ * and polls instead of blocking when anything is pending.
++ */
++int darwin_ipi_idle_pending(void)
++{
++	return __atomic_load_n(&pending_ipis[uml_curr_cpu()],
++			       __ATOMIC_ACQUIRE) != 0;
++}
++
+ void darwin_ipi_idle_end(void)
+ {
+ 	__atomic_store_n(&ipi_idle_waiting[uml_curr_cpu()], 0, __ATOMIC_RELEASE);
+diff --git a/arch/um/os-Darwin/time.c b/arch/um/os-Darwin/time.c
+index 50c8f60d0412c1948fc618a899cc87572e865179..b21584641a57a3033c85f577b38e80a532063009 100644
+--- a/arch/um/os-Darwin/time.c
++++ b/arch/um/os-Darwin/time.c
+@@ -298,6 +298,14 @@ void os_idle_sleep(void)
+ 		if (deadline_fd > wake_fd)
+ 			wake_fd = deadline_fd;
+ 		darwin_ipi_idle_begin();
++		/* A vector pending here has no wake edge of its own; see
++		 * darwin_ipi_idle_pending().  Drain it below rather than sleep on it.
++		 */
++		if (darwin_ipi_idle_pending()) {
++			timeout.tv_sec = 0;
++			timeout.tv_nsec = 0;
++			timeout_pointer = &timeout;
++		}
+ 		(void)pselect(wake_fd >= 0 ? wake_fd + 1 : 0,
+ 			      wake_fd >= 0 ? &read_fds : NULL, NULL, NULL,
+ 			      timeout_pointer, &mask);

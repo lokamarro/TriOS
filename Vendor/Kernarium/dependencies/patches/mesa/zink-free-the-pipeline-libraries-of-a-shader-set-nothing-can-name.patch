@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:27:30 +0900
+Subject: [PATCH] zink: free the pipeline libraries of a shader set nothing can
+ name
+
+The screen keeps one library cache for every set of shaders programs are
+built from, and each shader of the set holds a reference to it. The first
+shader of the set that is freed takes the cache out of the screen's table,
+so no program can find it again, but the cache, with every pipeline
+library it built, lives until the last shader of the set is freed. An
+app's fragment shader that shares a vertex shader with the launcher or
+SystemUI therefore left its libraries behind with each launch, and in
+KosmicKrisp each library keeps its generated shader objects and
+serialized NIR.
+
+Count the programs that hold a cache, and free its libraries when it is
+out of the table and the last of those programs lets go, whichever comes
+second: the shader's free or the program's release. A library only
+serves to link pipelines, so freeing one that no program holds needs no
+wait for the GPU. A set whose shaders all live stays cached and keeps its
+libraries, so a relaunch still links from them.
+---
+ src/gallium/drivers/zink/zink_compiler.c |  1 +
+ src/gallium/drivers/zink/zink_program.c  | 56 ++++++++++++++++++++++--
+ src/gallium/drivers/zink/zink_program.h  |  4 ++
+ src/gallium/drivers/zink/zink_types.h    |  6 +++
+ 4 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_compiler.c b/src/gallium/drivers/zink/zink_compiler.c
+index 4b92781755ecd95b538be89843cb4d959e821fdd..f7396b077dec109e2ca8d1c711eccef7eda88555 100644
+--- a/src/gallium/drivers/zink/zink_compiler.c
++++ b/src/gallium/drivers/zink/zink_compiler.c
+@@ -5994,6 +5994,7 @@ zink_gfx_shader_free(struct zink_screen *screen, struct zink_shader *shader)
+             _mesa_set_remove_key(&screen->pipeline_libs[idx], libs);
+             simple_mtx_unlock(&screen->pipeline_libs_lock[idx]);
+          }
++         zink_gfx_lib_cache_unreachable(screen, libs);
+       }
+       zink_gfx_lib_cache_unref(screen, libs);
+    }
+diff --git a/src/gallium/drivers/zink/zink_program.c b/src/gallium/drivers/zink/zink_program.c
+index 121b231475208dc8e0545ed4b37c1e9bd4cefa62..afcd0f99143e3bd6923de4124780180e290419d7 100644
+--- a/src/gallium/drivers/zink/zink_program.c
++++ b/src/gallium/drivers/zink/zink_program.c
+@@ -1179,6 +1179,53 @@ assign_io_mesh(struct zink_screen *screen,
+    zink_compiler_assign_io(screen, producer, consumer);
+ }
+ 
++static void
++free_lib_cache_libs(struct zink_screen *screen, struct zink_gfx_lib_cache *libs)
++{
++   simple_mtx_lock(&libs->lock);
++   set_foreach_remove(&libs->libs, he) {
++      struct zink_gfx_library_key *gkey = (void*)he->key;
++      VKSCR(DestroyPipeline)(screen->dev, gkey->pipeline, NULL);
++      FREE(gkey);
++   }
++   simple_mtx_unlock(&libs->lock);
++}
++
++/* A cache is found only by programs that hold every shader of its set, so once
++ * one of those shaders is freed (libs->removed) no new program can name it.
++ * Its libraries are then of use only to the programs that still hold it, and
++ * those are the only references that outlive the shader: the other shaders of
++ * the set keep the cache itself until the last one is freed, an app's shader
++ * sharing a vertex shader with the launcher's, say.  So the libraries go with
++ * the later of two events, the first shader's free and the last holding
++ * program's release.  Both change program_refs by an atomic operation, so
++ * exactly one of them is the second and sees the other's change.
++ */
++void
++zink_gfx_lib_cache_unreachable(struct zink_screen *screen, struct zink_gfx_lib_cache *libs)
++{
++   unsigned seen = p_atomic_read(&libs->program_refs);
++   while (!(seen & ZINK_LIB_CACHE_UNREACHABLE)) {
++      unsigned was = p_atomic_cmpxchg(&libs->program_refs, seen,
++                                      seen | ZINK_LIB_CACHE_UNREACHABLE);
++      if (was == seen) {
++         if (!seen)
++            free_lib_cache_libs(screen, libs);
++         return;
++      }
++      seen = was;
++   }
++}
++
++/* drop a program's hold on a cache; the cache lives for its shaders */
++void
++zink_gfx_lib_cache_program_unref(struct zink_screen *screen, struct zink_gfx_lib_cache *libs)
++{
++   if (p_atomic_dec_return(&libs->program_refs) == ZINK_LIB_CACHE_UNREACHABLE)
++      free_lib_cache_libs(screen, libs);
++   zink_gfx_lib_cache_unref(screen, libs);
++}
++
+ void
+ zink_gfx_lib_cache_unref(struct zink_screen *screen, struct zink_gfx_lib_cache *libs)
+ {
+@@ -1396,8 +1443,10 @@ gfx_program_init(struct zink_context *ctx, struct zink_gfx_program *prog)
+       else
+          prog->libs = find_or_create_lib_cache(screen, prog);
+    }
+-   if (prog->libs)
++   if (prog->libs) {
+       p_atomic_inc(&prog->libs->refcount);
++      p_atomic_inc(&prog->libs->program_refs);
++   }
+ 
+    struct mesa_blake3 sctx;
+    _mesa_blake3_init(&sctx);
+@@ -1502,6 +1551,7 @@ create_gfx_program_separable(struct zink_context *ctx, struct zink_shader **stag
+       prog->libs = create_lib_cache(prog, false);
+       /* this libs cache is owned by the program */
+       p_atomic_set(&prog->libs->refcount, 1);
++      p_atomic_set(&prog->libs->program_refs, 1);
+    }
+ 
+    unsigned refs = 0;
+@@ -1888,7 +1938,7 @@ release_gfx_program_state(struct zink_screen *screen,
+    }
+    /* the libraries of a shader set only this program still names */
+    if (prog->libs) {
+-      zink_gfx_lib_cache_unref(screen, prog->libs);
++      zink_gfx_lib_cache_program_unref(screen, prog->libs);
+       prog->libs = NULL;
+    }
+ }
+@@ -2028,7 +2078,7 @@ zink_destroy_gfx_program(struct zink_screen *screen,
+       }
+    }
+    if (prog->libs)
+-      zink_gfx_lib_cache_unref(screen, prog->libs);
++      zink_gfx_lib_cache_program_unref(screen, prog->libs);
+ 
+    ralloc_free(prog->base.ralloc_ctx);
+    FREE_CL(prog);
+diff --git a/src/gallium/drivers/zink/zink_program.h b/src/gallium/drivers/zink/zink_program.h
+index 9d7bf91f3d62af662fff1ab00ec4ead4b1b2ca9b..369e0776cda1e1788eac8015e8d75d9b93026f75 100644
+--- a/src/gallium/drivers/zink/zink_program.h
++++ b/src/gallium/drivers/zink/zink_program.h
+@@ -167,6 +167,10 @@ zink_destroy_gfx_program(struct zink_screen *screen,
+ void
+ zink_gfx_lib_cache_unref(struct zink_screen *screen, struct zink_gfx_lib_cache *libs);
+ void
++zink_gfx_lib_cache_program_unref(struct zink_screen *screen, struct zink_gfx_lib_cache *libs);
++void
++zink_gfx_lib_cache_unreachable(struct zink_screen *screen, struct zink_gfx_lib_cache *libs);
++void
+ zink_program_init(struct zink_context *ctx);
+ 
+ void
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index c75722ef54053b8fcada835fe104be97f20d4562..e432c0059a6ece36150814cb56e51ffac0d1e97c 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1105,10 +1105,16 @@ struct zink_gfx_pipeline_cache_entry {
+    };
+ };
+ 
++#define ZINK_LIB_CACHE_UNREACHABLE (1u << 31)
++
+ struct zink_gfx_lib_cache {
+    /* for hashing */
+    struct zink_shader *shaders[MESA_SHADER_MESH_STAGES];
+    unsigned refcount;
++   /* the programs that hold the cache, counted in refcount, plus
++    * ZINK_LIB_CACHE_UNREACHABLE once removed has taken effect: see
++    * zink_gfx_lib_cache_unreachable() */
++   unsigned program_refs;
+    bool removed; //once removed from cache
+    uint8_t stages_present;
+ 

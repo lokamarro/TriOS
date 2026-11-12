@@ -1,0 +1,2673 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 05:43:58 +0900
+Subject: [PATCH] kosmickrisp: implement legacy vertex attributes
+
+---
+ src/kosmickrisp/compiler/nir_to_msl.c         |   2 +-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |   1 +
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |   8 +
+ src/kosmickrisp/vulkan/kk_nir_lower_vbo.c     |  68 +-
+ src/kosmickrisp/vulkan/kk_nir_lower_vbo.h     |   6 +-
+ src/kosmickrisp/vulkan/kk_physical_device.c   |  10 +-
+ src/kosmickrisp/vulkan/kk_shader.c            | 680 ++++++++++++++++--
+ src/kosmickrisp/vulkan/kk_shader.h            |   8 +
+ src/kosmickrisp/vulkan/kk_shader_info.c       |  43 ++
+ src/kosmickrisp/vulkan/kk_shader_info.h       |  15 +
+ src/kosmickrisp/vulkan/meson.build            |  65 ++
+ .../tests/dynamic_vertex_input_cache_state.c  |  27 +
+ .../tests/dynamic_vertex_input_cache_state.h  |  24 +
+ .../vulkan/tests/test_blend_pipeline_key.c    | 514 +++++++++++++
+ .../tests/test_dynamic_vertex_input_cache.cpp | 350 +++++++++
+ .../tests/test_legacy_vertex_attributes.c     | 239 ++++++
+ .../vulkan/tests/test_line_raster_cache.cpp   |  23 +-
+ 17 files changed, 2016 insertions(+), 67 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_shader_info.c
+ create mode 100644 src/kosmickrisp/vulkan/kk_shader_info.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_blend_pipeline_key.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_dynamic_vertex_input_cache.cpp
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_legacy_vertex_attributes.c
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index dbeac584cb80354a0ff30d821bb9f17ba17f381f..14770e63fa4974e23da92856cddcd176dffca313 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1698,7 +1698,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       const char *no_component_type =
+          msl_pipe_format_to_msl_type(nir_intrinsic_format(instr));
+       if (instr->def.num_components == 1) {
+-         P(ctx, "(*(((constant %s*)", type);
++         P(ctx, "%s(*((constant %s*)(", type, no_component_type);
+       } else {
+          P(ctx, "%s(*(constant packed_%s*)(((constant %s*)", type, type,
+            no_component_type);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 9799d79209242d06c1daf1ca49e2397e623e6350..901239f351388235047704d96f169f94b823bcb4 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -312,6 +312,7 @@ struct kk_cmd_buffer {
+       struct kk_compute_state cs;
+       struct kk_conditional_rendering_state cond_render;
+       struct kk_shader *shaders[MESA_SHADER_STAGES];
++      struct kk_linked_graphics_pipeline *dynamic_vertex_input_pipeline;
+       /* Address of the binding 0 for when compute dispatches modify it.
+        * We are trying to be nice to ourselves. */
+       uint64_t root_addr;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 4443ca440c848bdff1da96cce4aebaef0c0ece2b..94b08bd91432cd8265637ee6f270832385fbf892 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -3074,6 +3074,14 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+ static void
+ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
++   if (unlikely(cmd->state.dynamic_vertex_input_pipeline != NULL)) {
++      VkResult result = kk_resolve_dynamic_vertex_input_pipeline(cmd);
++      if (result != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd->vk, result);
++         return;
++      }
++   }
++
+    kk_cmd_select_line_raster_variant(cmd);
+    data->upload_mask = build_per_draw_upload_mask(cmd);
+    kk_flush_gfx_state(cmd);
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
+index 6d56e5669ce5c77657322ffa90111fa45fb0de1a..1217364bde7fbf302095e86e77e62ed1aa453959 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
+@@ -18,6 +18,7 @@
+ struct ctx {
+    struct kk_attribute *attribs;
+    bool requires_robustness2;
++   bool byte_strides;
+ };
+ 
+ static bool
+@@ -86,6 +87,14 @@ kk_vbo_supports_format(enum pipe_format format)
+    return kk_vbo_internal_format(format) != PIPE_FORMAT_NONE;
+ }
+ 
++unsigned
++kk_vbo_interchange_alignment(enum pipe_format format)
++{
++   enum pipe_format interchange_format = kk_vbo_internal_format(format);
++   assert(interchange_format != PIPE_FORMAT_NONE);
++   return util_format_get_blocksize(interchange_format);
++}
++
+ static nir_def *
+ apply_swizzle_channel(nir_builder *b, nir_def *vec, unsigned swizzle,
+                       bool is_int)
+@@ -109,6 +118,34 @@ apply_swizzle_channel(nir_builder *b, nir_def *vec, unsigned swizzle,
+    }
+ }
+ 
++static nir_def *
++load_unaligned_components(nir_builder *b, nir_def *base,
++                          nir_def *byte_offset, unsigned num_components,
++                          unsigned bit_size)
++{
++   assert(num_components <= 4);
++   assert(bit_size == 8 || bit_size == 16 || bit_size == 32);
++
++   const unsigned bytes_per_component = bit_size / 8;
++   nir_def *components[4] = {NULL};
++   for (unsigned c = 0; c < num_components; c++) {
++      nir_def *value = nir_imm_int(b, 0);
++      for (unsigned byte_index = 0; byte_index < bytes_per_component;
++           byte_index++) {
++         nir_def *offset = nir_iadd_imm(
++            b, byte_offset, c * bytes_per_component + byte_index);
++         nir_def *byte = nir_load_constant_agx(
++            b, 1, 32, base, offset, .format = PIPE_FORMAT_R8_UINT,
++            .base = 0u);
++         value = nir_ior(
++            b, value, nir_ishl_imm(b, byte, byte_index * 8));
++      }
++      components[c] = nir_u2uN(b, value, bit_size);
++   }
++
++   return nir_vec(b, components, num_components);
++}
++
+ static bool
+ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ {
+@@ -141,7 +178,7 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    enum pipe_format interchange_format = kk_vbo_internal_format(attrib.format);
+    assert(interchange_format != PIPE_FORMAT_NONE);
+ 
+-   unsigned interchange_align = util_format_get_blocksize(interchange_format);
++   unsigned interchange_align = kk_vbo_interchange_alignment(attrib.format);
+    unsigned interchange_comps = util_format_get_nr_components(attrib.format);
+ 
+    /* In the hardware, uint formats zero-extend and float formats convert.
+@@ -188,13 +225,27 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       struct kk_root_descriptor_table, draw.buffer_strides[attrib.binding]);
+    nir_def *stride = nir_load_global_constant(
+       b, 1, 32, nir_iadd_imm(b, argbuf, buffer_stride_offset));
+-   nir_def *stride_offset_el =
+-      nir_imul(b, el, nir_udiv_imm(b, stride, interchange_align));
+ 
+-   /* Load the raw vector */
+-   nir_def *memory = nir_load_constant_agx(
+-      b, interchange_comps, interchange_register_size, base, stride_offset_el,
+-      .format = interchange_format, .base = 0u);
++   nir_def *memory;
++   if (ctx->byte_strides) {
++      /* Legacy vertex attributes permit strides which are not multiples of
++       * the interchange element size.  Keep the buffer base uniform and use
++       * R8 typed loads with a byte offset; wider typed loads align their base,
++       * while making the 64-bit base itself divergent is not supported by the
++       * Metal load path.  Reassemble each logical component explicitly.
++       */
++      nir_def *byte_offset = nir_imul(b, el, stride);
++      memory = load_unaligned_components(
++         b, base, byte_offset, interchange_comps,
++         interchange_register_size);
++   } else {
++      /* Preserve the ordinary aligned path as an element-indexed load. */
++      nir_def *load_offset =
++         nir_imul(b, el, nir_udiv_imm(b, stride, interchange_align));
++      memory = nir_load_constant_agx(
++         b, interchange_comps, interchange_register_size, base, load_offset,
++         .format = interchange_format, .base = 0u);
++   }
+ 
+    if (ctx->requires_robustness2) {
+       uint64_t attrib_clamp_offset =
+@@ -269,13 +320,14 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ 
+ bool
+ kk_nir_lower_vbo(nir_shader *nir, struct kk_attribute *attribs,
+-                 bool robustness2)
++                 bool robustness2, bool byte_strides)
+ {
+    assert(nir->info.stage == MESA_SHADER_VERTEX);
+ 
+    struct ctx ctx = {
+       .attribs = attribs,
+       .requires_robustness2 = robustness2,
++      .byte_strides = byte_strides,
+    };
+    return nir_shader_intrinsics_pass(nir, pass, nir_metadata_control_flow,
+                                      &ctx);
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
+index af47837e1f6638c899f0c1a0c6cab0e6233ede24..7cb1ed3d6b09257d160faf1dc5949eef4c358415 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
+@@ -36,10 +36,12 @@ struct kk_attribute {
+ };
+ 
+ bool kk_nir_lower_vbo(nir_shader *shader, struct kk_attribute *attribs,
+-                      bool robustness2);
++                      bool robustness2, bool byte_strides);
+ 
+ bool kk_vbo_supports_format(enum pipe_format format);
+ 
++unsigned kk_vbo_interchange_alignment(enum pipe_format format);
++
+ #ifdef __cplusplus
+ } /* extern C */
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index c568b0d18315b968d1651e1b3b9eee26c8892cb8..5c2a9df8e02d05e0f6d37264589ea1b13eee9885 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -179,6 +179,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_metal_objects = true,
+       .EXT_hdr_metadata = true,
+       .EXT_image_2d_view_of_3d = true,
++      .EXT_legacy_vertex_attributes = true,
+       .EXT_load_store_op_none = true,
+       .EXT_memory_budget = true,
+       .EXT_multi_draw = true,
+@@ -200,6 +201,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_swapchain_maintenance1 = true,
+ #endif
+       .EXT_vertex_attribute_robustness = true,
++      .EXT_vertex_input_dynamic_state = true,
+ 
+       .GOOGLE_decorate_string = true,
+       .GOOGLE_hlsl_functionality1 = true,
+@@ -476,6 +478,9 @@ kk_get_device_features(
+       .image2DViewOf3D = true,
+       .sampler2DViewOf3D = true,
+ 
++      /* VK_EXT_legacy_vertex_attributes */
++      .legacyVertexAttributes = true,
++
+       /* VK_EXT_multi_draw */
+       .multiDraw = true,
+ 
+@@ -516,6 +521,9 @@ kk_get_device_features(
+       /* VK_EXT_vertex_attribute_robustness */
+       .vertexAttributeRobustness = true,
+ 
++      /* VK_EXT_vertex_input_dynamic_state */
++      .vertexInputDynamicState = true,
++
+       /* EXT_ycbcr_2plane_444_formats */
+       .ycbcr2plane444Formats = true,
+    };
+@@ -831,7 +839,7 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
+       .resolveSrgbFormatSupportsTransferFunctionControl = true,
+ 
+       /* VK_EXT_legacy_vertex_attributes */
+-      .nativeUnalignedPerformance = true,
++      .nativeUnalignedPerformance = false,
+ 
+       /* VK_EXT_map_memory_placed */
+       .minPlacedMemoryMapAlignment = os_page_size,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 21d873e90fe050e02407174369e8dc9995bf0a0b..5fa2e298508c3af27efd8cee551e4231bf7adb09 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -18,6 +18,7 @@
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_physical_device.h"
+ #include "kk_sampler.h"
++#include "kk_shader_info.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+@@ -40,6 +41,7 @@
+ #include "vk_pipeline.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ static const nir_shader_compiler_options *
+ kk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
+@@ -169,7 +171,11 @@ kk_populate_vs_key(struct kk_vs_key *key,
+     * order and adjacency are handled by the runtime input mapping. */
+    key->generated_primitive_class =
+       u_decomposed_prim(vk_topology_to_mesa(state->ia->primitive_topology));
+-   key->vi = *state->vi;
++   /* Dynamic vertex input has no concrete description yet.  Its variants are
++    * selected by the vertex input observed at draw time, so the rest of the
++    * key still has to identify the shader. */
++   if (state->vi != NULL)
++      key->vi = *state->vi;
+ }
+ 
+ static void
+@@ -184,14 +190,17 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+    const bool complete = kk_graphics_state_is_complete(state);
+    _mesa_blake3_update(&blake3_ctx, &complete, sizeof(complete));
+ 
+-   /* Incomplete GPL subsets retain preprocessed NIR.  Their state is stored
+-    * and merged by the common pipeline implementation, and cannot be safely
+-    * dereferenced while generating the deferred shader cache key.
++   /* An incomplete GPL subset and a deferred dynamic vertex-input pipeline
++    * both retain preprocessed NIR, so neither can be identified by its shader
++    * alone.  Hash every substate that is present instead of abandoning the
++    * whole key: the deferred compilation still lowers the fragment-output
++    * state recorded here into the shader it produces.
+     */
+-   if (!complete)
++   if (state == NULL)
+       goto done;
+ 
+-   if (stages & VK_SHADER_STAGE_VERTEX_BIT) {
++   if ((stages & VK_SHADER_STAGE_VERTEX_BIT) && state->rs != NULL &&
++       state->ia != NULL) {
+       struct kk_vs_key key;
+       kk_populate_vs_key(&key, state);
+       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+@@ -201,13 +210,15 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+     * fragment stage.  Its generated FS and raster variant still depend on
+     * fragment-output state, notably the multisample configuration. */
+    if ((stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)) &&
++       state->rp != NULL &&
+        vk_render_pass_state_has_attachment_info(state->rp)) {
+       struct kk_fs_key key;
+       kk_populate_fs_key(&key, state);
+       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+    }
+ 
+-   if (stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)) {
++   if ((stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)) &&
++       state->mv != NULL) {
+       _mesa_blake3_update(&blake3_ctx, &state->mv->view_mask,
+                           sizeof(state->mv->view_mask));
+    }
+@@ -321,7 +332,8 @@ kk_nir_swizzle_fragment_output(nir_builder *b, nir_intrinsic_instr *intrin,
+ 
+ static void
+ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+-                const struct vk_pipeline_robustness_state *rs)
++                const struct vk_pipeline_robustness_state *rs,
++                bool byte_strides)
+ {
+    assert(!(nir->info.inputs_read & BITFIELD64_MASK(VERT_ATTRIB_GENERIC0)) &&
+           "Fixed-function attributes not used in Vulkan");
+@@ -352,7 +364,7 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+    bool robustness2 =
+       rs->vertex_inputs ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
+-   NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
++   NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2, byte_strides);
+ }
+ 
+ static nir_def *
+@@ -985,18 +997,6 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+ 
+-static bool
+-gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+-{
+-   if (intr->intrinsic != nir_intrinsic_load_input)
+-      return false;
+-
+-   struct nir_io_semantics io = nir_intrinsic_io_semantics(intr);
+-   BITSET_WORD *attribs_read = data;
+-   BITSET_SET(attribs_read, (io.location - VERT_ATTRIB_GENERIC0));
+-   return false;
+-}
+-
+ static void
+ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+                    const struct vk_graphics_pipeline_state *state)
+@@ -1005,8 +1005,7 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+    shader->info.uses_per_draw_data = msl_gather_uses_per_draw_data(nir);
+    shader->info.num_cull_distances = nir->info.cull_distance_array_size;
+    if (nir->info.stage == MESA_SHADER_VERTEX) {
+-      nir_shader_intrinsics_pass(nir, gather_vs_inputs, nir_metadata_all,
+-                                 &shader->info.vs.attribs_read);
++      shader->info.vs.attribs_read = kk_gather_vs_attribs_read(nir);
+       shader->info.vs.outputs_written = nir->info.outputs_written;
+    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       shader->info.fs.flat_inputs =
+@@ -1093,7 +1092,7 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+                      const struct vk_pipeline_robustness_state *robustness,
+                      const struct vk_graphics_pipeline_state *state,
+                      bool force_sw_vs, bool zero_based_instance,
+-                     bool line_multiview,
++                     bool line_multiview, bool byte_strides,
+                      const VkAllocationCallbacks *pAllocator,
+                      struct kk_shader **shader_out)
+ {
+@@ -1123,7 +1122,7 @@ kk_compile_shader_as(struct kk_device *dev, nir_shader *nir,
+    if (stage == MESA_SHADER_VERTEX) {
+       /* VBO lowering needs to go here otherwise, the linking step removes all
+        * inputs since we read vertex attributes from UBOs. */
+-      kk_lower_vs_vbo(nir, state, robustness);
++      kk_lower_vs_vbo(nir, state, robustness, byte_strides);
+       if (nir->info.next_stage == MESA_SHADER_TESS_CTRL || force_sw_vs) {
+          if (line_multiview)
+             NIR_PASS(_, nir, kk_nir_lower_line_multiview,
+@@ -1229,7 +1228,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+ {
+    return kk_compile_shader_as(dev, nir, nir->info.stage, prev_stage,
+                                robustness, state, force_sw_vs, false, false,
+-                               pAllocator, shader_out);
++                               false, pAllocator, shader_out);
+ }
+ 
+ static void
+@@ -3106,6 +3105,28 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+                                        &pipe->gfx.render);
+ }
+ 
++static VkResult
++kk_new_render_pipeline_state_from_origin(struct kk_device *dev,
++                                         struct kk_shader *vs,
++                                         uint16_t color_mask,
++                                         mtl_render_pipeline_state **state_out);
++
++/* Makes every render pipeline of a dynamic vertex-input variant come from
++ * regenerated MSL, as one for an attachment mask the shader did not declare
++ * does, so the tests can run that path on every draw. */
++static bool
++kk_regenerate_msl_forced(void)
++{
++   static int forced = -1;
++   int value = p_atomic_read(&forced);
++   if (value < 0) {
++      const char *env = getenv("MESA_KK_REGENERATE_MSL");
++      value = env != NULL && env[0] != '\0' && env[0] != '0';
++      p_atomic_set(&forced, value);
++   }
++   return value;
++}
++
+ mtl_render_pipeline_state *
+ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+                           uint16_t bound_color_mask)
+@@ -3115,7 +3136,8 @@ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+    /* A render pass binds every attachment the pipeline declares unless the
+     * application uses VK_EXT_dynamic_rendering_unused_attachments, so the
+     * pipeline compiled with the shader is almost always the right one. */
+-   if (likely(bound_color_mask == declared))
++   if (likely(bound_color_mask == declared) &&
++       (vs->msl_origin == NULL || !kk_regenerate_msl_forced()))
+       return vs->pipeline.gfx.render;
+ 
+    assert((bound_color_mask & ~declared) == 0);
+@@ -3134,8 +3156,10 @@ kk_shader_render_pipeline(struct kk_device *dev, struct kk_shader *vs,
+    /* Metal compiles outside the lock: command buffers recorded concurrently
+     * for different attachment masks must not serialize on it. */
+    mtl_render_pipeline_state *state = NULL;
+-   VkResult result =
+-      kk_new_render_pipeline_state(dev, vs, bound_color_mask, &state);
++   VkResult result = vs->msl_origin != NULL
++      ? kk_new_render_pipeline_state_from_origin(dev, vs, bound_color_mask,
++                                                 &state)
++      : kk_new_render_pipeline_state(dev, vs, bound_color_mask, &state);
+    if (result != VK_SUCCESS)
+       return NULL;
+ 
+@@ -3183,6 +3207,9 @@ kk_defer_graphics_shaders(struct kk_device *dev, uint32_t shader_count,
+ 
+       shader->info.stage = compile->stage;
+       shader->info.deferred = true;
++      if (compile->stage == MESA_SHADER_VERTEX)
++         shader->info.vs.attribs_read =
++            kk_gather_vs_attribs_read(compile->nir);
+       shader->deferred_robustness = *compile->robustness;
+       blob_init(&shader->deferred_nir);
+       nir_serialize(&shader->deferred_nir, compile->nir, false);
+@@ -3276,7 +3303,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                         const struct vk_graphics_pipeline_state *state,
+                         const struct vk_features *enabled_features,
+                         const VkAllocationCallbacks *pAllocator,
+-                        struct vk_shader **shaders_out)
++                        struct vk_shader **shaders_out, bool byte_strides)
+ {
+    VkResult result = VK_SUCCESS;
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+@@ -3662,7 +3689,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+          state, force_sw_vs,
+          i == geometry_shader || i == transform_feedback_raster_shader,
+          i == 0 && line_raster_emulation && !line_raster_materialize,
+-         pAllocator, &shaders[i]);
++         byte_strides, pAllocator, &shaders[i]);
+ 
+       if (result != VK_SUCCESS) {
+          /* Clean up all the shaders before this point */
+@@ -3833,23 +3860,26 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+    return result;
+ }
+ 
++/* byte_strides selects the vertex fetch of a dynamic vertex-input variant
++ * whose bound attributes are not aligned for Metal's own fetch. */
+ static VkResult
+ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+                         struct vk_shader_compile_info *infos,
+                         const struct vk_graphics_pipeline_state *state,
+                         const struct vk_features *enabled_features,
+                         const VkAllocationCallbacks *pAllocator,
+-                        struct vk_shader **shaders_out)
++                        struct vk_shader **shaders_out, bool byte_strides)
+ {
+-   /* A deferred GPL subset never gets here: it does not yet have a complete
+-    * raster configuration, so variant construction happens once, at the same
+-    * final-link boundary as native Metal compilation.  The common cache checks
+-    * compile-required before reaching this function. */
++   /* A deferred GPL subset or dynamic vertex input never gets here: neither
++    * has a complete draw configuration yet, so variant construction happens
++    * once, at the same final-link or vertex-input boundary as native Metal
++    * compilation.  The common cache checks compile-required before reaching
++    * this function. */
+    if (!state || !kk_graphics_state_is_complete(state) || shader_count == 0 ||
+        infos[0].stage != MESA_SHADER_VERTEX)
+       return kk_compile_shaders_single(device, shader_count, infos, state,
+                                        enabled_features, pAllocator,
+-                                       shaders_out);
++                                       shaders_out, byte_strides);
+ 
+    struct vk_input_assembly_state ia = *state->ia;
+    if (BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY))
+@@ -3867,7 +3897,7 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+    if (!kk_line_raster_has_native_variant(state, primitive, fixed_primitive))
+       return kk_compile_shaders_single(device, shader_count, infos, state,
+                                        enabled_features, pAllocator,
+-                                       shaders_out);
++                                       shaders_out, byte_strides);
+ 
+    struct vk_shader_compile_info generated_infos[shader_count];
+    memset(generated_infos, 0, sizeof(generated_infos));
+@@ -3903,7 +3933,7 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+ 
+    VkResult result = kk_compile_shaders_single(
+       device, shader_count, infos, &native, enabled_features, pAllocator,
+-      shaders_out);
++      shaders_out, byte_strides);
+    if (result != VK_SUCCESS) {
+       for (uint32_t i = 0; i < shader_count; i++)
+          ralloc_free(generated_infos[i].nir);
+@@ -3917,7 +3947,7 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+    struct vk_shader *generated_shaders[shader_count];
+    result = kk_compile_shaders_single(
+       device, shader_count, generated_infos, &generated, enabled_features,
+-      pAllocator, generated_shaders);
++      pAllocator, generated_shaders, byte_strides);
+    if (result != VK_SUCCESS) {
+       for (uint32_t i = 0; i < shader_count; i++) {
+          kk_shader_destroy(device,
+@@ -3952,15 +3982,18 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ {
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+ 
+-   /* A pipeline library's stages keep their NIR until the final link. */
++   /* A pipeline library's stages keep their NIR until the final link, and a
++    * dynamic vertex-input pipeline's until a draw binds its vertex layout. */
+    if (shader_count > 0 && infos[0].stage != MESA_SHADER_COMPUTE &&
+-       infos[0].defer_graphics_pipeline_link) {
++       (infos[0].defer_graphics_pipeline_link ||
++        (state && BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI)))) {
+       return kk_defer_graphics_shaders(dev, shader_count, infos, pAllocator,
+                                        shaders_out);
+    }
+ 
+    return kk_compile_shaders_impl(device, shader_count, infos, state,
+-                                  enabled_features, pAllocator, shaders_out);
++                                  enabled_features, pAllocator, shaders_out,
++                                  false);
+ }
+ 
+ /* The compile infos of a deferred graphics chain, one stage per entry in
+@@ -4007,9 +4040,41 @@ kk_deserialize_deferred_graphics_shaders(
+    return VK_SUCCESS;
+ }
+ 
++struct kk_deferred_graphics_shader {
++   mesa_shader_stage stage;
++   struct vk_pipeline_robustness_state robustness;
++   struct blob nir;
++};
++
+ struct kk_linked_graphics_pipeline {
+    blake3_hash key;
++   /* Live VkPipeline owners; protected by linked_graphics_pipelines_lock. */
++   uint32_t refcount;
+    struct kk_shader *shaders[MESA_SHADER_STAGES];
++
++   /* A variant compiled for a dynamic vertex-input parent: the parent and
++    * what compiled it, which compile its shaders' MSL again. */
++   struct kk_linked_graphics_pipeline *variant_of;
++   struct vk_vertex_input_state variant_vi;
++   bool variant_byte_strides;
++
++   bool dynamic_vertex_input;
++   struct {
++      struct vk_graphics_pipeline_state state;
++      void *state_data;
++
++      uint32_t shader_count;
++      struct kk_deferred_graphics_shader
++         sources[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++      uint32_t attribs_read;
++
++      uint32_t set_layout_count;
++      struct vk_descriptor_set_layout
++         *set_layouts[MESA_VK_MAX_DESCRIPTOR_SETS];
++
++      struct hash_table *variants;
++      simple_mtx_t lock;
++   } dynamic;
+ };
+ 
+ static void
+@@ -4020,9 +4085,30 @@ kk_free_linked_graphics_pipeline(
+    struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
+    struct kk_linked_graphics_pipeline *linked = linked_data;
+ 
+-   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
+-      if (linked->shaders[stage] != NULL)
+-         kk_shader_destroy(vk_dev, linked->shaders[stage], pAllocator);
++   if (linked->dynamic_vertex_input) {
++      hash_table_foreach(linked->dynamic.variants, entry) {
++         kk_free_linked_graphics_pipeline(vk_dev, entry->data,
++                                          &dev->vk.alloc);
++      }
++      _mesa_hash_table_destroy(linked->dynamic.variants, NULL);
++      simple_mtx_destroy(&linked->dynamic.lock);
++
++      for (uint32_t i = 0; i < linked->dynamic.shader_count; i++)
++         blob_finish(&linked->dynamic.sources[i].nir);
++
++      for (uint32_t i = 0; i < linked->dynamic.set_layout_count; i++) {
++         if (linked->dynamic.set_layouts[i] != NULL) {
++            vk_descriptor_set_layout_unref(
++               vk_dev, linked->dynamic.set_layouts[i]);
++         }
++      }
++
++      vk_free2(&dev->vk.alloc, pAllocator, linked->dynamic.state_data);
++   } else {
++      for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++         if (linked->shaders[stage] != NULL)
++            kk_shader_destroy(vk_dev, linked->shaders[stage], pAllocator);
++      }
+    }
+ 
+    vk_free2(&dev->vk.alloc, pAllocator, linked);
+@@ -4040,6 +4126,123 @@ kk_linked_graphics_pipeline_equal(const void *a, const void *b)
+    return memcmp(a, b, sizeof(blake3_hash)) == 0;
+ }
+ 
++static void
++kk_dynamic_vertex_input_key(const struct kk_linked_graphics_pipeline *linked,
++                            const struct vk_vertex_input_state *vi,
++                            bool byte_strides,
++                            blake3_hash key)
++{
++   struct mesa_blake3 hash;
++   _mesa_blake3_init(&hash);
++   _mesa_blake3_update(&hash, &linked->dynamic.attribs_read,
++                       sizeof(linked->dynamic.attribs_read));
++   _mesa_blake3_update(&hash, &byte_strides, sizeof(byte_strides));
++
++   u_foreach_bit(a, linked->dynamic.attribs_read) {
++      const bool attribute_valid =
++         vi->attributes_valid & BITFIELD_BIT(a);
++      _mesa_blake3_update(&hash, &a, sizeof(a));
++      _mesa_blake3_update(&hash, &attribute_valid,
++                          sizeof(attribute_valid));
++      if (!attribute_valid)
++         continue;
++
++      const struct vk_vertex_attribute_state *attribute = &vi->attributes[a];
++      _mesa_blake3_update(&hash, &attribute->binding,
++                          sizeof(attribute->binding));
++      _mesa_blake3_update(&hash, &attribute->format,
++                          sizeof(attribute->format));
++
++      const bool binding_valid =
++         vi->bindings_valid & BITFIELD_BIT(attribute->binding);
++      _mesa_blake3_update(&hash, &binding_valid, sizeof(binding_valid));
++      if (!binding_valid)
++         continue;
++
++      const struct vk_vertex_binding_state *binding =
++         &vi->bindings[attribute->binding];
++      _mesa_blake3_update(&hash, &binding->input_rate,
++                          sizeof(binding->input_rate));
++      _mesa_blake3_update(&hash, &binding->divisor,
++                          sizeof(binding->divisor));
++   }
++
++   _mesa_blake3_final(&hash, key);
++}
++
++/* Live VkPipeline owners share each dynamic vertex-input parent until the
++ * last owner releases it.  The parent, state copy, and compiled variants use
++ * the device allocator because they may outlive the first pipeline owner.
++ */
++static VkResult
++kk_create_dynamic_vertex_input_pipeline(
++   struct kk_device *dev, uint32_t shader_count,
++   struct kk_shader *const *shaders,
++   const struct vk_graphics_pipeline_state *state, uint32_t set_layout_count,
++   struct vk_descriptor_set_layout *const *set_layouts,
++   struct kk_linked_graphics_pipeline **linked_out)
++{
++   struct kk_linked_graphics_pipeline *linked = vk_zalloc(
++      &dev->vk.alloc, sizeof(*linked), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (linked == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   linked->dynamic_vertex_input = true;
++   simple_mtx_init(&linked->dynamic.lock, mtx_plain);
++   linked->dynamic.variants = _mesa_hash_table_create(
++      NULL, kk_linked_graphics_pipeline_hash,
++      kk_linked_graphics_pipeline_equal);
++   if (linked->dynamic.variants == NULL) {
++      simple_mtx_destroy(&linked->dynamic.lock);
++      vk_free(&dev->vk.alloc, linked);
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   VkResult result = vk_graphics_pipeline_state_copy(
++      &dev->vk, &linked->dynamic.state, state, NULL,
++      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &linked->dynamic.state_data);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   for (uint32_t i = 0; i < shader_count; i++) {
++      const struct kk_shader *shader = shaders[i];
++      if (!shader->info.deferred) {
++         result = vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
++         goto fail;
++      }
++
++      struct kk_deferred_graphics_shader *source =
++         &linked->dynamic.sources[linked->dynamic.shader_count++];
++      source->stage = shader->info.stage;
++      source->robustness = shader->deferred_robustness;
++      blob_init(&source->nir);
++      blob_write_bytes(&source->nir, shader->deferred_nir.data,
++                       shader->deferred_nir.size);
++      if (source->nir.out_of_memory) {
++         result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++         goto fail;
++      }
++
++      if (source->stage == MESA_SHADER_VERTEX)
++         linked->dynamic.attribs_read = shader->info.vs.attribs_read;
++   }
++
++   linked->dynamic.set_layout_count = set_layout_count;
++   for (uint32_t i = 0; i < set_layout_count; i++) {
++      if (set_layouts[i] != NULL) {
++         linked->dynamic.set_layouts[i] =
++            vk_descriptor_set_layout_ref(set_layouts[i]);
++      }
++   }
++
++   *linked_out = linked;
++   return VK_SUCCESS;
++
++fail:
++   kk_free_linked_graphics_pipeline(&dev->vk, linked, NULL);
++   return result;
++}
++
+ VkResult
+ kk_linked_graphics_pipeline_cache_init(struct kk_device *dev)
+ {
+@@ -4065,6 +4268,157 @@ kk_linked_graphics_pipeline_cache_finish(struct kk_device *dev)
+    simple_mtx_destroy(&dev->linked_graphics_pipelines_lock);
+ }
+ 
++static VkResult
++kk_compile_dynamic_vertex_input_variant(
++   struct kk_device *dev, struct kk_linked_graphics_pipeline *linked,
++   const struct vk_vertex_input_state *vi, bool byte_strides,
++   struct kk_linked_graphics_pipeline **variant_out)
++{
++   struct vk_shader_compile_info
++      infos[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] = {0};
++   struct vk_shader *compiled[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] = {0};
++
++   mesa_shader_stage stages[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++   const struct vk_pipeline_robustness_state
++      *robustness[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++   const struct blob *nir[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++   for (uint32_t i = 0; i < linked->dynamic.shader_count; i++) {
++      const struct kk_deferred_graphics_shader *source =
++         &linked->dynamic.sources[i];
++      stages[i] = source->stage;
++      robustness[i] = &source->robustness;
++      nir[i] = &source->nir;
++   }
++
++   VkResult result = kk_deserialize_deferred_graphics_shaders(
++      dev, linked->dynamic.shader_count, stages, robustness, nir,
++      linked->dynamic.set_layout_count, linked->dynamic.set_layouts, infos);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct vk_graphics_pipeline_state state = linked->dynamic.state;
++   state.vi = vi;
++   result = kk_compile_shaders_impl(
++      &dev->vk, linked->dynamic.shader_count, infos, &state,
++      &dev->vk.enabled_features, &dev->vk.alloc, compiled, byte_strides);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct kk_linked_graphics_pipeline *variant =
++      vk_zalloc(&dev->vk.alloc, sizeof(*variant), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (variant == NULL) {
++      for (uint32_t i = 0; i < linked->dynamic.shader_count; i++) {
++         kk_shader_destroy(
++            &dev->vk, container_of(compiled[i], struct kk_shader, vk),
++            &dev->vk.alloc);
++      }
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   for (uint32_t i = 0; i < linked->dynamic.shader_count; i++) {
++      struct kk_shader *shader =
++         container_of(compiled[i], struct kk_shader, vk);
++      variant->shaders[shader->info.stage] = shader;
++   }
++
++   *variant_out = variant;
++   return VK_SUCCESS;
++}
++
++static void
++kk_shader_drop_msl(struct kk_shader *shader,
++                   struct kk_linked_graphics_pipeline *origin)
++{
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      ralloc_free(shader->msl_data[stage].code);
++      shader->msl_data[stage].code = NULL;
++   }
++   ralloc_free(shader->transform_feedback_pre_gs_msl.code);
++   shader->transform_feedback_pre_gs_msl.code = NULL;
++   ralloc_free(shader->line_raster_materialize_msl.code);
++   shader->line_raster_materialize_msl.code = NULL;
++   ralloc_free(shader->line_stipple_prefix_msl.code);
++   shader->line_stipple_prefix_msl.code = NULL;
++   ralloc_free(shader->geometry_main_msl.code);
++   shader->geometry_main_msl.code = NULL;
++   ralloc_free(shader->geometry_count_msl.code);
++   shader->geometry_count_msl.code = NULL;
++   ralloc_free(shader->geometry_pre_gs_msl.code);
++   shader->geometry_pre_gs_msl.code = NULL;
++   shader->msl_origin = origin;
++}
++
++/* The Metal pipelines of a variant are built, and the MSL they were built
++ * from is of no use again unless a render pass binds fewer colour attachments
++ * than the pipeline declares (VK_EXT_dynamic_rendering_unused_attachments),
++ * which needs a render pipeline of its own.  A variant is never serialized,
++ * and MSL is large (tens of KiB for the smallest shader, a third of a MiB for
++ * the largest), so keep what compiles it again instead: the parent holds the
++ * NIR, and the variant the vertex input and stride choice it was compiled for.
++ */
++static void
++kk_variant_drop_msl(struct kk_linked_graphics_pipeline *variant,
++                    struct kk_linked_graphics_pipeline *parent,
++                    const struct vk_vertex_input_state *vi,
++                    bool byte_strides)
++{
++   variant->variant_of = parent;
++   variant->variant_vi = *vi;
++   variant->variant_byte_strides = byte_strides;
++
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      struct kk_shader *shader = variant->shaders[stage];
++      if (shader == NULL)
++         continue;
++      if (stage == MESA_SHADER_VERTEX) {
++         u_foreach_bit(line_stage, shader->info.vs.line_variant_stages) {
++            if (shader->line_variant_shaders[line_stage] != NULL)
++               kk_shader_drop_msl(shader->line_variant_shaders[line_stage],
++                                  variant);
++         }
++      }
++      kk_shader_drop_msl(shader, variant);
++   }
++}
++
++/* The twin of `vs` in a variant compiled again from the same parent and
++ * vertex input: the same NIR gives the same shaders, line variants included.
++ */
++static struct kk_shader *
++kk_variant_twin(struct kk_linked_graphics_pipeline *rebuilt,
++                struct kk_linked_graphics_pipeline *origin,
++                const struct kk_shader *vs)
++{
++   struct kk_shader *twin = rebuilt->shaders[MESA_SHADER_VERTEX];
++   if (twin != NULL && vs != origin->shaders[MESA_SHADER_VERTEX])
++      twin = twin->line_variant_shaders[MESA_SHADER_VERTEX];
++   return twin;
++}
++
++static VkResult
++kk_new_render_pipeline_state_from_origin(struct kk_device *dev,
++                                         struct kk_shader *vs,
++                                         uint16_t color_mask,
++                                         mtl_render_pipeline_state **state_out)
++{
++   struct kk_linked_graphics_pipeline *origin = vs->msl_origin;
++   struct kk_linked_graphics_pipeline *rebuilt = NULL;
++   VkResult result = kk_compile_dynamic_vertex_input_variant(
++      dev, origin->variant_of, &origin->variant_vi,
++      origin->variant_byte_strides, &rebuilt);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct kk_shader *twin = kk_variant_twin(rebuilt, origin, vs);
++   result = twin != NULL
++      ? kk_new_render_pipeline_state(dev, twin, color_mask, state_out)
++      : VK_ERROR_INVALID_SHADER_NV;
++
++   kk_free_linked_graphics_pipeline(&dev->vk, rebuilt, &dev->vk.alloc);
++   return result;
++}
++
+ static void
+ kk_linked_graphics_pipeline_key(
+    struct vk_device *vk_dev, uint32_t shader_count,
+@@ -4103,12 +4457,57 @@ kk_linked_graphics_pipeline_key(
+    _mesa_blake3_final(&hash, key);
+ }
+ 
++/* Dynamic vertex-input parents keep the native variants they compiled during
++ * command recording.  Equivalent pipelines therefore share one parent, and the
++ * consumed descriptor set layouts are referenced for its lifetime, so a live
++ * entry has unique layout pointers.
++ */
++static void
++kk_dynamic_vertex_input_parent_key(
++   struct vk_device *vk_dev, uint32_t shader_count,
++   struct vk_shader *const *shaders,
++   const struct vk_graphics_pipeline_state *state, uint32_t set_layout_count,
++   struct vk_descriptor_set_layout *const *set_layouts, blake3_hash key)
++{
++   blake3_hash linked_key;
++   kk_linked_graphics_pipeline_key(vk_dev, shader_count, shaders, state,
++                                   linked_key);
++
++   struct mesa_blake3 hash;
++   _mesa_blake3_init(&hash);
++   _mesa_blake3_update(&hash, linked_key, sizeof(linked_key));
++   _mesa_blake3_update(&hash, &set_layout_count, sizeof(set_layout_count));
++   for (uint32_t i = 0; i < set_layout_count; i++) {
++      const struct vk_descriptor_set_layout *set_layout = set_layouts[i];
++      _mesa_blake3_update(&hash, &set_layout, sizeof(set_layout));
++   }
++   _mesa_blake3_final(&hash, key);
++}
++
+ static void
+ kk_destroy_linked_graphics_pipeline(
+-   UNUSED struct vk_device *vk_dev, UNUSED void *linked_data,
++   struct vk_device *vk_dev, void *linked_data,
+    UNUSED const VkAllocationCallbacks *pAllocator)
+ {
+-   /* Entries remain reusable until device destruction. */
++   struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
++   struct kk_linked_graphics_pipeline *linked = linked_data;
++
++   simple_mtx_lock(&dev->linked_graphics_pipelines_lock);
++   assert(linked->refcount > 0);
++   bool last_owner = --linked->refcount == 0;
++   if (last_owner) {
++      struct hash_entry *entry =
++         _mesa_hash_table_search(dev->linked_graphics_pipelines, linked->key);
++      assert(entry != NULL && entry->data == linked);
++      _mesa_hash_table_remove(dev->linked_graphics_pipelines, entry);
++   }
++   simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++
++   /* The lookup table is weak: obsolete programs and their native variants
++    * must not accumulate for the lifetime of a long-running device.
++    */
++   if (last_owner)
++      kk_free_linked_graphics_pipeline(vk_dev, linked, &dev->vk.alloc);
+ }
+ 
+ static VkResult
+@@ -4129,6 +4528,74 @@ kk_link_graphics_pipeline(
+       has_deferred |= shader->info.deferred;
+    }
+ 
++   if (BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI)) {
++      /* The concrete vertex-input state is unknown until draw time, so the
++       * first variant necessarily requires compilation.  Honor the pipeline
++       * compile-required contract at creation rather than deferring forbidden
++       * compilation into command recording.
++       */
++      if (pipeline_flags &
++          VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
++         return VK_PIPELINE_COMPILE_REQUIRED;
++
++      struct kk_shader *shaders[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
++      for (uint32_t i = 0; i < shader_count; i++) {
++         shaders[i] = container_of(vk_shaders[i], struct kk_shader, vk);
++      }
++
++      /* Sharing the parent keeps the variants it compiled during command
++       * recording.  Applications that rebuild an equivalent pipeline for every
++       * program, as OpenGL frontends do, would otherwise repeat a complete
++       * native compilation at the first draw of each new pipeline.
++       */
++      blake3_hash dynamic_key;
++      kk_dynamic_vertex_input_parent_key(vk_dev, shader_count, vk_shaders,
++                                         state, set_layout_count, set_layouts,
++                                         dynamic_key);
++
++      simple_mtx_lock(&dev->linked_graphics_pipelines_lock);
++      struct hash_entry *dynamic_cached =
++         _mesa_hash_table_search(dev->linked_graphics_pipelines, dynamic_key);
++      if (dynamic_cached != NULL) {
++         struct kk_linked_graphics_pipeline *shared = dynamic_cached->data;
++         shared->refcount++;
++         *linked_data_out = shared;
++      }
++      simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++      if (dynamic_cached != NULL)
++         return VK_SUCCESS;
++
++      struct kk_linked_graphics_pipeline *linked = NULL;
++      VkResult result = kk_create_dynamic_vertex_input_pipeline(
++         dev, shader_count, shaders, state, set_layout_count, set_layouts,
++         &linked);
++      if (result != VK_SUCCESS)
++         return result;
++
++      memcpy(linked->key, dynamic_key, sizeof(linked->key));
++      linked->refcount = 1;
++
++      simple_mtx_lock(&dev->linked_graphics_pipelines_lock);
++      dynamic_cached =
++         _mesa_hash_table_search(dev->linked_graphics_pipelines, dynamic_key);
++      if (dynamic_cached == NULL) {
++         _mesa_hash_table_insert(dev->linked_graphics_pipelines, linked->key,
++                                 linked);
++         *linked_data_out = linked;
++      } else {
++         struct kk_linked_graphics_pipeline *shared = dynamic_cached->data;
++         shared->refcount++;
++         *linked_data_out = shared;
++      }
++      simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++
++      /* A concurrent creation may have won the race for this key. */
++      if (dynamic_cached != NULL)
++         kk_free_linked_graphics_pipeline(vk_dev, linked, NULL);
++
++      return VK_SUCCESS;
++   }
++
+    /* Monolithic pipelines and complete libraries already own their native
+     * Metal pipeline in the vertex shader.
+     */
+@@ -4143,7 +4610,9 @@ kk_link_graphics_pipeline(
+    struct hash_entry *cached =
+       _mesa_hash_table_search(dev->linked_graphics_pipelines, key);
+    if (cached != NULL) {
+-      *linked_data_out = cached->data;
++      struct kk_linked_graphics_pipeline *shared = cached->data;
++      shared->refcount++;
++      *linked_data_out = shared;
+       simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
+       return VK_SUCCESS;
+    }
+@@ -4180,7 +4649,7 @@ kk_link_graphics_pipeline(
+ 
+    result = kk_compile_shaders_impl(
+       vk_dev, shader_count, infos, state, &vk_dev->enabled_features,
+-      &dev->vk.alloc, compiled);
++      &dev->vk.alloc, compiled, false);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -4197,6 +4666,7 @@ kk_link_graphics_pipeline(
+    }
+ 
+    memcpy(linked->key, key, sizeof(linked->key));
++   linked->refcount = 1;
+ 
+    for (uint32_t i = 0; i < shader_count; i++) {
+       struct kk_shader *shader =
+@@ -4211,7 +4681,9 @@ kk_link_graphics_pipeline(
+                               linked);
+       *linked_data_out = linked;
+    } else {
+-      *linked_data_out = cached->data;
++      struct kk_linked_graphics_pipeline *shared = cached->data;
++      shared->refcount++;
++      *linked_data_out = shared;
+    }
+    simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
+ 
+@@ -4519,6 +4991,100 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
+    kk_cmd_use_graphics_shader(cmd, stage, shader);
+ }
+ 
++VkResult
++kk_resolve_dynamic_vertex_input_pipeline(struct kk_cmd_buffer *cmd)
++{
++   struct kk_linked_graphics_pipeline *linked =
++      cmd->state.dynamic_vertex_input_pipeline;
++   if (linked == NULL)
++      return VK_SUCCESS;
++
++   assert(linked->dynamic_vertex_input);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   const struct vk_vertex_input_state *vi =
++      cmd->vk.dynamic_graphics_state.vi;
++   bool byte_strides = false;
++   if (dev->vk.enabled_features.legacyVertexAttributes) {
++      u_foreach_bit(a, linked->dynamic.attribs_read) {
++         if (!(vi->attributes_valid & BITFIELD_BIT(a)))
++            continue;
++
++         const struct vk_vertex_attribute_state *attribute =
++            &vi->attributes[a];
++         enum pipe_format format =
++            vk_format_to_pipe_format(attribute->format);
++         unsigned alignment = kk_vbo_interchange_alignment(format);
++         uint64_t base =
++            cmd->state.gfx.vb.addr_range[attribute->binding].addr +
++            attribute->offset;
++         uint32_t stride =
++            cmd->vk.dynamic_graphics_state
++               .vi_binding_strides[attribute->binding];
++
++         if ((base % alignment) != 0 || (stride % alignment) != 0) {
++            byte_strides = true;
++            break;
++         }
++      }
++   }
++
++   blake3_hash key;
++   kk_dynamic_vertex_input_key(linked, vi, byte_strides, key);
++
++   /* A live VkPipeline owns this parent during command recording.  The parent
++    * keeps every variant until its last pipeline owner is destroyed, so a
++    * cached pointer remains valid after the lock is dropped.  In particular,
++    * never hold this lock while Metal
++    * compiles a variant: command buffers recorded concurrently for different
++    * vertex-input states must not serialize on native shader and pipeline
++    * creation.
++    */
++   simple_mtx_lock(&linked->dynamic.lock);
++   struct hash_entry *cached =
++      _mesa_hash_table_search(linked->dynamic.variants, key);
++   struct kk_linked_graphics_pipeline *variant =
++      cached != NULL ? cached->data : NULL;
++   simple_mtx_unlock(&linked->dynamic.lock);
++
++   if (variant == NULL) {
++      struct kk_linked_graphics_pipeline *candidate = NULL;
++      VkResult result = kk_compile_dynamic_vertex_input_variant(
++         dev, linked, vi, byte_strides, &candidate);
++      if (result != VK_SUCCESS)
++         return result;
++
++      memcpy(candidate->key, key, sizeof(candidate->key));
++      kk_variant_drop_msl(candidate, linked, vi, byte_strides);
++
++      simple_mtx_lock(&linked->dynamic.lock);
++      cached = _mesa_hash_table_search(linked->dynamic.variants, key);
++      if (cached != NULL) {
++         variant = cached->data;
++      } else {
++         _mesa_hash_table_insert(linked->dynamic.variants, candidate->key,
++                                 candidate);
++         variant = candidate;
++         candidate = NULL;
++      }
++      simple_mtx_unlock(&linked->dynamic.lock);
++
++      /* A concurrent recorder may have won the race for this key. */
++      if (candidate != NULL) {
++         kk_free_linked_graphics_pipeline(&dev->vk, candidate,
++                                          &dev->vk.alloc);
++      }
++   }
++
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      if (variant->shaders[stage] != NULL &&
++          cmd->state.gfx.bound_shaders[stage] != variant->shaders[stage]) {
++         kk_cmd_bind_graphics_shader(cmd, stage, variant->shaders[stage]);
++      }
++   }
++
++   return VK_SUCCESS;
++}
++
+ void
+ kk_cmd_select_line_raster_variant(struct kk_cmd_buffer *cmd)
+ {
+@@ -4550,6 +5116,11 @@ kk_cmd_bind_linked_graphics_pipeline(struct vk_command_buffer *cmd_buffer,
+       container_of(cmd_buffer, struct kk_cmd_buffer, vk);
+    struct kk_linked_graphics_pipeline *linked = linked_data;
+ 
++   if (linked->dynamic_vertex_input) {
++      cmd->state.dynamic_vertex_input_pipeline = linked;
++      return;
++   }
++
+    for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
+       if (linked->shaders[stage] != NULL) {
+          kk_cmd_bind_graphics_shader(cmd, stage, linked->shaders[stage]);
+@@ -4565,6 +5136,13 @@ kk_cmd_bind_shaders(struct vk_command_buffer *cmd_buffer, uint32_t stage_count,
+    struct kk_cmd_buffer *cmd =
+       container_of(cmd_buffer, struct kk_cmd_buffer, vk);
+ 
++   for (uint32_t i = 0; i < stage_count; i++) {
++      if (stages[i] == MESA_SHADER_VERTEX) {
++         cmd->state.dynamic_vertex_input_pipeline = NULL;
++         break;
++      }
++   }
++
+    for (uint32_t i = 0; i < stage_count; i++) {
+       struct kk_shader *shader = container_of(shaders[i], struct kk_shader, vk);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 305d35e072a40f0c3581acc02fac5e284c0f0542..dac32d3d0016066f07c35c801dba2731605d0e53 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -23,6 +23,7 @@
+ #include "util/u_dynarray.h"
+ 
+ struct kk_cmd_buffer;
++struct kk_linked_graphics_pipeline;
+ 
+ enum kk_texture_flags {
+    KK_TEXTURE_FLAG_CLAMP_TO_0 = 1u << 0,
+@@ -172,6 +173,8 @@ struct kk_attachment_variant {
+    mtl_render_pipeline_state *state;
+ };
+ 
++struct kk_linked_graphics_pipeline;
++
+ struct kk_shader {
+    struct vk_shader vk;
+ 
+@@ -189,6 +192,9 @@ struct kk_shader {
+    struct msl_compile_data geometry_main_msl;
+    struct msl_compile_data geometry_count_msl;
+    struct msl_compile_data geometry_pre_gs_msl;
++   /* Set when the MSL sources above were freed once the Metal pipelines were
++    * built: the dynamic vertex-input variant that can compile them again. */
++   struct kk_linked_graphics_pipeline *msl_origin;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+@@ -259,5 +265,7 @@ void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
+                                 struct kk_shader *shader);
+ 
+ void kk_cmd_select_line_raster_variant(struct kk_cmd_buffer *cmd);
++VkResult
++kk_resolve_dynamic_vertex_input_pipeline(struct kk_cmd_buffer *cmd);
+ 
+ #endif /* KK_SHADER_H */
+diff --git a/src/kosmickrisp/vulkan/kk_shader_info.c b/src/kosmickrisp/vulkan/kk_shader_info.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d919045308e893d3e47fff2b46e32e55536288d2
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_shader_info.c
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kk_shader_info.h"
++
++#include "compiler/nir/nir_builder.h"
++
++#include <assert.h>
++
++static bool
++gather_lowered_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_input)
++      return false;
++
++   const struct nir_io_semantics io = nir_intrinsic_io_semantics(intr);
++   assert(io.location >= VERT_ATTRIB_GENERIC0);
++   assert(io.location < VERT_ATTRIB_GENERIC0 + 32);
++
++   uint32_t *attribs_read = data;
++   *attribs_read |= BITFIELD_BIT(io.location - VERT_ATTRIB_GENERIC0);
++   return false;
++}
++
++uint32_t
++kk_gather_vs_attribs_read(nir_shader *nir)
++{
++   assert(nir->info.stage == MESA_SHADER_VERTEX);
++
++   if (!nir->info.io_lowered) {
++      assert(!(nir->info.inputs_read &
++               BITFIELD64_MASK(VERT_ATTRIB_GENERIC0)) &&
++             "Fixed-function attributes not used in Vulkan");
++      return nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
++   }
++
++   uint32_t attribs_read = 0;
++   nir_shader_intrinsics_pass(nir, gather_lowered_vs_inputs,
++                              nir_metadata_all, &attribs_read);
++   return attribs_read;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_shader_info.h b/src/kosmickrisp/vulkan/kk_shader_info.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..49e8a4e502d56e07d4a2f7add3d34668e5e5fc9d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_shader_info.h
+@@ -0,0 +1,15 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_SHADER_INFO_H
++#define KK_SHADER_INFO_H 1
++
++#include <stdint.h>
++
++struct nir_shader;
++
++uint32_t kk_gather_vs_attribs_read(struct nir_shader *nir);
++
++#endif
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 9d4278b8182a3043479ee173f3f3d443a793df56..025dec3c0bb7ad948535e92f1b7023bd8013f174 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -111,6 +111,8 @@ kk_files = files(
+   'kk_sampler.h',
+   'kk_sampler.c',
+   'kk_shader.h',
++  'kk_shader_info.h',
++  'kk_shader_info.c',
+   'kk_shader.c',
+   'kk_sync.h',
+   'kk_sync.c',
+@@ -324,6 +326,26 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_blend_pipeline_key',
++      executable(
++        'test_kosmickrisp_blend_pipeline_key',
++        files('tests/test_blend_pipeline_key.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_whole : libkk,
++        link_args : ['-Wl,-undefined,dynamic_lookup'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_line_raster_cache',
+       executable(
+@@ -347,6 +369,28 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_dynamic_vertex_input_cache',
++      executable(
++        'test_kosmickrisp_dynamic_vertex_input_cache',
++        files('tests/test_dynamic_vertex_input_cache.cpp',
++              'tests/dynamic_vertex_input_cache_state.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++        ],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+   endif
+ 
+   test(
+@@ -465,4 +509,25 @@ if with_tests
+     ),
+     suite : ['kosmickrisp'],
+   )
++
++  test(
++    'kosmickrisp_legacy_vertex_attributes',
++    executable(
++      'test_kosmickrisp_legacy_vertex_attributes',
++      files(
++        'tests/test_legacy_vertex_attributes.c',
++        'kk_nir_lower_vbo.c',
++        'kk_shader_info.c',
++      ),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_msl_to_nir,
++        idep_libkk_shaders_h,
++        idep_vulkan_runtime_headers,
++        idep_vulkan_util_headers,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
+ endif
+diff --git a/src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.c b/src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4fc955b106afa2482665c7d029d8f1d7d9f744b
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.c
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "dynamic_vertex_input_cache_state.h"
++
++#include "kosmickrisp/vulkan/kk_cmd_buffer.h"
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "util/hash_table.h"
++
++const struct kk_shader *
++kk_test_dynamic_vertex_input_shader(VkCommandBuffer command)
++{
++   const struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
++   return cmd->state.gfx.bound_shaders[MESA_SHADER_VERTEX];
++}
++
++unsigned
++kk_test_linked_graphics_pipeline_count(VkDevice device)
++{
++   struct kk_device *dev = kk_device_from_handle(device);
++   simple_mtx_lock(&dev->linked_graphics_pipelines_lock);
++   unsigned count = dev->linked_graphics_pipelines->entries;
++   simple_mtx_unlock(&dev->linked_graphics_pipelines_lock);
++   return count;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.h b/src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9d06319c3b7a3f42047b270a2cf6ab59f0794d8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/dynamic_vertex_input_cache_state.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: MIT */
++#pragma once
++
++#include <vulkan/vulkan.h>
++
++struct kk_shader;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Identity of the native vertex shader a recorded draw resolved.  Equivalent
++ * pipelines that share one dynamic vertex-input parent resolve the same
++ * variant object for the same vertex-input state.
++ */
++const struct kk_shader *
++kk_test_dynamic_vertex_input_shader(VkCommandBuffer command);
++
++unsigned
++kk_test_linked_graphics_pipeline_count(VkDevice device);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_blend_pipeline_key.c b/src/kosmickrisp/vulkan/tests/test_blend_pipeline_key.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..38d6cb51543e0522a076ce47f8a8429f0da63136
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_blend_pipeline_key.c
+@@ -0,0 +1,514 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Blending is lowered into the fragment shader, so two pipelines that share
++ * one shader but select different blend state must not share a compiled
++ * native pipeline.  A dynamic vertex-input pipeline compiles its shaders after
++ * creation, which is the case an OpenGL frontend always takes; its cache key
++ * must still cover the fragment-output state.  NIR construction keeps the test
++ * independent of a shader compiler executable. */
++#include "kosmickrisp/vulkan/kk_device.h"
++#include "kosmickrisp/vulkan/kk_entrypoints.h"
++#include "nir_builder.h"
++
++#include <math.h>
++#include <stdlib.h>
++
++#define CHECK(expr) do { \
++   VkResult result_ = (expr); \
++   if (result_ != VK_SUCCESS) { \
++      fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #expr, result_); \
++      abort(); \
++   } \
++} while (0)
++
++enum { WIDTH = 8, HEIGHT = 8, PIXELS = WIDTH * HEIGHT };
++
++static const float source_color[4] = {0.25f, 0.5f, 0.125f, 0.75f};
++static const float dest_color[4] = {0.5f, 0.25f, 0.75f, 0.5f};
++
++struct context {
++   VkDevice device;
++   VkQueue queue;
++   VkCommandBuffer cmd;
++   const struct vk_device_dispatch_table *api;
++   VkPhysicalDeviceMemoryProperties memory;
++};
++
++struct image {
++   VkImage image;
++   VkDeviceMemory memory;
++   VkImageView view;
++};
++
++/* One blend configuration and the software result it must produce. */
++struct blend_case {
++   const char *name;
++   VkBlendFactor src_color;
++   VkBlendFactor dst_color;
++   VkBlendOp color_op;
++   VkBlendFactor src_alpha;
++   VkBlendFactor dst_alpha;
++   VkBlendOp alpha_op;
++};
++
++static uint32_t
++memory_type(struct context *ctx, uint32_t bits, VkMemoryPropertyFlags flags)
++{
++   for (uint32_t i = 0; i < ctx->memory.memoryTypeCount; i++) {
++      if ((bits & BITFIELD_BIT(i)) &&
++          (ctx->memory.memoryTypes[i].propertyFlags & flags) == flags)
++         return i;
++   }
++   abort();
++}
++
++static struct image
++create_image(struct context *ctx)
++{
++   const VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {WIDTH, HEIGHT, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   struct image image;
++   CHECK(ctx->api->CreateImage(ctx->device, &info, NULL, &image.image));
++   VkMemoryRequirements req;
++   ctx->api->GetImageMemoryRequirements(ctx->device, image.image, &req);
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = memory_type(ctx, req.memoryTypeBits,
++                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++   };
++   CHECK(ctx->api->AllocateMemory(ctx->device, &alloc, NULL, &image.memory));
++   CHECK(ctx->api->BindImageMemory(ctx->device, image.image, image.memory, 0));
++   const VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image.image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   CHECK(ctx->api->CreateImageView(ctx->device, &view_info, NULL, &image.view));
++   return image;
++}
++
++static void
++destroy_image(struct context *ctx, struct image image)
++{
++   ctx->api->DestroyImageView(ctx->device, image.view, NULL);
++   ctx->api->DestroyImage(ctx->device, image.image, NULL);
++   ctx->api->FreeMemory(ctx->device, image.memory, NULL);
++}
++
++static nir_shader *
++build_vertex_shader(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, NULL,
++                                                  "blend-key-vs");
++   nir_def *id = nir_load_vertex_id(&b);
++   nir_def *x = nir_u2f32(&b, nir_iand_imm(&b, nir_ishl_imm(&b, id, 1), 2));
++   nir_def *y = nir_u2f32(&b, nir_iand_imm(&b, id, 2));
++   nir_variable *position = nir_variable_create(
++      b.shader, nir_var_shader_out, glsl_vec4_type(), "gl_Position");
++   position->data.location = VARYING_SLOT_POS;
++   nir_store_var(&b, position,
++      nir_vec4(&b, nir_fadd_imm(&b, nir_fmul_imm(&b, x, 2), -1),
++                   nir_fadd_imm(&b, nir_fmul_imm(&b, y, 2), -1),
++                   nir_imm_float(&b, 0), nir_imm_float(&b, 1)), 0xf);
++   return b.shader;
++}
++
++static nir_shader *
++build_fragment_shader(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL,
++                                                  "blend-key-fs");
++   nir_variable *color = nir_variable_create(
++      b.shader, nir_var_shader_out, glsl_vec4_type(), "outColor");
++   color->data.location = FRAG_RESULT_DATA0;
++   nir_store_var(&b, color,
++      nir_vec4(&b, nir_imm_float(&b, source_color[0]),
++                   nir_imm_float(&b, source_color[1]),
++                   nir_imm_float(&b, source_color[2]),
++                   nir_imm_float(&b, source_color[3])), 0xf);
++   return b.shader;
++}
++
++/* Every pipeline uses the same shaders, layout, topology and dynamic state,
++ * so only the blend configuration may separate them. */
++static VkPipeline
++create_pipeline(struct context *ctx, VkPipelineLayout layout,
++                const struct blend_case *blend)
++{
++   const VkPipelineShaderStageNirCreateInfoMESA nir[] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
++       .nir = build_vertex_shader()},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
++       .nir = build_fragment_shader()},
++   };
++   const VkPipelineShaderStageCreateInfo stages[] = {
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .pNext = &nir[0], .stage = VK_SHADER_STAGE_VERTEX_BIT, .pName = "main"},
++      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++       .pNext = &nir[1], .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
++       .pName = "main"},
++   };
++   const VkPipelineInputAssemblyStateCreateInfo ia = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
++   };
++   const VkViewport viewport = {0, 0, WIDTH, HEIGHT, 0, 1};
++   const VkRect2D scissor = {{0, 0}, {WIDTH, HEIGHT}};
++   const VkPipelineViewportStateCreateInfo vp = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1, .pViewports = &viewport,
++      .scissorCount = 1, .pScissors = &scissor,
++   };
++   const VkPipelineRasterizationStateCreateInfo rs = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL,
++      .cullMode = VK_CULL_MODE_NONE,
++      .lineWidth = 1,
++   };
++   const VkPipelineMultisampleStateCreateInfo ms = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
++   };
++   const VkPipelineColorBlendAttachmentState att = {
++      .blendEnable = VK_TRUE,
++      .srcColorBlendFactor = blend->src_color,
++      .dstColorBlendFactor = blend->dst_color,
++      .colorBlendOp = blend->color_op,
++      .srcAlphaBlendFactor = blend->src_alpha,
++      .dstAlphaBlendFactor = blend->dst_alpha,
++      .alphaBlendOp = blend->alpha_op,
++      .colorWriteMask = 0xf,
++   };
++   const VkPipelineColorBlendStateCreateInfo cb = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .logicOp = VK_LOGIC_OP_CLEAR,
++      .attachmentCount = 1, .pAttachments = &att,
++   };
++   /* Dynamic vertex input defers shader compilation past pipeline creation,
++    * exactly as the Zink OpenGL frontend does for every program. */
++   const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VERTEX_INPUT_EXT};
++   const VkPipelineDynamicStateCreateInfo dynamic = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
++      .dynamicStateCount = ARRAY_SIZE(dynamic_states),
++      .pDynamicStates = dynamic_states,
++   };
++   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++   const VkPipelineRenderingCreateInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1, .pColorAttachmentFormats = &format,
++   };
++   const VkGraphicsPipelineCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++      .pNext = &rendering,
++      .stageCount = 2, .pStages = stages,
++      .pInputAssemblyState = &ia,
++      .pViewportState = &vp, .pRasterizationState = &rs,
++      .pMultisampleState = &ms, .pColorBlendState = &cb,
++      .pDynamicState = &dynamic,
++      .layout = layout,
++   };
++   VkPipeline pipeline;
++   CHECK(ctx->api->CreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1,
++                                           &info, NULL, &pipeline));
++   ralloc_free(nir[0].nir);
++   ralloc_free(nir[1].nir);
++   return pipeline;
++}
++
++static float
++apply_factor(VkBlendFactor factor, const float *color, unsigned channel)
++{
++   switch (factor) {
++   case VK_BLEND_FACTOR_ZERO:
++      return 0.0f;
++   case VK_BLEND_FACTOR_ONE:
++      return 1.0f;
++   case VK_BLEND_FACTOR_SRC_ALPHA:
++      return source_color[3];
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:
++      return 1.0f - source_color[3];
++   case VK_BLEND_FACTOR_DST_ALPHA:
++      return dest_color[3];
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
++      return 1.0f - dest_color[3];
++   case VK_BLEND_FACTOR_SRC_COLOR:
++      return source_color[channel];
++   case VK_BLEND_FACTOR_DST_COLOR:
++      return dest_color[channel];
++   default:
++      abort();
++   }
++}
++
++static float
++apply_op(VkBlendOp op, float src, float dst)
++{
++   switch (op) {
++   case VK_BLEND_OP_ADD:
++      return src + dst;
++   case VK_BLEND_OP_SUBTRACT:
++      return src - dst;
++   case VK_BLEND_OP_REVERSE_SUBTRACT:
++      return dst - src;
++   case VK_BLEND_OP_MIN:
++      return fminf(src, dst);
++   case VK_BLEND_OP_MAX:
++      return fmaxf(src, dst);
++   default:
++      abort();
++   }
++}
++
++static unsigned
++expected_channel(const struct blend_case *blend, unsigned channel)
++{
++   const bool alpha = channel == 3;
++   const VkBlendFactor src_factor = alpha ? blend->src_alpha : blend->src_color;
++   const VkBlendFactor dst_factor = alpha ? blend->dst_alpha : blend->dst_color;
++   const VkBlendOp op = alpha ? blend->alpha_op : blend->color_op;
++   const float src =
++      source_color[channel] * apply_factor(src_factor, source_color, channel);
++   const float dst =
++      dest_color[channel] * apply_factor(dst_factor, dest_color, channel);
++   const float result = fminf(fmaxf(apply_op(op, src, dst), 0.0f), 1.0f);
++   return lroundf(result * 255.0f);
++}
++
++static bool
++render_and_verify(struct context *ctx, VkPipeline pipeline,
++                  const struct blend_case *blend)
++{
++   struct image target = create_image(ctx);
++
++   VkBuffer buffer;
++   const VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = PIXELS * 4,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   CHECK(ctx->api->CreateBuffer(ctx->device, &buffer_info, NULL, &buffer));
++   VkMemoryRequirements req;
++   ctx->api->GetBufferMemoryRequirements(ctx->device, buffer, &req);
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = memory_type(ctx, req.memoryTypeBits,
++         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
++   };
++   VkDeviceMemory memory;
++   CHECK(ctx->api->AllocateMemory(ctx->device, &alloc, NULL, &memory));
++   CHECK(ctx->api->BindBufferMemory(ctx->device, buffer, memory, 0));
++   uint8_t *pixels;
++   CHECK(ctx->api->MapMemory(ctx->device, memory, 0, VK_WHOLE_SIZE, 0,
++                             (void **)&pixels));
++   memset(pixels, 0xa5, PIXELS * 4);
++
++   CHECK(ctx->api->ResetCommandBuffer(ctx->cmd, 0));
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++   };
++   CHECK(ctx->api->BeginCommandBuffer(ctx->cmd, &begin));
++   const VkImageMemoryBarrier barrier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = target.image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   ctx->api->CmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
++
++   const VkRenderingAttachmentInfo attachment = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = target.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++      .clearValue = {.color = {.float32 = {dest_color[0], dest_color[1],
++                                           dest_color[2], dest_color[3]}}},
++   };
++   const VkRenderingInfo rendering = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = {{0, 0}, {WIDTH, HEIGHT}}, .layerCount = 1,
++      .colorAttachmentCount = 1, .pColorAttachments = &attachment,
++   };
++   ctx->api->CmdBeginRendering(ctx->cmd, &rendering);
++   ctx->api->CmdBindPipeline(ctx->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                             pipeline);
++   ctx->api->CmdSetVertexInputEXT(ctx->cmd, 0, NULL, 0, NULL);
++   ctx->api->CmdDraw(ctx->cmd, 3, 1, 0, 0);
++   ctx->api->CmdEndRendering(ctx->cmd);
++
++   const VkImageMemoryBarrier read_barrier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = target.image,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   ctx->api->CmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1,
++      &read_barrier);
++   const VkBufferImageCopy copy = {
++      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .imageExtent = {WIDTH, HEIGHT, 1},
++   };
++   ctx->api->CmdCopyImageToBuffer(ctx->cmd, target.image,
++      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
++   const VkMemoryBarrier host = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++   };
++   ctx->api->CmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
++   CHECK(ctx->api->EndCommandBuffer(ctx->cmd));
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1, .pCommandBuffers = &ctx->cmd,
++   };
++   CHECK(ctx->api->QueueSubmit(ctx->queue, 1, &submit, VK_NULL_HANDLE));
++   CHECK(ctx->api->QueueWaitIdle(ctx->queue));
++
++   unsigned expected[4];
++   for (unsigned c = 0; c < 4; c++)
++      expected[c] = expected_channel(blend, c);
++   unsigned bad = 0;
++   for (unsigned i = 0; i < PIXELS; i++)
++      for (unsigned c = 0; c < 4; c++)
++         bad += abs((int)pixels[4 * i + c] - (int)expected[c]) > 1;
++   printf("blend=%s pixel0=%u,%u,%u,%u expected=%u,%u,%u,%u mismatches=%u\n",
++          blend->name, pixels[0], pixels[1], pixels[2], pixels[3],
++          expected[0], expected[1], expected[2], expected[3], bad);
++
++   ctx->api->UnmapMemory(ctx->device, memory);
++   ctx->api->DestroyBuffer(ctx->device, buffer, NULL);
++   ctx->api->FreeMemory(ctx->device, memory, NULL);
++   destroy_image(ctx, target);
++   return bad == 0;
++}
++
++int
++main(void)
++{
++   const VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .apiVersion = VK_API_VERSION_1_3,
++   };
++   const VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   VkInstance instance;
++   CHECK(kk_CreateInstance(&instance_info, NULL, &instance));
++   PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)
++      kk_GetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices");
++   uint32_t count = 1;
++   VkPhysicalDevice physical;
++   CHECK(enumerate(instance, &count, &physical));
++   const float priority = 1;
++   const VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &priority,
++   };
++   const VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vertex_input = {
++      .sType =
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
++      .vertexInputDynamicState = VK_TRUE,
++   };
++   const VkPhysicalDeviceVulkan13Features features13 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .pNext = (void *)&vertex_input, .dynamicRendering = VK_TRUE,
++   };
++   const char *extensions[] = {
++      VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
++   };
++   const VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &features13,
++      .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = ARRAY_SIZE(extensions),
++      .ppEnabledExtensionNames = extensions,
++   };
++   struct context ctx = {0};
++   CHECK(kk_CreateDevice(physical, &device_info, NULL, &ctx.device));
++   PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
++      (PFN_vkGetPhysicalDeviceMemoryProperties)kk_GetInstanceProcAddr(
++         instance, "vkGetPhysicalDeviceMemoryProperties");
++   get_memory(physical, &ctx.memory);
++   ctx.api = &kk_device_from_handle(ctx.device)->exposed_dispatch_table;
++   ctx.api->GetDeviceQueue(ctx.device, 0, 0, &ctx.queue);
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = 0,
++   };
++   VkCommandPool pool;
++   CHECK(ctx.api->CreateCommandPool(ctx.device, &pool_info, NULL, &pool));
++   const VkCommandBufferAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   CHECK(ctx.api->AllocateCommandBuffers(ctx.device, &alloc, &ctx.cmd));
++
++   const VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++   };
++   VkPipelineLayout layout;
++   CHECK(ctx.api->CreatePipelineLayout(ctx.device, &layout_info, NULL,
++                                       &layout));
++
++   /* The first configuration establishes the compiled pipeline that a broken
++    * cache key would hand to the later ones. */
++   const struct blend_case cases[] = {
++      {"add_add", VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
++       VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD},
++      {"add_subtract_alpha", VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++       VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
++       VK_BLEND_OP_SUBTRACT},
++      {"separate_factors", VK_BLEND_FACTOR_SRC_ALPHA,
++       VK_BLEND_FACTOR_DST_ALPHA, VK_BLEND_OP_ADD,
++       VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
++       VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_OP_ADD},
++   };
++   VkPipeline pipelines[ARRAY_SIZE(cases)];
++   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++)
++      pipelines[i] = create_pipeline(&ctx, layout, &cases[i]);
++
++   bool pass = true;
++   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++)
++      pass &= render_and_verify(&ctx, pipelines[i], &cases[i]);
++
++   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++)
++      ctx.api->DestroyPipeline(ctx.device, pipelines[i], NULL);
++   ctx.api->DestroyPipelineLayout(ctx.device, layout, NULL);
++   ctx.api->FreeCommandBuffers(ctx.device, pool, 1, &ctx.cmd);
++   ctx.api->DestroyCommandPool(ctx.device, pool, NULL);
++   printf("%s\n", pass ? "PASS" : "FAIL");
++   return pass ? 0 : 1;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_dynamic_vertex_input_cache.cpp b/src/kosmickrisp/vulkan/tests/test_dynamic_vertex_input_cache.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..65706eb0008d3ae0755a925ff0ddbdc1ef9f3c3e
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_dynamic_vertex_input_cache.cpp
+@@ -0,0 +1,350 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ *
++ * Dynamic vertex-input pipelines defer native compilation to the draw that
++ * first supplies concrete vertex-input state.  Equivalent pipelines must share
++ * one parent so that the variants it compiled during command recording are
++ * reused, and that sharing must survive the destruction of the VkPipeline that
++ * happened to link the parent first.  An OpenGL frontend builds an equivalent
++ * pipeline for every program it links, so a per-VkPipeline parent repeats a
++ * complete native compilation at the first draw of each one.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++#include "dynamic_vertex_input_cache_state.h"
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (ok)
++      return;
++   std::fprintf(stderr, "%s: %d\n", operation, value);
++   std::exit(1);
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "line_raster_shaders/cache.vert.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "line_raster_shaders/cache.frag.h"
++;
++
++int main()
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "dynamic-vertex-input-cache";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceFeatures2);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count",
++           result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result =
++      vkEnumeratePhysicalDevices(instance, &physical_count, physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT reported_vertex_input{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
++      VkPhysicalDeviceFeatures2 reported{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++      reported.pNext = &reported_vertex_input;
++      vkGetPhysicalDeviceFeatures2(physical, &reported);
++      require(reported_vertex_input.vertexInputDynamicState,
++              "reported dynamic vertex input feature");
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
++                                               queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count &&
++             !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{
++         VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vertex_input_features{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
++      vertex_input_features.vertexInputDynamicState = VK_TRUE;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.pNext = &vertex_input_features;
++      features13.dynamicRendering = VK_TRUE;
++      const char *extensions[] = {
++         VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME};
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      device_info.enabledExtensionCount = 1;
++      device_info.ppEnabledExtensionNames = extensions;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++
++#define LOAD_D(name)                                                          \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdSetViewport);
++      LOAD_D(vkCmdSetScissor);
++      LOAD_D(vkCmdSetVertexInputEXT);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkQueueWaitIdle);
++#undef LOAD_D
++
++      VkQueue device_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &device_queue);
++      require(device_queue != VK_NULL_HANDLE, "device queue");
++
++      std::array<VkShaderModule, 2> modules{};
++      const std::array<const uint32_t *, 2> sources{vertex_spirv,
++                                                    fragment_spirv};
++      const std::array<size_t, 2> sizes{sizeof(vertex_spirv),
++                                        sizeof(fragment_spirv)};
++      for (unsigned i = 0; i < modules.size(); ++i) {
++         VkShaderModuleCreateInfo info{
++            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++         info.codeSize = sizes[i];
++         info.pCode = sources[i];
++         result = vkCreateShaderModule(device, &info, nullptr, &modules[i]);
++         require(result == VK_SUCCESS, "create module", result);
++      }
++
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "create layout", result);
++
++      const std::array<VkPipelineShaderStageCreateInfo, 2> stages{{
++         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
++          VK_SHADER_STAGE_VERTEX_BIT, modules[0], "main", nullptr},
++         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
++          VK_SHADER_STAGE_FRAGMENT_BIT, modules[1], "main", nullptr},
++      }};
++      VkPipelineVertexInputStateCreateInfo vi{
++         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      VkPipelineInputAssemblyStateCreateInfo ia{
++         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++      VkPipelineViewportStateCreateInfo vp{
++         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++      vp.viewportCount = vp.scissorCount = 1;
++      VkPipelineRasterizationStateCreateInfo rs{
++         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      rs.lineWidth = 1.0f;
++      VkPipelineMultisampleStateCreateInfo ms{
++         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++      ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++      VkPipelineColorBlendAttachmentState attachment{};
++      attachment.colorWriteMask = 15;
++      VkPipelineColorBlendStateCreateInfo cb{
++         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++      cb.attachmentCount = 1;
++      cb.pAttachments = &attachment;
++      const VkDynamicState dynamic_states[] = {
++         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
++         VK_DYNAMIC_STATE_VERTEX_INPUT_EXT};
++      VkPipelineDynamicStateCreateInfo dynamic{
++         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++      dynamic.dynamicStateCount = 3;
++      dynamic.pDynamicStates = dynamic_states;
++      const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++      VkPipelineRenderingCreateInfo rendering{
++         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      rendering.colorAttachmentCount = 1;
++      rendering.pColorAttachmentFormats = &format;
++      VkGraphicsPipelineCreateInfo pipeline_info{
++         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      pipeline_info.pNext = &rendering;
++      pipeline_info.stageCount = stages.size();
++      pipeline_info.pStages = stages.data();
++      pipeline_info.pVertexInputState = &vi;
++      pipeline_info.pInputAssemblyState = &ia;
++      pipeline_info.pViewportState = &vp;
++      pipeline_info.pRasterizationState = &rs;
++      pipeline_info.pMultisampleState = &ms;
++      pipeline_info.pColorBlendState = &cb;
++      pipeline_info.pDynamicState = &dynamic;
++      pipeline_info.layout = layout;
++
++      /* A compile is required for the first concrete vertex-input state, so
++       * pipeline creation must report it rather than deferring forbidden
++       * compilation into command recording. */
++      pipeline_info.flags =
++         VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
++      VkPipeline unexpected = VK_NULL_HANDLE;
++      result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                         &pipeline_info, nullptr, &unexpected);
++      require(result == VK_PIPELINE_COMPILE_REQUIRED,
++              "dynamic vertex-input compile-required", result);
++      require(unexpected == VK_NULL_HANDLE, "compile-required pipeline handle");
++
++      const unsigned baseline = kk_test_linked_graphics_pipeline_count(device);
++      pipeline_info.flags = 0;
++      VkPipeline first = VK_NULL_HANDLE;
++      result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                         &pipeline_info, nullptr, &first);
++      require(result == VK_SUCCESS, "first pipeline", result);
++      require(kk_test_linked_graphics_pipeline_count(device) == baseline + 1,
++              "first pipeline adds one parent");
++
++      VkCommandPoolCreateInfo pool_info{
++         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "command pool", result);
++
++      const VkViewport viewport{0, 0, 8, 8, 0, 1};
++      const VkRect2D scissor{{0, 0}, {8, 8}};
++      VkVertexInputBindingDescription2EXT binding{
++         VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT};
++      binding.binding = 0;
++      binding.stride = 4;
++      binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++      binding.divisor = 1;
++      VkVertexInputAttributeDescription2EXT attribute_state{
++         VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT};
++      attribute_state.location = 0;
++      attribute_state.binding = 0;
++      attribute_state.format = VK_FORMAT_R8G8B8A8_UNORM;
++      attribute_state.offset = 0;
++
++      /* Record one draw with the given pipeline and report the native vertex
++       * shader the dynamic vertex-input resolution selected. */
++      const auto record_draw = [&](VkPipeline pipeline) {
++         VkCommandBufferAllocateInfo allocate{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++         allocate.commandPool = pool;
++         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++         allocate.commandBufferCount = 1;
++         VkCommandBuffer command = VK_NULL_HANDLE;
++         auto allocated = vkAllocateCommandBuffers(device, &allocate, &command);
++         require(allocated == VK_SUCCESS, "command allocation", allocated);
++         VkCommandBufferBeginInfo begin{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++         allocated = vkBeginCommandBuffer(command, &begin);
++         require(allocated == VK_SUCCESS, "command begin", allocated);
++         VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
++         render.renderArea.extent = {8, 8};
++         render.layerCount = 1;
++         vkCmdBeginRendering(command, &render);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++         vkCmdSetViewport(command, 0, 1, &viewport);
++         vkCmdSetScissor(command, 0, 1, &scissor);
++         vkCmdSetVertexInputEXT(command, 1, &binding, 1, &attribute_state);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         const struct kk_shader *resolved =
++            kk_test_dynamic_vertex_input_shader(command);
++         require(resolved != nullptr, "resolved dynamic vertex-input shader");
++         vkCmdEndRendering(command);
++         allocated = vkEndCommandBuffer(command);
++         require(allocated == VK_SUCCESS, "command end", allocated);
++         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         submit.commandBufferCount = 1;
++         submit.pCommandBuffers = &command;
++         allocated = vkQueueSubmit(device_queue, 1, &submit, VK_NULL_HANDLE);
++         require(allocated == VK_SUCCESS, "command submit", allocated);
++         allocated = vkQueueWaitIdle(device_queue);
++         require(allocated == VK_SUCCESS, "command completion", allocated);
++         return resolved;
++      };
++
++      const struct kk_shader *compiled = record_draw(first);
++
++      /* An OpenGL frontend creates an equivalent pipeline for every program.
++       * The second pipeline must reuse the variant the first one compiled
++       * instead of repeating the native compilation. */
++      VkPipeline second = VK_NULL_HANDLE;
++      result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                         &pipeline_info, nullptr, &second);
++      require(result == VK_SUCCESS, "second pipeline", result);
++      require(kk_test_linked_graphics_pipeline_count(device) == baseline + 1,
++              "equivalent pipeline shares its parent");
++      require(record_draw(second) == compiled,
++              "equivalent pipeline reuses the compiled variant");
++
++      /* The shared parent outlives the pipeline that linked it first. */
++      vkDestroyPipeline(device, first, nullptr);
++      require(record_draw(second) == compiled,
++              "shared variant survives destroying the first pipeline");
++
++      vkDestroyPipeline(device, second, nullptr);
++      require(kk_test_linked_graphics_pipeline_count(device) == baseline,
++              "last pipeline releases its parent and native variants");
++
++      for (unsigned i = 0; i < 8; ++i) {
++         VkPipeline transient = VK_NULL_HANDLE;
++         result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                            &pipeline_info, nullptr, &transient);
++         require(result == VK_SUCCESS, "transient pipeline", result);
++         record_draw(transient);
++         vkDestroyPipeline(device, transient, nullptr);
++         require(kk_test_linked_graphics_pipeline_count(device) == baseline,
++                 "repeated pipeline destruction returns cache to baseline");
++      }
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      for (auto module : modules)
++         vkDestroyShaderModule(device, module, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   std::puts("dynamic vertex-input parent cache regression passed");
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_legacy_vertex_attributes.c b/src/kosmickrisp/vulkan/tests/test_legacy_vertex_attributes.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..52b911ba1d73f1cbcac004db2ec9ee60affcaf3d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_legacy_vertex_attributes.c
+@@ -0,0 +1,239 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kosmickrisp/vulkan/kk_nir_lower_vbo.h"
++#include "kosmickrisp/vulkan/kk_shader_info.h"
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <assert.h>
++#include <string.h>
++
++struct lowering_stats {
++   nir_intrinsic_instr *typed_load;
++   nir_intrinsic_instr *first_byte_load;
++   unsigned byte_loads;
++   unsigned global_constant_loads;
++   unsigned input_loads;
++   unsigned imul32;
++   unsigned imul64;
++   unsigned udiv32;
++   unsigned bcsel;
++   unsigned ult;
++   unsigned u2f32;
++   unsigned u2u32;
++   unsigned i2i32;
++};
++
++static void
++collect_stats(nir_shader *shader, struct lowering_stats *stats)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic) {
++               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++               if (intr->intrinsic == nir_intrinsic_load_input)
++                  stats->input_loads++;
++               else if (intr->intrinsic == nir_intrinsic_load_constant_agx) {
++                  if (nir_intrinsic_format(intr) == PIPE_FORMAT_R8_UINT) {
++                     if (stats->first_byte_load == NULL)
++                        stats->first_byte_load = intr;
++                     stats->byte_loads++;
++                  } else {
++                     stats->typed_load = intr;
++                  }
++               } else if (intr->intrinsic ==
++                          nir_intrinsic_load_global_constant)
++                  stats->global_constant_loads++;
++            } else if (instr->type == nir_instr_type_alu) {
++               nir_alu_instr *alu = nir_instr_as_alu(instr);
++               if (alu->op == nir_op_imul && alu->def.bit_size == 32)
++                  stats->imul32++;
++               else if (alu->op == nir_op_imul && alu->def.bit_size == 64)
++                  stats->imul64++;
++               else if (alu->op == nir_op_udiv && alu->def.bit_size == 32)
++                  stats->udiv32++;
++               else if (alu->op == nir_op_bcsel)
++                  stats->bcsel++;
++               else if (alu->op == nir_op_ult)
++                  stats->ult++;
++               else if (alu->op == nir_op_u2f32)
++                  stats->u2f32++;
++               else if (alu->op == nir_op_u2u32)
++                  stats->u2u32++;
++               else if (alu->op == nir_op_i2i32)
++                  stats->i2i32++;
++            }
++         }
++      }
++   }
++}
++
++static nir_shader *
++lower_vertex_fetch(enum pipe_format format, nir_alu_type dest_type,
++                   bool robustness2, bool byte_strides)
++{
++   static const nir_shader_compiler_options options = {0};
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_VERTEX, &options, "legacy vertex attribute lowering test");
++
++   nir_def *input = nir_load_input(
++      &b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 1,
++      .dest_type = dest_type,
++      .io_semantics = (nir_io_semantics) {
++         .location = VERT_ATTRIB_GENERIC0,
++         .num_slots = 1,
++      });
++   nir_store_global(&b, input, nir_imm_int64(&b, 0x1000),
++                    .align_mul = sizeof(uint32_t));
++
++   struct kk_attribute attribs[KK_MAX_ATTRIBS] = {
++      [0] = {
++         .binding = 0,
++         .format = format,
++      },
++   };
++   assert(kk_nir_lower_vbo(b.shader, attribs, robustness2, byte_strides));
++   nir_validate_shader(b.shader, "after legacy vertex attribute lowering");
++   return b.shader;
++}
++
++static void
++check_vertex_attribute_mask_phases(void)
++{
++   static const nir_shader_compiler_options options = {0};
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_VERTEX, &options, "vertex attribute mask phase test");
++
++   b.shader->info.inputs_read =
++      BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + 1) |
++      BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + 7);
++   assert(!b.shader->info.io_lowered);
++   assert(kk_gather_vs_attribs_read(b.shader) ==
++          (BITFIELD_BIT(1) | BITFIELD_BIT(7)));
++
++   nir_load_input(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                  .dest_type = nir_type_uint32,
++                  .io_semantics = (nir_io_semantics) {
++                     .location = VERT_ATTRIB_GENERIC0 + 3,
++                     .num_slots = 1,
++                  });
++   b.shader->info.io_lowered = true;
++   assert(kk_gather_vs_attribs_read(b.shader) == BITFIELD_BIT(3));
++
++   ralloc_free(b.shader);
++}
++
++static void
++check_aligned_fast_path(void)
++{
++   nir_shader *shader = lower_vertex_fetch(
++      PIPE_FORMAT_R32_UINT, nir_type_uint32, false, false);
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++
++   assert(stats.typed_load != NULL);
++   assert(stats.byte_loads == 0);
++   assert(stats.input_loads == 0);
++   assert(stats.imul32 == 1);
++   assert(stats.imul64 == 0);
++   assert(!nir_src_is_const(stats.typed_load->src[1]));
++
++   ralloc_free(shader);
++}
++
++static void
++check_legacy_byte_stride_path(void)
++{
++   nir_shader *shader = lower_vertex_fetch(
++      PIPE_FORMAT_R32_UINT, nir_type_uint32, false, true);
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++
++   assert(stats.typed_load == NULL);
++   assert(stats.byte_loads == sizeof(uint32_t));
++   assert(stats.first_byte_load != NULL);
++   assert(stats.input_loads == 0);
++   assert(stats.imul32 == 1);
++   assert(stats.imul64 == 0);
++   assert(stats.udiv32 == 0);
++   assert(stats.first_byte_load->src[0].ssa->bit_size == 64);
++   assert(stats.first_byte_load->src[1].ssa->bit_size == 32);
++   assert(stats.first_byte_load->def.bit_size == 32);
++
++   msl_optimize_nir(shader);
++   nir_shader_gather_info(shader, nir_shader_get_entrypoint(shader));
++   struct nir_to_msl_options options = {0};
++   char *msl = nir_to_msl(shader, &options);
++   assert(strstr(msl, "uint(*((constant uchar*)") != NULL);
++   ralloc_free(msl);
++
++   ralloc_free(shader);
++}
++
++static struct lowering_stats
++lower_and_collect(enum pipe_format format, nir_alu_type dest_type,
++                  bool robustness2)
++{
++   nir_shader *shader = lower_vertex_fetch(
++      format, dest_type, robustness2, true);
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++   ralloc_free(shader);
++   return stats;
++}
++
++static void
++check_numeric_type_mismatches(void)
++{
++   /* Cross-type results are implementation-dependent.  Keep KosmicKrisp's
++    * stable choice explicit: convert according to the vertex format, then let
++    * typeless NIR SSA carry those bits to the shader-declared type.
++    */
++   struct lowering_stats unorm_to_uint = lower_and_collect(
++      PIPE_FORMAT_R8_UNORM, nir_type_uint32, false);
++   assert(unorm_to_uint.byte_loads == 1);
++   assert(unorm_to_uint.u2f32 > 0);
++   assert(unorm_to_uint.u2u32 == 0);
++
++   struct lowering_stats uint_to_float = lower_and_collect(
++      PIPE_FORMAT_R8_UINT, nir_type_float32, false);
++   assert(uint_to_float.byte_loads == 1);
++   assert(uint_to_float.u2u32 > 0);
++   assert(uint_to_float.u2f32 == 0);
++
++   struct lowering_stats sint_to_uint = lower_and_collect(
++      PIPE_FORMAT_R8_SINT, nir_type_uint32, false);
++   assert(sint_to_uint.byte_loads == 1);
++   assert(sint_to_uint.i2i32 > 0);
++}
++
++static void
++check_robust_unaligned_fetch(void)
++{
++   struct lowering_stats stats = lower_and_collect(
++      PIPE_FORMAT_R16_UINT, nir_type_uint32, true);
++
++   assert(stats.byte_loads == sizeof(uint16_t));
++   assert(stats.global_constant_loads == 3);
++   assert(stats.bcsel == 1);
++   assert(stats.ult == 1);
++   assert(stats.imul32 == 1);
++   assert(stats.udiv32 == 0);
++}
++
++int
++main(void)
++{
++   check_vertex_attribute_mask_phases();
++   check_aligned_fast_path();
++   check_legacy_byte_stride_path();
++   check_numeric_type_mismatches();
++   check_robust_unaligned_fetch();
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_line_raster_cache.cpp b/src/kosmickrisp/vulkan/tests/test_line_raster_cache.cpp
+index cbffca7a551e4d65ffb0a28555fc6d83c9dc9bbc..f998501a8ca49b2c739b4fa452783558e0d8d57d 100644
+--- a/src/kosmickrisp/vulkan/tests/test_line_raster_cache.cpp
++++ b/src/kosmickrisp/vulkan/tests/test_line_raster_cache.cpp
+@@ -743,11 +743,12 @@ int main()
+             }
+          }
+ 
+-         /* GPL libraries serialize deferred NIR.  Final executable pairs are
+-          * cached for the device lifetime and reconstructed only on a cold
+-          * final link, not while creating a partial library or drawing. */
++         /* GPL libraries serialize deferred NIR. Final executable pairs are
++          * shared while an owner is live. After its last release a final link
++          * needs compilation, even when the library comes from a cache. */
+          std::vector<uint8_t> library_bytes;
+          const kk_shader *linked_owner = nullptr;
++         VkPipeline live_final = VK_NULL_HANDLE;
+          for (unsigned reload = 0; reload < 2; reload++) {
+             VkPipelineCacheCreateInfo library_cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+             library_cache_info.initialDataSize = library_bytes.size();
+@@ -789,6 +790,10 @@ int main()
+                                                nullptr, &final_pipeline);
+             require(result == (reload ? VK_SUCCESS : VK_PIPELINE_COMPILE_REQUIRED),
+                     "GPL final cache result", result);
++            if (reload) {
++               vkDestroyPipeline(device, live_final, nullptr);
++               live_final = VK_NULL_HANDLE;
++            }
+             if (!reload) {
+                final_info.flags = 0;
+                result = vkCreateGraphicsPipelines(device, library_cache, 1, &final_info,
+@@ -853,7 +858,17 @@ int main()
+             result = vkQueueWaitIdle(device_queue);
+             require(result == VK_SUCCESS, "GPL command completion", result);
+             vkDestroyCommandPool(device, pool, nullptr);
+-            vkDestroyPipeline(device, final_pipeline, nullptr);
++            if (!reload) {
++               live_final = final_pipeline;
++            } else {
++               vkDestroyPipeline(device, final_pipeline, nullptr);
++               VkPipeline cold = VK_NULL_HANDLE;
++               result = vkCreateGraphicsPipelines(device, library_cache, 1,
++                                                  &final_info, nullptr, &cold);
++               require(result == VK_PIPELINE_COMPILE_REQUIRED,
++                       "GPL final cache after last owner", result);
++               require(cold == VK_NULL_HANDLE, "GPL cold final result handle");
++            }
+             vkDestroyPipeline(device, library, nullptr);
+             size_t size = 0;
+             result = vkGetPipelineCacheData(device, library_cache, &size, nullptr);

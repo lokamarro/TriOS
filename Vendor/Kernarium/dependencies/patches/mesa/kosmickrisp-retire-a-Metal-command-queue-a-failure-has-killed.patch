@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 11:34:29 +0900
+Subject: [PATCH] kosmickrisp: retire a Metal command queue a failure has
+ killed
+
+Metal does not revive an MTL4CommandQueue that has killed a submission.
+Measured on an A15 with a trace of every commit and every report: after
+two genuine GPU timeouts the queue admitted each later commit and
+reported it failed in 0.0-0.1 ms, with MTL4CommandQueueErrorTimeout and
+an execution interval of a few microseconds, for every submission that
+followed. A twelve-case Vulkan CTS reproducer therefore fails its last
+seven cases with wrong pixels and wrong buffer contents, and a CTS
+fraction fails every remaining case after the collapse.
+
+The queue accepts work and runs none of it, and Metal 4 offers nothing
+that resets one, so the driver stops using it. The replacement is
+committed to on the queue's own submit thread and only once Metal has
+reported every submission the retired queue was given, which keeps this
+driver's single-queue ordering intact: no submission is split across the
+two queues, and the retired queue holds no report that could arrive
+after its owed signals were made good.
+
+Retirement reads a queue's reports and its failure under one lock, so
+the commit callback publishes a submission's report and the failure it
+carries in the same critical section. Otherwise a failing queue would
+look drained and healthy in between, and a later failing submission
+could find the earlier one's report already counted, retire the queue,
+clear its failure count, and let the first callback fail the queue that
+replaced it. The error is described and printed before the lock is
+taken so nothing unbounded runs inside it.
+
+The callback also acts on its report inside that critical section: the
+sweep a failure owes, the one a completion after a failure owes, and the
+drained check with its sweep of everything left. A verdict reached under
+the lock and acted on after it could outlive a retirement: the submit
+thread could retire the drained queue, clear its failure count and
+enqueue signals on the replacement at the serial it last committed, and
+the stale sweep would then raise those signals while the replacement was
+still running the work they follow. The submit path's drained check
+decides and sweeps under one lock for the same reason.
+
+The timeout contract in kk_queue_error.h said a device survives a
+timeout because the queue keeps working. The device still survives, but
+now because the queue that reported it is retired, and the contract says
+so.
+---
+ src/kosmickrisp/vulkan/kk_queue.c       | 191 ++++++++++++++++++------
+ src/kosmickrisp/vulkan/kk_queue.h       |   5 +-
+ src/kosmickrisp/vulkan/kk_queue_error.c |  11 +-
+ src/kosmickrisp/vulkan/kk_queue_error.h |  18 +--
+ 4 files changed, 163 insertions(+), 62 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 507b0b8e22f2e1bf30335d7abeee9a60441a0b04..73bd1f010677394f5421bc268fe49771d124ea14 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -63,12 +63,11 @@ kk_queue_signals_prune_locked(struct kk_queue_feedback *feedback)
+  * nothing on it can signal any more, or to the waiter's bound. A record whose
+  * event has already passed its value is not raised either. */
+ static unsigned
+-kk_queue_signals_make_good(struct kk_queue_feedback *feedback,
+-                           uint64_t through_serial)
++kk_queue_signals_make_good_locked(struct kk_queue_feedback *feedback,
++                                  uint64_t through_serial)
+ {
+    unsigned made_good = 0u;
+ 
+-   simple_mtx_lock(&feedback->signal_mutex);
+    kk_queue_signals_prune_locked(feedback);
+    struct kk_queue_signal *records = util_dynarray_begin(&feedback->signals);
+    uint32_t count =
+@@ -105,6 +104,17 @@ kk_queue_signals_make_good(struct kk_queue_feedback *feedback,
+       }
+    }
+    kk_queue_signals_prune_locked(feedback);
++
++   return made_good;
++}
++
++static unsigned
++kk_queue_signals_make_good(struct kk_queue_feedback *feedback,
++                           uint64_t through_serial)
++{
++   simple_mtx_lock(&feedback->signal_mutex);
++   unsigned made_good =
++      kk_queue_signals_make_good_locked(feedback, through_serial);
+    simple_mtx_unlock(&feedback->signal_mutex);
+ 
+    return made_good;
+@@ -142,14 +152,6 @@ kk_queue_complete_owed_signals(struct kk_queue *queue, mtl_shared_event *event)
+    return owed;
+ }
+ 
+-static void
+-kk_queue_signals_retire(struct kk_queue_feedback *feedback)
+-{
+-   simple_mtx_lock(&feedback->signal_mutex);
+-   kk_queue_signals_prune_locked(feedback);
+-   simple_mtx_unlock(&feedback->signal_mutex);
+-}
+-
+ static void
+ kk_queue_feedback_unref(struct kk_queue_feedback *feedback)
+ {
+@@ -214,15 +216,85 @@ kk_queue_record_signal(struct kk_queue_feedback *feedback,
+  * the queue may run before the record it would have resolved exists. Both
+  * sides therefore check, and whichever happens second does the work. */
+ static void
++kk_queue_resolve_if_drained_locked(struct kk_queue_feedback *feedback)
++{
++   if (feedback->failures > 0u && feedback->reported == feedback->last_serial)
++      kk_queue_signals_make_good_locked(feedback, UINT64_MAX);
++}
++
++/* The decision and the sweep share one critical section. Decided under the
++ * lock and acted on after it, a drained verdict could outlive a retirement:
++ * the submit thread can replace the drained queue, clear its failures and
++ * enqueue signals on the replacement, which the stale sweep would then raise
++ * while the replacement is still running the work they follow. */
++static void
+ kk_queue_resolve_if_drained(struct kk_queue_feedback *feedback)
+ {
+    simple_mtx_lock(&feedback->signal_mutex);
+-   bool drained = feedback->failures > 0u &&
+-                  feedback->reported == feedback->last_serial;
++   kk_queue_resolve_if_drained_locked(feedback);
+    simple_mtx_unlock(&feedback->signal_mutex);
++}
+ 
+-   if (drained)
+-      kk_queue_signals_make_good(feedback, UINT64_MAX);
++/* Metal does not revive a command queue that has killed a submission. It
++ * admits each later commit and reports it failed in well under a millisecond,
++ * with the same timeout code and no execution, for as long as the queue
++ * exists: a survived timeout leaves a queue that accepts work and runs none of
++ * it. Nothing in Metal 4 resets one, so the only repair is to stop using it and
++ * commit to a replacement.
++ *
++ * The replacement is made here, on the queue's own submit thread, so nothing
++ * observes a half-swapped handle, and only once Metal has reported every
++ * submission the retired queue was given. Waiting for that is what keeps the
++ * driver's single-queue ordering intact: no submission is ever split across the
++ * two queues, and the retired queue has no report left that could arrive after
++ * its signals were made good. A queue that never drains is a queue that stopped
++ * reporting, which is device loss and is handled as such.
++ */
++static bool
++kk_queue_replace_retired(struct kk_queue *queue)
++{
++   struct kk_queue_feedback *feedback = queue->feedback;
++   struct kk_device *dev = kk_queue_device(queue);
++
++   simple_mtx_lock(&feedback->signal_mutex);
++   bool retire =
++      feedback->failures > 0u && feedback->reported == feedback->last_serial;
++   simple_mtx_unlock(&feedback->signal_mutex);
++   if (!retire)
++      return true;
++
++   mtl_command_queue *replacement = mtl_new_command_queue(dev->mtl_handle);
++   if (!replacement)
++      return false;
++   mtl_command_queue_add_residency_set(replacement, dev->residency_set.handle);
++
++   /* The retired queue answered for everything it was given, so anything it
++    * still owes it destroyed. Make those signals good before its records are
++    * dropped with it, or a waiter would block on a queue that no longer
++    * exists. */
++   kk_queue_signals_make_good(feedback, UINT64_MAX);
++
++   mtl_command_queue *retired = queue->mtl_handle;
++   queue->mtl_handle = replacement;
++
++   simple_mtx_lock(&feedback->signal_mutex);
++   mtl_command_queue *retired_service = feedback->queue;
++   feedback->queue = mtl_retain(replacement);
++   /* The replacement owes nothing, so the recovery rules go back to sleep. */
++   feedback->failures = 0u;
++   simple_mtx_unlock(&feedback->signal_mutex);
++
++   mtl_release(retired_service);
++   mtl_command_queue_remove_residency_set(retired, dev->residency_set.handle);
++   mtl_release(retired);
++
++   /* A queue is only ever retired because Metal failed one of its
++    * submissions, which it has already reported, so this line says what
++    * happened to the queue rather than announcing a new problem. */
++   fprintf(stderr,
++           "KosmicKrisp retired the Metal command queue a failure had left "
++           "rejecting every submission, and committed to a new one\n");
++   return true;
+ }
+ 
+ static struct kk_queue_submission *
+@@ -243,53 +315,71 @@ commit_callback(struct mtl_feedback_data *data)
+    struct kk_queue_submission *submission = data->user_data;
+    struct kk_queue_feedback *feedback = submission->feedback;
+ 
+-   /* A serial is reserved immediately before its commit, so a submission the
+-    * queue is still holding always keeps this below last_serial. */
+-   simple_mtx_lock(&feedback->signal_mutex);
+-   ++feedback->reported;
+-   simple_mtx_unlock(&feedback->signal_mutex);
++   char report[KK_QUEUE_ERROR_REPORT_SIZE];
++   const bool failed = data->error != MTL_COMMAND_QUEUE_ERROR_NONE;
++   /* A lost queue owes every signal it still holds, because it runs nothing
++    * further. A survivable failure owes only the signals ordered behind the
++    * submission it names. */
++   const bool lost = failed && kk_queue_error_is_device_lost(data);
+ 
+-   if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+-      char report[KK_QUEUE_ERROR_REPORT_SIZE];
++   if (failed) {
+       kk_queue_error_describe(report, sizeof(report), data);
+       fprintf(stderr, "KosmicKrisp %s\n", report);
++   }
+ 
+-      /* A lost queue owes every signal it still holds, because it runs
+-       * nothing further. A survivable failure owes only the signals ordered
+-       * behind the submission it names. */
+-      bool lost = kk_queue_error_is_device_lost(data);
+-      simple_mtx_lock(&feedback->signal_mutex);
++   /* A serial is reserved immediately before its commit, so a submission the
++    * queue is still holding always keeps this below last_serial.
++    *
++    * Publish the report together with the failure it carries. Retirement reads
++    * both under this lock and acts once the queue has failed and has answered
++    * for everything it was given, so a report published ahead of its own
++    * failure lets a failing queue look drained and healthy: it is replaced,
++    * the replacement's state is cleared, and the failure then lands on the
++    * queue that replaced it.
++    *
++    * Act on the report in the same critical section. Once the lock is
++    * dropped, the submit thread can retire a queue this report drained, clear
++    * its failures and enqueue signals on the replacement at the serial it
++    * last committed, so a sweep decided here and run after the lock would
++    * raise signals whose work the replacement has not run.
++    */
++   unsigned made_good = 0u;
++   simple_mtx_lock(&feedback->signal_mutex);
++   ++feedback->reported;
++   if (failed) {
++      /* Survived or not, a failed queue runs nothing more that can be
++       * trusted. */
+       ++feedback->failures;
+-      simple_mtx_unlock(&feedback->signal_mutex);
+-      unsigned made_good = kk_queue_signals_make_good(
++      made_good = kk_queue_signals_make_good_locked(
+          feedback, lost ? UINT64_MAX : submission->serial);
+-      if (made_good)
+-         fprintf(stderr,
+-                 "KosmicKrisp completed %u timeline signal%s the failed "
+-                 "submission owed, so its waiters do not block forever\n",
+-                 made_good, made_good == 1u ? "" : "s");
+-
+-      /* Device teardown clears this pointer under the same lock. Never carry
+-       * a Vulkan pointer outside the lock into an asynchronous callback. */
+-      if (lost) {
+-         simple_mtx_lock(&feedback->mutex);
+-         if (feedback->device)
+-            vk_device_set_lost(&feedback->device->vk, "Metal %s", report);
+-         simple_mtx_unlock(&feedback->mutex);
+-      }
+-   } else if (p_atomic_read(&feedback->failures) > 0u) {
++   } else if (feedback->failures > 0u) {
+       /* This queue processes what it is given in order, so a completion also
+        * proves it went past every signal enqueued before this submission.
+        * One of those still short of its value was discarded rather than run,
+        * which is how the work killed behind a reported failure gets resolved
+        * without a report of its own. */
+-      kk_queue_signals_make_good(feedback, submission->serial - 1u);
++      kk_queue_signals_make_good_locked(feedback, submission->serial - 1u);
+    } else {
+       /* A completion proves every signal ordered ahead of it has run. */
+-      kk_queue_signals_retire(feedback);
++      kk_queue_signals_prune_locked(feedback);
+    }
++   kk_queue_resolve_if_drained_locked(feedback);
++   simple_mtx_unlock(&feedback->signal_mutex);
+ 
+-   kk_queue_resolve_if_drained(feedback);
++   if (made_good)
++      fprintf(stderr,
++              "KosmicKrisp completed %u timeline signal%s the failed "
++              "submission owed, so its waiters do not block forever\n",
++              made_good, made_good == 1u ? "" : "s");
++
++   /* Device teardown clears this pointer under the same lock. Never carry
++    * a Vulkan pointer outside the lock into an asynchronous callback. */
++   if (lost) {
++      simple_mtx_lock(&feedback->mutex);
++      if (feedback->device)
++         vk_device_set_lost(&feedback->device->vk, "Metal %s", report);
++      simple_mtx_unlock(&feedback->mutex);
++   }
+ 
+    if (feedback->submit_timing) {
+       /* These host-second timestamps cover the entire committed Metal batch.
+@@ -393,6 +483,13 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+    if (vk_queue_is_lost(&queue->vk))
+       return VK_ERROR_DEVICE_LOST;
+ 
++   /* A queue Metal has already failed accepts work and runs none of it, so it
++    * is replaced before anything is enqueued on it. */
++   if (!kk_queue_replace_retired(queue))
++      return vk_queue_set_lost(&queue->vk,
++                               "Failed to replace the Metal command queue a "
++                               "failure retired");
++
+    for (struct vk_sync_wait *wait = submit->waits,
+                             *end = submit->waits + submit->wait_count;
+         wait != end; ++wait) {
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index ae0a65d8b2223d23eaaf1be9c6c18b0459f004a7..015e724e083ea39ca33200b0f709dca558b12d2e 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -47,7 +47,10 @@ struct kk_queue_feedback {
+    struct util_dynarray signals;
+    /* How many failures Metal has reported against this queue. A queue that
+     * has never failed owes nothing it has not delivered, so the recovery
+-    * below stays out of the way until one does. */
++    * below stays out of the way until one does. Metal rejects every
++    * submission a command queue receives after that queue has killed one, so
++    * any failure, survived or not, also retires the native queue: the report
++    * counts it, the submit thread acts on it and clears the count. */
+    uint32_t failures;
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_queue_error.c b/src/kosmickrisp/vulkan/kk_queue_error.c
+index 66e8e1e365f641dab079cb9816f465a953d82b11..5f3ce0fbe9e8bf441aa51d14bf76ba559b53a9e7 100644
+--- a/src/kosmickrisp/vulkan/kk_queue_error.c
++++ b/src/kosmickrisp/vulkan/kk_queue_error.c
+@@ -42,17 +42,18 @@ kk_queue_error_is_device_lost(const struct mtl_feedback_data *data)
+    if (data->error == MTL_COMMAND_QUEUE_ERROR_NONE)
+       return false;
+ 
+-   /* A timeout is the one failure that leaves a live queue behind. Anything
+-    * else stopped the queue. */
++   /* A timeout is the one failure the device survives, by retiring the queue
++    * that reported it. Anything else stopped the queue. */
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_TIMEOUT)
+       return true;
+ 
+    /* A start timestamp means Metal admitted the submission. Admitting it and
+     * reporting no execution for it is the queue killing work it had already
+     * taken, which is what it does to whatever is queued behind a submission
+-    * that has just timed out; the queue is running, not stopped. Only a
+-    * submission the queue never admitted, or one it started and abandoned
+-    * without ever timestamping an end, says the queue itself stopped. */
++    * that has just timed out; the queue is retired, not lost with the
++    * device. Only a submission the queue never admitted, or one it started
++    * and abandoned without ever timestamping an end, says the queue itself
++    * stopped. */
+    return !kk_queue_error_admitted_submission(data);
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_queue_error.h b/src/kosmickrisp/vulkan/kk_queue_error.h
+index bd564c9ec9f0039cb6f1ac08d94d9108f8f2fc9d..ed26989e1aabaf52ed9398dc66da09ca490b1971 100644
+--- a/src/kosmickrisp/vulkan/kk_queue_error.h
++++ b/src/kosmickrisp/vulkan/kk_queue_error.h
+@@ -26,15 +26,15 @@ kk_queue_error_has_execution_interval(const struct mtl_feedback_data *data);
+  * A Metal command queue timeout says one submission exceeded the time the
+  * system allows, or was discarded while the system recovered from a hang
+  * another submission caused, in this process or any other; it does not say
+- * the device is broken. On a contended host the queue keeps accepting and
+- * completing work after such a report, and how long the GPU ran does not
+- * predict it: a submission executing for a fraction of a second is reported
+- * while a longer one on the same GPU succeeds. Losing the device would throw
+- * away a live queue and every result that would follow it, so a timeout for
+- * a submission Metal admitted is reported and survived. What such a report
+- * puts in doubt is that one submission's contents, which the driver cannot
+- * repair and Vulkan cannot express short of device loss; the work itself is
+- * where that shows.
++ * the device is broken, and how long the GPU ran does not predict it: a
++ * submission executing for a fraction of a second is reported while a longer
++ * one on the same GPU succeeds. The queue that reported it runs nothing more,
++ * so the driver retires that queue for a new one (see kk_queue.c) rather than
++ * losing the device and every result that would follow; a timeout for a
++ * submission Metal admitted is reported and survived.
++ * What such a report puts in doubt is that one submission's contents, which the
++ * driver cannot repair and Vulkan cannot express short of device loss; the
++ * work itself is where that shows.
+  *
+  * Every other error, and a timeout for a submission the queue never admitted
+  * or started and abandoned without an end timestamp, means the queue stopped

@@ -1,0 +1,329 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 15:43:31 +0900
+Subject: [PATCH] kosmickrisp: take an importer's row pitch for a linear image
+
+An importer that laid its memory out itself says so through an explicit
+DRM-modifier layout, and the layout was accepted only when each plane's row
+pitch was the one this driver would pick: the width rounded up to Metal's
+alignment. A video frame does not always have that pitch. The Android YV12
+buffer a software decoder produces is shared as one R8 texture whose chroma
+rows sit at the pitch of the luma rows, so a half-width plane arrives wider
+than this driver would lay it out, and importing it failed with an invalid
+plane layout - the frame never reached the GPU.
+
+Metal reads a texture over a buffer at whatever row pitch it is given, as
+long as that pitch holds a row, keeps to the pixel format's alignment and is
+no wider than the widest texture the device makes. Take the pitch from the
+layout, move the plane's rows apart and size the plane for them, and refuse a
+pitch Metal cannot read as before. A size the importer gives still has to
+hold the rows at the pitch it asked for.
+
+kosmickrisp_drm_plane_offset creates a three-plane frame at the pitch of its
+luma rows and at twice that, a single plane at a wider pitch, and the pitches
+that cannot be read.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_image.c             |  45 +++++--
+ src/kosmickrisp/vulkan/kk_image_layout.c      |  40 ++++--
+ src/kosmickrisp/vulkan/kk_image_layout.h      |  12 ++
+ .../vulkan/tests/test_drm_plane_offset.c      | 122 +++++++++++++++++-
+ 4 files changed, 193 insertions(+), 26 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index fc528f1c46a09eb46b9933603782e2f4ff5f1fd7..185793185b46f52f3eb921e6b3fd67f645d035c0 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -754,10 +754,13 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
+ 
+    /* An explicit layout describes memory this driver did not lay out: an
+     * importer names where each plane already is, which is how one dma-buf
+-    * carries a whole multi-plane frame. Metal fixes a linear texture's row
+-    * pitch through its own alignment rule and can start one only at a
+-    * multiple of that same alignment, so a layout that disagrees with either
+-    * has to be refused rather than silently ignored. */
++    * carries a whole multi-plane frame. Metal starts a linear texture only at
++    * a multiple of its alignment rule and needs a row pitch that holds a row
++    * and keeps to the same rule, so a layout that cannot meet them has to be
++    * refused rather than silently ignored. A pitch wider than this driver's
++    * own is the importer's to decide as well: a video frame in the Android
++    * YV12 and R8-emulated layouts places half-width chroma rows at the pitch
++    * of the luma rows, and a texture over a buffer reads them there. */
+    if (mod_explicit != NULL) {
+       if (mod_explicit->drmFormatModifierPlaneCount != image->plane_count) {
+          vk_image_finish(&image->vk);
+@@ -768,29 +771,43 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
+       }
+ 
+       for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+-         const struct kk_image_layout *layout = &image->planes[plane].layout;
++         struct kk_image_layout *layout = &image->planes[plane].layout;
+          const VkSubresourceLayout *given = &mod_explicit->pPlaneLayouts[plane];
+ 
+-         /* The row pitch is Metal's to decide, so a layout that names a
+-          * different one describes memory this driver cannot read. The
+-          * offset is the importer's to decide - that is the whole point of
+-          * an explicit layout - as long as a Metal texture can start there.
++         /* The offset and the row pitch are the importer's to decide - that
++          * is the whole point of an explicit layout - as long as a Metal
++          * texture can start there and its rows can sit that far apart.
+           */
+-         if (given->rowPitch != layout->linear_stride_B ||
++         if (!kk_image_layout_linear_stride_is_creatable(
++                layout, given->rowPitch,
++                kk_image_max_dimension(kk_device_physical(dev),
++                                       VK_IMAGE_TYPE_2D)) ||
+              given->offset % layout->align_B != 0 ||
+-             (given->size != 0 && given->size < layout->size_B) ||
+              given->arrayPitch != 0 || given->depthPitch != 0) {
+             vk_image_finish(&image->vk);
+             return vk_errorf(
+                dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+-               "plane %u wants offset %llu pitch %llu, Metal needs pitch %u "
+-               "at an offset that is a multiple of %u",
++               "plane %u wants offset %llu pitch %llu, Metal needs a pitch "
++               "of at least %u that is a multiple of %u, at an offset that "
++               "is a multiple of %u",
+                (unsigned)plane, (unsigned long long)given->offset,
+                (unsigned long long)given->rowPitch,
+-               (unsigned)layout->linear_stride_B,
++               (unsigned)layout->linear_stride_B, (unsigned)layout->align_B,
+                (unsigned)layout->align_B);
+          }
+ 
++         if (given->rowPitch != layout->linear_stride_B)
++            kk_image_layout_set_linear_stride(layout, given->rowPitch);
++
++         if (given->size != 0 && given->size < layout->size_B) {
++            vk_image_finish(&image->vk);
++            return vk_errorf(
++               dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
++               "plane %u is %llu bytes, its rows need %llu",
++               (unsigned)plane, (unsigned long long)given->size,
++               (unsigned long long)layout->size_B);
++         }
++
+          /* Nothing Vulkan says bounds the offset, but no allocation is
+           * larger than the device's largest buffer. A plane that ends past
+           * that could only be bound through a memory requirement that
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.c b/src/kosmickrisp/vulkan/kk_image_layout.c
+index 18932806d63262425bbf82c4e4fbd0dc5e6def75..880b23c72df84448bb8b9e8efb3324cbc25ffc5f 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.c
++++ b/src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -123,6 +123,36 @@ kk_image_layout_can_optimize(VkImageUsageFlags usage, VkImageTiling tiling,
+    return true;
+ }
+ 
++void
++kk_image_layout_set_linear_stride(struct kk_image_layout *layout,
++                                  uint32_t stride_B)
++{
++   layout->linear_stride_B = stride_B;
++   layout->layer_stride_B = (uint64_t)stride_B * layout->height_px;
++   /* Metal only allows for 2D texture with no mipmapping. */
++   layout->size_B = layout->layer_stride_B;
++   layout->level_offsets_B[0] = 0;
++   /* We add the end offset so we can easily recover the size of a level */
++   layout->level_offsets_B[1] = layout->layer_stride_B;
++}
++
++bool
++kk_image_layout_linear_stride_is_creatable(const struct kk_image_layout *layout,
++                                           uint64_t stride_B,
++                                           uint32_t max_width_px)
++{
++   /* Metal accepts any row pitch for a texture over a buffer that holds a
++    * row, is a multiple of the pixel format's alignment and is no wider than
++    * the widest texture the device makes of that format. The pitch this
++    * driver would pick is the smallest of them. */
++   const uint64_t bytes_per_texel =
++      util_format_get_blocksize(layout->format.pipe);
++   const uint64_t max_B =
++      align64(bytes_per_texel * max_width_px, layout->align_B);
++   return stride_B >= layout->linear_stride_B && stride_B <= max_B &&
++          stride_B % layout->align_B == 0;
++}
++
+ static void
+ kk_image_layout_calc_linear(const struct kk_device *dev,
+                             struct kk_image_layout *layout)
+@@ -131,14 +161,8 @@ kk_image_layout_calc_linear(const struct kk_device *dev,
+ 
+    layout->align_B = mtl_minimum_linear_texture_alignment_for_pixel_format(
+       dev->mtl_handle, layout->format.mtl);
+-   layout->linear_stride_B =
+-      align(bytes_per_texel * layout->width_px, layout->align_B);
+-   layout->layer_stride_B = layout->linear_stride_B * layout->height_px;
+-   /* Metal only allows for 2D texture with no mipmapping. */
+-   layout->size_B = layout->layer_stride_B;
+-   layout->level_offsets_B[0] = 0;
+-   /* We add the end offset so we can easily recover the size of a level */
+-   layout->level_offsets_B[1] = layout->layer_stride_B;
++   kk_image_layout_set_linear_stride(
++      layout, align(bytes_per_texel * layout->width_px, layout->align_B));
+ }
+ 
+ static void
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.h b/src/kosmickrisp/vulkan/kk_image_layout.h
+index ecfcfef12907a723f1499a4caf0e26dd3de5fec4..5c72cf30494860b2dd38b87a8f730fd93655f383 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.h
++++ b/src/kosmickrisp/vulkan/kk_image_layout.h
+@@ -225,6 +225,18 @@ kk_get_level_size_B(const struct kk_image_layout *layout, unsigned level)
+    return layout->level_offsets_B[level + 1] - layout->level_offsets_B[level];
+ }
+ 
++/* Whether the rows of a linear layout may sit stride_B bytes apart, as an
++ * importer that laid the memory out itself may ask. max_width_px is the widest
++ * texture of the device; a pitch below the one the layout would pick cannot
++ * hold a row. */
++bool kk_image_layout_linear_stride_is_creatable(const struct kk_image_layout *layout,
++                                                uint64_t stride_B,
++                                                uint32_t max_width_px);
++
++/* Move the rows of a linear layout apart, and the size with them. */
++void kk_image_layout_set_linear_stride(struct kk_image_layout *layout,
++                                       uint32_t stride_B);
++
+ bool kk_image_layout_can_optimize(VkImageUsageFlags usage, VkImageTiling tiling,
+                                   VkImageCreateFlags flags,
+                                   enum pipe_format format,
+diff --git a/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c b/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c
+index bc506b0119625898de780eef9cfa200dc955732e..928a9aeca82f7a624da212461189d6d53eff7935 100644
+--- a/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c
++++ b/src/kosmickrisp/vulkan/tests/test_drm_plane_offset.c
+@@ -1,7 +1,13 @@
+ /* SPDX-License-Identifier: MIT */
+ 
+-/* An explicit DRM-modifier layout names where each plane starts, and Vulkan
+- * puts no bound on that offset.  The image's memory requirement is the end of
++/* An explicit DRM-modifier layout names where each plane starts and how far
++ * apart its rows are. A video frame whose chroma rows sit at the pitch of its
++ * luma rows is one such layout, and Metal reads it through a texture over a
++ * buffer whatever the pitch is, so a pitch that holds a row and keeps to
++ * Metal's alignment is the importer's to choose, while one that cannot be
++ * read is refused.
++ *
++ * Vulkan puts no bound on the offset.  The image's memory requirement is the end of
+  * its last plane, so an offset near 2^64 would wrap that requirement below
+  * the plane's own size: a small allocation would then satisfy the bind rule
+  * and the plane would be bound far outside it.  No allocation is larger than
+@@ -114,8 +120,116 @@ main(void)
+       vkDestroyImage(device, image, NULL);
+    }
+ 
++   /* The pitch is the importer's to choose, within what Metal can read. */
++   image_info.pNext = &list;
++   const uint64_t pitches[] = {
++      /* Too narrow to hold a row, and not a multiple of any alignment. */
++      0,
++      layout.rowPitch - 1,
++      /* Wider than any texture Metal makes. */
++      UINT64_C(0x40000000),
++   };
++   for (unsigned i = 0; i < 3; i++) {
++      const VkSubresourceLayout given = {.rowPitch = pitches[i]};
++      VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_layout = {
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++         .drmFormatModifierPlaneCount = 1,
++         .pPlaneLayouts = &given,
++      };
++      image_info.pNext = &explicit_layout;
++      VkImage image = VK_NULL_HANDLE;
++      VkResult result = vkCreateImage(device, &image_info, NULL, &image);
++      fprintf(stderr, "pitch 0x%llx: vkCreateImage = %d\n",
++              (unsigned long long)pitches[i], result);
++      CHECK(result == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++   }
++
++   /* A wider pitch moves the rows apart and the end of the plane with them,
++    * and a size that cannot hold them is refused. */
++   {
++      VkSubresourceLayout given = {.rowPitch = 2 * layout.rowPitch};
++      VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_layout = {
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++         .drmFormatModifierPlaneCount = 1,
++         .pPlaneLayouts = &given,
++      };
++      image_info.pNext = &explicit_layout;
++
++      given.size = layout.size;
++      VkImage image = VK_NULL_HANDLE;
++      CHECK(vkCreateImage(device, &image_info, NULL, &image) ==
++            VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++
++      given.size = 0;
++      CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++      VkSubresourceLayout wide;
++      vkGetImageSubresourceLayout(device, image, &plane0, &wide);
++      CHECK(wide.rowPitch == 2 * layout.rowPitch);
++      VkMemoryRequirements requirements;
++      vkGetImageMemoryRequirements(device, image, &requirements);
++      CHECK(requirements.size >= 2 * layout.size);
++      vkDestroyImage(device, image, NULL);
++   }
++
++   /* The Android YV12 frame in the layout of an R8 texture: chroma rows at
++    * the pitch of the luma rows, each plane behind the one before. The pitch
++    * is the same for every plane and, for the half-width chroma planes, wider
++    * than the driver would choose. */
++   const VkImageAspectFlagBits memory_planes[3] = {
++      VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++      VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT,
++      VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT,
++   };
++   image_info.format = VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
++   image_info.extent = (VkExtent3D){128, 64, 1};
++   image_info.pNext = &list;
++   VkImage planar = VK_NULL_HANDLE;
++   CHECK(vkCreateImage(device, &image_info, NULL, &planar) == VK_SUCCESS);
++   VkSubresourceLayout luma;
++   const VkImageSubresource luma_plane = {.aspectMask = memory_planes[0]};
++   vkGetImageSubresourceLayout(device, planar, &luma_plane, &luma);
++   vkDestroyImage(device, planar, NULL);
++   for (unsigned scale = 1; scale <= 2; scale++) {
++      const uint64_t pitch = scale * luma.rowPitch;
++      VkSubresourceLayout planes[3] = {
++         {.offset = 0, .rowPitch = pitch},
++         {.offset = pitch * 64, .rowPitch = pitch},
++         {.offset = pitch * (64 + 32), .rowPitch = pitch},
++      };
++      VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_layout = {
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++         .drmFormatModifierPlaneCount = 3,
++         .pPlaneLayouts = planes,
++      };
++      image_info.pNext = &explicit_layout;
++      VkImage frame = VK_NULL_HANDLE;
++      VkResult result = vkCreateImage(device, &image_info, NULL, &frame);
++      fprintf(stderr, "3-plane pitch 0x%llx: vkCreateImage = %d\n",
++              (unsigned long long)pitch, result);
++      CHECK(result == VK_SUCCESS);
++      for (unsigned plane = 0; plane < 3; plane++) {
++         const VkImageSubresource subresource = {
++            .aspectMask = memory_planes[plane],
++         };
++         VkSubresourceLayout reported;
++         vkGetImageSubresourceLayout(device, frame, &subresource, &reported);
++         CHECK(reported.rowPitch == pitch);
++         CHECK(reported.offset == planes[plane].offset);
++      }
++      VkMemoryRequirements requirements;
++      vkGetImageMemoryRequirements(device, frame, &requirements);
++      CHECK(requirements.size >= pitch * (64 + 32 + 32));
++      vkDestroyImage(device, frame, NULL);
++   }
++
+    kk_test_destroy(&t);
+-   printf("an explicit DRM plane offset stays inside the largest "
+-          "allocation\n");
++   printf("an explicit DRM plane layout keeps its offset inside the largest "
++          "allocation and takes any pitch Metal can read\n");
+    return 0;
+ }

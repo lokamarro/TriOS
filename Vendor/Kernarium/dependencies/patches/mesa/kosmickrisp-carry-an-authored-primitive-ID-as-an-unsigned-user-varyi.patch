@@ -1,0 +1,1286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 19:01:17 +0900
+Subject: [PATCH] kosmickrisp: carry an authored primitive ID as an unsigned
+ user varying
+
+Metal's [[primitive_id]] is an unsigned value the rasterizer hands to the
+fragment stage. It is not a vertex output, so a Metal vertex function whose
+output struct declares it is rejected outright, taking the whole MTLLibrary
+with it:
+
+  error: type 'int' is not valid for attribute 'primitive_id'
+  error: invalid return type 'VertexOut' for vertex function
+
+A pipeline reaches that shape whenever an authored primitive ID has to travel
+as a varying. A geometry shader that writes gl_PrimitiveID is the usual
+producer - Mesa's zink emits one for every GL primitive Vulkan lacks, and
+copies the ID unconditionally because a driver that links the stages can drop
+the write - and the generated point and line raster stages republish the
+application's primitive ID the same way when the fragment shader reads it.
+nir_opt_varyings moves such a pair to a user slot, but only while the fragment
+shader takes part in the link; the generated-raster path deliberately keeps it
+out, and the geometry stage the driver emulates then leaves the ID on the
+built-in slot all the way into the generated vertex function.
+
+Spell that varying as an ordinary user attribute instead. A fragment shader
+that wants the rasterizer's own primitive ID reads the system value, which
+nir_to_msl still spells with the Metal attribute, so the two sources stay
+distinct.
+
+The two ends of that varying are not written by the same party: the
+generated raster stages republish the ID unsigned, a geometry shader stores
+gl_PrimitiveID signed, and the fragment shader reads it signed. Pin the slot
+with the other shapes the translator does not take from the shader: both
+ends declare the unsigned scalar of the Metal value the varying stands in
+for. The stores and loads are plain scalar assignments, so the bits are
+unchanged.
+
+The slots Metal owns are declared with Metal's attribute alone. An
+interpolation qualifier samples a user varying; the layer and viewport
+indices are values of the primitive, and a fragment input struct no longer
+adds "[[flat]]" behind "[[render_target_array_index]]" or
+"[[viewport_array_index]]". A user varying without a qualifier loses the
+stray space in front of its semicolon.
+
+On the OpenGL stack the missing library made every draw of a GL quad fail
+pipeline creation, and nothing caches a failure: glxgears rebuilt about twelve
+pipelines per frame and ran at 2.9 fps, with 314-358 host CPU-seconds per 1000
+frames against 6-8 for benchmarks that avoid quads.
+
+The new Meson test builds the ten combinations of {monolithic, pipeline
+library} x {geometry shader writes the ID, fragment reads it, neither} with
+static and dynamic polygon mode, and renders three triangles so the fragment
+shader can prove the value and not merely the compile. The four dynamic
+polygon mode cases fail with the Metal error without this change. The MSL
+translator test builds a vertex shader that stores the position, primitive
+ID, layer and viewport and a fragment shader that reads the last three, all
+as signed integers, and checks the declarations of both structs.
+---
+ src/kosmickrisp/compiler/msl_iomap.c          |  67 +-
+ src/kosmickrisp/vulkan/meson.build            |  14 +
+ .../primitive_id_link_shaders/copy_id.geom    |  17 +
+ .../primitive_id_link_shaders/copy_id.geom.h  | 102 +++
+ .../primitive_id_link_shaders/generate.sh     |   7 +
+ .../primitive_id_link_shaders/green.frag      |   7 +
+ .../primitive_id_link_shaders/green.frag.h    |  27 +
+ .../green_if_id.frag                          |   9 +
+ .../green_if_id.frag.h                        |  43 ++
+ .../passthrough.vert                          |   7 +
+ .../passthrough.vert.h                        |  49 ++
+ .../tests/test_geometry_primitive_id_link.cpp | 638 ++++++++++++++++++
+ .../vulkan/tests/test_msl_temporaries.c       |  97 +++
+ 13 files changed, 1064 insertions(+), 20 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_geometry_primitive_id_link.cpp
+
+diff --git a/src/kosmickrisp/compiler/msl_iomap.c b/src/kosmickrisp/compiler/msl_iomap.c
+index f0cf216fd0db5b7b7170738d8c0541a72978c787..45bb7b7ecb42236676c3be8a60835e20f913d45b 100644
+--- a/src/kosmickrisp/compiler/msl_iomap.c
++++ b/src/kosmickrisp/compiler/msl_iomap.c
+@@ -62,7 +62,15 @@ static const struct {
+ } VARYING_SLOT_INFO[NUM_TOTAL_VARYING_SLOTS] = {
+    [VARYING_SLOT_POS] = {"position"},
+    [VARYING_SLOT_PSIZ] = {"point_size"},
+-   [VARYING_SLOT_PRIMITIVE_ID] = {"primitive_id"},
++   /* Metal's [[primitive_id]] is an unsigned value the rasterizer hands to
++    * the fragment stage; it is not a vertex output and it is not an int, so a
++    * pipeline that carries an authored primitive ID as a varying - a geometry
++    * shader that writes gl_PrimitiveID, or the generated raster stage that
++    * republishes the application's primitive ID - has to carry it as an
++    * ordinary user varying.  A fragment shader that wants the rasterizer's own
++    * value reads the system value instead, which nir_to_msl still spells with
++    * the Metal attribute. */
++   [VARYING_SLOT_PRIMITIVE_ID] = {"primitive_id", .user = true},
+    [VARYING_SLOT_LAYER] = {"render_target_array_index"},
+    [VARYING_SLOT_VIEWPORT] = {"viewport_array_index"},
+    [VARYING_SLOT_CLIP_DIST0] = {"clip_0", .user = true, .scalarized = true},
+@@ -236,31 +244,41 @@ fs_input_no_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
+       scalarized ? "" : vector_suffixes[info.num_components];
+    unsigned components = scalarized ? info.num_components : 1;
+    const char *interp = "";
+-   switch (info.interpolation) {
+-   case INTERP_MODE_NOPERSPECTIVE:
+-      if (info.centroid)
+-         interp = "[[centroid_no_perspective]]";
+-      else if (info.sample)
+-         interp = "[[sample_no_perspective]]";
+-      else
+-         interp = "[[center_no_perspective]]";
+-      break;
+-   case INTERP_MODE_FLAT:
+-      interp = "[[flat]]";
+-      break;
+-   default:
+-      if (info.centroid)
+-         interp = "[[centroid_perspective]]";
+-      else if (info.sample)
+-         interp = "[[sample_perspective]]";
+-      break;
++   /* Only a user varying is sampled by an interpolation qualifier.  The layer
++    * and viewport indices are values of the primitive that Metal hands over
++    * under its own attribute, and they are declared with that attribute
++    * alone. */
++   if (VARYING_SLOT_INFO[location].user) {
++      switch (info.interpolation) {
++      case INTERP_MODE_NOPERSPECTIVE:
++         if (info.centroid)
++            interp = "[[centroid_no_perspective]]";
++         else if (info.sample)
++            interp = "[[sample_no_perspective]]";
++         else
++            interp = "[[center_no_perspective]]";
++         break;
++      case INTERP_MODE_FLAT:
++         interp = "[[flat]]";
++         break;
++      default:
++         if (info.centroid)
++            interp = "[[centroid_perspective]]";
++         else if (info.sample)
++            interp = "[[sample_perspective]]";
++         break;
++      }
+    }
+    for (int c = 0; c < components; c++) {
+       P_IND(ctx, "%s%s ", type, vector_suffix);
+       varying_slot_name(ctx, location, c);
+       P(ctx, " ");
+       varying_slot_semantic(ctx, location, c);
+-      P(ctx, " %s;\n", interp);
++      if (*interp) {
++         P(ctx, " %s;\n", interp);
++      } else {
++         P(ctx, ";\n");
++      }
+    }
+ }
+ 
+@@ -485,6 +503,15 @@ pin_metal_builtin_slot_shapes(struct io_slot_info *slots)
+       {VARYING_SLOT_PSIZ, nir_type_float32, 1u},
+       {VARYING_SLOT_LAYER, nir_type_uint32, 1u},
+       {VARYING_SLOT_VIEWPORT, nir_type_uint32, 1u},
++      /* An authored primitive ID travels as a user varying, so Metal does not
++       * fix its type, but the two ends of it are not written by the same
++       * party: the generated raster stages store it unsigned, a geometry
++       * shader stores gl_PrimitiveID signed, and the fragment shader reads it
++       * signed. Declare both ends as the unsigned scalar of the Metal value it
++       * stands in for, so that the interface never depends on how Metal links
++       * integer varyings whose signedness differs.
++       */
++      {VARYING_SLOT_PRIMITIVE_ID, nir_type_uint32, 1u},
+    };
+ 
+    for (unsigned i = 0u; i < ARRAY_SIZE(fixed); ++i) {
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index bfa9e96daccdf55c5d8fed7bf96acb09105be659..e84afbe9f311e68f646b729e89d52f64b2685b9e 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -759,6 +759,20 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_geometry_primitive_id_link',
++      executable(
++        'test_kosmickrisp_geometry_primitive_id_link',
++        files('tests/test_geometry_primitive_id_link.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_max_varyings',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom
+new file mode 100644
+index 0000000000000000000000000000000000000000..4111e7f7c62f041e92313ae7fd761ba221a003ba
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(triangles) in;
++layout(triangle_strip, max_vertices = 3) out;
++
++/* The shape a GL driver generates when it has to emulate a primitive Vulkan
++ * lacks: the geometry stage re-emits the primitive unchanged and copies the
++ * primitive ID, whether or not the fragment stage reads it. */
++void main()
++{
++   for (int i = 0; i < 3; ++i) {
++      gl_Position = gl_in[i].gl_Position;
++      gl_PrimitiveID = gl_PrimitiveIDIn;
++      EmitVertex();
++   }
++   EndPrimitive();
++}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom.h b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4752f91578bbbdf07c1221c3579b17927aa11464
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/copy_id.geom.h
+@@ -0,0 +1,102 @@
++{0x07230203,0x00010600,0x000d000b,0x0000002e,
++0x00000000,0x00020011,0x00000002,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0009000f,0x00000003,0x00000004,0x6e69616d,
++0x00000000,0x0000001a,0x0000001f,0x00000027,
++0x00000029,0x00030010,0x00000004,0x00000016,
++0x00040010,0x00000004,0x00000000,0x00000001,
++0x00030010,0x00000004,0x0000001d,0x00040010,
++0x00000004,0x0000001a,0x00000003,0x00030003,
++0x00000002,0x000001c2,0x000a0004,0x475f4c47,
++0x4c474f4f,0x70635f45,0x74735f70,0x5f656c79,
++0x656e696c,0x7269645f,0x69746365,0x00006576,
++0x00080004,0x475f4c47,0x4c474f4f,0x6e695f45,
++0x64756c63,0x69645f65,0x74636572,0x00657669,
++0x00040005,0x00000004,0x6e69616d,0x00000000,
++0x00030005,0x00000008,0x00000069,0x00060005,
++0x00000018,0x505f6c67,0x65567265,0x78657472,
++0x00000000,0x00060006,0x00000018,0x00000000,
++0x505f6c67,0x7469736f,0x006e6f69,0x00070006,
++0x00000018,0x00000001,0x505f6c67,0x746e696f,
++0x657a6953,0x00000000,0x00070006,0x00000018,
++0x00000002,0x435f6c67,0x4470696c,0x61747369,
++0x0065636e,0x00070006,0x00000018,0x00000003,
++0x435f6c67,0x446c6c75,0x61747369,0x0065636e,
++0x00030005,0x0000001a,0x00000000,0x00060005,
++0x0000001b,0x505f6c67,0x65567265,0x78657472,
++0x00000000,0x00060006,0x0000001b,0x00000000,
++0x505f6c67,0x7469736f,0x006e6f69,0x00070006,
++0x0000001b,0x00000001,0x505f6c67,0x746e696f,
++0x657a6953,0x00000000,0x00070006,0x0000001b,
++0x00000002,0x435f6c67,0x4470696c,0x61747369,
++0x0065636e,0x00070006,0x0000001b,0x00000003,
++0x435f6c67,0x446c6c75,0x61747369,0x0065636e,
++0x00040005,0x0000001f,0x695f6c67,0x0000006e,
++0x00060005,0x00000027,0x505f6c67,0x696d6972,
++0x65766974,0x00004449,0x00070005,0x00000029,
++0x505f6c67,0x696d6972,0x65766974,0x6e494449,
++0x00000000,0x00030047,0x00000018,0x00000002,
++0x00050048,0x00000018,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x00000018,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x00000018,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x00000018,0x00000003,0x0000000b,0x00000004,
++0x00030047,0x0000001b,0x00000002,0x00050048,
++0x0000001b,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x0000001b,0x00000001,0x0000000b,
++0x00000001,0x00050048,0x0000001b,0x00000002,
++0x0000000b,0x00000003,0x00050048,0x0000001b,
++0x00000003,0x0000000b,0x00000004,0x00040047,
++0x00000027,0x0000000b,0x00000007,0x00040047,
++0x00000029,0x0000000b,0x00000007,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00040015,0x00000006,0x00000020,0x00000001,
++0x00040020,0x00000007,0x00000007,0x00000006,
++0x0004002b,0x00000006,0x00000009,0x00000000,
++0x0004002b,0x00000006,0x00000010,0x00000003,
++0x00020014,0x00000011,0x00030016,0x00000013,
++0x00000020,0x00040017,0x00000014,0x00000013,
++0x00000004,0x00040015,0x00000015,0x00000020,
++0x00000000,0x0004002b,0x00000015,0x00000016,
++0x00000001,0x0004001c,0x00000017,0x00000013,
++0x00000016,0x0006001e,0x00000018,0x00000014,
++0x00000013,0x00000017,0x00000017,0x00040020,
++0x00000019,0x00000003,0x00000018,0x0004003b,
++0x00000019,0x0000001a,0x00000003,0x0006001e,
++0x0000001b,0x00000014,0x00000013,0x00000017,
++0x00000017,0x0004002b,0x00000015,0x0000001c,
++0x00000003,0x0004001c,0x0000001d,0x0000001b,
++0x0000001c,0x00040020,0x0000001e,0x00000001,
++0x0000001d,0x0004003b,0x0000001e,0x0000001f,
++0x00000001,0x00040020,0x00000021,0x00000001,
++0x00000014,0x00040020,0x00000024,0x00000003,
++0x00000014,0x00040020,0x00000026,0x00000003,
++0x00000006,0x0004003b,0x00000026,0x00000027,
++0x00000003,0x00040020,0x00000028,0x00000001,
++0x00000006,0x0004003b,0x00000028,0x00000029,
++0x00000001,0x0004002b,0x00000006,0x0000002c,
++0x00000001,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003b,0x00000007,0x00000008,0x00000007,
++0x0003003e,0x00000008,0x00000009,0x000200f9,
++0x0000000a,0x000200f8,0x0000000a,0x000400f6,
++0x0000000c,0x0000000d,0x00000000,0x000200f9,
++0x0000000e,0x000200f8,0x0000000e,0x0004003d,
++0x00000006,0x0000000f,0x00000008,0x000500b1,
++0x00000011,0x00000012,0x0000000f,0x00000010,
++0x000400fa,0x00000012,0x0000000b,0x0000000c,
++0x000200f8,0x0000000b,0x0004003d,0x00000006,
++0x00000020,0x00000008,0x00060041,0x00000021,
++0x00000022,0x0000001f,0x00000020,0x00000009,
++0x0004003d,0x00000014,0x00000023,0x00000022,
++0x00050041,0x00000024,0x00000025,0x0000001a,
++0x00000009,0x0003003e,0x00000025,0x00000023,
++0x0004003d,0x00000006,0x0000002a,0x00000029,
++0x0003003e,0x00000027,0x0000002a,0x000100da,
++0x000200f9,0x0000000d,0x000200f8,0x0000000d,
++0x0004003d,0x00000006,0x0000002b,0x00000008,
++0x00050080,0x00000006,0x0000002d,0x0000002b,
++0x0000002c,0x0003003e,0x00000008,0x0000002d,
++0x000200f9,0x0000000a,0x000200f8,0x0000000c,
++0x000100db,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..3c17b60b6910d1d00f6047639603c36e1b935cec
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in passthrough.vert copy_id.geom green.frag green_if_id.frag; do
++   glslc --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ea2f682fdd6c5b55105134b7491b9c3207e50e6
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(location = 0) out vec4 color;
++void main()
++{
++   color = vec4(0.0, 1.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag.h b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9302384ac90eb13198d93ac0abb811b32cce9bfd
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green.frag.h
+@@ -0,0 +1,27 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00030010,0x00000004,
++0x00000007,0x00030003,0x00000002,0x000001c2,
++0x000a0004,0x475f4c47,0x4c474f4f,0x70635f45,
++0x74735f70,0x5f656c79,0x656e696c,0x7269645f,
++0x69746365,0x00006576,0x00080004,0x475f4c47,
++0x4c474f4f,0x6e695f45,0x64756c63,0x69645f65,
++0x74636572,0x00657669,0x00040005,0x00000004,
++0x6e69616d,0x00000000,0x00040005,0x00000009,
++0x6f6c6f63,0x00000072,0x00040047,0x00000009,
++0x0000001e,0x00000000,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000004,0x00040020,0x00000008,
++0x00000003,0x00000007,0x0004003b,0x00000008,
++0x00000009,0x00000003,0x0004002b,0x00000006,
++0x0000000a,0x00000000,0x0004002b,0x00000006,
++0x0000000b,0x3f800000,0x0007002c,0x00000007,
++0x0000000c,0x0000000a,0x0000000b,0x0000000a,
++0x0000000b,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0003003e,0x00000009,0x0000000c,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..31be2aba0118f50a326eb579f82b82beaf6bb153
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(location = 0) out vec4 color;
++layout(constant_id = 0) const int expected_id = 0;
++void main()
++{
++   color = gl_PrimitiveID == expected_id ? vec4(0.0, 1.0, 0.0, 1.0)
++                                         : vec4(1.0, 0.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag.h b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1cafa4cf5fd5f3a5bdfc6791dd0f0bbca655ab1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/green_if_id.frag.h
+@@ -0,0 +1,43 @@
++{0x07230203,0x00010600,0x000d000b,0x00000016,
++0x00000000,0x00020011,0x00000001,0x00020011,
++0x00000002,0x0006000b,0x00000001,0x4c534c47,
++0x6474732e,0x3035342e,0x00000000,0x0003000e,
++0x00000000,0x00000001,0x0007000f,0x00000004,
++0x00000004,0x6e69616d,0x00000000,0x00000009,
++0x0000000c,0x00030010,0x00000004,0x00000007,
++0x00030003,0x00000002,0x000001c2,0x000a0004,
++0x475f4c47,0x4c474f4f,0x70635f45,0x74735f70,
++0x5f656c79,0x656e696c,0x7269645f,0x69746365,
++0x00006576,0x00080004,0x475f4c47,0x4c474f4f,
++0x6e695f45,0x64756c63,0x69645f65,0x74636572,
++0x00657669,0x00040005,0x00000004,0x6e69616d,
++0x00000000,0x00040005,0x00000009,0x6f6c6f63,
++0x00000072,0x00060005,0x0000000c,0x505f6c67,
++0x696d6972,0x65766974,0x00004449,0x00050005,
++0x0000000e,0x65707865,0x64657463,0x0064695f,
++0x00040047,0x00000009,0x0000001e,0x00000000,
++0x00040047,0x0000000c,0x0000000b,0x00000007,
++0x00030047,0x0000000c,0x0000000e,0x00040047,
++0x0000000e,0x00000001,0x00000000,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000004,0x00040020,
++0x00000008,0x00000003,0x00000007,0x0004003b,
++0x00000008,0x00000009,0x00000003,0x00040015,
++0x0000000a,0x00000020,0x00000001,0x00040020,
++0x0000000b,0x00000001,0x0000000a,0x0004003b,
++0x0000000b,0x0000000c,0x00000001,0x00040032,
++0x0000000a,0x0000000e,0x00000000,0x00020014,
++0x0000000f,0x0004002b,0x00000006,0x00000011,
++0x00000000,0x0004002b,0x00000006,0x00000012,
++0x3f800000,0x0007002c,0x00000007,0x00000013,
++0x00000011,0x00000012,0x00000011,0x00000012,
++0x0007002c,0x00000007,0x00000014,0x00000012,
++0x00000011,0x00000011,0x00000012,0x00050036,
++0x00000002,0x00000004,0x00000000,0x00000003,
++0x000200f8,0x00000005,0x0004003d,0x0000000a,
++0x0000000d,0x0000000c,0x000500aa,0x0000000f,
++0x00000010,0x0000000d,0x0000000e,0x000600a9,
++0x00000007,0x00000015,0x00000010,0x00000013,
++0x00000014,0x0003003e,0x00000009,0x00000015,
++0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..7604daaa30a3bdbfc56e3598ab3abf11b24d3790
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: MIT */
++#version 450
++layout(location = 0) in vec4 position;
++void main()
++{
++   gl_Position = position;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert.h b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad4b2b08317cdde672ceb39a945348f71e36ebfc
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/primitive_id_link_shaders/passthrough.vert.h
+@@ -0,0 +1,49 @@
++{0x07230203,0x00010600,0x000d000b,0x00000015,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000011,0x00030003,
++0x00000002,0x000001c2,0x000a0004,0x475f4c47,
++0x4c474f4f,0x70635f45,0x74735f70,0x5f656c79,
++0x656e696c,0x7269645f,0x69746365,0x00006576,
++0x00080004,0x475f4c47,0x4c474f4f,0x6e695f45,
++0x64756c63,0x69645f65,0x74636572,0x00657669,
++0x00040005,0x00000004,0x6e69616d,0x00000000,
++0x00060005,0x0000000b,0x505f6c67,0x65567265,
++0x78657472,0x00000000,0x00060006,0x0000000b,
++0x00000000,0x505f6c67,0x7469736f,0x006e6f69,
++0x00070006,0x0000000b,0x00000001,0x505f6c67,
++0x746e696f,0x657a6953,0x00000000,0x00070006,
++0x0000000b,0x00000002,0x435f6c67,0x4470696c,
++0x61747369,0x0065636e,0x00070006,0x0000000b,
++0x00000003,0x435f6c67,0x446c6c75,0x61747369,
++0x0065636e,0x00030005,0x0000000d,0x00000000,
++0x00050005,0x00000011,0x69736f70,0x6e6f6974,
++0x00000000,0x00030047,0x0000000b,0x00000002,
++0x00050048,0x0000000b,0x00000000,0x0000000b,
++0x00000000,0x00050048,0x0000000b,0x00000001,
++0x0000000b,0x00000001,0x00050048,0x0000000b,
++0x00000002,0x0000000b,0x00000003,0x00050048,
++0x0000000b,0x00000003,0x0000000b,0x00000004,
++0x00040047,0x00000011,0x0000001e,0x00000000,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00030016,0x00000006,0x00000020,
++0x00040017,0x00000007,0x00000006,0x00000004,
++0x00040015,0x00000008,0x00000020,0x00000000,
++0x0004002b,0x00000008,0x00000009,0x00000001,
++0x0004001c,0x0000000a,0x00000006,0x00000009,
++0x0006001e,0x0000000b,0x00000007,0x00000006,
++0x0000000a,0x0000000a,0x00040020,0x0000000c,
++0x00000003,0x0000000b,0x0004003b,0x0000000c,
++0x0000000d,0x00000003,0x00040015,0x0000000e,
++0x00000020,0x00000001,0x0004002b,0x0000000e,
++0x0000000f,0x00000000,0x00040020,0x00000010,
++0x00000001,0x00000007,0x0004003b,0x00000010,
++0x00000011,0x00000001,0x00040020,0x00000013,
++0x00000003,0x00000007,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x00000007,0x00000012,
++0x00000011,0x00050041,0x00000013,0x00000014,
++0x0000000d,0x0000000f,0x0003003e,0x00000014,
++0x00000012,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/test_geometry_primitive_id_link.cpp b/src/kosmickrisp/vulkan/tests/test_geometry_primitive_id_link.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..031f97d4361d2691a506927ca820136172ebb45f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_geometry_primitive_id_link.cpp
+@@ -0,0 +1,638 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A geometry shader may write gl_PrimitiveID whether or not the fragment
++ * shader reads it: a GL driver that emulates quads, flat shading or a
++ * provoking-vertex convention with a generated geometry stage copies the
++ * primitive ID unconditionally and expects the Vulkan driver to drop the
++ * write when nothing consumes it (Mesa's zink does exactly this).  A write
++ * that survives the link reaches the generated Metal vertex function as
++ * `int primitive_id [[primitive_id]]`, which Metal rejects - primitive_id is
++ * an unsigned rasterizer input, never a vertex output - so every pipeline
++ * with that shape fails to compile and the application re-creates it frame
++ * after frame.
++ *
++ * The three cases below cover the write that must disappear, the write that
++ * must arrive when the fragment shader does read it, and the rasterizer's own
++ * primitive ID with no geometry stage at all.  Each renders three triangles,
++ * only the last of which covers the render area, so a fragment shader that
++ * compares against primitive ID 2 proves the value and not just the compile.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "primitive_id_link_shaders/passthrough.vert.h"
++;
++static const uint32_t geometry_spirv[] =
++#include "primitive_id_link_shaders/copy_id.geom.h"
++;
++static const uint32_t green_spirv[] =
++#include "primitive_id_link_shaders/green.frag.h"
++;
++static const uint32_t green_if_id_spirv[] =
++#include "primitive_id_link_shaders/green_if_id.frag.h"
++;
++
++int main()
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "primitive-id-link";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceFeatures);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count",
++           result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count,
++                                       physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   constexpr uint32_t extent = 32;
++   constexpr VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceFeatures features{};
++      vkGetPhysicalDeviceFeatures(physical, &features);
++      require(features.geometryShader, "geometry shaders");
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
++                                               queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count &&
++             !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{
++         VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceFeatures enabled{};
++      enabled.geometryShader = VK_TRUE;
++      /* Every GL driver enables this for the GL query objects, and it makes
++       * the driver compile a second, instrumented variant of the pipeline. */
++      enabled.pipelineStatisticsQuery = features.pipelineStatisticsQuery;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.dynamicRendering = VK_TRUE;
++      /* A GL driver builds these pipelines out of libraries, which is what
++       * keeps the fragment stage out of sight while the pre-rasterization
++       * stages are compiled. */
++      VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT library_features{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
++      library_features.graphicsPipelineLibrary = VK_TRUE;
++      features13.pNext = &library_features;
++      /* A GL driver leaves the polygon mode dynamic, which makes the driver
++       * precompile the point and line raster variants of every pipeline. */
++      VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
++      dynamic3.extendedDynamicState3PolygonMode = VK_TRUE;
++      library_features.pNext = &dynamic3;
++      static const char *const device_extensions[] = {
++         VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
++         VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
++         VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
++      };
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      device_info.pEnabledFeatures = &enabled;
++      device_info.enabledExtensionCount = 3;
++      device_info.ppEnabledExtensionNames = device_extensions;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkResetCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdBindVertexBuffers);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkCreateFence);
++      LOAD_D(vkDestroyFence);
++      LOAD_D(vkWaitForFences);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      VkQueue device_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &device_queue);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto pick_memory = [&](uint32_t bits, VkMemoryPropertyFlags flags) {
++         uint32_t type = 0;
++         while (type < memory_properties.memoryTypeCount &&
++                (!(bits & (1u << type)) ||
++                 (memory_properties.memoryTypes[type].propertyFlags & flags) !=
++                    flags))
++            ++type;
++         require(type < memory_properties.memoryTypeCount, "memory type");
++         return type;
++      };
++
++      VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      image_info.imageType = VK_IMAGE_TYPE_2D;
++      image_info.format = color_format;
++      image_info.extent = {extent, extent, 1};
++      image_info.mipLevels = 1;
++      image_info.arrayLayers = 1;
++      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_info.usage =
++         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      VkImage color_image = VK_NULL_HANDLE;
++      result = vkCreateImage(device, &image_info, nullptr, &color_image);
++      require(result == VK_SUCCESS, "create image", result);
++      VkMemoryRequirements image_requirements{};
++      vkGetImageMemoryRequirements(device, color_image, &image_requirements);
++      VkMemoryAllocateInfo image_memory_info{
++         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      image_memory_info.allocationSize = image_requirements.size;
++      image_memory_info.memoryTypeIndex =
++         pick_memory(image_requirements.memoryTypeBits, 0);
++      VkDeviceMemory color_memory = VK_NULL_HANDLE;
++      result =
++         vkAllocateMemory(device, &image_memory_info, nullptr, &color_memory);
++      require(result == VK_SUCCESS, "allocate image", result);
++      result = vkBindImageMemory(device, color_image, color_memory, 0);
++      require(result == VK_SUCCESS, "bind image", result);
++      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view_info.image = color_image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++      view_info.format = color_format;
++      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      VkImageView color_view = VK_NULL_HANDLE;
++      result = vkCreateImageView(device, &view_info, nullptr, &color_view);
++      require(result == VK_SUCCESS, "create view", result);
++
++      auto make_buffer = [&](VkDeviceSize size, VkBufferUsageFlags usage,
++                             VkBuffer *buffer, VkDeviceMemory *memory,
++                             void **mapped) {
++         VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++         buffer_info.size = size;
++         buffer_info.usage = usage;
++         result = vkCreateBuffer(device, &buffer_info, nullptr, buffer);
++         require(result == VK_SUCCESS, "create buffer", result);
++         VkMemoryRequirements requirements{};
++         vkGetBufferMemoryRequirements(device, *buffer, &requirements);
++         VkMemoryAllocateInfo memory_info{
++            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++         memory_info.allocationSize = requirements.size;
++         memory_info.memoryTypeIndex =
++            pick_memory(requirements.memoryTypeBits,
++                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++         result = vkAllocateMemory(device, &memory_info, nullptr, memory);
++         require(result == VK_SUCCESS, "allocate buffer", result);
++         result = vkBindBufferMemory(device, *buffer, *memory, 0);
++         require(result == VK_SUCCESS, "bind buffer", result);
++         result = vkMapMemory(device, *memory, 0, VK_WHOLE_SIZE, 0, mapped);
++         require(result == VK_SUCCESS, "map buffer", result);
++      };
++
++      const VkDeviceSize readback_size = VkDeviceSize(extent) * extent * 4;
++      VkBuffer readback = VK_NULL_HANDLE;
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      void *readback_data = nullptr;
++      make_buffer(readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback,
++                  &readback_memory, &readback_data);
++
++      /* Three triangles: two off screen, then one that covers the render
++       * area, so the covering primitive's ID is 2. */
++      const float vertices[9][4] = {
++         {2.0f, 2.0f, 0.0f, 1.0f},  {2.0f, 3.0f, 0.0f, 1.0f},
++         {3.0f, 3.0f, 0.0f, 1.0f},  {2.0f, 2.0f, 0.0f, 1.0f},
++         {3.0f, 2.0f, 0.0f, 1.0f},  {3.0f, 3.0f, 0.0f, 1.0f},
++         {-1.0f, -1.0f, 0.0f, 1.0f}, {3.0f, -1.0f, 0.0f, 1.0f},
++         {-1.0f, 3.0f, 0.0f, 1.0f},
++      };
++      VkBuffer vertex_buffer = VK_NULL_HANDLE;
++      VkDeviceMemory vertex_memory = VK_NULL_HANDLE;
++      void *vertex_data = nullptr;
++      make_buffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                  &vertex_buffer, &vertex_memory, &vertex_data);
++      std::memcpy(vertex_data, vertices, sizeof(vertices));
++
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "create layout", result);
++
++      auto make_module = [&](const uint32_t *code, size_t size) {
++         VkShaderModuleCreateInfo module_info{
++            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++         module_info.codeSize = size;
++         module_info.pCode = code;
++         VkShaderModule module = VK_NULL_HANDLE;
++         result = vkCreateShaderModule(device, &module_info, nullptr, &module);
++         require(result == VK_SUCCESS, "create module", result);
++         return module;
++      };
++      VkShaderModule vertex_module =
++         make_module(vertex_spirv, sizeof(vertex_spirv));
++      VkShaderModule geometry_module =
++         make_module(geometry_spirv, sizeof(geometry_spirv));
++      VkShaderModule green_module = make_module(green_spirv, sizeof(green_spirv));
++      VkShaderModule green_if_id_module =
++         make_module(green_if_id_spirv, sizeof(green_if_id_spirv));
++
++      const VkViewport viewport{0.0f, 0.0f, float(extent), float(extent), 0.0f,
++                                1.0f};
++      const VkRect2D scissor{{0, 0}, {extent, extent}};
++
++      VkCommandPoolCreateInfo pool_info{
++         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "create command pool", result);
++      VkCommandBufferAllocateInfo allocate{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      allocate.commandPool = pool;
++      allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      allocate.commandBufferCount = 1;
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &allocate, &command);
++      require(result == VK_SUCCESS, "allocate command", result);
++
++      /* Returns 0 when every pixel came out green, 1 when the pipeline could
++       * not be built at all, and 2 when the image is wrong. */
++      auto run = [&](bool geometry, VkShaderModule fragment, bool libraries,
++                     bool dynamic_polygon_mode) {
++         const int32_t expected_id = 2;
++         VkSpecializationMapEntry entry{0u, 0u, sizeof(expected_id)};
++         VkSpecializationInfo specialization{1u, &entry, sizeof(expected_id),
++                                             &expected_id};
++
++         VkPipelineShaderStageCreateInfo stages[3]{};
++         uint32_t stage_count = 0;
++         auto add_stage = [&](VkShaderStageFlagBits bit, VkShaderModule module,
++                              bool specialize) {
++            VkPipelineShaderStageCreateInfo &info = stages[stage_count++];
++            info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++            info.stage = bit;
++            info.module = module;
++            info.pName = "main";
++            info.pSpecializationInfo = specialize ? &specialization : nullptr;
++         };
++         add_stage(VK_SHADER_STAGE_VERTEX_BIT, vertex_module, false);
++         if (geometry)
++            add_stage(VK_SHADER_STAGE_GEOMETRY_BIT, geometry_module, false);
++         add_stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment,
++                   fragment == green_if_id_module);
++
++         const VkVertexInputBindingDescription binding{
++            0u, uint32_t(sizeof(float) * 4), VK_VERTEX_INPUT_RATE_VERTEX};
++         const VkVertexInputAttributeDescription attribute{
++            0u, 0u, VK_FORMAT_R32G32B32A32_SFLOAT, 0u};
++         VkPipelineVertexInputStateCreateInfo vi{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         vi.vertexBindingDescriptionCount = 1;
++         vi.pVertexBindingDescriptions = &binding;
++         vi.vertexAttributeDescriptionCount = 1;
++         vi.pVertexAttributeDescriptions = &attribute;
++         VkPipelineInputAssemblyStateCreateInfo ia{
++            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++         ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++         VkPipelineViewportStateCreateInfo vp{
++            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++         vp.viewportCount = 1;
++         vp.pViewports = &viewport;
++         vp.scissorCount = 1;
++         vp.pScissors = &scissor;
++         VkPipelineRasterizationStateCreateInfo rs{
++            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++         rs.polygonMode = VK_POLYGON_MODE_FILL;
++         rs.cullMode = VK_CULL_MODE_NONE;
++         rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++         rs.lineWidth = 1.0f;
++         VkPipelineMultisampleStateCreateInfo ms{
++            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++         VkPipelineDepthStencilStateCreateInfo ds{
++            VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++         VkPipelineColorBlendAttachmentState blend_attachment{};
++         blend_attachment.colorWriteMask = 0xf;
++         VkPipelineColorBlendStateCreateInfo blend{
++            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++         blend.attachmentCount = 1;
++         blend.pAttachments = &blend_attachment;
++         const VkDynamicState dynamic_states[] = {
++            VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
++         };
++         VkPipelineDynamicStateCreateInfo dynamic{
++            VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++         dynamic.dynamicStateCount = 1;
++         dynamic.pDynamicStates = dynamic_states;
++         VkPipelineRenderingCreateInfo rendering{
++            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++         rendering.colorAttachmentCount = 1;
++         rendering.pColorAttachmentFormats = &color_format;
++         VkGraphicsPipelineCreateInfo pipeline_info{
++            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++         pipeline_info.pNext = &rendering;
++         pipeline_info.stageCount = stage_count;
++         pipeline_info.pStages = stages;
++         pipeline_info.pVertexInputState = &vi;
++         pipeline_info.pInputAssemblyState = &ia;
++         pipeline_info.pViewportState = &vp;
++         pipeline_info.pRasterizationState = &rs;
++         pipeline_info.pMultisampleState = &ms;
++         pipeline_info.pDepthStencilState = &ds;
++         pipeline_info.pColorBlendState = &blend;
++         if (dynamic_polygon_mode)
++            pipeline_info.pDynamicState = &dynamic;
++         pipeline_info.layout = layout;
++         VkPipeline pipeline = VK_NULL_HANDLE;
++         VkPipeline parts[4] = {};
++         if (!libraries) {
++            result = vkCreateGraphicsPipelines(
++               device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline);
++            if (result != VK_SUCCESS || pipeline == VK_NULL_HANDLE) {
++               std::printf("  pipeline creation failed: %d\n", result);
++               return 1;
++            }
++         } else {
++            auto create_part = [&](uint32_t index,
++                                   VkGraphicsPipelineLibraryFlagsEXT flags,
++                                   VkGraphicsPipelineCreateInfo info) {
++               VkGraphicsPipelineLibraryCreateInfoEXT part{
++                  VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
++               part.flags = flags;
++               part.pNext = &rendering;
++               info.pNext = &part;
++               info.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++               info.layout = layout;
++               result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                                  &info, nullptr, &parts[index]);
++               return result == VK_SUCCESS && parts[index] != VK_NULL_HANDLE;
++            };
++            VkGraphicsPipelineCreateInfo input_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            input_info.pVertexInputState = &vi;
++            input_info.pInputAssemblyState = &ia;
++            VkGraphicsPipelineCreateInfo pre_raster_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            pre_raster_info.stageCount = stage_count - 1;
++            pre_raster_info.pStages = stages;
++            pre_raster_info.pViewportState = &vp;
++            pre_raster_info.pRasterizationState = &rs;
++            if (dynamic_polygon_mode)
++               pre_raster_info.pDynamicState = &dynamic;
++            VkGraphicsPipelineCreateInfo fragment_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            fragment_info.stageCount = 1;
++            fragment_info.pStages = &stages[stage_count - 1];
++            fragment_info.pMultisampleState = &ms;
++            fragment_info.pDepthStencilState = &ds;
++            VkGraphicsPipelineCreateInfo output_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            output_info.pMultisampleState = &ms;
++            output_info.pColorBlendState = &blend;
++            const bool built =
++               create_part(0,
++                           VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
++                           input_info) &&
++               create_part(1,
++                           VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
++                           pre_raster_info) &&
++               create_part(2, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
++                           fragment_info) &&
++               create_part(3,
++                           VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
++                           output_info);
++            if (!built) {
++               std::printf("  library creation failed: %d\n", result);
++               for (VkPipeline part : parts)
++                  if (part != VK_NULL_HANDLE)
++                     vkDestroyPipeline(device, part, nullptr);
++               return 1;
++            }
++            VkPipelineLibraryCreateInfoKHR link{
++               VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
++            link.libraryCount = 4;
++            link.pLibraries = parts;
++            VkGraphicsPipelineCreateInfo link_info{
++               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            link_info.pNext = &link;
++            link_info.layout = layout;
++            result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                               &link_info, nullptr, &pipeline);
++            for (VkPipeline part : parts)
++               vkDestroyPipeline(device, part, nullptr);
++            if (result != VK_SUCCESS || pipeline == VK_NULL_HANDLE) {
++               std::printf("  library link failed: %d\n", result);
++               return 1;
++            }
++         }
++
++         result = vkResetCommandPool(device, pool, 0);
++         require(result == VK_SUCCESS, "reset command pool", result);
++         VkCommandBufferBeginInfo begin{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++         result = vkBeginCommandBuffer(command, &begin);
++         require(result == VK_SUCCESS, "begin command", result);
++
++         VkRenderingAttachmentInfo color_attachment{
++            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++         color_attachment.imageView = color_view;
++         color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++         color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++         color_attachment.clearValue.color.float32[3] = 1.0f;
++         VkRenderingInfo render_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++         render_info.renderArea = scissor;
++         render_info.layerCount = 1;
++         render_info.colorAttachmentCount = 1;
++         render_info.pColorAttachments = &color_attachment;
++         vkCmdBeginRendering(command, &render_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++         VkDeviceSize offset = 0;
++         vkCmdBindVertexBuffers(command, 0, 1, &vertex_buffer, &offset);
++         vkCmdDraw(command, 9, 1, 0, 0);
++         vkCmdEndRendering(command);
++
++         VkImageMemoryBarrier to_source{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++         to_source.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++         to_source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++         to_source.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         to_source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++         to_source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_source.image = color_image;
++         to_source.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++         VkBufferImageCopy region{};
++         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++         region.imageExtent = {extent, extent, 1};
++         vkCmdCopyImageToBuffer(command, color_image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &region);
++         result = vkEndCommandBuffer(command);
++         require(result == VK_SUCCESS, "end command", result);
++
++         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++         VkFence fence = VK_NULL_HANDLE;
++         result = vkCreateFence(device, &fence_info, nullptr, &fence);
++         require(result == VK_SUCCESS, "create fence", result);
++         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         submit.commandBufferCount = 1;
++         submit.pCommandBuffers = &command;
++         result = vkQueueSubmit(device_queue, 1, &submit, fence);
++         require(result == VK_SUCCESS, "submit command", result);
++         result = vkWaitForFences(device, 1, &fence, VK_TRUE, 20000000000ull);
++         require(result == VK_SUCCESS, "draw retired", result);
++         vkDestroyFence(device, fence, nullptr);
++         vkDestroyPipeline(device, pipeline, nullptr);
++
++         const auto *pixels = static_cast<const uint8_t *>(readback_data);
++         uint32_t wrong = 0;
++         for (VkDeviceSize p = 0; p < readback_size; p += 4) {
++            if (pixels[p + 0] > 5 || pixels[p + 1] < 250)
++               ++wrong;
++         }
++         if (wrong) {
++            std::printf("  %u of %u pixels are not green (first %u,%u,%u,%u)\n",
++                        wrong, uint32_t(readback_size / 4), pixels[0], pixels[1],
++                        pixels[2], pixels[3]);
++            return 2;
++         }
++         return 0;
++      };
++
++      struct Case {
++         const char *name;
++         bool geometry;
++         VkShaderModule fragment;
++         bool libraries;
++         bool dynamic_polygon_mode;
++      };
++      const Case cases[] = {
++         {"geometry writes the primitive id, fragment ignores it", true,
++          green_module, false, false},
++         {"geometry writes the primitive id, fragment reads it", true,
++          green_if_id_module, false, false},
++         {"no geometry stage, fragment reads the rasterizer primitive id",
++          false, green_if_id_module, false, false},
++         {"libraries: geometry writes the primitive id, fragment ignores it",
++          true, green_module, true, false},
++         {"libraries: geometry writes the primitive id, fragment reads it",
++          true, green_if_id_module, true, false},
++         {"libraries: no geometry stage, fragment reads the primitive id",
++          false, green_if_id_module, true, false},
++         {"dynamic polygon mode: geometry writes the primitive id, fragment "
++          "ignores it", true, green_module, false, true},
++         {"dynamic polygon mode: geometry writes the primitive id, fragment "
++          "reads it", true, green_if_id_module, false, true},
++         {"dynamic polygon mode, libraries: geometry writes the primitive id, "
++          "fragment ignores it", true, green_module, true, true},
++         {"dynamic polygon mode: no geometry stage, fragment reads the "
++          "primitive id", false, green_if_id_module, false, true},
++      };
++      bool failed = false;
++      for (const Case &test : cases) {
++         std::printf("%s\n", test.name);
++         if (run(test.geometry, test.fragment, test.libraries,
++                 test.dynamic_polygon_mode) != 0)
++            failed = true;
++      }
++      require(!failed, "every primitive id link compiles and delivers");
++      std::printf("primitive id links compile and deliver\n");
++
++      vkDestroyCommandPool(device, pool, nullptr);
++      for (VkShaderModule module : {vertex_module, geometry_module,
++                                    green_module, green_if_id_module})
++         vkDestroyShaderModule(device, module, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyBuffer(device, vertex_buffer, nullptr);
++      vkFreeMemory(device, vertex_memory, nullptr);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      vkDestroyImageView(device, color_view, nullptr);
++      vkDestroyImage(device, color_image, nullptr);
++      vkFreeMemory(device, color_memory, nullptr);
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c b/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c
+index 0f65860e7d4baf25aa0379875e18fe7c902e71db..f8d557ed6d555b9c593649653428cd50404df1c3 100644
+--- a/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c
++++ b/src/kosmickrisp/vulkan/tests/test_msl_temporaries.c
+@@ -175,11 +175,108 @@ scan_msl(const char *msl, struct scan *scan)
+    }
+ }
+ 
++/* The slots Metal owns have a type Metal fixes, whatever type the shader
++ * stored: the layer and viewport indices are unsigned and carry no
++ * interpolation qualifier.  An authored primitive ID is not a vertex output
++ * Metal knows, so it crosses the interface as a flat user varying, and both
++ * ends declare it unsigned although the shaders here store and read it signed.
++ */
++static void
++check_builtin_varyings(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_VERTEX, &kk_nir_options, "msl builtin varyings");
++   nir_shader *nir = b.shader;
++   nir->info.io_lowered = true;
++
++   nir_def *pos = nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f);
++   nir_store_output(&b, pos, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_float32,
++                    .io_semantics.location = VARYING_SLOT_POS,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_POS);
++
++   nir_def *prim = nir_imm_int(&b, 42);
++   nir_store_output(&b, prim, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_int32,
++                    .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID);
++
++   nir_store_output(&b, prim, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_int32,
++                    .io_semantics.location = VARYING_SLOT_LAYER,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_LAYER);
++
++   nir_store_output(&b, prim, nir_imm_int(&b, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_int32,
++                    .io_semantics.location = VARYING_SLOT_VIEWPORT,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_VIEWPORT);
++
++   nir_validate_shader(nir, "msl builtin varyings");
++
++   struct nir_to_msl_options options = {.rts_component_count = {4}};
++   char *msl = nir_to_msl(nir, &options);
++   CHECK(msl != NULL);
++
++   CHECK(strstr(msl, "uint primitive_id [[user(primitive_id)]];") != NULL);
++   CHECK(strstr(msl, "uint render_target_array_index [[render_target_array_index]];") != NULL);
++   CHECK(strstr(msl, "uint viewport_array_index [[viewport_array_index]];") != NULL);
++
++   ralloc_free(msl);
++   ralloc_free(nir);
++
++   nir_builder fb = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "msl builtin fs inputs");
++   nir_shader *fnir = fb.shader;
++   fnir->info.io_lowered = true;
++   nir_def *in_prim = nir_load_input(&fb, 1, 32, nir_imm_int(&fb, 0),
++                                     .base = 0, .range = 1,
++                                     .dest_type = nir_type_int32,
++                                     .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID,
++                                     .io_semantics.num_slots = 1);
++   fnir->info.inputs_read |= BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID);
++   nir_def *in_layer = nir_load_input(&fb, 1, 32, nir_imm_int(&fb, 0),
++                                      .base = 1, .range = 1,
++                                      .dest_type = nir_type_int32,
++                                      .io_semantics.location = VARYING_SLOT_LAYER,
++                                      .io_semantics.num_slots = 1);
++   fnir->info.inputs_read |= BITFIELD64_BIT(VARYING_SLOT_LAYER);
++   nir_def *in_viewport = nir_load_input(&fb, 1, 32, nir_imm_int(&fb, 0),
++                                         .base = 2, .range = 1,
++                                         .dest_type = nir_type_int32,
++                                         .io_semantics.location = VARYING_SLOT_VIEWPORT,
++                                         .io_semantics.num_slots = 1);
++   fnir->info.inputs_read |= BITFIELD64_BIT(VARYING_SLOT_VIEWPORT);
++   nir_def *color = nir_vec4(&fb, nir_i2f32(&fb, in_prim), nir_i2f32(&fb, in_layer),
++                             nir_i2f32(&fb, in_viewport), nir_imm_float(&fb, 1.0f));
++   nir_store_output(&fb, color, nir_imm_int(&fb, 0), .base = 0, .range = 1,
++                    .component = 0, .src_type = nir_type_float32,
++                    .io_semantics.location = FRAG_RESULT_DATA0,
++                    .io_semantics.num_slots = 1);
++   fnir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
++   nir_validate_shader(fnir, "msl builtin fs inputs");
++
++   char *fmsl = nir_to_msl(fnir, &options);
++   CHECK(fmsl != NULL);
++   CHECK(strstr(fmsl, "uint primitive_id [[user(primitive_id)]] [[flat]];") != NULL);
++   CHECK(strstr(fmsl, "uint render_target_array_index [[render_target_array_index]];") != NULL);
++   CHECK(strstr(fmsl, "uint viewport_array_index [[viewport_array_index]];") != NULL);
++   CHECK(strstr(fmsl, "float4 color_0 [[color(0)]];") != NULL);
++
++   ralloc_free(fmsl);
++   ralloc_free(fnir);
++}
++
+ int
+ main(void)
+ {
+    glsl_type_singleton_init_or_ref();
+ 
++   check_builtin_varyings();
++
+    nir_shader *nir = build_accumulating_fs();
+    msl_optimize_nir(nir);
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));

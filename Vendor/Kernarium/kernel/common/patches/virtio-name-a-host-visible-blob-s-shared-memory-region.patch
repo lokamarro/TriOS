@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 09:06:53 +0900
+Subject: [PATCH] virtio: name a host-visible blob's shared-memory region
+
+A host-visible Virtio-GPU blob lives in the device's shared-memory region
+rather than in guest pages, so a guest driver that imports its dma-buf has
+no guest-physical address to describe it to its own device: the exported
+scatter list carries an aperture address that only the GPU's backend can
+interpret, and an unmappable blob exports no addresses at all.
+
+Let the exporting driver name the region instead. A virtio dma-buf gains an
+optional get_shm_region operation, and Virtio-GPU answers it for a mappable
+VRAM blob with the region ID and the blob's offset and extent inside it. A
+host that serves both devices resolves that pair to the memory the exporting
+device published there.
+
+This adds an accessor only; guest-page buffers are unaffected.
+---
+ drivers/gpu/drm/virtio/virtgpu_prime.c | 32 ++++++++++++++++++++++++++
+ drivers/virtio/virtio_dma_buf.c        | 31 +++++++++++++++++++++++++
+ include/linux/virtio_dma_buf.h         |  7 ++++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_prime.c b/drivers/gpu/drm/virtio/virtgpu_prime.c
+index ce49282198cbf6aa31751248f4b3f30c74494d1c..59114caf081352bff4703c7e6c121a668a275a74 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_prime.c
++++ b/drivers/gpu/drm/virtio/virtgpu_prime.c
+@@ -45,6 +45,37 @@ static int virtgpu_virtio_get_uuid(struct dma_buf *buf,
+ 	return 0;
+ }
+ 
++/*
++ * A host-visible blob lives in the device's shared-memory region rather than
++ * in guest pages, so an importing virtio driver has no guest-physical address
++ * to give its own device. Name the region instead; a host that serves both
++ * devices resolves the offset to the same host memory.
++ */
++static int virtgpu_virtio_get_shm_region(struct dma_buf *buf, u8 *id,
++					 u64 *offset, u64 *size)
++{
++	struct drm_gem_object *obj = buf->priv;
++	struct virtio_gpu_object *bo = gem_to_virtio_gpu_obj(obj);
++	struct virtio_gpu_device *vgdev = obj->dev->dev_private;
++	struct virtio_gpu_object_vram *vram;
++
++	if (!virtio_gpu_is_vram(bo) ||
++	    !(bo->blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE))
++		return -ENODEV;
++
++	vram = to_virtio_gpu_vram(bo);
++	wait_event(vgdev->resp_wq, vram->map_state != STATE_INITIALIZING);
++	if (vram->map_state != STATE_OK ||
++	    !drm_mm_node_allocated(&vram->vram_node) ||
++	    vram->vram_node.start < vgdev->host_visible_region.addr)
++		return -ENODEV;
++
++	*id = VIRTIO_GPU_SHM_ID_HOST_VISIBLE;
++	*offset = vram->vram_node.start - vgdev->host_visible_region.addr;
++	*size = vram->vram_node.size;
++	return 0;
++}
++
+ static struct sg_table *
+ virtgpu_gem_map_dma_buf(struct dma_buf_attachment *attach,
+ 			enum dma_data_direction dir)
+@@ -86,6 +117,7 @@ static const struct virtio_dma_buf_ops virtgpu_dmabuf_ops =  {
+ 	},
+ 	.device_attach = drm_gem_map_attach,
+ 	.get_uuid = virtgpu_virtio_get_uuid,
++	.get_shm_region = virtgpu_virtio_get_shm_region,
+ };
+ 
+ int virtio_gpu_resource_assign_uuid(struct virtio_gpu_device *vgdev,
+diff --git a/drivers/virtio/virtio_dma_buf.c b/drivers/virtio/virtio_dma_buf.c
+index 95c10632f84a7d3845df94b1945e08c7ee747829..db22a1e074eab4fa56bb8599a007dbeab02aab4b 100644
+--- a/drivers/virtio/virtio_dma_buf.c
++++ b/drivers/virtio/virtio_dma_buf.c
+@@ -87,6 +87,37 @@ int virtio_dma_buf_get_uuid(struct dma_buf *dma_buf,
+ }
+ EXPORT_SYMBOL(virtio_dma_buf_get_uuid);
+ 
++/**
++ * virtio_dma_buf_get_shm_region - names the virtio shared-memory region that
++ *	backs a virtio dma-buf
++ * @dma_buf: [in] buffer to query
++ * @id: [out] the exporting device's shared-memory region ID
++ * @offset: [out] the buffer's offset inside that region
++ * @size: [out] the extent reserved for the buffer inside that region
++ *
++ * A host-visible virtio buffer lives in a shared-memory region of the
++ * exporting device rather than in guest pages, so an importing virtio driver
++ * cannot describe it to its own device with guest-physical addresses. This
++ * names the region instead, which a host that serves both devices can resolve.
++ *
++ * Returns: 0 on success, negative on failure.
++ */
++int virtio_dma_buf_get_shm_region(struct dma_buf *dma_buf, u8 *id, u64 *offset,
++				  u64 *size)
++{
++	const struct virtio_dma_buf_ops *ops;
++
++	if (!is_virtio_dma_buf(dma_buf))
++		return -EINVAL;
++
++	ops = container_of(dma_buf->ops, const struct virtio_dma_buf_ops, ops);
++	if (!ops->get_shm_region)
++		return -ENODEV;
++
++	return ops->get_shm_region(dma_buf, id, offset, size);
++}
++EXPORT_SYMBOL(virtio_dma_buf_get_shm_region);
++
+ MODULE_DESCRIPTION("dma-bufs for virtio exported objects");
+ MODULE_LICENSE("GPL");
+ MODULE_IMPORT_NS("DMA_BUF");
+diff --git a/include/linux/virtio_dma_buf.h b/include/linux/virtio_dma_buf.h
+index a2fdf217ac6222c08dbd04471c4fc47c4576e146..b6a0211c1139499400a84984c6ade62f587f67a8 100644
+--- a/include/linux/virtio_dma_buf.h
++++ b/include/linux/virtio_dma_buf.h
+@@ -18,12 +18,17 @@
+  * @device_attach: [optional] callback invoked by virtio_dma_buf_attach during
+  *		   all attach operations.
+  * @get_uid: [required] callback to get the uuid of the exported object.
++ * @get_shm_region: [optional] callback to name the virtio shared-memory
++ *		    region backing the exported object, for drivers whose
++ *		    device shares that region with the exporting device.
+  */
+ struct virtio_dma_buf_ops {
+ 	struct dma_buf_ops ops;
+ 	int (*device_attach)(struct dma_buf *dma_buf,
+ 			     struct dma_buf_attachment *attach);
+ 	int (*get_uuid)(struct dma_buf *dma_buf, uuid_t *uuid);
++	int (*get_shm_region)(struct dma_buf *dma_buf, u8 *id, u64 *offset,
++			      u64 *size);
+ };
+ 
+ int virtio_dma_buf_attach(struct dma_buf *dma_buf,
+@@ -33,5 +38,7 @@ struct dma_buf *virtio_dma_buf_export
+ 	(const struct dma_buf_export_info *exp_info);
+ bool is_virtio_dma_buf(struct dma_buf *dma_buf);
+ int virtio_dma_buf_get_uuid(struct dma_buf *dma_buf, uuid_t *uuid);
++int virtio_dma_buf_get_shm_region(struct dma_buf *dma_buf, u8 *id, u64 *offset,
++				  u64 *size);
+ 
+ #endif /* _LINUX_VIRTIO_DMA_BUF_H */

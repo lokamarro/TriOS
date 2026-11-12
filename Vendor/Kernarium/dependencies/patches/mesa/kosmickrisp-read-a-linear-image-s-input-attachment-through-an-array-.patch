@@ -1,0 +1,671 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 20:46:42 +0900
+Subject: [PATCH] kosmickrisp: read a linear image's input attachment through
+ an array view
+
+Android's swapchain offers VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT on every
+surface, and Unity creates its swapchain with it: Angry Birds 2's images ask
+for TRANSFER_SRC, TRANSFER_DST, COLOR_ATTACHMENT and INPUT_ATTACHMENT. Venus
+imports each of those native buffers as a DRM_FORMAT_MOD_LINEAR image, and
+this driver refused every one with VK_ERROR_INITIALIZATION_FAILED, so the
+game never got a swapchain and its window stayed black.
+
+The refusal came from how input attachments are bound, not from what Metal
+can do. This driver reads every input attachment as a 2D array, and it made
+that possible by creating the image itself as a 2D array texture. Metal makes
+only a 2D texture of a buffer, so a linear layout could not be an input
+attachment at all. But every colour attachment view already carries a 2D
+array view of its image for input attachment reads, and Metal does make a 2D
+array view of a 2D texture over a buffer; it reads back the same texels.
+
+So a linear layout stays a 2D texture whatever its usage, and its input
+attachment is read through that view -- including through a one-layer 2D
+array view, whose own texture is still 2D. A modifier image, which already
+renders, now offers the input attachment Vulkan requires of any format with
+the colour attachment feature, and the image format query answers what
+vkCreateImage accepts. Plain linear tiling keeps the capabilities it has
+always had. Optimal images are unchanged.
+
+The Meson suite pins the policy, and a new test creates a modifier image with
+the swapchain's usage from both a modifier list and an explicit layout,
+clears it, and reads the clear back through each view's input attachment
+texture.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_image.c             |   9 +-
+ src/kosmickrisp/vulkan/kk_image_layout.c      |  13 +-
+ src/kosmickrisp/vulkan/kk_image_view.c        |   6 +-
+ src/kosmickrisp/vulkan/kk_linear_layout.h     |  35 +-
+ src/kosmickrisp/vulkan/meson.build            |  21 +
+ .../tests/test_linear_input_attachment.m      | 376 ++++++++++++++++++
+ .../vulkan/tests/test_linear_layout.c         |  44 +-
+ 7 files changed, 470 insertions(+), 34 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_linear_input_attachment.m
+
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 72b1f4c24d3a54cddfdc590480a53cc9bc1fbdbe..fc528f1c46a09eb46b9933603782e2f4ff5f1fd7 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -374,11 +374,10 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+    if (linear_layout && pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+-   /* A linear layout renders, but only as a plain 2D texture: this driver
+-    * binds an input attachment as a 2D array, which Metal refuses to make out
+-    * of a buffer. kk_linear_layout.h owns which attachment usages survive
+-    * that, and a modifier image keeps the colour attachment a swapchain image
+-    * is created with. */
++   /* A linear layout renders, but only as a plain 2D texture, and Metal has
++    * no linear depth or stencil texture. kk_linear_layout.h owns which
++    * attachment usages survive that: a modifier image keeps the colour and
++    * input attachment a swapchain image is created with. */
+    if (kk_linear_layout_refuses_usage(tiling, pImageFormatInfo->usage))
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.c b/src/kosmickrisp/vulkan/kk_image_layout.c
+index 0e47357795bd7bbfe499f30c19f55ff977afacad..18932806d63262425bbf82c4e4fbd0dc5e6def75 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.c
++++ b/src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -24,9 +24,11 @@ vk_image_to_mtl_texture_type(const struct vk_image *image)
+    switch (image->image_type) {
+    case VK_IMAGE_TYPE_1D:
+    case VK_IMAGE_TYPE_2D:
+-      /* We require input attachments to be arrays */
++      /* Input attachments are read as arrays. A linear layout, which Metal
++       * only makes a 2D texture of, is read through a 2D array view. */
+       if (array_layers > 1 ||
+-          (image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
++          ((image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
++           kk_input_attachment_makes_array_texture(image->tiling)))
+          return samples > 1u ? MTL_TEXTURE_TYPE_2D_ARRAY_MULTISAMPLE
+                              : MTL_TEXTURE_TYPE_2D_ARRAY;
+       return samples > 1u ? MTL_TEXTURE_TYPE_2D_MULTISAMPLE
+@@ -266,9 +268,10 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
+ 
+    /* A linear texture is a texture over a MTLBuffer, and Metal answers any
+     * type but MTLTextureType2D for one with an assertion that ends the
+-    * process. The image format query already refuses the usages that would
+-    * ask for another type; this is what stops a descriptor Metal cannot
+-    * represent even when nothing consulted that query. */
++    * process. The image format query already refuses what would ask for
++    * another type, such as more than one layer; this is what stops a
++    * descriptor Metal cannot represent even when nothing consulted that
++    * query. */
+    if (layout->linear && !kk_linear_layout_type_is_creatable(layout->type))
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index ed1661f14380b8ffe27ffce5c03ff20f26e58216..682a65f74e339a2e50409a9c6e7f924a5b270070 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -232,9 +232,13 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+ 
+       if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
++         /* A linear layout's own texture is 2D whatever the view, so even a
++          * 2D array view of one needs a 2D array texture to be read as an
++          * input attachment through. */
+          bool requires_type_change =
+             view_layout.view_type != VK_IMAGE_VIEW_TYPE_3D &&
+-            view_layout.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++            (view_layout.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
++             plane->layout.linear);
+          bool requires_format_change = view->vk.format != image->vk.format;
+          VkImageViewType original_type = view_layout.view_type;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_linear_layout.h b/src/kosmickrisp/vulkan/kk_linear_layout.h
+index 3e3033f8b37b45eb83f5ea105cdf492cfd04ea46..239139bb548cce76edb35a79b7420a5f0157dcd6 100644
+--- a/src/kosmickrisp/vulkan/kk_linear_layout.h
++++ b/src/kosmickrisp/vulkan/kk_linear_layout.h
+@@ -18,14 +18,20 @@
+  * Such a texture renders: Metal accepts MTLTextureUsageRenderTarget on it,
+  * and this driver already asks for one whenever a linear image is a transfer
+  * destination. What Metal refuses, by an assertion that ends the process, is
+- * a linear texture of any type but MTLTextureType2D -- and this driver binds
+- * every input attachment as a 2D array.
++ * a linear texture of any type but MTLTextureType2D.
+  *
+- * A modifier image is therefore offered as a colour attachment, because a
+- * Wayland swapchain image is exactly that and common WSI has no fallback when
+- * no modifier can hold one, while plain linear tiling keeps the capabilities
+- * it has always had. Both refuse an input attachment, and neither has a
+- * depth or stencil texture in Metal at all.
++ * This driver reads every input attachment as a 2D array. An optimal image
++ * that can be one is created as a 2D array texture outright; a linear layout
++ * stays a 2D texture and is read through a 2D array view of it, which Metal
++ * does make of a texture over a buffer. An input attachment therefore goes
++ * wherever a colour attachment goes -- Vulkan requires that of any format
++ * with the colour attachment feature, and Android's swapchain offers both.
++ *
++ * A modifier image is offered as a colour and input attachment, because a
++ * Wayland or Android swapchain image is exactly that and common WSI has no
++ * fallback when no modifier can hold one, while plain linear tiling keeps
++ * the capabilities it has always had. Neither has a depth or stencil texture
++ * in Metal at all.
+  */
+ static inline bool
+ kk_tiling_is_linear_layout(VkImageTiling tiling)
+@@ -49,13 +55,20 @@ kk_linear_layout_refuses_usage(VkImageTiling tiling, VkImageUsageFlags usage)
+    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+       return true;
+ 
+-   if (usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
+-      return true;
+-
+-   return (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
++   return (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                    VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
+           !kk_linear_layout_renders(tiling);
+ }
+ 
++/* Whether an input attachment makes the image's own texture a 2D array. A
++ * linear layout cannot be one, so its input attachment is read through the
++ * 2D array view every attachment view of it carries instead. */
++static inline bool
++kk_input_attachment_makes_array_texture(VkImageTiling tiling)
++{
++   return !kk_tiling_is_linear_layout(tiling);
++}
++
+ /* The one Metal texture type a linear layout can have. A descriptor Metal
+  * cannot represent has to become a Vulkan error before it reaches Metal. */
+ static inline bool
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 09f61bcdd8e99c05ee94d93803c8d4e218147801..3731ff09f215b95f1dd0a868593e77472cd6d695 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -954,6 +954,27 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_linear_input_attachment',
++      executable(
++        'test_kosmickrisp_linear_input_attachment',
++        files('tests/test_linear_input_attachment.m'),
++        include_directories : kk_test_include_directories,
++        dependencies : [
++          idep_mtl_bridge,
++          idep_nir,
++          idep_vulkan_runtime_headers,
++          idep_vulkan_util_headers,
++          idep_vulkan_wsi_headers,
++          idep_libkk_shaders_h,
++          dependency('appleframeworks', modules : ['Foundation', 'Metal']),
++        ],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+     test(
+       'kosmickrisp_command_pool_release',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_linear_input_attachment.m b/src/kosmickrisp/vulkan/tests/test_linear_input_attachment.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..5caaab5ce96053206073d4228a5734fbf4b8667c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_linear_input_attachment.m
+@@ -0,0 +1,376 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Android's swapchain offers VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT on every
++ * surface and Unity creates its swapchain with it. Venus imports each of
++ * those native buffers as a DRM_FORMAT_MOD_LINEAR image, so a modifier image
++ * has to be creatable as an input attachment, and the input attachment has to
++ * read the texels the image holds. Metal makes only a 2D texture of a buffer,
++ * so the image stays 2D and every attachment view carries a 2D array view of
++ * it, which is what an input attachment is read through. */
++#define VK_NO_PROTOTYPES
++#include "kosmickrisp/vulkan/kk_image.h"
++#include "kosmickrisp/vulkan/kk_image_view.h"
++
++#include "drm-uapi/drm_fourcc.h"
++
++#include <Foundation/Foundation.h>
++#include <Metal/Metal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++#define CHECK(x)                                                               \
++   do {                                                                        \
++      if (!(x)) {                                                              \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);               \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++#define CHECK_VK(x) CHECK((x) == VK_SUCCESS)
++#define LOAD_I(name)                                                           \
++   PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name);       \
++   CHECK(name)
++#define LOAD_D(name)                                                           \
++   PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name);           \
++   CHECK(name)
++
++enum { WIDTH = 64, HEIGHT = 32 };
++
++/* TRANSFER_SRC | TRANSFER_DST | COLOR_ATTACHMENT | INPUT_ATTACHMENT, the
++ * usage Unity's Android swapchain images are created with. */
++static const VkImageUsageFlags swapchain_usage =
++   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++
++static const uint8_t clear_texel[4] = {51, 102, 153, 255};
++
++struct context {
++   VkInstance instance;
++   VkPhysicalDevice physical;
++   VkDevice device;
++   VkQueue queue;
++   VkCommandPool pool;
++   PFN_vkGetDeviceProcAddr get_device_proc;
++   VkPhysicalDeviceMemoryProperties memory;
++};
++
++static uint32_t
++memory_type(const struct context *ctx, uint32_t bits)
++{
++   for (uint32_t i = 0; i < ctx->memory.memoryTypeCount; i++) {
++      if ((bits & (1u << i)) &&
++          (ctx->memory.memoryTypes[i].propertyFlags &
++           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         return i;
++   }
++   abort();
++}
++
++static VkResult
++query(const struct context *ctx, VkImageTiling tiling, VkImageUsageFlags usage)
++{
++   VkInstance instance = ctx->instance;
++   LOAD_I(vkGetPhysicalDeviceImageFormatProperties2);
++   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier = {
++      .sType =
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++      .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   const VkPhysicalDeviceImageFormatInfo2 info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++      .pNext = tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ? &modifier
++                                                                 : NULL,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .type = VK_IMAGE_TYPE_2D,
++      .tiling = tiling,
++      .usage = usage,
++   };
++   VkImageFormatProperties2 props = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++   };
++   return vkGetPhysicalDeviceImageFormatProperties2(ctx->physical, &info,
++                                                    &props);
++}
++
++static VkImage
++create_image(const struct context *ctx, const void *modifier_info)
++{
++   VkDevice device = ctx->device;
++   PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = ctx->get_device_proc;
++   LOAD_D(vkCreateImage);
++   const VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = modifier_info,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {WIDTH, HEIGHT, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = swapchain_usage,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   CHECK_VK(vkCreateImage(device, &info, NULL, &image));
++   return image;
++}
++
++/* Clear the image through Vulkan, then read it back through each view's
++ * input attachment texture. */
++static void
++check_image(const struct context *ctx, VkImage image, const char *what)
++{
++   VkDevice device = ctx->device;
++   PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = ctx->get_device_proc;
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkAllocateCommandBuffers);
++   LOAD_D(vkFreeCommandBuffers);
++   LOAD_D(vkBeginCommandBuffer);
++   LOAD_D(vkEndCommandBuffer);
++   LOAD_D(vkCmdPipelineBarrier);
++   LOAD_D(vkCmdClearColorImage);
++   LOAD_D(vkQueueSubmit);
++   LOAD_D(vkQueueWaitIdle);
++
++   VkMemoryRequirements req;
++   vkGetImageMemoryRequirements(device, image, &req);
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = memory_type(ctx, req.memoryTypeBits),
++   };
++   VkDeviceMemory memory;
++   CHECK_VK(vkAllocateMemory(device, &alloc, NULL, &memory));
++   CHECK_VK(vkBindImageMemory(device, image, memory, 0));
++
++   const struct kk_image *kk_img = kk_image_from_handle(image);
++   id<MTLTexture> base = (id<MTLTexture>)kk_img->planes[0].mtl_handle;
++   CHECK(base != nil);
++   CHECK(base.textureType == MTLTextureType2D);
++   CHECK(base.buffer != nil);
++
++   const VkCommandBufferAllocateInfo cmd_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = ctx->pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VkCommandBuffer cmd;
++   CHECK_VK(vkAllocateCommandBuffers(device, &cmd_info, &cmd));
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   CHECK_VK(vkBeginCommandBuffer(cmd, &begin));
++   const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                                          1};
++   const VkImageMemoryBarrier to_dst = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = range,
++   };
++   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
++                        &to_dst);
++   const VkClearColorValue color = {
++      .float32 = {clear_texel[0] / 255.0f, clear_texel[1] / 255.0f,
++                  clear_texel[2] / 255.0f, 1.0f},
++   };
++   vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                        &color, 1, &range);
++   const VkImageMemoryBarrier to_read = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = range,
++   };
++   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
++                        NULL, 1, &to_read);
++   CHECK_VK(vkEndCommandBuffer(cmd));
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &cmd,
++   };
++   CHECK_VK(vkQueueSubmit(ctx->queue, 1, &submit, VK_NULL_HANDLE));
++   CHECK_VK(vkQueueWaitIdle(ctx->queue));
++   vkFreeCommandBuffers(device, ctx->pool, 1, &cmd);
++
++   /* A 2D view and a one-layer 2D array view both read their input
++    * attachment through a 2D array texture over the image's own buffer. */
++   const VkImageViewType view_types[] = {VK_IMAGE_VIEW_TYPE_2D,
++                                         VK_IMAGE_VIEW_TYPE_2D_ARRAY};
++   for (unsigned i = 0; i < 2u; i++) {
++      const VkImageViewCreateInfo view_info = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++         .image = image,
++         .viewType = view_types[i],
++         .format = VK_FORMAT_R8G8B8A8_UNORM,
++         .subresourceRange = range,
++      };
++      VkImageView view;
++      CHECK_VK(vkCreateImageView(device, &view_info, NULL, &view));
++      const struct kk_image_view *kk_view = kk_image_view_from_handle(view);
++      id<MTLTexture> input = (id<MTLTexture>)kk_view->planes[0].mtl_handle_input;
++      CHECK(input != nil);
++      CHECK(kk_view->planes[0].input_gpu_resource_id != 0);
++      CHECK(input.textureType == MTLTextureType2DArray);
++      CHECK(input.arrayLength == 1);
++      CHECK(input.parentTexture == base);
++
++      uint8_t texels[HEIGHT][WIDTH][4];
++      memset(texels, 0, sizeof(texels));
++      [input getBytes:texels
++            bytesPerRow:WIDTH * 4
++          bytesPerImage:WIDTH * HEIGHT * 4
++             fromRegion:MTLRegionMake2D(0, 0, WIDTH, HEIGHT)
++            mipmapLevel:0
++                  slice:0];
++      unsigned mismatches = 0;
++      for (unsigned y = 0; y < HEIGHT; y++) {
++         for (unsigned x = 0; x < WIDTH; x++)
++            mismatches += memcmp(texels[y][x], clear_texel, 4) != 0;
++      }
++      printf("%s view type %u: input texture 2D array over the image, "
++             "%u mismatching texels\n",
++             what, (unsigned)view_types[i], mismatches);
++      CHECK(mismatches == 0);
++      vkDestroyImageView(device, view, NULL);
++   }
++
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, memory, NULL);
++}
++
++int
++main(void)
++{
++   @autoreleasepool {
++      struct context ctx = {0};
++      const VkApplicationInfo app = {
++         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++         .apiVersion = VK_API_VERSION_1_3,
++      };
++      const VkInstanceCreateInfo instance_info = {
++         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++         .pApplicationInfo = &app,
++      };
++      VkInstance instance = VK_NULL_HANDLE;
++      LOAD_I(vkCreateInstance);
++      CHECK_VK(vkCreateInstance(&instance_info, NULL, &instance));
++      ctx.instance = instance;
++      LOAD_I(vkEnumeratePhysicalDevices);
++      LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++      LOAD_I(vkCreateDevice);
++      LOAD_I(vkDestroyInstance);
++      LOAD_I(vkGetDeviceProcAddr);
++      uint32_t count = 1;
++      CHECK(vkEnumeratePhysicalDevices(instance, &count, &ctx.physical) >= 0);
++      CHECK(count == 1);
++      vkGetPhysicalDeviceMemoryProperties(ctx.physical, &ctx.memory);
++
++      /* The image format query answers what vkCreateImage accepts: a
++       * modifier image holds the input attachment, plain linear tiling still
++       * does not. */
++      CHECK_VK(query(&ctx, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++                     swapchain_usage));
++      CHECK(query(&ctx, VK_IMAGE_TILING_LINEAR,
++                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) ==
++            VK_ERROR_FORMAT_NOT_SUPPORTED);
++
++      const float priority = 1.0f;
++      const VkDeviceQueueCreateInfo queue_info = {
++         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++         .queueFamilyIndex = 0,
++         .queueCount = 1,
++         .pQueuePriorities = &priority,
++      };
++      const char *extensions[] = {VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
++      const VkDeviceCreateInfo device_info = {
++         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++         .queueCreateInfoCount = 1,
++         .pQueueCreateInfos = &queue_info,
++         .enabledExtensionCount = 1,
++         .ppEnabledExtensionNames = extensions,
++      };
++      VkDevice device = VK_NULL_HANDLE;
++      CHECK_VK(vkCreateDevice(ctx.physical, &device_info, NULL, &device));
++      ctx.device = device;
++      ctx.get_device_proc = vkGetDeviceProcAddr;
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkGetImageSubresourceLayout);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkDestroyDevice);
++      vkGetDeviceQueue(device, 0, 0, &ctx.queue);
++      const VkCommandPoolCreateInfo pool_info = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++         .queueFamilyIndex = 0,
++      };
++      CHECK_VK(vkCreateCommandPool(device, &pool_info, NULL, &ctx.pool));
++
++      /* Wayland-style: the driver picks from a modifier list. */
++      const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
++      const VkImageDrmFormatModifierListCreateInfoEXT list = {
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++         .drmFormatModifierCount = 1,
++         .pDrmFormatModifiers = &linear,
++      };
++      VkImage listed = create_image(&ctx, &list);
++
++      /* Android-style: the importer names the layout gralloc gave the
++       * buffer, which is the layout this driver lays out itself. */
++      const VkImageSubresource plane0 = {
++         .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++      };
++      VkSubresourceLayout layout;
++      vkGetImageSubresourceLayout(device, listed, &plane0, &layout);
++      const VkSubresourceLayout given = {
++         .offset = 0,
++         .rowPitch = layout.rowPitch,
++      };
++      const VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_layout = {
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++         .drmFormatModifierPlaneCount = 1,
++         .pPlaneLayouts = &given,
++      };
++      VkImage explicit_image = create_image(&ctx, &explicit_layout);
++
++      check_image(&ctx, listed, "modifier list");
++      check_image(&ctx, explicit_image, "explicit layout");
++
++      vkDestroyCommandPool(device, ctx.pool, NULL);
++      vkDestroyDevice(device, NULL);
++      vkDestroyInstance(instance, NULL);
++   }
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_linear_layout.c b/src/kosmickrisp/vulkan/tests/test_linear_layout.c
+index 7e2bfa65cdce9a797663cc6a0901b5538278a764..2fd82189d30602b706c4db71248362e380ebd7cf 100644
+--- a/src/kosmickrisp/vulkan/tests/test_linear_layout.c
++++ b/src/kosmickrisp/vulkan/tests/test_linear_layout.c
+@@ -29,10 +29,34 @@ check_a_modifier_image_can_be_a_colour_attachment(void)
+          VK_IMAGE_USAGE_STORAGE_BIT));
+ }
+ 
++/* Android's swapchain offers VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT on every
++ * surface, and Unity asks for it, so an imported native buffer -- always a
++ * modifier image here -- has to hold an input attachment too. Such an image
++ * stays a 2D texture, the only type Metal makes of a buffer, and its input
++ * attachment is read through a 2D array view of it instead. */
++static void
++check_a_modifier_image_can_be_an_input_attachment(void)
++{
++   assert(!kk_linear_layout_refuses_usage(
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
++
++   /* The usage Unity creates its Android swapchain with. */
++   assert(!kk_linear_layout_refuses_usage(
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++         VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
++
++   assert(!kk_input_attachment_makes_array_texture(
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT));
++   assert(!kk_input_attachment_makes_array_texture(VK_IMAGE_TILING_LINEAR));
++   assert(kk_input_attachment_makes_array_texture(VK_IMAGE_TILING_OPTIMAL));
++}
++
+ /* Metal makes a linear texture out of a MTLBuffer and refuses any type but
+- * MTLTextureType2D for one, by an assertion that ends the host process. This
+- * driver binds every input attachment as a 2D array, so a linear layout can
+- * never carry one; Metal has no linear depth or stencil texture at all. */
++ * MTLTextureType2D for one, by an assertion that ends the host process, and
++ * it has no linear depth or stencil texture at all. */
+ static void
+ check_a_linear_layout_refuses_what_metal_cannot_represent(void)
+ {
+@@ -43,11 +67,6 @@ check_a_linear_layout_refuses_what_metal_cannot_represent(void)
+ 
+    for (unsigned i = 0; i < 2u; i++) {
+       assert(kk_tiling_is_linear_layout(linear_layouts[i]));
+-      assert(kk_linear_layout_refuses_usage(
+-         linear_layouts[i], VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
+-      assert(kk_linear_layout_refuses_usage(
+-         linear_layouts[i], VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+-                               VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
+       assert(kk_linear_layout_refuses_usage(
+          linear_layouts[i], VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
+    }
+@@ -58,16 +77,16 @@ check_a_linear_layout_refuses_what_metal_cannot_represent(void)
+    assert(kk_linear_layout_type_is_creatable(MTL_TEXTURE_TYPE_2D));
+ }
+ 
+-/* Plain linear tiling keeps the capabilities it has always had: a colour
+- * attachment there would have to answer for an input attachment too, because
+- * nothing narrows what an application may create with a format that reports
+- * VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT. */
++/* Plain linear tiling keeps the capabilities it has always had: neither a
++ * colour nor an input attachment. */
+ static void
+ check_plain_linear_tiling_is_unchanged(void)
+ {
+    assert(!kk_linear_layout_renders(VK_IMAGE_TILING_LINEAR));
+    assert(kk_linear_layout_refuses_usage(VK_IMAGE_TILING_LINEAR,
+                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
++   assert(kk_linear_layout_refuses_usage(VK_IMAGE_TILING_LINEAR,
++                                         VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
+ }
+ 
+ /* Optimal tiling is not a linear layout and none of this applies to it. */
+@@ -85,6 +104,7 @@ int
+ main(void)
+ {
+    check_a_modifier_image_can_be_a_colour_attachment();
++   check_a_modifier_image_can_be_an_input_attachment();
+    check_a_linear_layout_refuses_what_metal_cannot_represent();
+    check_plain_linear_tiling_is_unchanged();
+    check_optimal_tiling_is_never_refused();

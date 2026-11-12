@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:34:17 +0900
+Subject: [PATCH] um: let the Darwin network wake a suspend the guest starts
+
+Android suspends itself whenever its last wakelock goes away, as it does
+once the screen is off on battery or a user is removed.  Only the
+management console, VNC input and the RTC alarm ended such a suspend, so
+a guest nobody touched answered nothing from the network until healthd's
+next RTC alarm, a minute later and ten on battery.  The first adb command
+after the display went off waited that long.
+
+Make the network interface a wake source for a suspend the guest starts,
+as a phone's wireless interface is.  um_irq_set_guest_wake() marks the
+descriptors of an interrupt, and um_irqs_suspend() leaves them notifying
+unless the suspend is the host's.  The host's suspend ends only with the
+host's wake: it freezes a guest the host wants quiet, and its retry after
+-EBUSY expects only the guest's own wake sources, an RTC alarm, to end an
+attempt.  um_suspend_host_requested() tells the two apart, from the
+host's request until the guest has replied that it is suspended.
+
+A received frame also reports a wakeup that keeps the guest awake for
+500 ms.  It aborts a suspend that is being entered and makes the
+wakeup_count handshake of an automatic suspend fail, so that the stack
+and the task the frames are for can answer before the next suspend
+begins.  The host's suspend ignores it.  darwin_net_kern.guest_wake=0
+turns the wake and the hold off.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/darwin_net_kern.c  | 34 ++++++++++++++++++++++++++++++
+ arch/um/drivers/mconsole_kern.c    | 14 ++++++++++++
+ arch/um/include/shared/irq_kern.h  |  7 ++++++
+ arch/um/include/shared/kern_util.h |  1 +
+ arch/um/kernel/irq.c               | 33 ++++++++++++++++++++++++++---
+ 5 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/arch/um/drivers/darwin_net_kern.c b/arch/um/drivers/darwin_net_kern.c
+index 62b5c169bddbb46e83c9e16f5f648a6a3446fca8..5ed5683ae98f5d92c36c8da34478e6eae8e11fc9 100644
+--- a/arch/um/drivers/darwin_net_kern.c
++++ b/arch/um/drivers/darwin_net_kern.c
+@@ -3,14 +3,33 @@
+ #include <linux/etherdevice.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
++#include <linux/moduleparam.h>
+ #include <linux/netdevice.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/skbuff.h>
+ #include <darwin_net.h>
+ #include <irq_kern.h>
++#include <kern_util.h>
+ 
+ /* The bridge's DARWIN_UML_NET_FRAME_SIZE, which kernel code cannot include. */
+ #define DARWIN_NET_FRAME_SIZE 2048
+ 
++/*
++ * Received frames wake a suspend the guest started itself, as a phone's
++ * wireless interface does, and keep the guest awake for this long after each
++ * burst, so that the stack and the task the frames are for can answer before
++ * an automatic suspend begins again.  A suspend the host asked for is not
++ * woken by the network.  darwin_net_kern.guest_wake=0 turns the wake and the
++ * hold off.
++ */
++#define DARWIN_NET_RX_WAKE_MS 500
++
++static bool darwin_net_guest_wake = true;
++module_param_named(guest_wake, darwin_net_guest_wake, bool, 0444);
++MODULE_PARM_DESC(guest_wake, "Let received frames wake a suspend the guest started");
++
++static struct wakeup_source *darwin_net_wakeup;
++
+ struct darwin_net_private {
+ 	struct net_device *device;
+ 	struct napi_struct napi;
+@@ -77,6 +96,14 @@ static irqreturn_t darwin_net_interrupt(int irq, void *data)
+ 	(void)irq;
+ 	if (!private->backend_ready || !netif_running(device))
+ 		return IRQ_NONE;
++	/*
++	 * A frame that arrives while the guest starts a suspend aborts it, and
++	 * one that ended a suspend holds the guest awake.  The host's own
++	 * suspend ignores both: only the host's wake ends it.
++	 */
++	if (darwin_net_wakeup && !um_suspend_host_requested())
++		pm_wakeup_ws_event(darwin_net_wakeup, DARWIN_NET_RX_WAKE_MS,
++				   true);
+ 	napi_schedule(&private->napi);
+ 	return IRQ_HANDLED;
+ }
+@@ -126,6 +153,8 @@ static int darwin_net_open_device(struct net_device *device)
+ 	}
+ 	private->receive_irq = irq;
+ 	device->irq = irq;
++	if (darwin_net_wakeup)
++		um_irq_set_guest_wake(irq, darwin_net_guest_wake);
+ 	netif_carrier_on(device);
+ 	netif_start_queue(device);
+ 	return 0;
+@@ -181,8 +210,13 @@ static int __init darwin_net_init(void)
+ 		eth_hw_addr_random(device);
+ 	if (!private->backend_ready)
+ 		netif_carrier_off(device);
++	if (darwin_net_guest_wake)
++		darwin_net_wakeup = wakeup_source_register(NULL,
++							   "darwin-net-rx");
+ 	result = register_netdev(device);
+ 	if (result != 0) {
++		wakeup_source_unregister(darwin_net_wakeup);
++		darwin_net_wakeup = NULL;
+ 		free_netdev(device);
+ 		return result;
+ 	}
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index 5a0c3b28f9cfef9e38a5014c87efde6f510b7cc8..5fc5a60835ab307a691943899b6c53893ab2762d 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -246,6 +246,15 @@ int um_suspend_wake_requested(void)
+ 	return READ_ONCE(suspend_woken);
+ }
+ 
++/*
++ * Whether the suspend under way, or about to begin, is the host's: from its
++ * request until the guest has entered the suspend and replied.
++ */
++int um_suspend_host_requested(void)
++{
++	return READ_ONCE(suspend_request) != NULL;
++}
++
+ /*
+  * The PM core gives a suspend up with -EBUSY when something gets in its way,
+  * typically a wake source of the guest's own, such as an RTC alarm, that
+@@ -311,6 +320,11 @@ int um_suspend_wake_requested(void)
+ 	return 0;
+ }
+ 
++int um_suspend_host_requested(void)
++{
++	return 0;
++}
++
+ void mconsole_suspend(struct mc_request *req)
+ {
+ 	mconsole_reply(req, "System suspend is not configured", 1, 0);
+diff --git a/arch/um/include/shared/irq_kern.h b/arch/um/include/shared/irq_kern.h
+index 44357fa6ee29c37af8d03e866ad3da3656de605f..5b8549dcd830cfc4736482d127169d7bb8ec85d9 100644
+--- a/arch/um/include/shared/irq_kern.h
++++ b/arch/um/include/shared/irq_kern.h
+@@ -76,5 +76,12 @@ static inline bool um_irq_timetravel_handler_used(void)
+ }
+ 
+ void um_free_irq(int irq, void *dev_id);
++/*
++ * Make the descriptors of an interrupt a wake source for a system suspend
++ * the guest starts itself, as Android does once its display is off, and
++ * never for one the host asks for through the management console.  Unlike
++ * irq_set_irq_wake(), which makes them a wake source for both.
++ */
++void um_irq_set_guest_wake(int irq, bool on);
+ void free_irqs(void);
+ #endif
+diff --git a/arch/um/include/shared/kern_util.h b/arch/um/include/shared/kern_util.h
+index 738bb8a006bef0a46796d020c7b8a62635461dca..da49b319b8d0c3ff03a9a29504bd3d6c3720a8a3 100644
+--- a/arch/um/include/shared/kern_util.h
++++ b/arch/um/include/shared/kern_util.h
+@@ -86,6 +86,7 @@ extern void fatal_sigsegv(void) __attribute__ ((noreturn));
+ void um_idle_sleep(void);
+ void um_suspend_notify_entered(void);
+ int um_suspend_wake_requested(void);
++int um_suspend_host_requested(void);
+ 
+ void kasan_map_memory(void *start, size_t len);
+ 
+diff --git a/arch/um/kernel/irq.c b/arch/um/kernel/irq.c
+index 5912f659c7d620bbeafdb6c26e476a6394e79681..b3ec418a15562010328501b23b534c163b465fc0 100644
+--- a/arch/um/kernel/irq.c
++++ b/arch/um/kernel/irq.c
+@@ -40,6 +40,8 @@ struct irq_reg {
+ 	bool active;
+ 	bool pending;
+ 	bool wakeup;
++	/* A wake source only for a suspend the guest started itself. */
++	bool guest_wakeup;
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+ 	bool pending_event;
+ 	void (*timetravel_handler)(int, int, void *,
+@@ -587,6 +589,11 @@ void um_irqs_suspend(void)
+ {
+ 	struct irq_entry *entry;
+ 	unsigned long flags;
++	/*
++	 * The host's own suspend ends only with the host's wake: the
++	 * descriptors that wake the guest's suspends stay quiet for it.
++	 */
++	bool guest_suspend = !um_suspend_host_requested();
+ 
+ 	irqs_suspended = true;
+ 
+@@ -606,6 +613,7 @@ void um_irqs_suspend(void)
+ 			 * any FDs that should be suspended.
+ 			 */
+ 			if (entry->reg[t].wakeup ||
++			    (guest_suspend && entry->reg[t].guest_wakeup) ||
+ 			    entry->reg[t].irq == SIGIO_WRITE_IRQ
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+ 			    || entry->reg[t].timetravel_handler
+@@ -658,7 +666,7 @@ void um_irqs_resume(void)
+  * any of them is input for the interrupt.  Every one of them wakes the
+  * suspended system, so every one carries the setting.
+  */
+-static int normal_irq_set_wake(struct irq_data *d, unsigned int on)
++static void set_irq_wake_flag(int irq, bool on, bool guest_only)
+ {
+ 	struct irq_entry *entry;
+ 	unsigned long flags;
+@@ -671,16 +679,35 @@ static int normal_irq_set_wake(struct irq_data *d, unsigned int on)
+ 			if (!entry->reg[t].events)
+ 				continue;
+ 
+-			if (entry->reg[t].irq != d->irq)
++			if (entry->reg[t].irq != irq)
+ 				continue;
+-			entry->reg[t].wakeup = on;
++			if (guest_only)
++				entry->reg[t].guest_wakeup = on;
++			else
++				entry->reg[t].wakeup = on;
+ 		}
+ 	}
+ 	raw_spin_unlock_irqrestore(&irq_lock, flags);
++}
++
++static int normal_irq_set_wake(struct irq_data *d, unsigned int on)
++{
++	set_irq_wake_flag(d->irq, on, false);
+ 	return 0;
+ }
++
++void um_irq_set_guest_wake(int irq, bool on)
++{
++	set_irq_wake_flag(irq, on, true);
++}
++EXPORT_SYMBOL(um_irq_set_guest_wake);
+ #else
+ #define normal_irq_set_wake NULL
++
++void um_irq_set_guest_wake(int irq, bool on)
++{
++}
++EXPORT_SYMBOL(um_irq_set_guest_wake);
+ #endif
+ 
+ /*

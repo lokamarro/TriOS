@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 17:51:51 +0900
+Subject: [PATCH] kosmickrisp: report complete Metal diagnostics
+
+---
+ src/kosmickrisp/vulkan/kk_debug.c  |  1 +
+ src/kosmickrisp/vulkan/kk_debug.h  |  2 ++
+ src/kosmickrisp/vulkan/kk_queue.c  | 24 +++++++++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_shader.c |  8 ++++++--
+ 4 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 616c5648590733c004179f7ca53cc71ec7f4d041..375698e44092641f2445a939b5482146de09734c 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,7 @@ const struct debug_named_value flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"submit_timing", KK_DEBUG_SUBMIT_TIMING},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index 4a418ecc210f6a674e3beaca1c9be9b56c9774c6..178dcc89bd30cde7c58f89aa96945344a54ad5e8 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,8 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   /* Print raw GPU execution intervals for completed Metal submissions. */
++   KK_DEBUG_SUBMIT_TIMING = 1ull << 3,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 28577a5e8f2b50716c89b8ad509620115f264f6d..c9d180dcf7481440bfc4cc6b0c9ce09b675f5a2c 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -8,6 +8,7 @@
+ #include "kk_queue.h"
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
+ #include "kk_device.h"
+ #include "kk_physical_device.h"
+ #include "kk_sync.h"
+@@ -17,17 +18,37 @@
+ 
+ #include "vk_cmd_queue.h"
+ 
++#include <stdio.h>
++
+ static void
+ commit_callback(struct mtl_feedback_data *data)
+ {
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+       struct kk_device *dev = (struct kk_device *)data->user_data;
++      fprintf(stderr, "KosmicKrisp command queue error: %s, message: %s\n",
++              mtl_command_queue_error_to_string(data->error),
++              data->error_message ?: "(none)");
+       vk_device_set_lost(
+          &dev->vk, "Command queue error: %s, with message \"%s\"",
+          mtl_command_queue_error_to_string(data->error), data->error_message);
+    }
+ }
+ 
++static void
++commit_timing_callback(struct mtl_feedback_data *data)
++{
++   commit_callback(data);
++
++   /* These host-second timestamps cover the entire committed Metal batch,
++    * including copies and clears. They are not Vulkan timestamp queries.
++    * The device address is an opaque identifier; do not dereference it here.
++    * KosmicKrisp exposes one command queue per device.
++    */
++   fprintf(stderr,
++           "KK_SUBMIT_TIMING device=%p gpu_start_s=%.17g gpu_end_s=%.17g error=%u\n",
++           data->user_data, data->gpu_start, data->gpu_end, (unsigned)data->error);
++}
++
+ static void
+ rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
+ {
+@@ -153,7 +174,8 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+    queue->mtl_handle = mtl_new_command_queue(dev->mtl_handle);
+    mtl_command_queue_add_residency_set(queue->mtl_handle,
+                                        dev->residency_set.handle);
+-   queue->feedback_callback = commit_callback;
++   queue->feedback_callback = KK_DEBUG(SUBMIT_TIMING) ? commit_timing_callback
++                                                    : commit_callback;
+ 
+    queue->vk.driver_submit = kk_queue_submit;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 463c743c6bb932be789180a12ab601ca8aeee401..9c2fe2b63c86a07b6d803937a354b52aedea7abb 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -31,6 +31,8 @@
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_pipeline.h"
+ 
++#include <stdio.h>
++
+ static const nir_shader_compiler_options *
+ kk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
+                    UNUSED const struct vk_pipeline_robustness_state *rs)
+@@ -874,8 +876,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    ralloc_steal(NULL, (void *)entrypoint_name);
+    data->entrypoint_name = (char *)entrypoint_name;
+ 
+-   if (KK_DEBUG(MSL))
+-      mesa_logi("%s\n", data->code);
++   if (KK_DEBUG(MSL)) {
++      fprintf(stderr, "KosmicKrisp MSL (%s):\n%s\n",
++              data->entrypoint_name, data->code);
++   }
+ 
+    ralloc_free(nir);
+ 

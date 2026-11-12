@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 08:20:46 +0900
+Subject: [PATCH] vrend: bind a shader's buffers from the lowest one it
+ declares
+
+A guest that lowers its buffer bindings numbers its TGSI buffer declarations
+from the lowest binding point the shader uses, so a declared index is not a
+binding point: a program that points several blocks at one binding declares
+one index per block, and the last of them can sit past the final binding
+point. The translation already knows this and rebases every declaration onto
+the first one when it emits the GLSL binding, but the limit was checked, and
+the masks were kept, in the declared index space, where a 32-bit mask and a
+32-entry qualifier array cannot reach.
+
+Two shader storage blocks bound to the last binding point therefore made
+vrend_shader_create() reject the shader with "Buffer view exceeded", which
+fails the whole command buffer: every command batched with it, including the
+draws of later programs, is dropped and the frame stays at the clear colour.
+KHR-GL46.layout_binding.buffer_layout_binding_atomicAdd_FragmentShader
+declares that pair and then renders, so it read black where its buffer sums
+to green.
+
+Check the binding a declaration occupies, which is its rebased index plus the
+points earlier stages hold, and keep the declaration-space bookkeeping wide
+enough for the indices a guest can send: one stage declares at most one block
+per binding point, so the declarations span less than twice the limit. The
+instruction paths keep using the declared index, so the emitted names are
+unchanged.
+
+Every declared and every referenced buffer index then selects a bit of those
+64-bit masks, so each has to stay inside them. A declaration whose range
+runs backwards is refused, since its last index no longer bounds its first,
+and so is an instruction naming a buffer register at or past the declaration
+limit: the first pass sees every instruction before the second emits any.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_shader.c | 98 +++++++++++++++++++++++++++++-----------
+ src/vrend/vrend_shader.h |  6 +++
+ 2 files changed, 77 insertions(+), 27 deletions(-)
+
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 2fbdbd125aebbe22e820e60415d81df5c43e4fb8..d57aa56633949cf68a824cf78d8350a669339aa3 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -234,12 +234,15 @@ struct dump_ctx {
+    uint32_t samplers_used;
+ 
+    uint32_t ssbo_first_binding;
+-   uint32_t ssbo_used_mask;
+-   uint32_t ssbo_atomic_mask;
++   /* Indexed by the declared buffer index, which the guest bases on the
++    * lowest binding point it uses and which therefore reaches beyond the
++    * binding points themselves. */
++   uint64_t ssbo_used_mask;
++   uint64_t ssbo_atomic_mask;
+    uint32_t ssbo_array_base;
+    uint32_t ssbo_atomic_array_base;
+-   uint32_t ssbo_integer_mask;
+-   uint8_t ssbo_memory_qualifier[PIPE_MAX_SHADER_BUFFERS];
++   uint64_t ssbo_integer_mask;
++   uint8_t ssbo_memory_qualifier[VREND_MAX_SSBO_DECLARATIONS];
+    int32_t ssbo_last_binding;
+ 
+    struct vrend_shader_image images[PIPE_MAX_SHADER_IMAGES];
+@@ -2030,16 +2033,25 @@ iter_declaration(struct tgsi_iterate_context *iter,
+          return false;
+       break;
+    case TGSI_FILE_BUFFER:
+-      if (decl->Range.First + ctx->key->ssbo_binding_offset >= VREND_MAX_COMBINED_SSBO_BINDING_POINTS) {
++      /* The binding this stage occupies is the declared index rebased onto
++       * the lowest one the shader declares, which the first pass has already
++       * found, plus the points the earlier stages hold. */
++      if (decl->Range.First > decl->Range.Last ||
++          decl->Range.Last >= VREND_MAX_SSBO_DECLARATIONS) {
++         virgl_error("Buffer declarations exceeded, max is %d\n", VREND_MAX_SSBO_DECLARATIONS);
++         return false;
++      }
++      if (decl->Range.Last - ctx->ssbo_first_binding + ctx->key->ssbo_binding_offset >=
++          VREND_MAX_COMBINED_SSBO_BINDING_POINTS) {
+          virgl_error("Buffer view exceeded, max is %d\n", VREND_MAX_COMBINED_SSBO_BINDING_POINTS);
+          return false;
+       }
+-      ctx->ssbo_used_mask |= (1 << decl->Range.First);
++      ctx->ssbo_used_mask |= (UINT64_C(1) << decl->Range.First);
+ 
+       if (decl->Declaration.Atomic) {
+          if (decl->Range.First < ctx->ssbo_atomic_array_base)
+             ctx->ssbo_atomic_array_base = decl->Range.First;
+-         ctx->ssbo_atomic_mask |= (1 << decl->Range.First);
++         ctx->ssbo_atomic_mask |= (UINT64_C(1) << decl->Range.First);
+       } else {
+          if (decl->Range.First < ctx->ssbo_array_base)
+             ctx->ssbo_array_base = decl->Range.First;
+@@ -3909,7 +3921,7 @@ static bool is_integer_memory(const struct dump_ctx *ctx, enum tgsi_file_type fi
+ {
+    switch(file_type) {
+    case TGSI_FILE_BUFFER:
+-      return !!(ctx->ssbo_integer_mask & (1 << index));
++      return !!(ctx->ssbo_integer_mask & (UINT64_C(1) << index));
+    case TGSI_FILE_MEMORY:
+       return ctx->integer_memory;
+    default:
+@@ -3937,15 +3949,15 @@ static bool set_image_qualifier(struct vrend_shader_image images[],
+ }
+ 
+ static bool set_memory_qualifier(uint8_t ssbo_memory_qualifier[],
+-                                 uint32_t ssbo_used_mask,
++                                 uint64_t ssbo_used_mask,
+                                  const struct tgsi_full_instruction *inst,
+                                  uint32_t reg_index, bool indirect)
+ {
+    if (inst->Memory.Qualifier == TGSI_MEMORY_COHERENT) {
+       if (indirect) {
+          while (ssbo_used_mask)
+-            ssbo_memory_qualifier[u_bit_scan(&ssbo_used_mask)] = TGSI_MEMORY_COHERENT;
+-      } else if (reg_index < PIPE_MAX_SHADER_BUFFERS) {
++            ssbo_memory_qualifier[u_bit_scan64(&ssbo_used_mask)] = TGSI_MEMORY_COHERENT;
++      } else if (reg_index < VREND_MAX_SSBO_DECLARATIONS) {
+          ssbo_memory_qualifier[reg_index] = TGSI_MEMORY_COHERENT;
+       } else
+          return false;
+@@ -3969,7 +3981,7 @@ static void make_ssbo_varstring(const struct dump_ctx *ctx, char result[128],
+                                 unsigned register_index, bool indirect, int indirect_register)
+ {
+    const char *cname = tgsi_proc_to_prefix(ctx->prog_type);
+-   bool atomic_ssbo = ctx->ssbo_atomic_mask & (1 << register_index);
++   bool atomic_ssbo = ctx->ssbo_atomic_mask & (UINT64_C(1) << register_index);
+    const char *atomic_str = atomic_ssbo ? "atomic" : "";
+    unsigned base = atomic_ssbo ? ctx->ssbo_atomic_array_base : ctx->ssbo_array_base;
+ 
+@@ -4082,11 +4094,11 @@ translate_store(const struct dump_ctx *ctx,
+          emit_store_mem(glsl_strbufs, dst, dst_reg->Register.WriteMask, srcs,
+                         conversion);
+       } else {
+-         bool atomic_ssbo = ctx->ssbo_atomic_mask & (1 << dst_reg->Register.Index);
++         bool atomic_ssbo = ctx->ssbo_atomic_mask & (UINT64_C(1) << dst_reg->Register.Index);
+          int base = atomic_ssbo ? ctx->ssbo_atomic_array_base : ctx->ssbo_array_base;
+-         uint32_t mask = ctx->ssbo_used_mask;
++         uint64_t mask = ctx->ssbo_used_mask;
+          int start, array_count;
+-         u_bit_scan_consecutive_range(&mask, &start, &array_count);
++         u_bit_scan_consecutive_range64(&mask, &start, &array_count);
+ 
+          emit_buff(glsl_strbufs, "switch (addr%d + %d) {\n", dst_reg->Indirect.Index,
+                    dst_reg->Register.Index - base);
+@@ -4226,7 +4238,7 @@ translate_load(const struct dump_ctx *ctx,
+       emit_buff(glsl_strbufs, "ssbo_addr_temp = uint(floatBitsToUint(%s)) >> 2;\n", srcs[1]);
+ 
+       atomic_op[0] = atomic_src[0] = '\0';
+-      if (ctx->ssbo_atomic_mask & (1 << src->Register.Index)) {
++      if (ctx->ssbo_atomic_mask & (UINT64_C(1) << src->Register.Index)) {
+          /* Emulate atomicCounter with atomicOr. */
+          strcpy(atomic_op, "atomicOr");
+          strcpy(atomic_src, ", uint(0)");
+@@ -4240,11 +4252,11 @@ translate_load(const struct dump_ctx *ctx,
+       } else {
+          char src[128] = "";
+ 
+-         bool atomic_ssbo = ctx->ssbo_atomic_mask & (1 << inst->Src[0].Register.Index);
++         bool atomic_ssbo = ctx->ssbo_atomic_mask & (UINT64_C(1) << inst->Src[0].Register.Index);
+          unsigned base = atomic_ssbo ? ctx->ssbo_atomic_array_base : ctx->ssbo_array_base;
+          int start, array_count;
+-         uint32_t mask = ctx->ssbo_used_mask;
+-         u_bit_scan_consecutive_range(&mask, &start, &array_count);
++         uint64_t mask = ctx->ssbo_used_mask;
++         u_bit_scan_consecutive_range64(&mask, &start, &array_count);
+ 
+          emit_buff(glsl_strbufs, "switch (addr%d + %d) {\n", inst->Src[0].Indirect.Index, inst->Src[0].Register.Index - base);
+          for (int i = 0; i < array_count; ++i) {
+@@ -6982,20 +6994,20 @@ static int emit_ios_common(const struct dump_ctx *ctx,
+    }
+ 
+    if (ctx->info.indirect_files & (1 << TGSI_FILE_BUFFER)) {
+-      uint32_t mask = ctx->ssbo_used_mask;
++      uint64_t mask = ctx->ssbo_used_mask;
+       while (mask) {
+          int start, count;
+-         u_bit_scan_consecutive_range(&mask, &start, &count);
++         u_bit_scan_consecutive_range64(&mask, &start, &count);
+          int binding = start + ctx->key->ssbo_binding_offset - ctx->ssbo_first_binding;
+-         const char *atomic = (ctx->ssbo_atomic_mask & (1 << start)) ? "atomic" : "";
++         const char *atomic = (ctx->ssbo_atomic_mask & (UINT64_C(1) << start)) ? "atomic" : "";
+          emit_hdrf(glsl_strbufs, "layout (binding = %d, std430) buffer %sssbo%d { uint %sssbocontents%d[]; } %sssboarr%s[%d];\n", binding, sname, start, sname, start, sname, atomic, count);
+       }
+    } else {
+-      uint32_t mask = ctx->ssbo_used_mask;
++      uint64_t mask = ctx->ssbo_used_mask;
+       while (mask) {
+-         uint32_t id = u_bit_scan(&mask);
++         uint32_t id = u_bit_scan64(&mask);
+          int binding = id + ctx->key->ssbo_binding_offset - ctx->ssbo_first_binding;
+-         enum vrend_type_qualifier type = (ctx->ssbo_integer_mask & (1 << id)) ? INT : UINT;
++         enum vrend_type_qualifier type = (ctx->ssbo_integer_mask & (UINT64_C(1) << id)) ? INT : UINT;
+          char *coherent = ctx->ssbo_memory_qualifier[id] == TGSI_MEMORY_COHERENT ? "coherent" : "";
+          emit_hdrf(glsl_strbufs, "layout (binding = %d, std430) %s buffer %sssbo%d { %s %sssbocontents%d[]; };\n", binding, coherent, sname, id,
+                   get_string(type), sname, id);
+@@ -8032,15 +8044,44 @@ static bool fill_interpolants(const struct dump_ctx *ctx, struct vrend_variable_
+    return fill_fragment_interpolants(ctx, &sinfo->fs_info);
+ }
+ 
++/* Whether every buffer register an instruction names indexes a declaration
++ * slot. The index is the guest's, and it selects a bit of the 64-bit masks
++ * the declarations fill, so an index outside them would shift a mask by more
++ * than it holds. */
++static bool buffer_registers_in_range(const struct tgsi_full_instruction *inst)
++{
++   for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; ++i) {
++      const struct tgsi_src_register *reg = &inst->Src[i].Register;
++      if (reg->File == TGSI_FILE_BUFFER &&
++          (reg->Index < 0 || reg->Index >= VREND_MAX_SSBO_DECLARATIONS))
++         return false;
++   }
++   for (unsigned i = 0; i < inst->Instruction.NumDstRegs; ++i) {
++      const struct tgsi_dst_register *reg = &inst->Dst[i].Register;
++      if (reg->File == TGSI_FILE_BUFFER &&
++          (reg->Index < 0 || reg->Index >= VREND_MAX_SSBO_DECLARATIONS))
++         return false;
++   }
++   return true;
++}
++
+ static bool analyze_instruction(struct tgsi_iterate_context *iter,
+                                    struct tgsi_full_instruction *inst)
+ {
+    struct dump_ctx *ctx = (struct dump_ctx *)iter;
+    uint32_t opcode = inst->Instruction.Opcode;
++
++   /* The first pass sees every instruction before the second emits any, so
++    * refusing here covers both. */
++   if (!buffer_registers_in_range(inst)) {
++      virgl_error("Buffer register index exceeded, max is %d\n",
++                  VREND_MAX_SSBO_DECLARATIONS);
++      return false;
++   }
+    if (opcode == TGSI_OPCODE_ATOMIMIN || opcode == TGSI_OPCODE_ATOMIMAX) {
+        const struct tgsi_full_src_register *src = &inst->Src[0];
+        if (src->Register.File == TGSI_FILE_BUFFER)
+-         ctx->ssbo_integer_mask |= 1 << src->Register.Index;
++         ctx->ssbo_integer_mask |= UINT64_C(1) << src->Register.Index;
+        if (src->Register.File == TGSI_FILE_MEMORY)
+          ctx->integer_memory = true;
+    }
+@@ -8092,7 +8133,10 @@ static void fill_sinfo(const struct dump_ctx *ctx, struct vrend_shader_info *sin
+    sinfo->fog_input_mask = ctx->fog_input_mask;
+    sinfo->fog_output_mask = ctx->fog_output_mask;
+ 
+-   sinfo->ssbo_used_mask = ctx->ssbo_used_mask >> (ctx->ssbo_first_binding != UINT32_MAX ? ctx->ssbo_first_binding : 0);
++   /* The declarations of one stage never span more binding points than the
++    * limit, so the rebased mask is the one the draw path binds from. */
++   sinfo->ssbo_used_mask = (uint32_t)(ctx->ssbo_used_mask >>
++      (ctx->ssbo_first_binding != UINT32_MAX ? ctx->ssbo_first_binding : 0));
+    sinfo->ssbo_binding_offset  = ctx->key->ssbo_binding_offset;
+ 
+    sinfo->ssbo_last_binding = ctx->key->ssbo_binding_offset + ctx->ssbo_last_binding -
+diff --git a/src/vrend/vrend_shader.h b/src/vrend/vrend_shader.h
+index 7f5897baec4c3567871dbf8bd65f6bb0254bde45..68e5acab68c120b53c1e52e4b9cf1cf4dfff0264 100644
+--- a/src/vrend/vrend_shader.h
++++ b/src/vrend/vrend_shader.h
+@@ -34,6 +34,12 @@
+ 
+ #define VREND_POLYGON_STIPPLE_SIZE 32
+ #define VREND_MAX_COMBINED_SSBO_BINDING_POINTS 32
++/* A guest numbers its buffer declarations from the lowest binding point
++ * the shader uses, so a declared index is not a binding point: a program
++ * that points several blocks at one binding declares one index per block.
++ * The declarations of one stage therefore span at most one binding point
++ * short of twice the limit. */
++#define VREND_MAX_SSBO_DECLARATIONS (2 * VREND_MAX_COMBINED_SSBO_BINDING_POINTS)
+ 
+ #define VREND_SHADER_SAMPLER_VIEWS_MASK_LENGTH \
+    ((PIPE_MAX_SHADER_SAMPLER_VIEWS + 63) / 64)

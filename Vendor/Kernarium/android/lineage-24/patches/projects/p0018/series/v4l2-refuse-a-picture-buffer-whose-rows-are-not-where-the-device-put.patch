@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:28:58 +0900
+Subject: [PATCH] v4l2: refuse a picture buffer whose rows are not where the
+ device puts them
+
+The device writes a decoded picture, and reads an encoder input frame,
+at the row pitch it negotiated, and the buffer comes from the product's
+allocator, which lays rows out at a pitch of its own. When the two
+differ every row after the first lands in the wrong place and the
+picture comes out skewed with nothing to report it: the guest's minigbm
+pads the rows of NV12 and P010 buffers to 16 bytes and the device used
+to state them tight, so decoders and encoders of widths that are not a
+multiple of 16 produced skewed pictures that the tests found only by
+their checksums.
+
+The device now states the allocator's pitch. The decoder compares the
+pitch of each output buffer, from its gralloc metadata, with the one the
+output format carries, and the encoder compares the stride of each
+plane of an input frame with the one the device reports; either stops
+the codec with an error that names both numbers, so a drift between the
+two rules is a refusal to start and not a quiet skew.
+
+The encoder also queues a frame held in one buffer at the size the
+device negotiated. It used the size of a tight picture, which is
+shorter than the negotiated one whenever the pitch is padded (a packed
+32-bit frame of a width that is not a multiple of 4), and the driver
+refuses a buffer shorter than its negotiated size.
+---
+ components/VideoFrame.cpp                     | 14 +++++++++++++
+ .../v4l2_codec2/components/VideoFrame.h       |  5 +++++
+ v4l2/V4L2Decoder.cpp                          | 14 +++++++++++++
+ v4l2/V4L2Encoder.cpp                          | 20 +++++++++++++++++--
+ v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h   |  2 ++
+ 5 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/components/VideoFrame.cpp b/components/VideoFrame.cpp
+index 54d4f5a50906f6ec28f6965d8c3c8b9e544d36f3..fe600171fc6721cf881e0f8ecb5e877f4f8fe3a2 100644
+--- a/components/VideoFrame.cpp
++++ b/components/VideoFrame.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <v4l2_codec2/components/VideoFrame.h>
+ 
++#include <v4l2_codec2/common/VideoTypes.h>
++
+ #include <C2AllocatorGralloc.h>
+ #include <log/log.h>
+ 
+@@ -50,6 +52,18 @@ int32_t VideoFrame::getBitstreamId() const {
+     return mBitstreamId;
+ }
+ 
++uint32_t VideoFrame::getRowPitch() const {
++    const C2Handle* const handle = mGraphicBlock->handle();
++    if (!handle) return 0;
++    uint32_t width, height, format, stride, generation, igbpSlot;
++    uint64_t usage, igbpId;
++    _UnwrapNativeCodec2GrallocMetadata(handle, &width, &height, &format, &usage, &stride,
++                                       &generation, &igbpId, &igbpSlot);
++    // The gralloc stride counts the pixels of the first plane, which are two bytes in P010.
++    const uint32_t sampleBytes = format == static_cast<uint32_t>(HalPixelFormat::YCBCR_P010) ? 2 : 1;
++    return stride * sampleBytes;
++}
++
+ void VideoFrame::flushToHost() {
+     C2GraphicView view = mGraphicBlock->map().get();
+     if (view.error() != C2_OK) ALOGW("Failed to map the frame to flush it to the host: %d", view.error());
+diff --git a/components/include/v4l2_codec2/components/VideoFrame.h b/components/include/v4l2_codec2/components/VideoFrame.h
+index 2077d73f72c27204b93422f3af2bdf154f2023b8..09d8248138aad089767c18f95948c120fcf5d1bd 100644
+--- a/components/include/v4l2_codec2/components/VideoFrame.h
++++ b/components/include/v4l2_codec2/components/VideoFrame.h
+@@ -32,6 +32,11 @@ public:
+     void setBitstreamId(int32_t bitstreamId);
+     int32_t getBitstreamId() const;
+ 
++    // The distance in bytes between the rows of the first plane as the allocator laid the buffer out,
++    // or 0 if the block carries no gralloc metadata. The device writes the rows at the pitch it
++    // negotiated, so the two have to be the same number.
++    uint32_t getRowPitch() const;
++
+     // Get the read-only C2GraphicBlock, should be called after calling setVisibleRect().
+     C2ConstGraphicBlock getGraphicBlock();
+ 
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index e2752f2f978f14ef8b72a1fbacaae7fddd943b93..6a0818b412dbdac86d8b82d91bae0a00d5e08495 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -343,6 +343,7 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+         return false;
+     }
+     mCodedSize.set(adjustedFormat->fmt.pix_mp.width, adjustedFormat->fmt.pix_mp.height);
++    mOutputRowPitch = adjustedFormat->fmt.pix_mp.plane_fmt[0].bytesperline;
+     mVisibleRect = getVisibleRect(mCodedSize);
+ 
+     ALOGI("Need %zu output buffers. coded size: %s, visible rect: %s", *numOutputBuffers,
+@@ -982,6 +983,19 @@ void V4L2Decoder::onVideoFrameReady(
+         return;
+     }
+ 
++    // The device writes the rows at the pitch it negotiated and whoever reads the buffer, the
++    // client or the GPU, reads them at the pitch of its allocator. A buffer whose rows are not
++    // where the device writes them would show a skewed picture that nothing else reports, so the
++    // decoder refuses to run on it.
++    const uint32_t bufferRowPitch = frame->getRowPitch();
++    if (bufferRowPitch != 0 && mOutputRowPitch != 0 && bufferRowPitch != mOutputRowPitch) {
++        ALOGE("%s(): The output buffer's rows are %u bytes apart but the device writes them %u "
++              "bytes apart (coded size %s, blockId=%u)",
++              __func__, bufferRowPitch, mOutputRowPitch, toString(mCodedSize).c_str(), blockId);
++        onError();
++        return;
++    }
++
+     uint32_t v4l2Id = outputBuffer->bufferId();
+     ALOGV("QBUF to output queue, blockId=%u, V4L2Id=%u", blockId, v4l2Id);
+ 
+diff --git a/v4l2/V4L2Encoder.cpp b/v4l2/V4L2Encoder.cpp
+index 48b0611c3cfa5bb0aafe6e2743bba4623738d0dc..07b91758dec06f9d249b3cf16a1a5cda961df57f 100644
+--- a/v4l2/V4L2Encoder.cpp
++++ b/v4l2/V4L2Encoder.cpp
+@@ -1009,6 +1009,20 @@ bool V4L2Encoder::enqueueInputBuffer(std::unique_ptr<InputFrame> frame) {
+ 
+     ALOGV("%s(): queuing input buffer (index: %" PRId64 ")", __func__, index);
+ 
++    // The device reads the rows at the pitch it negotiated, and the frame's rows lie at the pitch
++    // of the allocator that made it. A frame whose rows are elsewhere would be encoded skewed
++    // with nothing else to report it, so the encoder refuses it.
++    for (size_t i = 0; i < planes.size(); ++i) {
++        if (planes[i].mStride != mInputLayout->mPlanes[i].mStride) {
++            ALOGE("%s(): The input frame's plane %zu has rows %u bytes apart but the device reads "
++                  "them %u bytes apart (coded size %s)",
++                  __func__, i, planes[i].mStride, mInputLayout->mPlanes[i].mStride,
++                  toString(mInputCodedSize).c_str());
++            onError();
++            return false;
++        }
++    }
++
+     auto buffer = mInputQueue->getFreeBuffer();
+     if (!buffer) {
+         ALOGE("Failed to get free buffer from device input queue");
+@@ -1041,8 +1055,10 @@ bool V4L2Encoder::enqueueInputBuffer(std::unique_ptr<InputFrame> frame) {
+     } else {
+         ALOG_ASSERT(!planes.empty());
+         // If the input format is single-planar, then we only submit one buffer which contains
+-        // all the color planes.
+-        size_t bytesUsed = allocationSize(format, mInputLayout->mCodedSize);
++        // all the color planes. The buffer holds them at the device's pitch, so its size is the
++        // one the device negotiated: a tight picture is smaller whenever the allocator pads rows,
++        // and the driver refuses a buffer shorter than the negotiated size.
++        size_t bytesUsed = mInputLayout->mPlanes[0].mSize;
+ 
+         // TODO(crbug.com/901264): The way to pass an offset within a DMA-buf is not defined
+         // in V4L2 specification, so we abuse data_offset for now. Fix it when we have the
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+index 0e5b61ed774ecb0988418e1ce000f0099e9e089b..ccff9964ca0eaa130954b43b86306ba90a9ea965 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -151,6 +151,8 @@ private:
+ 
+     ui::Size mCodedSize;
+     Rect mVisibleRect;
++    // The distance in bytes between the rows of the first plane that the device writes.
++    uint32_t mOutputRowPitch = 0;
+ 
+     // Currently enqueued frame at the deocder device, mapped using V4L2 buffer ID.
+     std::map<size_t, std::unique_ptr<VideoFrame>> mFrameAtDevice;

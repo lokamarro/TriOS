@@ -1,0 +1,1042 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 01:28:14 +0900
+Subject: [PATCH] kosmickrisp: implement non-seamless cube maps
+
+A VK_EXT_non_seamless_cube_map sampler is served by sampling the same
+storage through a 2D array alias of the constituent cube faces, so the
+lowering turns a cube coordinate into a face and, for a cube array, the
+array layer itself.
+
+The cube a cube array coordinate selects is rounded and clamped against
+the layer count the alias reports, and only then scaled by the six faces.
+Vulkan clamps the cube against the cube count before the faces are
+indexed, and clamping afterwards is not the same thing: a coordinate one
+cube past the end would become an index six faces past the end, which
+lands on the last face of the last cube instead of on the selected face
+of it, and a coordinate below zero would collapse onto the first face of
+the first cube the same way.
+
+dEQP-VK.texture.shadow.cube_array.* sweeps the coordinate from just below
+the first cube to well past the last one. In a native side by side
+comparison against the seamless path, which Metal resolves natively, the
+only differing texels are mip level choices near a face boundary, where
+the lowered path evaluates the projected derivative per fragment instead
+of across the quad; both lie inside the level range the reference allows.
+---
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |   3 +
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  |   5 +-
+ src/kosmickrisp/vulkan/kk_image_view.c        |  19 ++
+ src/kosmickrisp/vulkan/kk_image_view.h        |   4 +
+ .../vulkan/kk_nir_lower_descriptors.c         | 137 +++++++-
+ .../vulkan/kk_nir_lower_textures.c            | 312 +++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   4 +
+ src/kosmickrisp/vulkan/kk_shader.c            |   5 +-
+ src/kosmickrisp/vulkan/kk_shader.h            |   5 +-
+ src/kosmickrisp/vulkan/meson.build            |  22 ++
+ .../tests/test_non_seamless_cube_lowering.c   | 267 +++++++++++++++
+ 11 files changed, 771 insertions(+), 12 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_non_seamless_cube_lowering.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index ae9d752ca1a911affc567f1b077b7b38719ac6b6..50045f7f5d9c99e8c06abdcfc6ff0138185f4c1e 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -77,6 +77,8 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+             assert(view->planes[plane].sampled_gpu_resource_id);
+             desc[plane].image_gpu_resource_id =
+                view->planes[plane].sampled_gpu_resource_id;
++            desc[plane].cube_array_gpu_resource_id =
++               view->planes[plane].cube_array_gpu_resource_id;
+          }
+          desc[plane].image_swizzle =
+             kk_pack_component_mapping(view->vk.swizzle);
+@@ -104,6 +106,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+          desc[plane].lod_min_fp16 = sampler->lod_min_fp16;
+          desc[plane].lod_max_fp16 = sampler->lod_max_fp16;
+          desc[plane].sampler_swizzle = sampler->border_swizzle;
++         desc[plane].sampler_flags = sampler->vk.flags;
+       }
+ 
+       if (sampler->has_border) {
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index c0f74932a0392030c5e16a324068b7ebd7f31edf..1962ba6a1ccd8ed65d83593d1325dbba58800e28 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -28,7 +28,10 @@ struct kk_sampled_image_descriptor {
+    /* Packed VkComponentMapping supplied with the sampler.  Bit 31 indicates
+     * that the mapping was explicit; otherwise image_swizzle is used. */
+    uint32_t sampler_swizzle;
+-   uint32_t pad_to_power_2[5];
++   /* Same-format 2D-array alias for cube sampling without edge seams. */
++   uint64_t cube_array_gpu_resource_id;
++   VkSamplerCreateFlags sampler_flags;
++   uint32_t pad_to_power_2;
+ };
+ 
+ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index 8d1786f8e7ee2212d2547901a53bce9a9d71a94b..9e601ea3333360b63fa253afdcbded153be81eaf 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -181,6 +181,22 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+          view->planes[view_plane].sampled_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_sampled);
++
++         if (dev->vk.enabled_features.nonSeamlessCubeMap &&
++             (view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
++              view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
++            struct kk_view_layout array_layout = view_layout;
++            array_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++            view->planes[view_plane].mtl_handle_cube_array =
++               mtl_new_texture_view_with(mtl_handle, &array_layout);
++            if (!view->planes[view_plane].mtl_handle_cube_array) {
++               kk_image_view_finish(dev, view);
++               return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++            }
++            view->planes[view_plane].cube_array_gpu_resource_id =
++               mtl_texture_get_gpu_resource_id(
++                  view->planes[view_plane].mtl_handle_cube_array);
++         }
+       }
+ 
+       if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+@@ -241,6 +257,9 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
+       if (view->planes[plane].mtl_handle_sampled)
+          mtl_release(view->planes[plane].mtl_handle_sampled);
+ 
++      if (view->planes[plane].mtl_handle_cube_array)
++         mtl_release(view->planes[plane].mtl_handle_cube_array);
++
+       if (view->planes[plane].mtl_handle_storage)
+          mtl_release(view->planes[plane].mtl_handle_storage);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.h b/src/kosmickrisp/vulkan/kk_image_view.h
+index e9927f93d22154d59bcd752edbd97c93739e641e..3c4447d2d953a23a81ed43a7d101793763e376b3 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.h
++++ b/src/kosmickrisp/vulkan/kk_image_view.h
+@@ -28,6 +28,9 @@ struct kk_image_view {
+       enum pipe_format format;
+ 
+       mtl_texture *mtl_handle_sampled;
++      /* Same storage as mtl_handle_sampled, exposed as its constituent faces
++       * for VK_EXT_non_seamless_cube_map shader lowering. */
++      mtl_texture *mtl_handle_cube_array;
+       mtl_texture
+          *mtl_handle_storage; // TODO_KOSMICKRISP We can probably get rid of
+                               // this once we lower 2D cubes and 3D to 2D array?
+@@ -45,6 +48,7 @@ struct kk_image_view {
+       mtl_texture *mtl_handle_subres;
+ 
+       uint64_t sampled_gpu_resource_id;
++      uint64_t cube_array_gpu_resource_id;
+       uint64_t storage_gpu_resource_id;
+       uint64_t input_gpu_resource_id;
+    } planes[3];
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index f1f7f63a6a403c1dd84fa546252f0de7fbe89415..b6a69512d544c0e52ecf00eb0f03496d85dbcf27 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -10,6 +10,7 @@
+ #include "kk_descriptor_set.h"
+ #include "kk_descriptor_set_layout.h"
+ #include "kk_shader.h"
++#include "kk_sampler.h"
+ 
+ #include "kosmickrisp/compiler/nir_to_msl.h"
+ 
+@@ -29,8 +30,34 @@ struct lower_descriptors_ctx {
+    bool clamp_desc_array_bounds;
+    nir_address_format ubo_addr_format;
+    nir_address_format ssbo_addr_format;
++   bool lower_non_seamless_cube;
+ };
+ 
++enum non_seamless_cube_mode {
++   NON_SEAMLESS_CUBE_NATIVE,
++   NON_SEAMLESS_CUBE_STATIC,
++   NON_SEAMLESS_CUBE_DYNAMIC,
++};
++
++static bool
++is_non_seamless_cube_sample(const nir_tex_instr *tex)
++{
++   if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE ||
++       !nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex))
++      return false;
++
++   switch (tex->op) {
++   case nir_texop_tex:
++   case nir_texop_txb:
++   case nir_texop_txl:
++   case nir_texop_txd:
++   case nir_texop_tg4:
++      return true;
++   default:
++      return false;
++   }
++}
++
+ static const struct kk_descriptor_set_binding_layout *
+ get_binding_layout(uint32_t set, uint32_t binding,
+                    const struct lower_descriptors_ctx *ctx)
+@@ -353,6 +380,53 @@ get_resource_deref_binding(nir_builder *b, nir_deref_instr *deref,
+    *binding = var->data.binding;
+ }
+ 
++static enum non_seamless_cube_mode
++non_seamless_cube_mode(nir_tex_instr *tex, nir_deref_instr *sampler_deref,
++                       const struct lower_descriptors_ctx *ctx)
++{
++   if (!ctx->lower_non_seamless_cube || !is_non_seamless_cube_sample(tex))
++      return NON_SEAMLESS_CUBE_NATIVE;
++
++   bool constant_index = true;
++   uint32_t array_index = 0;
++   if (sampler_deref->deref_type == nir_deref_type_array) {
++      constant_index = nir_src_is_const(sampler_deref->arr.index);
++      if (constant_index)
++         array_index = nir_src_as_uint(sampler_deref->arr.index);
++      sampler_deref = nir_deref_instr_parent(sampler_deref);
++   }
++
++   assert(sampler_deref->deref_type == nir_deref_type_var);
++   const nir_variable *var = sampler_deref->var;
++
++   const struct kk_descriptor_set_binding_layout *binding_layout =
++      get_binding_layout(var->data.descriptor_set, var->data.binding, ctx);
++   if (binding_layout->immutable_samplers == NULL)
++      return NON_SEAMLESS_CUBE_DYNAMIC;
++
++   const VkSamplerCreateFlags flag =
++      VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
++   bool non_seamless;
++   if (constant_index) {
++      assert(array_index < binding_layout->array_size);
++      non_seamless =
++         (binding_layout->immutable_samplers[array_index]->vk.flags & flag) !=
++         0;
++   } else {
++      non_seamless =
++         (binding_layout->immutable_samplers[0]->vk.flags & flag) != 0;
++      for (uint32_t i = 1; i < binding_layout->array_size; i++) {
++         bool element_non_seamless =
++            (binding_layout->immutable_samplers[i]->vk.flags & flag) != 0;
++         if (element_non_seamless != non_seamless)
++            return NON_SEAMLESS_CUBE_DYNAMIC;
++      }
++   }
++
++   return non_seamless ? NON_SEAMLESS_CUBE_STATIC
++                       : NON_SEAMLESS_CUBE_NATIVE;
++}
++
+ static nir_def *
+ load_resource_addr(nir_builder *b, unsigned num_components, unsigned bit_size,
+                    nir_deref_instr *deref, unsigned offset_B,
+@@ -548,6 +622,11 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+ 
+    nir_deref_instr *texture_deref =
+       nir_src_as_deref(nir_src_for_ssa(texture));
++   nir_deref_instr *sampler_deref =
++      sampler ? nir_src_as_deref(nir_src_for_ssa(sampler)) : NULL;
++   enum non_seamless_cube_mode non_seamless_mode =
++      sampler_deref ? non_seamless_cube_mode(tex, sampler_deref, ctx)
++                    : NON_SEAMLESS_CUBE_NATIVE;
+    if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+       assert(plane == 0);
+       if (tex->op == nir_texop_txs) {
+@@ -690,8 +769,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+    }
+ 
+    {
+-      unsigned offs =
+-         offsetof(struct kk_sampled_image_descriptor, image_gpu_resource_id);
++      const bool static_non_seamless =
++         non_seamless_mode == NON_SEAMLESS_CUBE_STATIC;
++      unsigned offs = static_non_seamless
++                         ? offsetof(struct kk_sampled_image_descriptor,
++                                    cube_array_gpu_resource_id)
++                         : offsetof(struct kk_sampled_image_descriptor,
++                                    image_gpu_resource_id);
+ 
+       nir_def *resource_addr = load_resource_addr(
+          b, 1, 64, nir_src_as_deref(nir_src_for_ssa(texture)),
+@@ -699,15 +783,52 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+ 
+       nir_def *handle = NULL;
+       if (tex->is_shadow) {
+-         handle = nir_load_depth_texture_kk(b, 1, 64, resource_addr,
+-                                            .image_dim = tex->sampler_dim,
+-                                            .image_array = tex->is_array);
++         handle = nir_load_depth_texture_kk(
++            b, 1, 64, resource_addr,
++            .image_dim = static_non_seamless ? GLSL_SAMPLER_DIM_2D
++                                              : tex->sampler_dim,
++            .image_array = static_non_seamless ? true : tex->is_array);
+       } else {
+          handle = nir_load_texture_handle_kk(
+             b, 1, 64, resource_addr, .dest_type = tex->dest_type,
+-            .image_dim = tex->sampler_dim, .image_array = tex->is_array);
++            .image_dim = static_non_seamless ? GLSL_SAMPLER_DIM_2D
++                                              : tex->sampler_dim,
++            .image_array = static_non_seamless ? true : tex->is_array);
+       }
+       nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
++
++      if (static_non_seamless)
++         tex->backend_flags |= KK_TEXTURE_FLAG_NON_SEAMLESS_STATIC;
++   }
++
++   if (non_seamless_mode == NON_SEAMLESS_CUBE_DYNAMIC) {
++      unsigned offs = offsetof(struct kk_sampled_image_descriptor,
++                               cube_array_gpu_resource_id);
++      nir_def *resource_addr = load_resource_addr(
++         b, 1, 64, texture_deref, plane_offset_B + offs, ctx);
++      nir_def *array_handle =
++         tex->is_shadow
++            ? nir_load_depth_texture_kk(b, 1, 64, resource_addr,
++                                        .image_dim = GLSL_SAMPLER_DIM_2D,
++                                        .image_array = true)
++            : nir_load_texture_handle_kk(b, 1, 64, resource_addr,
++                                         .dest_type = tex->dest_type,
++                                         .image_dim = GLSL_SAMPLER_DIM_2D,
++                                         .image_array = true);
++
++      nir_def *sampler_flags = load_resource_deref_desc(
++         b, 1, 32, sampler_deref,
++         plane_offset_B +
++            offsetof(struct kk_sampled_image_descriptor, sampler_flags),
++         ctx);
++      nir_def *non_seamless = nir_ine_imm(
++         b, nir_iand_imm(b, sampler_flags,
++                         VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT),
++         0);
++
++      nir_tex_instr_add_src(tex, nir_tex_src_backend1, non_seamless);
++      nir_tex_instr_add_src(tex, nir_tex_src_backend2, array_handle);
++      tex->backend_flags |= KK_TEXTURE_FLAG_NON_SEAMLESS_DYNAMIC;
+    }
+ 
+    if (sampler != NULL) {
+@@ -926,7 +1047,8 @@ bool
+ kk_nir_lower_descriptors(nir_shader *nir,
+                          const struct vk_pipeline_robustness_state *rs,
+                          uint32_t set_layout_count,
+-                         struct vk_descriptor_set_layout *const *set_layouts)
++                         struct vk_descriptor_set_layout *const *set_layouts,
++                         bool lower_non_seamless_cube)
+ {
+    struct lower_descriptors_ctx ctx = {
+       .clamp_desc_array_bounds =
+@@ -937,6 +1059,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
+          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
+       .ssbo_addr_format = kk_buffer_addr_format(rs->storage_buffers),
+       .ubo_addr_format = kk_buffer_addr_format(rs->uniform_buffers),
++      .lower_non_seamless_cube = lower_non_seamless_cube,
+    };
+ 
+    assert(set_layout_count <= KK_MAX_SETS);
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_textures.c b/src/kosmickrisp/vulkan/kk_nir_lower_textures.c
+index 4e77b4de2d79158856908ad27c3e3bd89ddbb91c..b492059e869c2e95d39ca8b765633c402ae27a26 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_textures.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_textures.c
+@@ -17,6 +17,315 @@
+ 
+ #include "stdbool.h"
+ 
++struct cube_coord {
++   nir_def *x;
++   nir_def *y;
++   nir_def *z;
++   nir_def *abs_x;
++   nir_def *abs_y;
++   nir_def *abs_z;
++   nir_def *cube_layer_base;
++};
++
++/* Width, height and layer count of the same-format 2D array alias. */
++static nir_def *
++array_texture_size(nir_builder *b, nir_def *array_handle)
++{
++   nir_tex_instr *txs = nir_tex_instr_create(b->shader, 2);
++   txs->op = nir_texop_txs;
++   txs->sampler_dim = GLSL_SAMPLER_DIM_2D;
++   txs->is_array = true;
++   txs->dest_type = nir_type_int32;
++   txs->src[0] =
++      nir_tex_src_for_ssa(nir_tex_src_texture_handle, array_handle);
++   txs->src[1] =
++      nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
++   nir_def_init(&txs->instr, &txs->def, 3, 32);
++   nir_builder_instr_insert(b, &txs->instr);
++   return &txs->def;
++}
++
++static nir_def *
++array_texture_width(nir_builder *b, nir_def *array_handle)
++{
++   return nir_channel(b, array_texture_size(b, array_handle), 0);
++}
++
++/* First face of the cube an array coordinate selects.  Vulkan rounds the
++ * coordinate to the nearest even integer and clamps it against the cube count
++ * before the six faces are indexed, so the clamp has to happen here.  Scaling
++ * first and leaving the product to the 2D array alias to clamp instead lands
++ * an out of range coordinate on the last face of the last cube rather than on
++ * the selected face of the last cube. */
++static nir_def *
++cube_array_layer_base(nir_builder *b, nir_def *layer, nir_def *array_handle)
++{
++   nir_def *layer_count =
++      nir_channel(b, array_texture_size(b, array_handle), 2);
++   nir_def *max_cube =
++      nir_i2fN(b, nir_iadd_imm(b, nir_udiv_imm(b, layer_count, 6), -1),
++               layer->bit_size);
++   nir_def *cube =
++      nir_fclamp(b, nir_fround_even(b, layer),
++                 nir_imm_floatN_t(b, 0.0, layer->bit_size), max_cube);
++
++   return nir_fmul_imm(b, cube, 6.0);
++}
++
++static nir_def *
++cube_face_x(nir_builder *b, const struct cube_coord *coord)
++{
++   nir_def *positive = nir_fge_imm(b, coord->x, 0.0);
++   nir_def *scale = nir_fdiv(
++      b, nir_imm_floatN_t(b, -0.5, coord->x->bit_size), coord->abs_x);
++   nir_def *u = nir_fadd_imm(
++      b, nir_fmul(b, nir_fmul(b, nir_fsign(b, coord->x), scale), coord->z),
++      0.5);
++   nir_def *v = nir_fadd_imm(b, nir_fmul(b, scale, coord->y), 0.5);
++   nir_def *face = nir_bcsel(
++      b, positive, nir_imm_floatN_t(b, 0.0, coord->x->bit_size),
++      nir_imm_floatN_t(b, 1.0, coord->x->bit_size));
++   return nir_vec3(b, u, v, nir_fadd(b, face, coord->cube_layer_base));
++}
++
++static nir_def *
++cube_face_y(nir_builder *b, const struct cube_coord *coord)
++{
++   nir_def *positive = nir_fge_imm(b, coord->y, 0.0);
++   nir_def *scale = nir_fdiv(
++      b, nir_imm_floatN_t(b, 0.5, coord->y->bit_size), coord->abs_y);
++   nir_def *u = nir_fadd_imm(b, nir_fmul(b, scale, coord->x), 0.5);
++   nir_def *v = nir_fadd_imm(
++      b, nir_fmul(b, nir_fmul(b, nir_fsign(b, coord->y), scale), coord->z),
++      0.5);
++   nir_def *face = nir_bcsel(
++      b, positive, nir_imm_floatN_t(b, 2.0, coord->y->bit_size),
++      nir_imm_floatN_t(b, 3.0, coord->y->bit_size));
++   return nir_vec3(b, u, v, nir_fadd(b, face, coord->cube_layer_base));
++}
++
++static nir_def *
++cube_face_z(nir_builder *b, const struct cube_coord *coord)
++{
++   nir_def *positive = nir_fge_imm(b, coord->z, 0.0);
++   nir_def *scale = nir_fdiv(
++      b, nir_imm_floatN_t(b, -0.5, coord->z->bit_size), coord->abs_z);
++   nir_def *u = nir_fadd_imm(
++      b, nir_fmul(b, nir_fmul(b, nir_fsign(b, coord->z), scale),
++                  nir_fneg(b, coord->x)),
++      0.5);
++   nir_def *v = nir_fadd_imm(b, nir_fmul(b, scale, coord->y), 0.5);
++   nir_def *face = nir_bcsel(
++      b, positive, nir_imm_floatN_t(b, 4.0, coord->z->bit_size),
++      nir_imm_floatN_t(b, 5.0, coord->z->bit_size));
++   return nir_vec3(b, u, v, nir_fadd(b, face, coord->cube_layer_base));
++}
++
++static nir_def *
++cube_to_array_coord(nir_builder *b, nir_def *coord, bool is_array,
++                    nir_def *array_handle)
++{
++   struct cube_coord cube = {
++      .x = nir_channel(b, coord, 0),
++      .y = nir_channel(b, coord, 1),
++      .z = nir_channel(b, coord, 2),
++      .cube_layer_base = nir_imm_floatN_t(b, 0.0, coord->bit_size),
++   };
++   cube.abs_x = nir_fabs(b, cube.x);
++   cube.abs_y = nir_fabs(b, cube.y);
++   cube.abs_z = nir_fabs(b, cube.z);
++
++   if (is_array) {
++      cube.cube_layer_base =
++         cube_array_layer_base(b, nir_channel(b, coord, 3), array_handle);
++   }
++
++   nir_def *face_x = cube_face_x(b, &cube);
++   nir_def *face_y = cube_face_y(b, &cube);
++   nir_def *face_z = cube_face_z(b, &cube);
++   nir_def *use_x =
++      nir_iand(b, nir_fge(b, cube.abs_x, cube.abs_y),
++               nir_fge(b, cube.abs_x, cube.abs_z));
++   nir_def *use_y =
++      nir_iand(b, nir_fge(b, cube.abs_y, cube.abs_x),
++               nir_fge(b, cube.abs_y, cube.abs_z));
++
++   return nir_bcsel(b, use_x, face_x,
++                    nir_bcsel(b, use_y, face_y, face_z));
++}
++
++/* Derive the implicit cube LOD before selecting a face.  Derivatives of the
++ * selected 2D coordinates are discontinuous across a quad that straddles a
++ * face boundary, which can otherwise select a spuriously coarse mip. */
++static nir_def *
++cube_implicit_lod(nir_builder *b, nir_def *coord, nir_def *array_handle)
++{
++   nir_def *p = nir_trim_vector(b, coord, 3);
++   nir_def *dPdx = nir_ddx(b, p);
++   nir_def *dPdy = nir_ddy(b, p);
++   nir_def *abs_p = nir_fabs(b, p);
++   nir_def *abs_x = nir_channel(b, abs_p, 0);
++   nir_def *abs_y = nir_channel(b, abs_p, 1);
++   nir_def *abs_z = nir_channel(b, abs_p, 2);
++   nir_def *use_x =
++      nir_iand(b, nir_fge(b, abs_x, abs_y), nir_fge(b, abs_x, abs_z));
++   nir_def *use_y =
++      nir_iand(b, nir_fge(b, abs_y, abs_x), nir_fge(b, abs_y, abs_z));
++   const unsigned yzx[3] = {1, 2, 0};
++   const unsigned xzy[3] = {0, 2, 1};
++
++   nir_def *Q = nir_bcsel(
++      b, use_x, nir_swizzle(b, p, yzx, 3),
++      nir_bcsel(b, use_y, nir_swizzle(b, p, xzy, 3), p));
++   nir_def *dQdx = nir_bcsel(
++      b, use_x, nir_swizzle(b, dPdx, yzx, 3),
++      nir_bcsel(b, use_y, nir_swizzle(b, dPdx, xzy, 3), dPdx));
++   nir_def *dQdy = nir_bcsel(
++      b, use_x, nir_swizzle(b, dPdy, yzx, 3),
++      nir_bcsel(b, use_y, nir_swizzle(b, dPdy, xzy, 3), dPdy));
++
++   nir_def *rcp_Q_z = nir_frcp(b, nir_channel(b, Q, 2));
++   nir_def *Q_xy = nir_trim_vector(b, Q, 2);
++   nir_def *tmp = nir_fmul(b, Q_xy, rcp_Q_z);
++   nir_def *dx = nir_fmul(
++      b, rcp_Q_z,
++      nir_fsub(b, nir_trim_vector(b, dQdx, 2),
++               nir_fmul(b, tmp, nir_channel(b, dQdx, 2))));
++   nir_def *dy = nir_fmul(
++      b, rcp_Q_z,
++      nir_fsub(b, nir_trim_vector(b, dQdy, 2),
++               nir_fmul(b, tmp, nir_channel(b, dQdy, 2))));
++   nir_def *rho2 = nir_fmax(b, nir_fdot(b, dx, dx), nir_fdot(b, dy, dy));
++   nir_def *width = nir_i2fN(
++      b, array_texture_width(b, array_handle), coord->bit_size);
++
++   return nir_fadd_imm(
++      b, nir_fmul_imm(b,
++                      nir_flog2(b, nir_fmul(b, width,
++                                           nir_fmul(b, width, rho2))),
++                      0.5),
++      -1.0);
++}
++
++static void
++remove_non_seamless_sources(nir_tex_instr *tex)
++{
++   int src = nir_tex_instr_src_index(tex, nir_tex_src_backend1);
++   if (src >= 0)
++      nir_tex_instr_remove_src(tex, src);
++
++   src = nir_tex_instr_src_index(tex, nir_tex_src_backend2);
++   if (src >= 0)
++      nir_tex_instr_remove_src(tex, src);
++
++   tex->backend_flags &= ~(KK_TEXTURE_FLAG_NON_SEAMLESS_STATIC |
++                           KK_TEXTURE_FLAG_NON_SEAMLESS_DYNAMIC);
++}
++
++static nir_tex_instr *
++clone_cube_sample(nir_builder *b, const nir_tex_instr *tex)
++{
++   nir_tex_instr *clone =
++      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
++   nir_builder_instr_insert(b, &clone->instr);
++   remove_non_seamless_sources(clone);
++   return clone;
++}
++
++static nir_def *
++clone_non_seamless_sample(nir_builder *b, const nir_tex_instr *tex,
++                          nir_def *array_handle)
++{
++   int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++   assert(coord_src >= 0);
++   nir_def *cube_coord = tex->src[coord_src].src.ssa;
++   /* A statically lowered sample already carries the 2D array alias as its
++    * texture handle; a dynamic one keeps the cube handle and passes the alias
++    * alongside it. */
++   nir_def *handle = array_handle;
++   if (handle == NULL) {
++      int tex_handle_src =
++         nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
++      assert(tex_handle_src >= 0);
++      handle = tex->src[tex_handle_src].src.ssa;
++   }
++   nir_def *coord =
++      cube_to_array_coord(b, cube_coord, tex->is_array, handle);
++
++   nir_tex_instr *clone = clone_cube_sample(b, tex);
++   clone->sampler_dim = GLSL_SAMPLER_DIM_2D;
++   clone->is_array = true;
++   clone->array_is_lowered_cube = true;
++   clone->coord_components = 3;
++   coord_src = nir_tex_instr_src_index(clone, nir_tex_src_coord);
++   nir_src_rewrite(&clone->src[coord_src].src, coord);
++
++   if (array_handle != NULL) {
++      int handle_src =
++         nir_tex_instr_src_index(clone, nir_tex_src_texture_handle);
++      assert(handle_src >= 0);
++      nir_src_rewrite(&clone->src[handle_src].src, array_handle);
++   }
++
++   if (clone->op == nir_texop_tex || clone->op == nir_texop_txb) {
++      int handle_src =
++         nir_tex_instr_src_index(clone, nir_tex_src_texture_handle);
++      assert(handle_src >= 0);
++      b->cursor = nir_before_instr(&clone->instr);
++      nir_def *lod = nir_shader_supports_implicit_lod(b->shader)
++                        ? cube_implicit_lod(
++                             b, cube_coord, clone->src[handle_src].src.ssa)
++                        : nir_imm_floatN_t(b, 0.0, cube_coord->bit_size);
++      nir_def *bias = nir_steal_tex_src(clone, nir_tex_src_bias);
++      if (bias)
++         lod = nir_fadd(b, lod, nir_f2fN(b, bias, lod->bit_size));
++      nir_def *min_lod = nir_steal_tex_src(clone, nir_tex_src_min_lod);
++      if (min_lod)
++         lod = nir_fmax(b, lod, nir_f2fN(b, min_lod, lod->bit_size));
++      nir_tex_instr_add_src(clone, nir_tex_src_lod, lod);
++      clone->op = nir_texop_txl;
++      b->cursor = nir_after_instr(&clone->instr);
++   }
++
++   return &clone->def;
++}
++
++static bool
++lower_non_seamless_cube_filter(const nir_instr *instr, UNUSED const void *data)
++{
++   if (instr->type != nir_instr_type_tex)
++      return false;
++
++   const nir_tex_instr *tex = nir_instr_as_tex(instr);
++   return tex->backend_flags & (KK_TEXTURE_FLAG_NON_SEAMLESS_STATIC |
++                                KK_TEXTURE_FLAG_NON_SEAMLESS_DYNAMIC);
++}
++
++static nir_def *
++lower_non_seamless_cube(nir_builder *b, nir_instr *instr, UNUSED void *data)
++{
++   nir_tex_instr *tex = nir_instr_as_tex(instr);
++   const bool dynamic =
++      tex->backend_flags & KK_TEXTURE_FLAG_NON_SEAMLESS_DYNAMIC;
++
++   if (!dynamic)
++      return clone_non_seamless_sample(b, tex, NULL);
++
++   int condition_src = nir_tex_instr_src_index(tex, nir_tex_src_backend1);
++   int array_handle_src = nir_tex_instr_src_index(tex, nir_tex_src_backend2);
++   assert(condition_src >= 0 && array_handle_src >= 0);
++   nir_def *condition = tex->src[condition_src].src.ssa;
++   nir_def *array_handle = tex->src[array_handle_src].src.ssa;
++
++   nir_push_if(b, condition);
++   nir_def *non_seamless = clone_non_seamless_sample(b, tex, array_handle);
++   nir_push_else(b, NULL);
++   nir_def *seamless = &clone_cube_sample(b, tex)->def;
++   nir_pop_if(b, NULL);
++
++   return nir_if_phi(b, non_seamless, seamless);
++}
++
+ static bool
+ lower_texture_buffer_tex_instr(nir_builder *b, nir_tex_instr *tex)
+ {
+@@ -200,7 +509,8 @@ fence_image(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ bool
+ kk_nir_lower_textures(nir_shader *nir)
+ {
+-   bool progress = false;
++   bool progress = nir_shader_lower_instructions(
++      nir, lower_non_seamless_cube_filter, lower_non_seamless_cube, NULL);
+    nir_foreach_function_impl(impl, nir) {
+       nir_foreach_block_safe(block, impl) {
+          nir_builder b = nir_builder_create(impl);
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 3b6abef5623321c2b01e71da3b36abcf613c8111..37ee3d63009edb8bb3ad76699950e228d67d0ad0 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -181,6 +181,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_multi_draw = true,
+       .EXT_mutable_descriptor_type = true,
+       .EXT_nested_command_buffer = true,
++      .EXT_non_seamless_cube_map = true,
+       .EXT_post_depth_coverage = true,
+       .EXT_primitive_restart_index = true,
+       .EXT_primitive_topology_list_restart = true,
+@@ -469,6 +470,9 @@ kk_get_device_features(
+       .nestedCommandBufferRendering = true,
+       .nestedCommandBufferSimultaneousUse = true,
+ 
++      /* VK_EXT_non_seamless_cube_map */
++      .nonSeamlessCubeMap = true,
++
+       /* VK_EXT_primitive_restart_index */
+       .primitiveRestartIndex = true,
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 93b77ae4a35eb7d96c3667d5d3de34ac9fc6b600..30f3e79e3ed19f91608d9813eaa8625a2af45867 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -892,7 +892,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+     * the lower descriptor pass
+     */
+    NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count,
+-            set_layouts);
++            set_layouts, dev->vk.enabled_features.nonSeamlessCubeMap);
+    NIR_PASS(_, nir, kk_nir_lower_textures);
+ 
+    if (dev->vk.enabled_features.nullDescriptor)
+@@ -2450,7 +2450,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       /* Dynamic half-Z lowering above introduces load_clip_z_coeff after the
+        * application GS has already completed descriptor lowering. */
+       NIR_PASS(_, raster, kk_nir_lower_descriptors, gs_compile->robustness,
+-               gs_compile->set_layout_count, gs_compile->set_layouts);
++               gs_compile->set_layout_count, gs_compile->set_layouts,
++               dev->vk.enabled_features.nonSeamlessCubeMap);
+       nir_shaders[geometry_shader] = raster;
+ 
+       kk_gs_to_compute(main, 64);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 67d45395434530d7b1f835fa75a079edb1588883..c3db6c67894eced6b1ac299b77006f39d03624e2 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -25,6 +25,8 @@ struct kk_cmd_buffer;
+ 
+ enum kk_texture_flags {
+    KK_TEXTURE_FLAG_CLAMP_TO_0 = 1u << 0,
++   KK_TEXTURE_FLAG_NON_SEAMLESS_STATIC = 1u << 1,
++   KK_TEXTURE_FLAG_NON_SEAMLESS_DYNAMIC = 1u << 2,
+ };
+ 
+ struct kk_tess_info {
+@@ -193,7 +195,8 @@ bool
+ kk_nir_lower_descriptors(nir_shader *nir,
+                          const struct vk_pipeline_robustness_state *rs,
+                          uint32_t set_layout_count,
+-                         struct vk_descriptor_set_layout *const *set_layouts);
++                         struct vk_descriptor_set_layout *const *set_layouts,
++                         bool lower_non_seamless_cube);
+ 
+ /* Loads from the root descriptor table the way the descriptor lowering does,
+  * for the other passes that read it. */
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index e0aa4cd8bad2045135b6e88e25b62294c90a2e22..41263c24aacc40a8a0848260ca4785663fecf8db 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -284,4 +284,26 @@ if with_tests
+     ),
+     suite : ['kosmickrisp'],
+   )
++
++  test(
++    'kosmickrisp_non_seamless_cube_lowering',
++    executable(
++      'test_kosmickrisp_non_seamless_cube_lowering',
++      files(
++        'tests/test_non_seamless_cube_lowering.c',
++        'kk_nir_lower_textures.c',
++        'kk_nir_lower_descriptors.c',
++      ),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_vulkan_runtime_headers,
++        idep_vulkan_util_headers,
++        idep_vulkan_wsi_headers,
++        idep_msl_to_nir,
++        idep_libkk_shaders_h,
++      ],
++    ),
++    suite : ['kosmickrisp'],
++  )
+ endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_non_seamless_cube_lowering.c b/src/kosmickrisp/vulkan/tests/test_non_seamless_cube_lowering.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e082731d11c24f439b3e6a91d97656b06dbb21a8
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_non_seamless_cube_lowering.c
+@@ -0,0 +1,267 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Metal samples cube maps seamlessly, so a VK_EXT_non_seamless_cube_map
++ * sampler is served by sampling the same storage through a 2D array alias of
++ * the constituent faces.  Vulkan rounds a cube array coordinate to the nearest
++ * even integer and clamps it against the cube count *before* the six faces are
++ * indexed, so the lowering has to clamp there too: scaling an out of range
++ * coordinate by six first and leaving the product for the 2D array alias to
++ * clamp lands the sample on the last face of the last cube instead of on the
++ * selected face of it.
++ */
++
++#include "kosmickrisp/vulkan/kk_descriptor_set_layout.h"
++#include "kosmickrisp/vulkan/kk_descriptor_types.h"
++#include "kosmickrisp/vulkan/kk_shader.h"
++#include "vulkan/runtime/vk_pipeline.h"
++
++#include "compiler/glsl_types.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition)                                                      \
++   do {                                                                       \
++      if (!(condition)) {                                                      \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,      \
++                 #condition);                                                  \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++
++struct lowering_stats {
++   /* Samples rewritten onto the 2D array alias of the cube faces. */
++   unsigned lowered_samples;
++   /* Samples left on the native cube path. */
++   unsigned cube_samples;
++   /* Coordinates scaled by the six faces of a cube. */
++   unsigned face_scales;
++   /* ... of those, the ones that clamp the rounded coordinate first. */
++   unsigned clamped_face_scales;
++   /* ... and the ones that scale a bare rounded coordinate, the defect. */
++   unsigned unclamped_face_scales;
++   /* Size queries against the 2D array alias. */
++   unsigned array_size_queries;
++};
++
++static nir_alu_instr *
++alu_source(nir_def *def, nir_op op)
++{
++   nir_instr *parent = nir_def_instr(def);
++   if (parent->type != nir_instr_type_alu)
++      return NULL;
++
++   nir_alu_instr *alu = nir_instr_as_alu(parent);
++   return alu->op == op ? alu : NULL;
++}
++
++static bool
++is_float_immediate(nir_def *def, double value)
++{
++   if (!nir_src_is_const(nir_src_for_ssa(def)))
++      return false;
++
++   return nir_src_as_float(nir_src_for_ssa(def)) == value;
++}
++
++/* fclamp() is fmin(fmax(x, lo), hi), and the rounded coordinate has to sit
++ * underneath both of them. */
++static bool
++scales_a_clamped_coordinate(nir_def *scaled)
++{
++   nir_alu_instr *min = alu_source(scaled, nir_op_fmin);
++   if (min == NULL)
++      return false;
++
++   nir_alu_instr *max = alu_source(min->src[0].src.ssa, nir_op_fmax);
++   if (max == NULL)
++      return false;
++
++   return alu_source(max->src[0].src.ssa, nir_op_fround_even) != NULL;
++}
++
++static void
++collect_stats(nir_shader *shader, struct lowering_stats *stats)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_tex) {
++               nir_tex_instr *tex = nir_instr_as_tex(instr);
++
++               if (tex->op == nir_texop_txs) {
++                  if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && tex->is_array)
++                     stats->array_size_queries++;
++                  continue;
++               }
++
++               if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
++                  stats->cube_samples++;
++               else if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
++                        tex->is_array)
++                  stats->lowered_samples++;
++               continue;
++            }
++
++            if (instr->type != nir_instr_type_alu)
++               continue;
++
++            nir_alu_instr *alu = nir_instr_as_alu(instr);
++            if (alu->op != nir_op_fmul)
++               continue;
++
++            for (unsigned i = 0; i < 2; i++) {
++               if (!is_float_immediate(alu->src[i].src.ssa, 6.0))
++                  continue;
++
++               nir_def *scaled = alu->src[1 - i].src.ssa;
++               stats->face_scales++;
++               if (scales_a_clamped_coordinate(scaled))
++                  stats->clamped_face_scales++;
++               else if (alu_source(scaled, nir_op_fround_even) != NULL)
++                  stats->unclamped_face_scales++;
++               break;
++            }
++         }
++      }
++   }
++}
++
++static nir_shader *
++build_cube_sample(bool is_array, bool is_shadow)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "non-seamless cube lowering test");
++
++   const struct glsl_type *sampler_type =
++      glsl_sampler_type(GLSL_SAMPLER_DIM_CUBE, is_shadow, is_array,
++                        GLSL_TYPE_FLOAT);
++   nir_variable *variable =
++      nir_variable_create(b.shader, nir_var_uniform, sampler_type, "sampler");
++   variable->data.descriptor_set = 0;
++   variable->data.binding = 0;
++
++   nir_deref_instr *deref = nir_build_deref_var(&b, variable);
++   nir_def *frag = nir_load_frag_coord(&b);
++   const unsigned components = is_array ? 4 : 3;
++   nir_def *coord = nir_trim_vector(&b, frag, components);
++
++   nir_tex_instr *tex = nir_tex_instr_create(b.shader, is_shadow ? 4 : 3);
++   tex->op = nir_texop_tex;
++   tex->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
++   tex->is_array = is_array;
++   tex->is_shadow = is_shadow;
++   tex->dest_type = nir_type_float32;
++   tex->coord_components = components;
++   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
++   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
++   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
++   if (is_shadow) {
++      tex->src[3] =
++         nir_tex_src_for_ssa(nir_tex_src_comparator, nir_imm_float(&b, 0.5f));
++   }
++   nir_def_init(&tex->instr, &tex->def, 4, 32);
++   nir_builder_instr_insert(&b, &tex->instr);
++
++   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out,
++                                             glsl_vec4_type(), "color");
++   color->data.location = FRAG_RESULT_DATA0;
++   nir_store_var(&b, color, &tex->def, 0xf);
++
++   return b.shader;
++}
++
++/* The descriptor lowering has to run first: it is what recognises the sampler
++ * as possibly non-seamless and attaches the 2D array alias. */
++static void
++lower(nir_shader *shader)
++{
++   struct kk_descriptor_set_layout *layout =
++      calloc(1, sizeof(*layout) + sizeof(layout->binding[0]));
++   CHECK(layout != NULL);
++   layout->binding_count = 1;
++   layout->binding[0] = (struct kk_descriptor_set_binding_layout){
++      .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++      .array_size = 1,
++      .stride = sizeof(struct kk_sampled_image_descriptor),
++   };
++   struct vk_descriptor_set_layout *set_layouts[] = {&layout->vk};
++   const struct vk_pipeline_robustness_state robustness = {
++      .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
++   };
++
++   CHECK(kk_nir_lower_descriptors(shader, &robustness, 1, set_layouts, true));
++   nir_validate_shader(shader, "non-seamless cube descriptor lowering");
++   CHECK(kk_nir_lower_textures(shader));
++   nir_validate_shader(shader, "non-seamless cube texture lowering");
++   free(layout);
++}
++
++static void
++check_cube_array_clamps_the_cube(bool is_shadow)
++{
++   nir_shader *shader = build_cube_sample(true, is_shadow);
++   lower(shader);
++
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++
++   /* A sampler that is only known at draw time keeps both paths: the native
++    * cube sample and the lowered one against the face alias. */
++   CHECK(stats.lowered_samples == 1);
++   CHECK(stats.cube_samples == 1);
++
++   /* The cube the coordinate selects is rounded, clamped and only then scaled
++    * by the six faces.  A bare rounded coordinate reaching the scale is the
++    * defect this test pins. */
++   CHECK(stats.face_scales == 1);
++   CHECK(stats.clamped_face_scales == 1);
++   CHECK(stats.unclamped_face_scales == 0);
++
++   /* The clamp needs the cube count, which only the alias can report. */
++   CHECK(stats.array_size_queries >= 1);
++
++   ralloc_free(shader);
++   printf("non-seamless cube lowering PASS cube-array%s\n",
++          is_shadow ? "-shadow" : "");
++}
++
++static void
++check_cube_needs_no_layer(void)
++{
++   nir_shader *shader = build_cube_sample(false, false);
++   lower(shader);
++
++   struct lowering_stats stats = {0};
++   collect_stats(shader, &stats);
++
++   CHECK(stats.lowered_samples == 1);
++   CHECK(stats.cube_samples == 1);
++   /* A plain cube has exactly one cube, so nothing is scaled by its faces. */
++   CHECK(stats.face_scales == 0);
++
++   ralloc_free(shader);
++   printf("non-seamless cube lowering PASS cube\n");
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   check_cube_array_clamps_the_cube(false);
++   check_cube_array_clamps_the_cube(true);
++   check_cube_needs_no_layer();
++
++   glsl_type_singleton_decref();
++   printf("non-seamless cube lowering PASS\n");
++   return 0;
++}

@@ -1,0 +1,457 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 12:11:34 +0900
+Subject: [PATCH] kosmickrisp: write every channel of a swizzled colour
+ attachment
+
+Metal refuses a swizzled view of a renderable texture, so a colour format
+whose channels Metal only offers in another order, such as
+VK_FORMAT_B4G4R4A4_UNORM_PACK16 on A4B4G4R4, is rendered to in the
+hardware's order with the shader moving the channels. The lowering
+reordered the stored value and left the store's width alone, but a store
+names the attachment channels it writes as its own leading lanes: a
+fragment shader that writes fewer than four channels then wrote the
+hardware's leading lanes instead of the lanes those channels live in, so
+the last channel it wrote was never stored and the lane it did write held
+a component the value does not have. An OpenGL ES 3.2 guest saw it as
+dEQP-GLES3.functional.fragment_out.{basic,array}.fixed.rgba4_* failing
+for the float, vec2 and vec3 outputs and passing for vec4: the channel
+after the ones that happened to line up came back undefined.
+
+Rebuild such a store over all four lanes in the hardware's order and let
+its write mask name the lanes the shader actually wrote, and read a load
+back the same way. Move the pass into its own file so a test can reach
+it, and cover every channel count and both channel orders.
+---
+ .../kk_nir_lower_fragment_output_swizzle.c    | 125 ++++++++++++++
+ src/kosmickrisp/vulkan/kk_shader.c            |  54 +-----
+ src/kosmickrisp/vulkan/kk_shader.h            |   4 +
+ src/kosmickrisp/vulkan/meson.build            |  21 +++
+ .../tests/test_fragment_output_swizzle.c      | 160 ++++++++++++++++++
+ 5 files changed, 311 insertions(+), 53 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_nir_lower_fragment_output_swizzle.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_fragment_output_swizzle.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_fragment_output_swizzle.c b/src/kosmickrisp/vulkan/kk_nir_lower_fragment_output_swizzle.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a99be20458da387cf5b3d63187d3564ac977b2a9
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_fragment_output_swizzle.c
+@@ -0,0 +1,125 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Metal refuses a swizzled view of a renderable texture, so a colour format
++ * whose channels Metal only offers in another order is rendered to through
++ * the hardware's order and the shader moves the channels itself.
++ *
++ * A store names the attachment channels it writes as the leading lanes of the
++ * store, so reordering the stored value alone cannot move a channel: the
++ * hardware lane a Vulkan channel belongs in may be past the store's width and
++ * never written at all. Rebuild such a store over all four lanes in the
++ * hardware's order and let its write mask name the lanes the shader actually
++ * wrote; a load reads every lane and picks the Vulkan channels back out.
++ */
++
++#include "kk_shader.h"
++
++#include "kk_format.h"
++
++#include "nir_builder.h"
++#include "vk_format.h"
++#include "vk_graphics_state.h"
++
++static const struct kk_va_format *
++attachment_format(nir_intrinsic_instr *intrin,
++                  const struct vk_graphics_pipeline_state *state)
++{
++   unsigned slot = nir_intrinsic_io_semantics(intrin).location;
++   if (slot < FRAG_RESULT_DATA0 || slot > FRAG_RESULT_DATA7)
++      return NULL;
++
++   VkFormat vk_format =
++      state->rp->color_attachment_formats[slot - FRAG_RESULT_DATA0];
++   if (vk_format == VK_FORMAT_UNDEFINED)
++      return NULL;
++
++   enum pipe_format format = vk_format_to_pipe_format(vk_format);
++   const struct kk_va_format *supported_format = kk_get_va_format(format);
++   if (supported_format == NULL || supported_format->is_native)
++      return NULL;
++
++   return supported_format;
++}
++
++static bool
++lower_fragment_output_swizzle(nir_builder *b, nir_intrinsic_instr *intrin,
++                              void *data)
++{
++   if (intrin->intrinsic != nir_intrinsic_store_output &&
++       intrin->intrinsic != nir_intrinsic_load_output)
++      return false;
++
++   const struct vk_graphics_pipeline_state *state =
++      (const struct vk_graphics_pipeline_state *)data;
++   const struct kk_va_format *supported_format =
++      attachment_format(intrin, state);
++   if (supported_format == NULL)
++      return false;
++
++   /* The hardware lane a Vulkan channel lives in. */
++   const unsigned channel_unswizzle[] = {
++      supported_format->unswizzle.red, supported_format->unswizzle.green,
++      supported_format->unswizzle.blue, supported_format->unswizzle.alpha};
++   /* Its inverse: the Vulkan channel a hardware lane holds. */
++   unsigned channel_swizzle[4] = {0u};
++   for (uint32_t i = 0u; i < 4u; ++i)
++      channel_swizzle[channel_unswizzle[i]] = i;
++
++   const unsigned component = nir_intrinsic_component(intrin);
++
++   if (intrin->intrinsic == nir_intrinsic_store_output) {
++      const unsigned write_mask = nir_intrinsic_write_mask(intrin);
++      nir_def *value = intrin->src[0].ssa;
++      assert(component + value->num_components <= 4u);
++
++      b->cursor = nir_before_instr(&intrin->instr);
++      nir_def *undefined = nir_undef(b, 1, value->bit_size);
++      nir_def *vulkan_order[4] = {undefined, undefined, undefined, undefined};
++      unsigned hardware_mask = 0u;
++      for (uint32_t i = 0u; i < value->num_components; ++i) {
++         if (!(write_mask & BITFIELD_BIT(i)))
++            continue;
++         vulkan_order[component + i] = nir_channel(b, value, i);
++         hardware_mask |= BITFIELD_BIT(channel_unswizzle[component + i]);
++      }
++
++      nir_def *hardware_order[4];
++      for (uint32_t i = 0u; i < 4u; ++i)
++         hardware_order[i] = vulkan_order[channel_swizzle[i]];
++
++      nir_src_rewrite(&intrin->src[0], nir_vec(b, hardware_order, 4u));
++      intrin->num_components = 4u;
++      nir_intrinsic_set_write_mask(intrin, hardware_mask);
++      nir_intrinsic_set_component(intrin, 0u);
++      return true;
++   }
++
++   const unsigned num_components = intrin->def.num_components;
++   assert(component + num_components <= 4u);
++
++   unsigned swizzle[4];
++   for (uint32_t i = 0u; i < num_components; ++i)
++      swizzle[i] = channel_unswizzle[component + i];
++
++   intrin->def.num_components = 4u;
++   intrin->num_components = 4u;
++   nir_intrinsic_set_component(intrin, 0u);
++
++   b->cursor = nir_after_instr(&intrin->instr);
++   nir_def *unswizzled =
++      nir_swizzle(b, &intrin->def, swizzle, num_components);
++   nir_def_rewrite_uses_after(&intrin->def, unswizzled);
++   return true;
++}
++
++bool
++kk_nir_lower_fragment_output_swizzle(
++   nir_shader *nir, const struct vk_graphics_pipeline_state *state)
++{
++   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
++   return nir_shader_intrinsics_pass(nir, lower_fragment_output_swizzle,
++                                     nir_metadata_control_flow, (void *)state);
++}
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index efa2fc92ec9c62f972a5aaca1f402088329b13e7..0f701d680fcf5568dac65a84132da2f656ed028a 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -281,57 +281,6 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
+    return glsl_count_attribute_slots(type, false);
+ }
+ 
+-static bool
+-kk_nir_swizzle_fragment_output(nir_builder *b, nir_intrinsic_instr *intrin,
+-                               void *data)
+-{
+-   if (intrin->intrinsic != nir_intrinsic_store_output &&
+-       intrin->intrinsic != nir_intrinsic_load_output)
+-      return false;
+-
+-   unsigned slot = nir_intrinsic_io_semantics(intrin).location;
+-   if (slot < FRAG_RESULT_DATA0)
+-      return false;
+-
+-   const struct vk_graphics_pipeline_state *state =
+-      (const struct vk_graphics_pipeline_state *)data;
+-   VkFormat vk_format =
+-      state->rp->color_attachment_formats[slot - FRAG_RESULT_DATA0];
+-   if (vk_format == VK_FORMAT_UNDEFINED)
+-      return false;
+-
+-   enum pipe_format format = vk_format_to_pipe_format(vk_format);
+-   const struct kk_va_format *supported_format = kk_get_va_format(format);
+-
+-   /* Check if we have to apply any swizzle */
+-   if (!supported_format->is_native) {
+-      unsigned channel_unswizzle[] = {
+-         supported_format->unswizzle.red, supported_format->unswizzle.green,
+-         supported_format->unswizzle.blue, supported_format->unswizzle.alpha};
+-
+-      if (intrin->intrinsic == nir_intrinsic_store_output) {
+-         unsigned channel_swizzle[4] = {0u};
+-         for (uint32_t i = 0u; i < 4; ++i)
+-            channel_swizzle[channel_unswizzle[i]] = i;
+-
+-         b->cursor = nir_before_instr(&intrin->instr);
+-         nir_def *to_replace = intrin->src[0].ssa;
+-         nir_def *swizzled = nir_swizzle(b, to_replace, channel_swizzle,
+-                                         to_replace->num_components);
+-         nir_src_rewrite(&intrin->src[0], swizzled);
+-      } else {
+-         b->cursor = nir_after_instr(&intrin->instr);
+-         nir_def *to_replace = &intrin->def;
+-         nir_def *swizzled = nir_swizzle(b, to_replace, channel_unswizzle,
+-                                         to_replace->num_components);
+-         nir_def_rewrite_uses_after(to_replace, swizzled);
+-      }
+-      return true;
+-   }
+-
+-   return false;
+-}
+-
+ static void
+ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+                 const struct vk_pipeline_robustness_state *rs,
+@@ -1296,8 +1245,7 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+             NULL);
+ 
+    /* Swizzle non-native formats' outputs */
+-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, kk_nir_swizzle_fragment_output,
+-            nir_metadata_control_flow, (void *)state);
++   NIR_PASS(_, nir, kk_nir_lower_fragment_output_swizzle, state);
+ 
+    NIR_PASS(_, nir, msl_nir_fs_io_types);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 9f0cd9139b883bc7e3332fff669f08347b3694ff..138de17daa7a8769e539537b27a22048f7f0b9d6 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -298,6 +298,10 @@ nir_def *kk_nir_border_compare(struct nir_builder *b, nir_def *op,
+ nir_def *kk_nir_border_probe_reference(struct nir_builder *b, nir_def *op,
+                                        unsigned bit_size);
+ 
++struct vk_graphics_pipeline_state;
++bool kk_nir_lower_fragment_output_swizzle(
++   nir_shader *nir, const struct vk_graphics_pipeline_state *state);
++
+ bool kk_nir_lower_textures(nir_shader *nir);
+ 
+ bool kk_nir_lower_vs_multiview(nir_shader *nir, uint32_t view_mask);
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 5bda031ed06c824e570e8cc18ddb94d6d0ea7b80..0fa84eb69971ae2cdb2cd7bd3f1c85d5e56f9834 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -98,6 +98,7 @@ kk_files = files(
+   'kk_instance.h',
+   'kk_instance.c',
+   'kk_nir_lower_custom_border.c',
++  'kk_nir_lower_fragment_output_swizzle.c',
+   'kk_nir_lower_descriptors.c',
+   'kk_nir_lower_multiview.c',
+   'kk_nir_lower_null_images.c',
+@@ -1063,6 +1064,26 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_fragment_output_swizzle',
++    executable(
++      'test_kosmickrisp_fragment_output_swizzle',
++      files('tests/test_fragment_output_swizzle.c'),
++      include_directories : kk_test_include_directories,
++      dependencies : [
++        idep_nir,
++        idep_vulkan_runtime_headers,
++        idep_vulkan_util_headers,
++        idep_vulkan_wsi_headers,
++        idep_msl_to_nir,
++        idep_libkk_shaders_h,
++      ],
++      link_whole : libkk,
++      link_args : ['-Wl,-undefined,dynamic_lookup'],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_rgb32_texel_lowering',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_fragment_output_swizzle.c b/src/kosmickrisp/vulkan/tests/test_fragment_output_swizzle.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cff37893083732e7505da0d39551150b16f2492
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_fragment_output_swizzle.c
+@@ -0,0 +1,160 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A colour format Metal only offers in another channel order is rendered to
++ * through the hardware's order, and the shader moves the channels.  A store
++ * that writes fewer than four channels is the case that breaks a naive
++ * value-only swizzle: the hardware lane a Vulkan channel belongs in can sit
++ * past the store's width, so the store has to cover all four lanes and name
++ * the written ones in its mask.
++ */
++
++#include "kosmickrisp/vulkan/kk_format.h"
++#include "kosmickrisp/vulkan/kk_shader.h"
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++#include "vk_format.h"
++#include "vk_graphics_state.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition)                                                       \
++   do {                                                                        \
++      if (!(condition)) {                                                       \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,      \
++                 #condition);                                                   \
++         abort();                                                               \
++      }                                                                         \
++   } while (0)
++
++static nir_shader *
++build_fragment_store(unsigned components)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &kk_nir_options, "fragment colour store");
++   nir_shader *nir = b.shader;
++   nir->info.io_lowered = true;
++
++   nir_def *channels[4];
++   for (unsigned i = 0; i < components; ++i)
++      channels[i] = nir_imm_int(&b, 0x10u + i);
++
++   nir_store_output(&b, nir_vec(&b, channels, components), nir_imm_int(&b, 0),
++                    .base = 0, .range = 1, .write_mask = BITFIELD_MASK(components),
++                    .component = 0, .src_type = nir_type_uint32,
++                    .io_semantics.location = FRAG_RESULT_DATA0,
++                    .io_semantics.num_slots = 1);
++   nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
++   return nir;
++}
++
++static nir_intrinsic_instr *
++find_store(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++            if (intrin->intrinsic == nir_intrinsic_store_output)
++               return intrin;
++         }
++      }
++   }
++   return NULL;
++}
++
++/* The constant a lane of the rebuilt store carries; a lane the shader never
++ * wrote is left undefined instead. */
++static uint64_t
++lane_value(nir_def *value, unsigned lane)
++{
++   nir_scalar scalar = nir_scalar_resolved(value, lane);
++   CHECK(nir_scalar_is_const(scalar));
++   return nir_scalar_as_uint(scalar);
++}
++
++static bool
++lane_is_undef(nir_def *value, unsigned lane)
++{
++   nir_scalar scalar = nir_scalar_resolved(value, lane);
++   return nir_def_instr(scalar.def)->type == nir_instr_type_undef;
++}
++
++static void
++check_format(VkFormat format, unsigned components)
++{
++   struct vk_render_pass_state rp = {
++      .color_attachment_count = 1,
++      .color_attachment_formats = {format},
++   };
++   struct vk_graphics_pipeline_state state = {.rp = &rp};
++
++   nir_shader *nir = build_fragment_store(components);
++   const bool progress = kk_nir_lower_fragment_output_swizzle(nir, &state);
++
++   const struct kk_va_format *supported =
++      kk_get_va_format(vk_format_to_pipe_format(format));
++   CHECK(supported != NULL);
++
++   nir_intrinsic_instr *store = find_store(nir);
++   CHECK(store != NULL);
++
++   if (supported->is_native) {
++      CHECK(!progress);
++      CHECK(store->num_components == components);
++      ralloc_free(nir);
++      return;
++   }
++
++   /* Every lane is written, in the hardware's order, and the mask names the
++    * lanes the Vulkan channels the shader wrote actually live in. */
++   CHECK(progress);
++   CHECK(store->num_components == 4);
++   CHECK(nir_intrinsic_component(store) == 0);
++
++   unsigned expected_mask = 0;
++   for (unsigned i = 0; i < components; ++i)
++      expected_mask |= BITFIELD_BIT(supported->unswizzle.channels[i]);
++   CHECK(nir_intrinsic_write_mask(store) == expected_mask);
++
++   nir_def *value = store->src[0].ssa;
++   CHECK(value->num_components == 4);
++   for (unsigned i = 0; i < components; ++i) {
++      const unsigned lane = supported->unswizzle.channels[i];
++      CHECK(lane_value(value, lane) == 0x10u + i);
++   }
++   for (unsigned lane = 0; lane < 4; ++lane) {
++      if (expected_mask & BITFIELD_BIT(lane))
++         continue;
++      CHECK(lane_is_undef(value, lane));
++   }
++   ralloc_free(nir);
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++
++   static const VkFormat formats[] = {
++      VK_FORMAT_B4G4R4A4_UNORM_PACK16,
++      VK_FORMAT_R4G4B4A4_UNORM_PACK16,
++      VK_FORMAT_R8G8B8A8_UNORM,
++   };
++
++   for (unsigned f = 0; f < ARRAY_SIZE(formats); ++f)
++      for (unsigned components = 1; components <= 4; ++components)
++         check_format(formats[f], components);
++
++   glsl_type_singleton_decref();
++   printf("fragment output swizzle: ok\n");
++   return 0;
++}

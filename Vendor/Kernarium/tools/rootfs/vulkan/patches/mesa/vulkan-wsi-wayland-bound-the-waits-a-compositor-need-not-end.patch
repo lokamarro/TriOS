@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 16:40:47 +0900
+Subject: [PATCH] vulkan/wsi/wayland: bound the waits a compositor need not end
+
+A FIFO swapchain on a compositor without wp_fifo_v1 is throttled with a
+wl_surface.frame callback: each present arms one and the next present waits
+for it. Common WSI waits for that callback with wl_display_dispatch_queue()
+and no bound, treating the callback as owed. It is not owed. A compositor
+sends frame callbacks only for a surface it is actually painting, so a surface
+that is occluded, unmapped, or on a compositor that has stopped repainting
+never receives one, and vkQueuePresentKHR - which takes no timeout and has no
+specification licence to block indefinitely - never returns. The application
+has no way out: a present that never completes cannot be cancelled, and the
+swapchain cannot be destroyed while it is in progress.
+
+Wait for that callback with a bound instead. Poll the display queue in 100 ms
+slices for at most a second, then destroy the outstanding callback and present
+un-throttled. Presentation still cannot outrun the compositor, because
+acquiring the next image waits for a wl_buffer.release, so at most image_count
+frames are ever in flight; only the extra one-frame pacing is lost, and only
+while the compositor is withholding callbacks. A compositor that paces
+normally answers within a refresh interval and never reaches the bound.
+
+vkWaitForPresentKHR has the neighbouring problem. An unbounded wait is what
+the application asked for and the specification says it never times out, so it
+must not be cut short and success must not be fabricated - but it should not
+be spent parked in one poll() that only the compositor can end. Spend it in a
+loop of 100 ms dispatches that re-reads the swapchain between slices, and
+report a swapchain that has been retired as VK_ERROR_OUT_OF_DATE_KHR rather
+than waiting for a present id its successor now owns. A real timeout still
+returns VK_TIMEOUT at the application's own deadline, and a failed display
+connection still ends the wait. vkWaitForPresent2KHR gets the same treatment.
+---
+ src/vulkan/wsi/wsi_common_wayland.c | 122 +++++++++++++++++++++++++---
+ 1 file changed, 111 insertions(+), 11 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_wayland.c b/src/vulkan/wsi/wsi_common_wayland.c
+index 33a4059617c0689ebc9c703a0ec1ae537692fe43..236738311d7be6ce20da5c3af52e6d6c48e34683 100644
+--- a/src/vulkan/wsi/wsi_common_wayland.c
++++ b/src/vulkan/wsi/wsi_common_wayland.c
+@@ -2760,6 +2760,28 @@ wsi_wl_swapchain_present_id_completes_in_finite_time_locked(struct wsi_wl_swapch
+    return present_id <= chain->present_ids.max_forward_progress_present_id;
+ }
+ 
++/* Longest a present wait blocks in one dispatch before it re-reads the
++ * swapchain state.
++ *
++ * An application may legitimately ask vkWaitForPresentKHR for an unbounded
++ * wait, and the specification says such a wait never times out, so the bound
++ * below is not a timeout: the wait still only ends when the present id
++ * completes, the swapchain goes out of date, or the display connection fails.
++ * It exists so that an unbounded wait is spent in a loop that observes those
++ * conditions rather than parked in a single poll() that only the compositor
++ * can end.
++ */
++#define WSI_WL_PRESENT_WAIT_SLICE_NS (100ull * 1000 * 1000)
++
++static void
++wsi_wl_present_wait_slice(struct timespec *end_time, uint64_t deadline)
++{
++   if (deadline == OS_TIMEOUT_INFINITE)
++      deadline = os_time_get_absolute_timeout(WSI_WL_PRESENT_WAIT_SLICE_NS);
++
++   timespec_from_nsec(end_time, deadline);
++}
++
+ static VkResult
+ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
+                                   uint64_t present_id,
+@@ -2822,9 +2844,14 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
+    /* If app timeout is beyond the deadline we set for reply,
+     * always treat the timeout as successful. */
+    VkResult timeout_result = assumed_success_at < atimeout ? VK_SUCCESS : VK_TIMEOUT;
+-   timespec_from_nsec(&end_time, MIN2(atimeout, assumed_success_at));
++   uint64_t deadline = MIN2(atimeout, assumed_success_at);
+ 
+    while (1) {
++      /* A retired swapchain never completes another present id: the surface
++       * belongs to its successor. */
++      if (chain->retired)
++         return VK_ERROR_OUT_OF_DATE_KHR;
++
+       err = mtx_lock(&chain->present_ids.lock);
+       if (err != thrd_success)
+          return VK_ERROR_OUT_OF_DATE_KHR;
+@@ -2836,7 +2863,13 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
+          return VK_SUCCESS;
+ 
+ retry:
++      wsi_wl_present_wait_slice(&end_time, deadline);
+       ret = dispatch_present_id_queue(wsi_chain, &end_time);
++      if (ret == VK_TIMEOUT && deadline == OS_TIMEOUT_INFINITE) {
++         /* Only this slice expired.  The application asked for an unbounded
++          * wait, so keep waiting, having re-read the swapchain state. */
++         continue;
++      }
+       if (ret == VK_TIMEOUT) {
+          if (timeout_result == VK_SUCCESS && chain->fifo && !chain->present_ids.frame_fallback) {
+             /* If there have been subsequent commits since when we made the decision to add a timeout,
+@@ -2846,7 +2879,7 @@ retry:
+                return VK_ERROR_OUT_OF_DATE_KHR;
+ 
+             if (wsi_wl_swapchain_present_id_completes_in_finite_time_locked(chain, present_id)) {
+-               timespec_from_nsec(&end_time, atimeout);
++               deadline = atimeout;
+                timeout_result = VK_TIMEOUT;
+             }
+             mtx_unlock(&chain->present_ids.lock);
+@@ -2911,7 +2944,6 @@ wsi_wl_swapchain_wait_for_present2(struct wsi_swapchain *wsi_chain,
+       atimeout = timeout;
+    else
+       atimeout = os_time_get_absolute_timeout(timeout);
+-   timespec_from_nsec(&end_time, atimeout);
+ 
+    /* Need to observe that the swapchain semaphore has been unsignalled,
+     * as this is guaranteed when a present is complete. */
+@@ -2921,6 +2953,11 @@ wsi_wl_swapchain_wait_for_present2(struct wsi_swapchain *wsi_chain,
+       return result;
+ 
+    while (1) {
++      /* A retired swapchain never completes another present id: the surface
++       * belongs to its successor. */
++      if (chain->retired)
++         return VK_ERROR_OUT_OF_DATE_KHR;
++
+       err = mtx_lock(&chain->present_ids.lock);
+       if (err != thrd_success)
+          return VK_ERROR_OUT_OF_DATE_KHR;
+@@ -2931,7 +2968,10 @@ wsi_wl_swapchain_wait_for_present2(struct wsi_swapchain *wsi_chain,
+       if (completed)
+          return VK_SUCCESS;
+ 
++      wsi_wl_present_wait_slice(&end_time, atimeout);
+       ret = dispatch_present_id_queue(wsi_chain, &end_time);
++      if (ret == VK_TIMEOUT && atimeout == OS_TIMEOUT_INFINITE)
++         continue;
+       if (ret != VK_SUCCESS)
+          return ret;
+    }
+@@ -3277,6 +3317,71 @@ set_timestamp(struct wsi_wl_swapchain *chain,
+    return true;
+ }
+ 
++/* Longest a present spends throttling on the previous frame callback.
++ *
++ * A FIFO swapchain on a compositor without wp_fifo_v1 is throttled with a
++ * wl_surface.frame callback: the previous present arms one and this present
++ * waits for it.  A compositor only owes that callback for a surface it is
++ * actually painting, so a surface that is occluded, unmapped, or on a
++ * compositor that has stopped repainting never receives one.  Waiting for it
++ * without a bound turns vkQueuePresentKHR - which has no timeout parameter and
++ * no spec licence to block indefinitely - into a hang the application cannot
++ * escape.
++ *
++ * Give up on the callback after this long and present un-throttled instead.
++ * Presentation cannot outrun the compositor even then, because acquiring the
++ * next image still waits for a wl_buffer.release, so at most image_count
++ * frames are ever in flight.  The bound is an order of magnitude above any
++ * plausible refresh interval, so a compositor that paces normally never
++ * reaches it.
++ */
++#define WSI_WL_LEGACY_FIFO_WAIT_NS (1000ull * 1000 * 1000)
++
++/* Slice the wait so a compositor that is merely slow is still observed
++ * promptly, and so the loop re-reads the connection between slices. */
++#define WSI_WL_LEGACY_FIFO_SLICE_NS (100ull * 1000 * 1000)
++
++/* Wait for the frame callback the previous present armed, or for the bound
++ * above.  Returns false only when the display connection failed.
++ */
++static bool
++wsi_wl_swapchain_await_legacy_fifo(struct wsi_wl_swapchain *chain,
++                                   bool *queue_dispatched)
++{
++   struct wsi_wl_display *display = chain->wsi_wl_surface->display;
++   uint64_t give_up_at =
++      os_time_get_absolute_timeout(WSI_WL_LEGACY_FIFO_WAIT_NS);
++
++   while (!chain->legacy_fifo_ready) {
++      struct timespec end_time;
++      uint64_t slice = os_time_get_absolute_timeout(WSI_WL_LEGACY_FIFO_SLICE_NS);
++
++      timespec_from_nsec(&end_time, MIN2(slice, give_up_at));
++      int ret = loader_wayland_dispatch(display->wl_display, display->queue,
++                                        &end_time);
++      if (ret < 0)
++         return false;
++      if (ret > 0)
++         *queue_dispatched = true;
++
++      if (chain->legacy_fifo_ready)
++         break;
++
++      if (os_time_get_nano() >= (int64_t)give_up_at) {
++         /* The callback is never going to arrive.  Drop it rather than leave
++          * it outstanding, so the callback this present arms owns the ready
++          * flag on its own. */
++         if (chain->frame) {
++            wl_callback_destroy(chain->frame);
++            chain->frame = NULL;
++         }
++         chain->legacy_fifo_ready = true;
++      }
++   }
++
++   return true;
++}
++
+ static VkResult
+ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+                                uint32_t image_index,
+@@ -3324,14 +3429,9 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+    /* For KHR_swapchain_maintenance1. We might have transitioned from FIFO to MAILBOX.
+     * In this case we need to let the FIFO request complete, before presenting MAILBOX. */
+-   while (!chain->legacy_fifo_ready) {
+-      int ret = wl_display_dispatch_queue(wsi_wl_surface->display->wl_display,
+-                                          wsi_wl_surface->display->queue);
+-      if (ret < 0)
+-         return VK_ERROR_OUT_OF_DATE_KHR;
+-
+-      queue_dispatched = true;
+-   }
++   if (!chain->legacy_fifo_ready &&
++       !wsi_wl_swapchain_await_legacy_fifo(chain, &queue_dispatched))
++      return VK_ERROR_OUT_OF_DATE_KHR;
+ 
+    if (chain->base.image_info.explicit_sync) {
+       struct wsi_wl_image *image = &chain->images[image_index];

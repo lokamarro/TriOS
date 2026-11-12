@@ -1,0 +1,307 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 22:57:57 +0900
+Subject: [PATCH] x87: an unmasked overflow or underflow rebiases a register
+ result
+
+While the control word unmasks overflow or underflow, x87 delivers an
+out-of-range result to a register with its significand rounded as if
+the exponent were unbounded, at the control word's precision, and its
+exponent brought back into range by 24576: down for an overflow, up
+for an underflow, which an exact tiny result raises too. A result
+still out of range after that overflows as if masked or becomes a
+zero. The helpers left the masked result, an infinity or a denormal.
+
+SoftFloat's state gains rebias bits, softfloat_rebias_overflow and
+softfloat_rebias_underflow, which only softfloat_roundPackToExtF80
+reads, so conversions to other formats, and so stores, never rebias.
+The x87 helpers set them from the control word.
+
+FSCALE built 2^n with exp2l and multiplied by it, so a scale beyond the
+format's own exponent range gave an infinity or a zero where the
+result itself is in range, such as 1.5 * 2^-16382 scaled by 20000. A
+new SoftFloat routine, extF80_scale, adds the truncated scale to the
+exponent and rounds once at full precision; a scale of zero leaves
+even a denormal alone, as on a Xeon 8581C.
+---
+ External/SoftFloat-3e/CMakeLists.txt          |  1 +
+ .../include/SoftFloat-3e/softfloat.h          |  2 +
+ .../include/SoftFloat-3e/softfloat_types.h    | 20 ++++++
+ External/SoftFloat-3e/src/extF80_scale.c      | 47 ++++++++++++++
+ .../SoftFloat-3e/src/s_roundPackToExtF80.c    | 62 +++++++++++++++++++
+ FEXCore/Source/Common/SoftFloat.h             | 36 ++++++-----
+ .../Core/Interpreter/Fallbacks/F80Fallbacks.h |  9 +++
+ 7 files changed, 161 insertions(+), 16 deletions(-)
+ create mode 100644 External/SoftFloat-3e/src/extF80_scale.c
+
+diff --git a/External/SoftFloat-3e/CMakeLists.txt b/External/SoftFloat-3e/CMakeLists.txt
+index ba903435815f6c84d6abe52220011712cbacf039..97af2da081c313c11d118ec1bf9b818c9f5205ea 100644
+--- a/External/SoftFloat-3e/CMakeLists.txt
++++ b/External/SoftFloat-3e/CMakeLists.txt
+@@ -5,6 +5,7 @@ add_library(softfloat_3e STATIC
+   src/extF80_div.c
+   src/extF80_sub.c
+   src/extF80_mul.c
++  src/extF80_scale.c
+   src/extF80_rem.c
+   src/extF80_x87Rem.c
+   src/extF80_sqrt.c
+diff --git a/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h b/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h
+index cef590039c2ecc396ff69a41b29151ec2ec343bc..1988beaa59ac1a448f43d5af04f808bd39714ed1 100644
+--- a/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h
++++ b/External/SoftFloat-3e/include/SoftFloat-3e/softfloat.h
+@@ -236,6 +236,8 @@ extFloat80_t extF80_sub( struct softfloat_state *, extFloat80_t, extFloat80_t );
+ FEXCORE_PRESERVE_ALL_ATTR
+ extFloat80_t extF80_mul( struct softfloat_state *, extFloat80_t, extFloat80_t );
+ FEXCORE_PRESERVE_ALL_ATTR
++extFloat80_t extF80_scale( struct softfloat_state *, extFloat80_t, int_fast32_t );
++FEXCORE_PRESERVE_ALL_ATTR
+ extFloat80_t extF80_div( struct softfloat_state *, extFloat80_t, extFloat80_t );
+ FEXCORE_PRESERVE_ALL_ATTR
+ extFloat80_t extF80_rem( struct softfloat_state *, extFloat80_t, extFloat80_t );
+diff --git a/External/SoftFloat-3e/include/SoftFloat-3e/softfloat_types.h b/External/SoftFloat-3e/include/SoftFloat-3e/softfloat_types.h
+index 61f69ba6003144828213689f45cb04e259b16361..fd44e2feef48b31de6f055361ff3d4860e212426 100644
+--- a/External/SoftFloat-3e/include/SoftFloat-3e/softfloat_types.h
++++ b/External/SoftFloat-3e/include/SoftFloat-3e/softfloat_types.h
+@@ -104,6 +104,21 @@ enum {
+     softfloat_flag_roundedUp = 64
+ };
+ 
++/*----------------------------------------------------------------------------
++| x87 exponent rebias.  While the x87 control word unmasks overflow or
++| underflow, an extended result out of range for a register destination
++| keeps its significand, rounded as if the exponent were unbounded, and has
++| its exponent brought back into range by 24576 (0x6000), raising the
++| exception.  An unmasked underflow is raised for a tiny result even when
++| it is exact.  A result still out of range after the adjustment overflows
++| as if masked, or becomes a zero.  Only softfloat_roundPackToExtF80 reads
++| this; conversions to other formats, and so stores, never rebias.
++*----------------------------------------------------------------------------*/
++enum {
++    softfloat_rebias_overflow  = 1,
++    softfloat_rebias_underflow = 2
++};
++
+ struct softfloat_state {
+ /*----------------------------------------------------------------------------
+ | Software floating-point underflow tininess-detection mode.
+@@ -125,6 +140,11 @@ uint8_t exceptionFlags; /* = 0 */
+ | Valid values are 32, 64, and 80.
+ *----------------------------------------------------------------------------*/
+ uint8_t roundingPrecision; /* = 80 */
++
++/*----------------------------------------------------------------------------
++| x87 exponent rebias for extended results: softfloat_rebias_* bits.
++*----------------------------------------------------------------------------*/
++uint8_t rebias; /* = 0 */
+ };
+ 
+ #endif
+diff --git a/External/SoftFloat-3e/src/extF80_scale.c b/External/SoftFloat-3e/src/extF80_scale.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..05f742c5d5be39e7714f3b6b7c91296b7a2097a9
+--- /dev/null
++++ b/External/SoftFloat-3e/src/extF80_scale.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*============================================================================
++
++An addition to the SoftFloat IEEE Floating-Point Arithmetic Package,
++Release 3e, by John R. Hauser, distributed under the package's terms.
++
++=============================================================================*/
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "platform.h"
++#include "internals.h"
++#include "softfloat.h"
++
++/*----------------------------------------------------------------------------
++| x87 FSCALE of a finite operand by 2^n: the operand with n added to its
++| exponent, rounded once, at full precision whatever the rounding precision.
++| A zero, an infinity or a NaN comes back as it is, and so does any operand,
++| a denormal one included, for n of zero.  Any n beyond 2^16 saturates the
++| result, x87 exponent rebias included, so it is clamped there.
++*----------------------------------------------------------------------------*/
++FEXCORE_PRESERVE_ALL_ATTR
++extFloat80_t extF80_scale( struct softfloat_state *state, extFloat80_t a, int_fast32_t n )
++{
++    union { struct extFloat80M s; extFloat80_t f; } uA;
++    uint_fast16_t uiA64;
++    uint_fast64_t sig;
++    bool sign;
++    int_fast32_t exp;
++    struct exp32_sig64 normExpSig;
++
++    uA.f = a;
++    uiA64 = uA.s.signExp;
++    sig = uA.s.signif;
++    sign = signExtF80UI64( uiA64 );
++    exp = expExtF80UI64( uiA64 );
++    if ( (exp == 0x7FFF) || ! sig || ! n ) return a;
++    if ( ! exp ) exp = 1;
++    if ( ! (sig & UINT64_C( 0x8000000000000000 )) ) {
++        normExpSig = softfloat_normSubnormalExtF80Sig( sig );
++        exp += normExpSig.exp;
++        sig = normExpSig.sig;
++    }
++    if ( 0x10000 < n ) n = 0x10000;
++    if ( n < -0x10000 ) n = -0x10000;
++    return softfloat_roundPackToExtF80( state, sign, exp + n, sig, 0, 80 );
++}
+diff --git a/External/SoftFloat-3e/src/s_roundPackToExtF80.c b/External/SoftFloat-3e/src/s_roundPackToExtF80.c
+index ea614fd5ce048d09ceb09997ec3ec4fe6baefe3b..3bd47e5474da50dbd0ec345abf64ebeda3f84b69 100644
+--- a/External/SoftFloat-3e/src/s_roundPackToExtF80.c
++++ b/External/SoftFloat-3e/src/s_roundPackToExtF80.c
+@@ -84,6 +84,32 @@ extFloat80_t
+     }
+     roundBits = sig & roundMask;
+     /*------------------------------------------------------------------------
++    | x87 exponent rebias (softfloat_rebias_overflow).
++    *------------------------------------------------------------------------*/
++    if ( state->rebias && (0x7FFD <= (uint32_t) (exp - 1)) ) {
++        if ( exp <= 0 ) {
++            if (
++                (state->rebias & softfloat_rebias_underflow)
++                    && (   (state->detectTininess
++                                == softfloat_tininess_beforeRounding)
++                        || (exp < 0)
++                        || (sig <= (uint64_t) (sig + roundIncrement)))
++            ) {
++                softfloat_raiseFlags( state, softfloat_flag_underflow );
++                exp += 0x6000;
++                if ( exp <= 0 ) goto rebiasedZero;
++            }
++        } else if (
++            (state->rebias & softfloat_rebias_overflow)
++                && (   (0x7FFE < exp)
++                    || ((exp == 0x7FFE)
++                            && ((uint64_t) (sig + roundIncrement) < sig)))
++        ) {
++            softfloat_raiseFlags( state, softfloat_flag_overflow );
++            exp -= 0x6000;
++        }
++    }
++    /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+     if ( 0x7FFD <= (uint32_t) (exp - 1) ) {
+         if ( exp <= 0 ) {
+@@ -163,6 +189,34 @@ extFloat80_t
+                 && sigExtra;
+     }
+     /*------------------------------------------------------------------------
++    | x87 exponent rebias (softfloat_rebias_overflow).
++    *------------------------------------------------------------------------*/
++    if ( state->rebias && (0x7FFD <= (uint32_t) (exp - 1)) ) {
++        if ( exp <= 0 ) {
++            if (
++                (state->rebias & softfloat_rebias_underflow)
++                    && (   (state->detectTininess
++                                == softfloat_tininess_beforeRounding)
++                        || (exp < 0)
++                        || ! doIncrement
++                        || (sig < UINT64_C( 0xFFFFFFFFFFFFFFFF )))
++            ) {
++                softfloat_raiseFlags( state, softfloat_flag_underflow );
++                exp += 0x6000;
++                if ( exp <= 0 ) goto rebiasedZero;
++            }
++        } else if (
++            (state->rebias & softfloat_rebias_overflow)
++                && (   (0x7FFE < exp)
++                    || ((exp == 0x7FFE)
++                            && (sig == UINT64_C( 0xFFFFFFFFFFFFFFFF ))
++                            && doIncrement))
++        ) {
++            softfloat_raiseFlags( state, softfloat_flag_overflow );
++            exp -= 0x6000;
++        }
++    }
++    /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+     if ( 0x7FFD <= (uint32_t) (exp - 1) ) {
+         if ( exp <= 0 ) {
+@@ -268,6 +322,14 @@ extFloat80_t
+             }
+         }
+     }
++    goto packReturn;
++    /*------------------------------------------------------------------------
++    | A result still tiny after the rebias is a zero.
++    *------------------------------------------------------------------------*/
++ rebiasedZero:
++    softfloat_raiseFlags( state, softfloat_flag_inexact );
++    exp = 0;
++    sig = 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+  packReturn:
+diff --git a/FEXCore/Source/Common/SoftFloat.h b/FEXCore/Source/Common/SoftFloat.h
+index 11837c316c19be252d2cc4f79dda0f3138feda55..039cd1f73669b42157fdd7cf8f630a59ea3328f0 100644
+--- a/FEXCore/Source/Common/SoftFloat.h
++++ b/FEXCore/Source/Common/SoftFloat.h
+@@ -304,23 +304,27 @@ struct FEX_PACKED X80SoftFloat {
+ 
+     return Result;
+ #else
+-    extFloat80_t Zero {0, 0};
+-    if (extF80_eq(state, lhs, Zero)) {
+-      // FSCALE(0, +Inf) is 0 * Inf, which is invalid. FSCALE(0, anything
+-      // else) is still 0.
+-      if (rhs.Top.Exponent == 0x7FFF && rhs.Top.Sign == 0 && (rhs.Significand & 0x7FFFFFFFFFFFFFFFULL) == 0) {
+-        state->exceptionFlags |= softfloat_flag_invalid;
+-        X80SoftFloat QNaN(0, 0x7FFFUL, 0xC000000000000000ULL);
+-        return QNaN;
+-      }
+-      return lhs;
++    // FSCALE adds ST(1), truncated, to ST(0)'s exponent and rounds once
++    // (extF80_scale), whatever the exponent's size: a factor of 2^n itself
++    // overflows long before the result does. A NaN propagates as in a
++    // multiplication; 2^+Inf is an infinity, which a zero makes invalid,
++    // and 2^-Inf a zero, which an infinity makes invalid.
++    const auto IsNaN = [](const X80SoftFloat& Value) {
++      return Value.Top.Exponent == 0x7FFF && (Value.Significand & 0x7FFF'FFFF'FFFF'FFFFULL) != 0;
++    };
++    if (IsNaN(lhs) || IsNaN(rhs)) {
++      return extF80_mul(state, lhs, rhs);
+     }
+-    X80SoftFloat Int = FRNDINT(state, rhs, softfloat_round_minMag);
+-    BIGFLOAT Src2_d = Int.ToFMax(state);
+-    Src2_d = FEXCore::cephes_128bit::exp2l(Src2_d);
+-    X80SoftFloat Src2_X80(state, Src2_d);
+-    X80SoftFloat Result = extF80_mul(state, lhs, Src2_X80);
+-    return Result;
++    if (rhs.Top.Exponent == 0x7FFF) {
++      const X80SoftFloat Infinity(0, 0x7FFFUL, 0x8000'0000'0000'0000ULL);
++      return rhs.Top.Sign ? extF80_div(state, lhs, Infinity) : extF80_mul(state, lhs, Infinity);
++    }
++    // Any n beyond 2^16 saturates the result.
++    int32_t N = rhs.Top.Sign ? -0x10000 : 0x10000;
++    if (rhs.Top.Exponent < 0x3FFF + 16) {
++      N = extF80_to_i32(state, rhs, softfloat_round_minMag, false);
++    }
++    return extF80_scale(state, lhs, N);
+ #endif
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+index 8f933869e2aea0948b3b19dd161a90901798176d..2c426b37cbd95cb426004715052a87d13ce4e994 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+@@ -33,6 +33,15 @@ FEXCORE_PRESERVE_ALL_ATTR static softfloat_state SoftFloatStateFromFCW(uint16_t
+   case 3: State.roundingMode = softfloat_round_minMag; break;
+   }
+ 
++  // While the control word unmasks overflow or underflow, an extended
++  // result out of range is rebiased, as x87 delivers it to a register.
++  if ((FCW & (1U << 3)) == 0) {
++    State.rebias |= softfloat_rebias_overflow;
++  }
++  if ((FCW & (1U << 4)) == 0) {
++    State.rebias |= softfloat_rebias_underflow;
++  }
++
+   return State;
+ }
+ 

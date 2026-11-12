@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 01:56:59 +0000
+Subject: [PATCH] aaudio: start a low-latency track with a small buffer
+
+A low-latency stream with a data callback whose app leaves the
+capacity unspecified gets a FAST track eight bursts long. The legacy
+path never sets the track's buffer size, so the buffer is the whole
+track, and the callback keeps it full: every burst adds to the output
+latency. The MMAP path starts its buffer at half its capacity.
+
+Start such a track's buffer at two bursts and grow it by one burst for
+each underrun the track reports, up to its capacity, which stays eight
+bursts. Once the app sets a buffer size, the stream leaves the size to
+it. A stream that sets its capacity, has no data callback or is not
+granted a FAST track keeps its whole track as its buffer.
+---
+ .../libaaudio/src/legacy/AudioStreamTrack.cpp | 50 +++++++++++++++++++
+ media/libaaudio/src/legacy/AudioStreamTrack.h | 11 ++++
+ 2 files changed, 61 insertions(+)
+
+diff --git a/media/libaaudio/src/legacy/AudioStreamTrack.cpp b/media/libaaudio/src/legacy/AudioStreamTrack.cpp
+index 7487bb687239fa99f321858b389f1cf98c4c1b89..9c998308a90078f657e08e6ed5f0e97a5886813f 100644
+--- a/media/libaaudio/src/legacy/AudioStreamTrack.cpp
++++ b/media/libaaudio/src/legacy/AudioStreamTrack.cpp
+@@ -43,6 +43,9 @@ using android::content::AttributionSourceState;
+ // Arbitrary and somewhat generous number of bursts.
+ #define DEFAULT_BURSTS_PER_BUFFER_CAPACITY     8
+ 
++// The bursts a stream that tunes its buffer size starts with (see tuneBufferSize()).
++#define DEFAULT_BURSTS_PER_TUNED_BUFFER        2
++
+ /*
+  * Create a stream that uses the AudioTrack.
+  */
+@@ -298,6 +301,20 @@ aaudio_result_t AudioStreamTrack::open(const AAudioStreamOpenRequest& openReques
+     }
+     setPerformanceMode(actualPerformanceMode);
+ 
++    // A FAST track of the default capacity holds eight bursts, and its callback keeps them
++    // full, so they all add to the latency. Start such a track with a small buffer instead and
++    // grow it when it underruns, until the app sets a size of its own.
++    if (notificationFrames < 0
++            && actualPerformanceMode == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY) {
++        std::lock_guard<std::mutex> lock(mBufferTuningLock);
++        const ssize_t size = mAudioTrack->setBufferSizeInFrames(
++                DEFAULT_BURSTS_PER_TUNED_BUFFER * getFramesPerBurst());
++        if (size > 0 && size < getBufferCapacity()) {
++            mTunedUnderrunCount = mAudioTrack->getUnderrunCount();
++            mTuningBufferSize.store(true);
++        }
++    }
++
+     setSharingMode(AAUDIO_SHARING_MODE_SHARED); // EXCLUSIVE mode not supported in legacy
+ 
+     // Log if we did not get what we asked for.
+@@ -443,6 +460,7 @@ aaudio_result_t AudioStreamTrack::requestStop_l() {
+ }
+ 
+ aaudio_result_t AudioStreamTrack::processCommands() {
++    tuneBufferSize();
+     status_t err;
+     aaudio_wrapping_frames_t position;
+     switch (getState()) {
+@@ -533,6 +551,9 @@ aaudio_result_t AudioStreamTrack::write(const void *buffer,
+ 
+ aaudio_result_t AudioStreamTrack::setBufferSize(int32_t requestedFrames)
+ {
++    // The app sizes the buffer from now on.
++    std::lock_guard<std::mutex> lock(mBufferTuningLock);
++    mTuningBufferSize.store(false);
+     // Do not ask for less than one burst.
+     if (requestedFrames < getFramesPerBurst()) {
+         requestedFrames = getFramesPerBurst();
+@@ -560,6 +581,35 @@ int32_t AudioStreamTrack::getXRunCount() const
+     return static_cast<int32_t>(mAudioTrack->getUnderrunCount());
+ }
+ 
++void AudioStreamTrack::tuneBufferSize() {
++    if (!mTuningBufferSize.load()) {
++        return;
++    }
++    const uint32_t underruns = mAudioTrack->getUnderrunCount();
++    std::lock_guard<std::mutex> lock(mBufferTuningLock);
++    // Check again under the lock: a size the app set meanwhile stays.
++    if (!mTuningBufferSize.load() || underruns == mTunedUnderrunCount) {
++        return;
++    }
++    const uint32_t newUnderruns = underruns - mTunedUnderrunCount;
++    mTunedUnderrunCount = underruns;
++    const ssize_t size = mAudioTrack->getBufferSizeInFrames();
++    if (size < 0) {
++        return;
++    }
++    const int32_t capacity = getBufferCapacity();
++    int64_t grownSize = size + int64_t{newUnderruns} * getFramesPerBurst();
++    if (grownSize > capacity) {
++        grownSize = capacity;
++    }
++    const ssize_t grown = mAudioTrack->setBufferSizeInFrames(static_cast<size_t>(grownSize));
++    ALOGD("%s() %u new underruns: buffer size %zd -> %zd of %d frames",
++          __func__, newUnderruns, size, grown, capacity);
++    if (grown < 0 || grown >= capacity) {
++        mTuningBufferSize.store(false);
++    }
++}
++
+ int32_t AudioStreamTrack::getFramesPerBurstFromDevice() const {
+     return static_cast<int32_t>(mAudioTrack->getNotificationPeriodInFrames());
+ }
+diff --git a/media/libaaudio/src/legacy/AudioStreamTrack.h b/media/libaaudio/src/legacy/AudioStreamTrack.h
+index ff41f04bb4ad9ae2497cab6879c5e3cecb9680cf..59177d61c2d841631bb1c6e6fbf54ddc880db678 100644
+--- a/media/libaaudio/src/legacy/AudioStreamTrack.h
++++ b/media/libaaudio/src/legacy/AudioStreamTrack.h
+@@ -139,6 +139,11 @@ protected:
+ 
+ private:
+ 
++    // A low-latency callback stream whose app leaves the capacity unspecified starts with a
++    // buffer of two bursts. This grows the buffer by one burst per underrun since its last
++    // call, up to the capacity, until the app sets a size of its own.
++    void tuneBufferSize();
++
+     android::sp<android::AudioTrack> mAudioTrack;
+ 
+     // adapts between variable sized blocks and fixed size blocks
+@@ -147,6 +152,12 @@ private:
+     // TODO add 64-bit position reporting to AudioTrack and use it.
+     aaudio_wrapping_frames_t         mPositionWhenPausing = 0;
+ 
++    // Whether the stream tunes its buffer size (see tuneBufferSize()).
++    std::atomic<bool>                mTuningBufferSize{false};
++    std::mutex                       mBufferTuningLock;
++    // The underruns that the buffer size already accounts for.
++    uint32_t                         mTunedUnderrunCount GUARDED_BY(mBufferTuningLock) = 0;
++
+     // Offload --------------------------------------------
+     std::atomic<int32_t>        mOffloadDelayFrames = 0;
+     std::atomic<int32_t>        mOffloadPaddingFrames = 0;

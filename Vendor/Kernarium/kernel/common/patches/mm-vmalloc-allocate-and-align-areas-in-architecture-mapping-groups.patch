@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:58:06 +0900
+Subject: [PATCH] mm: vmalloc: allocate and align areas in architecture mapping
+ groups
+
+An MMU that maps kernel virtual memory in units of several pages keeps
+a unit coherent with the other aliases of its frames only while it maps
+one naturally aligned, physically contiguous group. Let the architecture
+name that group order. vmalloc() then aligns every area to the group,
+rounds it to whole groups and allocates whole groups, splitting them so
+the area still tracks small pages; vmap() aligns its areas so that
+grouped pages map as whole groups. Kernel-private areas fall back to
+small pages when groups are unavailable, and so does an allocation that
+may not fail; VM_USERMAP areas do not, because a user mapping needs the
+group.
+
+remap_vmalloc_range_partial() now bounds a range that starts inside an
+area by what follows its start, not by the whole area, so that a caller
+may map from an interior address. It also says once when a range it
+maps holds a whole group that is not contiguous and aligned, and names
+the allocation, because such an area is incoherent with its user
+mapping.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/linux/vmalloc.h | 15 ++++++++
+ mm/vmalloc.c            | 81 ++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+index 380dcc5a470e810fb1d38f96e3429ec5dcab0940..179b22e71b4a181ab266c4a6c35b08db6ff1beef 100644
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@ -14,6 +14,21 @@
+ 
+ #include <asm/vmalloc.h>
+ 
++/*
++ * An architecture that maps kernel virtual memory in units of
++ * PAGE_SIZE << arch_vmap_group_order() keeps such a unit coherent with the
++ * other aliases of its frames only while it maps one naturally aligned,
++ * physically contiguous group of pages. vmalloc() then aligns every area to
++ * the unit and allocates whole groups; vmap() aligns its areas so that a
++ * caller passing grouped pages gets whole groups too.
++ */
++#ifndef arch_vmap_group_order
++static inline unsigned int arch_vmap_group_order(void)
++{
++	return 0;
++}
++#endif
++
+ struct vm_area_struct;		/* vma defining user mapping in mm_types.h */
+ struct notifier_block;		/* in notifier.h */
+ struct iov_iter;		/* in uio.h */
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 60025b682bc06a6c9917d43ca44bce0f9b5280c7..c19c76a5f2d372f8d5cb9d42807bfac69a944199 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -3543,7 +3543,13 @@ void *vmap(struct page **pages, unsigned int count,
+ 		return NULL;
+ 
+ 	size = (unsigned long)count << PAGE_SHIFT;
+-	area = get_vm_area_caller(size, flags, __builtin_return_address(0));
++	/* Align to the architecture's mapping group so that grouped pages
++	 * passed in by the caller map as whole groups. */
++	area = __get_vm_area_node(size, arch_vmap_group_order() ?
++				  PAGE_SIZE << arch_vmap_group_order() : 1,
++				  PAGE_SHIFT, flags, VMALLOC_START, VMALLOC_END,
++				  NUMA_NO_NODE, GFP_KERNEL,
++				  __builtin_return_address(0));
+ 	if (!area)
+ 		return NULL;
+ 
+@@ -3707,7 +3713,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+ 
+ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 				 pgprot_t prot, unsigned int page_shift,
+-				 int node)
++				 unsigned int group_order, int node)
+ {
+ 	const gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
+ 	bool nofail = gfp_mask & __GFP_NOFAIL;
+@@ -3716,6 +3722,7 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 	unsigned long array_size;
+ 	unsigned int nr_small_pages = size >> PAGE_SHIFT;
+ 	unsigned int page_order;
++	unsigned int alloc_order;
+ 	unsigned int flags;
+ 	int ret;
+ 
+@@ -3742,6 +3749,9 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 
+ 	set_vm_area_page_order(area, page_shift - PAGE_SHIFT);
+ 	page_order = vm_area_page_order(area);
++	/* Groups are allocated whole and split; the area still maps and
++	 * tracks small pages, so only the allocation order changes. */
++	alloc_order = max(page_order, group_order);
+ 
+ 	/*
+ 	 * High-order nofail allocations are really expensive and
+@@ -3751,9 +3761,9 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 	 * Please note, the __vmalloc_node_range_noprof() falls-back
+ 	 * to order-0 pages if high-order attempt is unsuccessful.
+ 	 */
+-	area->nr_pages = vm_area_alloc_pages((page_order ?
++	area->nr_pages = vm_area_alloc_pages((alloc_order ?
+ 		gfp_mask & ~__GFP_NOFAIL : gfp_mask) | __GFP_NOWARN,
+-		node, page_order, nr_small_pages, area->pages);
++		node, alloc_order, nr_small_pages, area->pages);
+ 
+ 	atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+ 	/* All pages of vm should be charged to same memcg, so use first one. */
+@@ -3776,7 +3786,7 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 		 * Since we always retry allocations at order-0 in the huge page
+ 		 * case a warning for either is spurious.
+ 		 */
+-		if (!fatal_signal_pending(current) && page_order == 0)
++		if (!fatal_signal_pending(current) && alloc_order == 0)
+ 			warn_alloc(gfp_mask, NULL,
+ 				"vmalloc error: size %lu, failed to allocate pages",
+ 				area->nr_pages * PAGE_SIZE);
+@@ -3852,6 +3862,7 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
+ 			const void *caller)
+ {
+ 	struct vm_struct *area;
++	unsigned int group_order = arch_vmap_group_order();
+ 	void *ret;
+ 	kasan_vmalloc_flags_t kasan_flags = KASAN_VMALLOC_NONE;
+ 	unsigned long original_align = align;
+@@ -3884,9 +3895,13 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
+ 	}
+ 
+ again:
+-	area = __get_vm_area_node(size, align, shift, VM_ALLOC |
+-				  VM_UNINITIALIZED | vm_flags, start, end, node,
+-				  gfp_mask, caller);
++	area = __get_vm_area_node(size,
++				  group_order ?
++					max(align, PAGE_SIZE << group_order) :
++					align,
++				  max(shift, PAGE_SHIFT + group_order),
++				  VM_ALLOC | VM_UNINITIALIZED | vm_flags,
++				  start, end, node, gfp_mask, caller);
+ 	if (!area) {
+ 		bool nofail = gfp_mask & __GFP_NOFAIL;
+ 		warn_alloc(gfp_mask, NULL,
+@@ -3924,7 +3939,8 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
+ 	}
+ 
+ 	/* Allocate physical pages and map them into vmalloc space. */
+-	ret = __vmalloc_area_node(area, gfp_mask, prot, shift, node);
++	ret = __vmalloc_area_node(area, gfp_mask, prot, shift, group_order,
++				  node);
+ 	if (!ret)
+ 		goto fail;
+ 
+@@ -3961,6 +3977,16 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
+ 		align = original_align;
+ 		goto again;
+ 	}
++	/*
++	 * Memory shared with user space must stay coherent with its user
++	 * mappings, so only kernel-private areas fall back to small pages,
++	 * and an allocation that may not fail does too.
++	 */
++	if (group_order &&
++	    (!(vm_flags & VM_USERMAP) || (gfp_mask & __GFP_NOFAIL))) {
++		group_order = 0;
++		goto again;
++	}
+ 
+ 	return NULL;
+ }
+@@ -4554,6 +4580,37 @@ long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
+ 	return count - remains;
+ }
+ 
++/*
++ * Memory that user space maps stays coherent with its kernel alias only
++ * while each architecture mapping group inside it is a naturally aligned,
++ * physically contiguous run of pages. Say so, once, when a caller maps a
++ * whole group that is not. A range that covers no whole group, such as a
++ * small ring buffer, is the caller's to keep coherent.
++ */
++static void vmap_check_user_groups(const struct vm_struct *area,
++				   const void *kaddr, unsigned long size)
++{
++	const unsigned long group = 1UL << arch_vmap_group_order();
++	const unsigned long bytes = group << PAGE_SHIFT;
++	unsigned long addr = ALIGN((unsigned long)kaddr, bytes);
++	const unsigned long end = round_down((unsigned long)kaddr + size, bytes);
++	unsigned long pfn, i;
++
++	for (; addr < end; addr += bytes) {
++		pfn = page_to_pfn(vmalloc_to_page((void *)addr));
++		if (pfn & (group - 1))
++			goto warn;
++		for (i = 1; i < group; i++)
++			if (page_to_pfn(vmalloc_to_page(
++				    (void *)(addr + (i << PAGE_SHIFT)))) != pfn + i)
++				goto warn;
++	}
++	return;
++warn:
++	pr_warn_once("remap_vmalloc_range: memory from %pS is not whole aligned groups; its kernel and user views may differ\n",
++		     area->caller);
++}
++
+ /**
+  * remap_vmalloc_range_partial - map vmalloc pages to userspace
+  * @vma:		vma to cover
+@@ -4594,11 +4651,15 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
+ 	if (!(area->flags & (VM_USERMAP | VM_DMA_COHERENT)))
+ 		return -EINVAL;
+ 
++	/* kaddr may lie inside the area; bound the range by what follows it. */
+ 	if (check_add_overflow(size, off, &end_index) ||
+-	    end_index > get_vm_area_size(area))
++	    end_index > get_vm_area_size(area) - (kaddr - area->addr))
+ 		return -EINVAL;
+ 	kaddr += off;
+ 
++	if (arch_vmap_group_order())
++		vmap_check_user_groups(area, kaddr, size);
++
+ 	do {
+ 		struct page *page = vmalloc_to_page(kaddr);
+ 		int ret;

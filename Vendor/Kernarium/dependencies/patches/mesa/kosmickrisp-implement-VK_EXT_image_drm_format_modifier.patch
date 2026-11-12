@@ -1,0 +1,624 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 11:24:15 +0900
+Subject: [PATCH] kosmickrisp: implement VK_EXT_image_drm_format_modifier
+
+The Android 2025 baseline that VP_ANDROID_17_requirements inherits makes this
+extension mandatory, and the guest Venus driver uses it as the other of the two
+conditions for offering VK_ANDROID_native_buffer and the Android hardware
+buffer import.
+
+The driver already sized and validated VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+images: the layout code treats every non-optimal tiling as linear, the image
+format query restricts a modifier image to a single 2D level and layer, and its
+memory requirements ask for a dedicated allocation. What was missing was the
+extension itself, so nothing could ask for one.
+
+Metal describes no tiling an agent outside this driver could agree on, so
+DRM_FORMAT_MOD_LINEAR is the only modifier offered, the way lavapipe does it on
+a platform without real modifiers. A modifier image is then exactly a linear
+image with a name for its layout, and that decides the rest: the modifier is
+reported for the formats linear tiling supports, the image format query answers
+about linear tiling once it has seen a supported modifier, and an explicit plane
+layout is accepted only where it matches the layout Metal's own alignment rule
+produces, because this driver cannot lay a texture out any other way.
+
+A modifier image does carry one capability plain linear tiling does not: it can
+be a colour attachment. Advertising a modifier that nothing renderable can use
+breaks every window system that presents through one, because Mesa's common WSI
+filters the modifier list with vkGetPhysicalDeviceImageFormatProperties2 and has
+no fallback when nothing survives -- it fails vkCreateSwapchainKHR with
+VK_ERROR_OUT_OF_HOST_MEMORY, which dEQP records as a ResourceError that ends the
+whole CTS session. Metal renders into a linear texture perfectly well, and this
+driver already asks for MTLTextureUsageRenderTarget whenever a linear image is a
+transfer destination. What Metal refuses, by an assertion that ends the process,
+is a linear texture of any type but MTLTextureType2D, and this driver binds every
+input attachment as a 2D array. So a linear layout refuses an input attachment
+rather than a colour attachment, plain linear tiling keeps the capabilities it
+has always had, and a layout Metal could not represent becomes a Vulkan error
+before Metal ever sees the descriptor. kk_linear_layout.h owns that policy and
+its Meson test pins it.
+
+The modifier is kept in struct kk_image rather than struct vk_image, whose
+drm_format_mod field the common runtime carries only on Linux and the BSDs.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_format.c            |  55 +++++-
+ src/kosmickrisp/vulkan/kk_image.c             | 158 ++++++++++++++++--
+ src/kosmickrisp/vulkan/kk_image.h             |   8 +
+ src/kosmickrisp/vulkan/kk_image_layout.c      |   9 +
+ src/kosmickrisp/vulkan/kk_linear_layout.h     |  67 ++++++++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   1 +
+ src/kosmickrisp/vulkan/meson.build            |  10 ++
+ .../vulkan/tests/test_linear_layout.c         |  92 ++++++++++
+ 8 files changed, 384 insertions(+), 16 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_linear_layout.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_linear_layout.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_format.c b/src/kosmickrisp/vulkan/kk_format.c
+index 6512a40d8ada6748b16bd2d2096b23b3b6ea2537..08eeba36f09f019b5c2803450b843af1e62470d1 100644
+--- a/src/kosmickrisp/vulkan/kk_format.c
++++ b/src/kosmickrisp/vulkan/kk_format.c
+@@ -16,6 +16,9 @@
+ 
+ #include "vk_enum_defines.h"
+ #include "vk_format.h"
++#include "vk_util.h"
++
++#include "drm-uapi/drm_fourcc.h"
+ 
+ #define MTL_FMT_ALL_NO_ATOMIC(width)                                           \
+    .bit_widths = width, .filter = 1u, .write = 1u, .color = 1u, .blend = 1u,   \
+@@ -389,11 +392,17 @@ kk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+ {
+    VK_FROM_HANDLE(kk_physical_device, pdevice, physicalDevice);
+ 
+-   VkFormatFeatureFlags2 linear2, optimal2, buffer2;
++   VkFormatFeatureFlags2 linear2, optimal2, buffer2, modifier2;
+    linear2 =
+       kk_get_image_format_features(pdevice, format, VK_IMAGE_TILING_LINEAR, 0);
+    optimal2 =
+       kk_get_image_format_features(pdevice, format, VK_IMAGE_TILING_OPTIMAL, 0);
++   /* A modifier image is a linear image that may also be rendered into, so
++    * the modifier lists below report its own feature set, not linear
++    * tiling's. */
++   modifier2 = kk_get_image_format_features(
++      pdevice, format, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      DRM_FORMAT_MOD_LINEAR);
+    buffer2 = kk_get_buffer_format_features(pdevice, format);
+ 
+    pFormatProperties->formatProperties = (VkFormatProperties){
+@@ -412,6 +421,50 @@ kk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+          break;
+       }
+ 
++      /* Metal describes no tiling that an agent outside this driver could
++       * agree on, so DRM_FORMAT_MOD_LINEAR is the only modifier offered, and
++       * it is offered exactly for the formats a linear image can use. */
++      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT: {
++         VkDrmFormatModifierPropertiesListEXT *list = (void *)ext;
++         VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
++                                list->pDrmFormatModifierProperties,
++                                &list->drmFormatModifierCount);
++         if (modifier2 != 0) {
++            vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
++                                     mod)
++            {
++               *mod = (VkDrmFormatModifierPropertiesEXT){
++                  .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++                  .drmFormatModifierPlaneCount =
++                     vk_format_get_plane_count(format),
++                  .drmFormatModifierTilingFeatures =
++                     vk_format_features2_to_features(modifier2),
++               };
++            }
++         }
++         break;
++      }
++
++      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT: {
++         VkDrmFormatModifierPropertiesList2EXT *list = (void *)ext;
++         VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
++                                list->pDrmFormatModifierProperties,
++                                &list->drmFormatModifierCount);
++         if (modifier2 != 0) {
++            vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
++                                     mod)
++            {
++               *mod = (VkDrmFormatModifierProperties2EXT){
++                  .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++                  .drmFormatModifierPlaneCount =
++                     vk_format_get_plane_count(format),
++                  .drmFormatModifierTilingFeatures = modifier2,
++               };
++            }
++         }
++         break;
++      }
++
+       default:
+          vk_debug_ignored_stype(ext->sType);
+          break;
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index e471adeb520cc849e53c3bd0b7e85cdb259a8412..ef38be429500e3de85e20f05d9481f6fd1eba61b 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -7,6 +7,8 @@
+ 
+ #include "kk_image.h"
+ 
++#include "kk_linear_layout.h"
++
+ #include "kk_buffer_view.h"
+ #include "kk_device.h"
+ #include "kk_device_memory.h"
+@@ -25,6 +27,8 @@
+ #include "vk_semaphore.h"
+ #include "wsi_common_private.h"
+ 
++#include "drm-uapi/drm_fourcc.h"
++
+ #include <vulkan/vulkan_metal.h>
+ 
+ static VkFormatFeatureFlags2
+@@ -34,6 +38,19 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+ {
+    VkFormatFeatureFlags2 features = 0;
+ 
++   /* DRM_FORMAT_MOD_LINEAR is the only modifier this driver exposes, because
++    * Metal describes no tiling an outside agent could agree on. A modifier
++    * image is therefore laid out exactly like a linear one, and has a linear
++    * image's capabilities plus the colour attachment a swapchain image needs
++    * (see kk_linear_layout.h). */
++   const bool modifier_layout =
++      tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++   if (modifier_layout) {
++      if (drm_format_mod != DRM_FORMAT_MOD_LINEAR)
++         return 0;
++      tiling = VK_IMAGE_TILING_LINEAR;
++   }
++
+    /* Metal does not support linear tiling for compressed formats */
+    if (tiling == VK_IMAGE_TILING_LINEAR && vk_format_is_compressed(vk_format))
+       return 0;
+@@ -69,7 +86,8 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+    }
+ 
+    /* We disable A8 format due to lower blend pass issues */
+-   if (va_format->color && tiling != VK_IMAGE_TILING_LINEAR &&
++   if (va_format->color &&
++       (tiling != VK_IMAGE_TILING_LINEAR || modifier_layout) &&
+        vk_format != VK_FORMAT_A8_UNORM) {
+       features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+       features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
+@@ -237,6 +255,33 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+    memset(&pImageFormatProperties->imageFormatProperties, 0,
+           sizeof(pImageFormatProperties->imageFormatProperties));
+ 
++   /* A modifier image is a linear image with an agreed layout, and
++    * DRM_FORMAT_MOD_LINEAR is the only modifier this driver offers. Every
++    * limit a linear image has applies, so ask the rest of this function about
++    * linear tiling once the modifier is known to be one we support. */
++   uint64_t drm_format_mod = DRM_FORMAT_MOD_INVALID;
++   VkImageTiling tiling = pImageFormatInfo->tiling;
++   if (tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
++      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
++         vk_find_struct_const(pImageFormatInfo->pNext,
++                              PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
++      if (mod_info == NULL ||
++          mod_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR)
++         return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++      /* This driver has one queue family, so a concurrent modifier image can
++       * only name that family. */
++      if (mod_info->sharingMode == VK_SHARING_MODE_CONCURRENT) {
++         for (uint32_t i = 0; i < mod_info->queueFamilyIndexCount; i++) {
++            if (mod_info->pQueueFamilyIndices[i] != 0)
++               return VK_ERROR_FORMAT_NOT_SUPPORTED;
++         }
++      }
++
++      drm_format_mod = mod_info->drmFormatModifier;
++   }
++   const bool linear_layout = kk_tiling_is_linear_layout(tiling);
++
+    /* Metal does not support depth/stencil textures that are not 2D (we make 1D
+     * textures 2D) */
+    if (vk_format_is_depth_or_stencil(pImageFormatInfo->format) &&
+@@ -261,34 +306,29 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+    VkFormatFeatureFlags2 features;
+    if (ycbcr_info == NULL) {
+       features = kk_get_image_plane_format_features(
+-         pdev, pImageFormatInfo->format, pImageFormatInfo->tiling, 0u);
++         pdev, pImageFormatInfo->format, tiling, drm_format_mod);
+    } else {
+       features = ~0ull;
+       assert(ycbcr_info->n_planes > 0);
+       for (uint8_t plane = 0; plane < ycbcr_info->n_planes; plane++) {
+          const VkFormat plane_format = ycbcr_info->planes[plane].format;
+          features &= kk_get_image_plane_format_features(
+-            pdev, plane_format, pImageFormatInfo->tiling, 0u);
++            pdev, plane_format, tiling, drm_format_mod);
+       }
+    }
+ 
+    if (features == 0)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+-   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+-       pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
++   if (linear_layout && pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+-   /* TODO_KOSMICKRISP Linear images cannot be used as color attachments as long
+-    * as input attachments are changed to arrays. Vulkan specifies that any
+-    * image format supporting the color attachment feature also supports being
+-    * used as an input attachment, and Metal disallows arrays for linear
+-    * textures.
+-    */
+-   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+-       (pImageFormatInfo->usage &
+-        (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+-         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
++   /* A linear layout renders, but only as a plain 2D texture: this driver
++    * binds an input attachment as a 2D array, which Metal refuses to make out
++    * of a buffer. kk_linear_layout.h owns which attachment usages survive
++    * that, and a modifier image keeps the colour attachment a swapchain image
++    * is created with. */
++   if (kk_linear_layout_refuses_usage(tiling, pImageFormatInfo->usage))
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
+@@ -537,6 +577,48 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
+ {
+    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
+ 
++   image->drm_format_mod = DRM_FORMAT_MOD_INVALID;
++
++   const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit = NULL;
++
++   /* DRM_FORMAT_MOD_LINEAR is the only one offered, so both ways of
++    * asking for a modifier image can only arrive at it, and an explicit
++    * layout is honoured only where it agrees with the layout this driver
++    * would compute for the same image. */
++   if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
++      const VkImageDrmFormatModifierListCreateInfoEXT *mod_list =
++         vk_find_struct_const(pCreateInfo->pNext,
++                              IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
++      mod_explicit = vk_find_struct_const(
++         pCreateInfo->pNext,
++         IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
++
++      if (mod_list != NULL) {
++         bool found = false;
++         for (uint32_t i = 0; i < mod_list->drmFormatModifierCount; i++) {
++            if (mod_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR)
++               found = true;
++         }
++         if (!found) {
++            vk_image_finish(&image->vk);
++            return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                             "no supported DRM format modifier in the list");
++         }
++      } else if (mod_explicit != NULL) {
++         if (mod_explicit->drmFormatModifier != DRM_FORMAT_MOD_LINEAR) {
++            vk_image_finish(&image->vk);
++            return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                             "unsupported DRM format modifier");
++         }
++      } else {
++         vk_image_finish(&image->vk);
++         return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                          "modifier tiling needs a modifier list or layout");
++      }
++
++      image->drm_format_mod = DRM_FORMAT_MOD_LINEAR;
++   }
++
+    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+        image->vk.samples > 1) {
+@@ -589,6 +671,52 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
+       }
+    }
+ 
++   /* An explicit layout describes memory this driver did not lay out. Metal
++    * fixes a linear texture's row pitch through its own alignment rule, so
++    * the only explicit layout that can be bound here is the one this driver
++    * would have produced; anything else has to be refused rather than
++    * silently ignored. */
++   if (mod_explicit != NULL) {
++      if (mod_explicit->drmFormatModifierPlaneCount != image->plane_count) {
++         vk_image_finish(&image->vk);
++         return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
++                          "explicit layout describes %u planes, image has %u",
++                          mod_explicit->drmFormatModifierPlaneCount,
++                          (unsigned)image->plane_count);
++      }
++
++      for (uint8_t plane = 0; plane < image->plane_count; plane++) {
++         const struct kk_image_layout *layout = &image->planes[plane].layout;
++         const VkSubresourceLayout *given = &mod_explicit->pPlaneLayouts[plane];
++
++         if (given->offset != 0 || given->rowPitch != layout->linear_stride_B ||
++             (given->size != 0 && given->size != layout->size_B) ||
++             given->arrayPitch != 0 || given->depthPitch != 0) {
++            vk_image_finish(&image->vk);
++            return vk_errorf(
++               dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
++               "plane %u wants offset %llu pitch %llu, Metal lays it out at "
++               "offset 0 pitch %u",
++               (unsigned)plane, (unsigned long long)given->offset,
++               (unsigned long long)given->rowPitch,
++               (unsigned)layout->linear_stride_B);
++         }
++      }
++   }
++
++   return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_GetImageDrmFormatModifierPropertiesEXT(
++   VkDevice device, VkImage _image,
++   VkImageDrmFormatModifierPropertiesEXT *pProperties)
++{
++   VK_FROM_HANDLE(kk_image, image, _image);
++
++   assert(image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
++   pProperties->drmFormatModifier = image->drm_format_mod;
++
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_image.h b/src/kosmickrisp/vulkan/kk_image.h
+index 33afaa676a436b1f924d6fc00aff642f127909dd..8f4e3b4e689969ce8ffe9a9179953b291af0010b 100644
+--- a/src/kosmickrisp/vulkan/kk_image.h
++++ b/src/kosmickrisp/vulkan/kk_image.h
+@@ -52,6 +52,14 @@ struct kk_image {
+ 
+    uint8_t plane_count;
+    struct kk_image_plane planes[3];
++
++   /* VK_EXT_image_drm_format_modifier.
++    *
++    * DRM_FORMAT_MOD_INVALID unless the image was created with
++    * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT.  The common runtime carries
++    * this field only on Linux and the BSDs, so this driver keeps its own.
++    */
++   uint64_t drm_format_mod;
+ };
+ 
+ #define kk_foreach_slice(ndx, image, subresource_member)                       \
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.c b/src/kosmickrisp/vulkan/kk_image_layout.c
+index b746720288d3a4a4718a7974968b439b3fa86e7e..707e9efd32fa9950cd2831c172558a615cb6be1f 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.c
++++ b/src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -9,6 +9,7 @@
+ #include "kk_device.h"
+ #include "kk_format.h"
+ #include "kk_image_extent.h"
++#include "kk_linear_layout.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/mtl_format.h"
+@@ -252,6 +253,14 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
+    if (!kk_image_extent_is_creatable(&extent))
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
++   /* A linear texture is a texture over a MTLBuffer, and Metal answers any
++    * type but MTLTextureType2D for one with an assertion that ends the
++    * process. The image format query already refuses the usages that would
++    * ask for another type; this is what stops a descriptor Metal cannot
++    * represent even when nothing consulted that query. */
++   if (layout->linear && !kk_linear_layout_type_is_creatable(layout->type))
++      return VK_ERROR_INITIALIZATION_FAILED;
++
+    if (layout->linear) {
+       kk_image_layout_calc_linear(dev, layout);
+    } else {
+diff --git a/src/kosmickrisp/vulkan/kk_linear_layout.h b/src/kosmickrisp/vulkan/kk_linear_layout.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e3033f8b37b45eb83f5ea105cdf492cfd04ea46
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_linear_layout.h
+@@ -0,0 +1,67 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_LINEAR_LAYOUT_H
++#define KK_LINEAR_LAYOUT_H 1
++
++#include "kosmickrisp/bridge/mtl_types.h"
++
++#include <vulkan/vulkan_core.h>
++
++#include <stdbool.h>
++
++/* Metal lays out both VK_IMAGE_TILING_LINEAR and this driver's only DRM
++ * format modifier, DRM_FORMAT_MOD_LINEAR, as a texture over a MTLBuffer.
++ *
++ * Such a texture renders: Metal accepts MTLTextureUsageRenderTarget on it,
++ * and this driver already asks for one whenever a linear image is a transfer
++ * destination. What Metal refuses, by an assertion that ends the process, is
++ * a linear texture of any type but MTLTextureType2D -- and this driver binds
++ * every input attachment as a 2D array.
++ *
++ * A modifier image is therefore offered as a colour attachment, because a
++ * Wayland swapchain image is exactly that and common WSI has no fallback when
++ * no modifier can hold one, while plain linear tiling keeps the capabilities
++ * it has always had. Both refuse an input attachment, and neither has a
++ * depth or stencil texture in Metal at all.
++ */
++static inline bool
++kk_tiling_is_linear_layout(VkImageTiling tiling)
++{
++   return tiling == VK_IMAGE_TILING_LINEAR ||
++          tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++}
++
++static inline bool
++kk_linear_layout_renders(VkImageTiling tiling)
++{
++   return tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++}
++
++static inline bool
++kk_linear_layout_refuses_usage(VkImageTiling tiling, VkImageUsageFlags usage)
++{
++   if (!kk_tiling_is_linear_layout(tiling))
++      return false;
++
++   if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
++      return true;
++
++   if (usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
++      return true;
++
++   return (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
++          !kk_linear_layout_renders(tiling);
++}
++
++/* The one Metal texture type a linear layout can have. A descriptor Metal
++ * cannot represent has to become a Vulkan error before it reaches Metal. */
++static inline bool
++kk_linear_layout_type_is_creatable(enum mtl_texture_type type)
++{
++   return type == MTL_TEXTURE_TYPE_2D;
++}
++
++#endif /* KK_LINEAR_LAYOUT_H */
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index fb3cd714bb3a433a3413a1ce6160011528322886..42716090f5c48b55a0081ec11684e307622b7498 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -181,6 +181,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_metal_objects = true,
+       .EXT_hdr_metadata = true,
+       .EXT_image_2d_view_of_3d = true,
++      .EXT_image_drm_format_modifier = true,
+       .EXT_legacy_vertex_attributes = true,
+       .EXT_load_store_op_none = true,
+       .EXT_memory_budget = true,
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 0fa84eb69971ae2cdb2cd7bd3f1c85d5e56f9834..2b05f2e146f9f6a5c6b64c3121d1ff7c9bf7d1b9 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -946,6 +946,16 @@ if with_tests
+     suite : ['kosmickrisp'],
+   )
+ 
++  test(
++    'kosmickrisp_linear_layout',
++    executable(
++      'test_kosmickrisp_linear_layout',
++      files('tests/test_linear_layout.c'),
++      include_directories : [inc_include, inc_src],
++    ),
++    suite : ['kosmickrisp'],
++  )
++
+   test(
+     'kosmickrisp_depth_clip',
+     executable(
+diff --git a/src/kosmickrisp/vulkan/tests/test_linear_layout.c b/src/kosmickrisp/vulkan/tests/test_linear_layout.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e2bfa65cdce9a797663cc6a0901b5538278a764
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_linear_layout.c
+@@ -0,0 +1,92 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kosmickrisp/vulkan/kk_linear_layout.h"
++
++#include <assert.h>
++
++/* A Wayland swapchain image is a colour attachment, and common WSI asks this
++ * driver about one modifier at a time: it filters the modifier list with
++ * vkGetPhysicalDeviceImageFormatProperties2 and, when nothing survives, it
++ * has no fallback and fails vkCreateSwapchainKHR with
++ * VK_ERROR_OUT_OF_HOST_MEMORY -- which dEQP records as a ResourceError that
++ * ends the whole CTS session. The one modifier this driver offers therefore
++ * has to hold a colour attachment. */
++static void
++check_a_modifier_image_can_be_a_colour_attachment(void)
++{
++   assert(!kk_linear_layout_refuses_usage(
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
++
++   /* The rest of a swapchain image's usual usage. */
++   assert(!kk_linear_layout_refuses_usage(
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++         VK_IMAGE_USAGE_STORAGE_BIT));
++}
++
++/* Metal makes a linear texture out of a MTLBuffer and refuses any type but
++ * MTLTextureType2D for one, by an assertion that ends the host process. This
++ * driver binds every input attachment as a 2D array, so a linear layout can
++ * never carry one; Metal has no linear depth or stencil texture at all. */
++static void
++check_a_linear_layout_refuses_what_metal_cannot_represent(void)
++{
++   const VkImageTiling linear_layouts[] = {
++      VK_IMAGE_TILING_LINEAR,
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++   };
++
++   for (unsigned i = 0; i < 2u; i++) {
++      assert(kk_tiling_is_linear_layout(linear_layouts[i]));
++      assert(kk_linear_layout_refuses_usage(
++         linear_layouts[i], VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
++      assert(kk_linear_layout_refuses_usage(
++         linear_layouts[i], VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                               VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
++      assert(kk_linear_layout_refuses_usage(
++         linear_layouts[i], VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
++   }
++
++   assert(!kk_linear_layout_type_is_creatable(MTL_TEXTURE_TYPE_2D_ARRAY));
++   assert(!kk_linear_layout_type_is_creatable(MTL_TEXTURE_TYPE_2D_MULTISAMPLE));
++   assert(!kk_linear_layout_type_is_creatable(MTL_TEXTURE_TYPE_3D));
++   assert(kk_linear_layout_type_is_creatable(MTL_TEXTURE_TYPE_2D));
++}
++
++/* Plain linear tiling keeps the capabilities it has always had: a colour
++ * attachment there would have to answer for an input attachment too, because
++ * nothing narrows what an application may create with a format that reports
++ * VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT. */
++static void
++check_plain_linear_tiling_is_unchanged(void)
++{
++   assert(!kk_linear_layout_renders(VK_IMAGE_TILING_LINEAR));
++   assert(kk_linear_layout_refuses_usage(VK_IMAGE_TILING_LINEAR,
++                                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
++}
++
++/* Optimal tiling is not a linear layout and none of this applies to it. */
++static void
++check_optimal_tiling_is_never_refused(void)
++{
++   assert(!kk_tiling_is_linear_layout(VK_IMAGE_TILING_OPTIMAL));
++   assert(!kk_linear_layout_refuses_usage(
++      VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
++                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
++}
++
++int
++main(void)
++{
++   check_a_modifier_image_can_be_a_colour_attachment();
++   check_a_linear_layout_refuses_what_metal_cannot_represent();
++   check_plain_linear_tiling_is_unchanged();
++   check_optimal_tiling_is_never_refused();
++   return 0;
++}

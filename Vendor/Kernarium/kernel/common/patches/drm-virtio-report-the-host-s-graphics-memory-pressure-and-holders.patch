@@ -1,0 +1,725 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:25:15 +0900
+Subject: [PATCH] drm/virtio: report the host's graphics memory pressure and
+ holders
+
+A Darwin UML host gives the guest's graphics a fixed device-memory budget
+that the guest's own memory accounting cannot see, so a guest reclaimer
+cannot tell when the budget is nearly spent or which process holds it.
+Negotiate a private feature (VIRTIO_GPU_F_UML_MEMORY_REPORT, bit 23) with
+one query command, VIRTIO_GPU_CMD_UML_GET_MEMORY, and one event,
+VIRTIO_GPU_EVENT_UML_MEMORY (events_read bit 1). The reply carries the
+budget, the pool's use, what the guest's contexts hold, the refusal count,
+a pressure state, and up to 16 holders by process (pid, bytes, idle time,
+contexts, command name), largest first.
+
+The driver keeps the last reply and serves it from gpu_memory_report on the
+primary DRM minor, a mode 0600 file for a user-space reclaimer such as
+Android's lmkd. Reading formats the stored reply and never waits for the
+host. Writing "arm <min_bytes> <min_idle_ms>" subscribes to the event and
+sets the holder filters, "refresh" asks again and "disarm" unsubscribes; a
+write only queues a work item, which keeps at most one query on the control
+queue. A stored reply calls sysfs_notify(), so poll() reports POLLPRI. The
+event schedules the same work item rather than config_changed_work, so a
+host that holds its answers cannot delay display hotplug. The file belongs
+to the minor's directory and goes with it when the DRM device is unplugged, at
+shutdown as at removal; the driver stops queueing and notifying before that
+and never removes the file by name. Without the feature there is no file, and
+nothing changes for a guest.
+
+The wire declarations are kernel/common/gpu/virtio_gpu_uml.h in the owning
+Darwin host repository; drivers/gpu/drm/virtio/virtgpu_uml.h is a copy
+that its sync script checks, together with the codes it shares with
+include/uapi/linux/virtio_gpu.h.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/virtio/Makefile               |   3 +-
+ drivers/gpu/drm/virtio/virtgpu_drv.c          |   8 +
+ drivers/gpu/drm/virtio/virtgpu_drv.h          |  59 ++++
+ drivers/gpu/drm/virtio/virtgpu_kms.c          |  16 +-
+ .../gpu/drm/virtio/virtgpu_memory_report.c    | 301 ++++++++++++++++++
+ drivers/gpu/drm/virtio/virtgpu_uml.h          | 118 +++++++
+ drivers/gpu/drm/virtio/virtgpu_vq.c           |  28 ++
+ 7 files changed, 530 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/virtio/virtgpu_memory_report.c
+ create mode 100644 drivers/gpu/drm/virtio/virtgpu_uml.h
+
+diff --git a/drivers/gpu/drm/virtio/Makefile b/drivers/gpu/drm/virtio/Makefile
+index 437406234ab21926b4099e0b3cedb5738e946548..be00cb75d7acfddf641d971e5f1881639f0679f3 100644
+--- a/drivers/gpu/drm/virtio/Makefile
++++ b/drivers/gpu/drm/virtio/Makefile
+@@ -7,6 +7,7 @@ virtio-gpu-y := virtgpu_drv.o virtgpu_kms.o virtgpu_gem.o virtgpu_vram.o \
+ 	virtgpu_host_blob.o \
+ 	virtgpu_display.o virtgpu_vq.o \
+ 	virtgpu_fence.o virtgpu_object.o virtgpu_debugfs.o virtgpu_plane.o \
+-	virtgpu_ioctl.o virtgpu_prime.o virtgpu_trace_points.o virtgpu_submit.o
++	virtgpu_ioctl.o virtgpu_prime.o virtgpu_trace_points.o virtgpu_submit.o \
++	virtgpu_memory_report.o
+ 
+ obj-$(CONFIG_DRM_VIRTIO_GPU) += virtio-gpu.o
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index 7fcf4b6d85fca96f7d624c68a8a426230c9a9569..5c406874ea73ac63a7788254169a6cdb1d24de12 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -107,6 +107,9 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
+ 	if (ret)
+ 		goto err_deinit;
+ 
++	/* The report is an aid: a driver that cannot create its file still works. */
++	virtio_gpu_memory_report_register(dev->dev_private);
++
+ 	drm_client_setup(vdev->priv, NULL);
+ 
+ 	return 0;
+@@ -122,6 +125,7 @@ static void virtio_gpu_remove(struct virtio_device *vdev)
+ {
+ 	struct drm_device *dev = vdev->priv;
+ 
++	virtio_gpu_memory_report_stop(dev->dev_private);
+ 	drm_dev_unplug(dev);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_ATOMIC))
+@@ -135,6 +139,9 @@ static void virtio_gpu_shutdown(struct virtio_device *vdev)
+ {
+ 	struct drm_device *dev = vdev->priv;
+ 
++	/* The unplug below deletes the minor's directory with the report file. */
++	virtio_gpu_memory_report_stop(dev->dev_private);
++
+ 	if (drm_core_check_feature(dev, DRIVER_ATOMIC))
+ 		drm_atomic_helper_shutdown(dev);
+ 
+@@ -168,6 +175,7 @@ static unsigned int features[] = {
+ 	VIRTIO_GPU_F_RESOURCE_UUID,
+ 	VIRTIO_GPU_F_RESOURCE_BLOB,
+ 	VIRTIO_GPU_F_CONTEXT_INIT,
++	VIRTIO_GPU_F_UML_MEMORY_REPORT,
+ };
+ static struct virtio_driver virtio_gpu_driver = {
+ 	.feature_table = features,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 81cfae58b4f7b7dfc1031457e645f58c68112761..a5a4646259fc437767bf1e518689af039ebd8300 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -45,6 +45,8 @@
+ 
+ #include <xen/xen.h>
+ 
++#include "virtgpu_uml.h"
++
+ #define DRIVER_NAME "virtio_gpu"
+ #define DRIVER_DESC "virtio GPU"
+ 
+@@ -292,6 +294,50 @@ struct virtio_gpu_drv_cap_cache {
+ 	atomic_t is_valid;
+ };
+ 
++/*
++ * The host's last report of its graphics memory (VIRTIO_GPU_F_UML_MEMORY_REPORT),
++ * which gpu_memory_report on the primary DRM minor serves and lmkd reads.
++ */
++struct virtio_gpu_memory_holder {
++	u64 bytes;
++	u32 pid;
++	u32 contexts;
++	u32 idle_ms;
++	char comm[VIRTIO_GPU_UML_COMM_LEN];
++};
++
++struct virtio_gpu_memory_report {
++	struct work_struct work;
++	/*
++	 * Serializes sysfs_notify() with virtio_gpu_memory_report_stop(); never
++	 * held with lock.
++	 */
++	struct mutex notify_lock;
++	/* The primary minor's device from the file's creation to the stop. */
++	struct device *kdev;
++	/* Protects everything below, and is never held across a wait. */
++	spinlock_t lock;
++	/* What the last reply said: seq counts the replies stored. */
++	u64 seq;
++	u64 stored_ns;
++	u64 budget_bytes;
++	u64 used_bytes;
++	u64 context_bytes;
++	u64 refusals;
++	u32 state;
++	u32 generation;
++	u32 holder_count;
++	struct virtio_gpu_memory_holder holders[VIRTIO_GPU_UML_MAX_HOLDERS];
++	/* What the guest asked for. */
++	bool armed;
++	u32 min_idle_ms;
++	u64 min_bytes;
++	/* A query is wanted, one is on the control queue, the report is stopped. */
++	bool wanted;
++	bool in_flight;
++	bool stopping;
++};
++
+ struct virtio_gpu_device {
+ 	struct drm_device *ddev;
+ 
+@@ -324,10 +370,12 @@ struct virtio_gpu_device {
+ 	bool has_resource_blob;
+ 	bool has_host_visible;
+ 	bool has_context_init;
++	bool has_uml_memory_report;
+ 	struct virtio_shm_region host_visible_region;
+ 	struct drm_mm host_visible_mm;
+ 
+ 	struct work_struct config_changed_work;
++	struct virtio_gpu_memory_report memory_report;
+ 
+ 	struct work_struct obj_free_work;
+ 	spinlock_t obj_free_lock;
+@@ -440,6 +488,8 @@ void virtio_gpu_cursor_ping(struct virtio_gpu_device *vgdev,
+ 			    struct virtio_gpu_output *output);
+ int virtio_gpu_cmd_get_display_info(struct virtio_gpu_device *vgdev);
+ int virtio_gpu_cmd_get_capset_info(struct virtio_gpu_device *vgdev, int idx);
++int virtio_gpu_cmd_uml_get_memory(struct virtio_gpu_device *vgdev, u32 flags,
++				  u32 min_idle_ms, u64 min_bytes);
+ int virtio_gpu_cmd_get_capset(struct virtio_gpu_device *vgdev,
+ 			      int idx, int version,
+ 			      struct virtio_gpu_drv_cap_cache **cache_p);
+@@ -588,4 +638,13 @@ void virtio_gpu_vram_unmap_dma_buf(struct device *dev,
+ int virtio_gpu_execbuffer_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *file);
+ 
++/* virtgpu_memory_report.c */
++void virtio_gpu_memory_report_init(struct virtio_gpu_device *vgdev);
++int virtio_gpu_memory_report_register(struct virtio_gpu_device *vgdev);
++void virtio_gpu_memory_report_stop(struct virtio_gpu_device *vgdev);
++void virtio_gpu_memory_report_flush(struct virtio_gpu_device *vgdev);
++void virtio_gpu_memory_report_event(struct virtio_gpu_device *vgdev);
++void virtio_gpu_memory_report_reply(struct virtio_gpu_device *vgdev,
++				    struct virtio_gpu_vbuffer *vbuf);
++
+ #endif
+diff --git a/drivers/gpu/drm/virtio/virtgpu_kms.c b/drivers/gpu/drm/virtio/virtgpu_kms.c
+index 34bd7b36a488478f23b596c9526f267d8b2189b2..2e6e705d99ca8cfb4f1ee3e84d2633912eae6fcb 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c
+@@ -42,6 +42,12 @@ static void virtio_gpu_config_changed_work_func(struct work_struct *work)
+ 	/* read the config space */
+ 	virtio_cread_le(vgdev->vdev, struct virtio_gpu_config,
+ 			events_read, &events_read);
++	/* First: it only queues a work item, and the display waits for the host. */
++	if (vgdev->has_uml_memory_report &&
++	    (events_read & VIRTIO_GPU_EVENT_UML_MEMORY)) {
++		virtio_gpu_memory_report_event(vgdev);
++		events_clear |= VIRTIO_GPU_EVENT_UML_MEMORY;
++	}
+ 	if (events_read & VIRTIO_GPU_EVENT_DISPLAY) {
+ 		if (vgdev->num_scanouts) {
+ 			if (vgdev->has_edid)
+@@ -155,6 +161,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
+ 	INIT_LIST_HEAD(&vgdev->cap_cache);
+ 	INIT_WORK(&vgdev->config_changed_work,
+ 		  virtio_gpu_config_changed_work_func);
++	virtio_gpu_memory_report_init(vgdev);
+ 
+ 	INIT_WORK(&vgdev->obj_free_work,
+ 		  virtio_gpu_array_put_free_work);
+@@ -200,14 +207,18 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
+ 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
+ 		vgdev->has_context_init = true;
+ 
++	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_UML_MEMORY_REPORT))
++		vgdev->has_uml_memory_report = true;
++
+ 	DRM_INFO("features: %cvirgl %cedid %cresource_blob %chost_visible",
+ 		 vgdev->has_virgl_3d    ? '+' : '-',
+ 		 vgdev->has_edid        ? '+' : '-',
+ 		 vgdev->has_resource_blob ? '+' : '-',
+ 		 vgdev->has_host_visible ? '+' : '-');
+ 
+-	DRM_INFO("features: %ccontext_init\n",
+-		 vgdev->has_context_init ? '+' : '-');
++	DRM_INFO("features: %ccontext_init %cmemory_report\n",
++		 vgdev->has_context_init ? '+' : '-',
++		 vgdev->has_uml_memory_report ? '+' : '-');
+ 
+ 	ret = virtio_find_vqs(vgdev->vdev, 2, vqs, vqs_info, NULL);
+ 	if (ret) {
+@@ -292,6 +303,7 @@ void virtio_gpu_deinit(struct drm_device *dev)
+ 	struct virtio_gpu_device *vgdev = dev->dev_private;
+ 
+ 	virtio_gpu_host_blob_unregister(vgdev);
++	virtio_gpu_memory_report_flush(vgdev);
+ 	flush_work(&vgdev->obj_free_work);
+ 	flush_work(&vgdev->ctrlq.dequeue_work);
+ 	flush_work(&vgdev->cursorq.dequeue_work);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_memory_report.c b/drivers/gpu/drm/virtio/virtgpu_memory_report.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a92425bf0543e1711216a9927797c09cf514956
+--- /dev/null
++++ b/drivers/gpu/drm/virtio/virtgpu_memory_report.c
+@@ -0,0 +1,301 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * The host's graphics memory report.
++ *
++ * A host GPU that gives the guest a fixed memory budget tells the guest how
++ * near the budget is and which guest processes hold it
++ * (VIRTIO_GPU_F_UML_MEMORY_REPORT, see virtgpu_uml.h). The driver keeps the
++ * host's last answer in gpu_memory_report on the primary DRM minor, a root-only
++ * file that a reclaimer in user space (Android's lmkd) reads:
++ *
++ *   seq=<n> age_ms=<n> state=<n> refused=<n> budget=<n> used=<n> held=<n> armed=<0|1> generation=<n>
++ *   <pid> <bytes> <idle_ms> <contexts> <comm>
++ *   ...
++ *
++ * Reading never waits for the host: it formats the stored answer. Writing
++ * "arm <min_bytes> <min_idle_ms>", "refresh" or "disarm" queues a work item
++ * that asks the host, and returns. The answer is stored when it arrives,
++ * which notifies the file (poll() reports POLLPRI). While armed the host
++ * raises an event when its pool goes under pressure or calm, or an allocation
++ * is refused, and the driver asks again.
++ */
++
++#include <linux/device.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++
++#include <drm/drm_file.h>
++
++#include "virtgpu_drv.h"
++
++#define MEMORY_REPORT_FILE "gpu_memory_report"
++
++static void virtio_gpu_memory_report_work_func(struct work_struct *work)
++{
++	struct virtio_gpu_device *vgdev =
++		container_of(work, struct virtio_gpu_device,
++			     memory_report.work);
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++	u32 flags = 0, min_idle_ms;
++	u64 min_bytes;
++
++	spin_lock_irq(&report->lock);
++	if (!report->wanted || report->in_flight || report->stopping) {
++		/* The reply to the query in flight asks again. */
++		spin_unlock_irq(&report->lock);
++		return;
++	}
++	report->wanted = false;
++	report->in_flight = true;
++	if (report->armed)
++		flags = VIRTIO_GPU_UML_MEMORY_SUBSCRIBE |
++			VIRTIO_GPU_UML_MEMORY_GUEST_RECLAIMS;
++	min_idle_ms = report->min_idle_ms;
++	min_bytes = report->min_bytes;
++	spin_unlock_irq(&report->lock);
++
++	if (virtio_gpu_cmd_uml_get_memory(vgdev, flags, min_idle_ms,
++					  min_bytes)) {
++		spin_lock_irq(&report->lock);
++		report->in_flight = false;
++		spin_unlock_irq(&report->lock);
++		return;
++	}
++	virtio_gpu_notify(vgdev);
++}
++
++void virtio_gpu_memory_report_init(struct virtio_gpu_device *vgdev)
++{
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++
++	spin_lock_init(&report->lock);
++	mutex_init(&report->notify_lock);
++	INIT_WORK(&report->work, virtio_gpu_memory_report_work_func);
++}
++
++/* Asks the host for a report, with the filters and the subscription set. */
++static void virtio_gpu_memory_report_want(struct virtio_gpu_device *vgdev)
++{
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++	bool queue;
++
++	spin_lock_irq(&report->lock);
++	report->wanted = true;
++	queue = !report->stopping && !report->in_flight;
++	spin_unlock_irq(&report->lock);
++	if (queue)
++		schedule_work(&report->work);
++}
++
++/* The host raised the event: it has a new report. */
++void virtio_gpu_memory_report_event(struct virtio_gpu_device *vgdev)
++{
++	virtio_gpu_memory_report_want(vgdev);
++}
++
++/* The answer to a query (control queue worker). */
++void virtio_gpu_memory_report_reply(struct virtio_gpu_device *vgdev,
++				    struct virtio_gpu_vbuffer *vbuf)
++{
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++	struct virtio_gpu_uml_memory *resp =
++		(struct virtio_gpu_uml_memory *)vbuf->resp_buf;
++	bool again;
++	u32 count, i, c;
++
++	if (le32_to_cpu(resp->hdr.type) == VIRTIO_GPU_RESP_OK_UML_MEMORY) {
++		count = min_t(u32, le32_to_cpu(resp->holder_count),
++			      VIRTIO_GPU_UML_MAX_HOLDERS);
++		spin_lock_irq(&report->lock);
++		report->seq++;
++		report->stored_ns = ktime_get_boottime_ns();
++		report->budget_bytes = le64_to_cpu(resp->budget_bytes);
++		report->used_bytes = le64_to_cpu(resp->used_bytes);
++		report->context_bytes = le64_to_cpu(resp->context_bytes);
++		report->refusals = le64_to_cpu(resp->refusals);
++		report->state = le32_to_cpu(resp->state);
++		report->generation = le32_to_cpu(resp->generation);
++		report->holder_count = 0;
++		for (i = 0; i < count; i++) {
++			const struct virtio_gpu_uml_memory_holder *src =
++				&resp->holders[i];
++			struct virtio_gpu_memory_holder *dst =
++				&report->holders[report->holder_count];
++
++			/* The host never lists a process without an ID or a name. */
++			if (!src->pid || !src->comm[0])
++				continue;
++			dst->bytes = le64_to_cpu(src->bytes);
++			dst->pid = le32_to_cpu(src->pid);
++			dst->contexts = le32_to_cpu(src->contexts);
++			dst->idle_ms = le32_to_cpu(src->idle_ms);
++			memcpy(dst->comm, src->comm, sizeof(dst->comm));
++			dst->comm[sizeof(dst->comm) - 1] = '\0';
++			/* One holder per line: nothing the host sent may end it. */
++			for (c = 0; dst->comm[c]; c++)
++				if ((unsigned char)dst->comm[c] < 0x20 ||
++				    dst->comm[c] == 0x7f)
++					dst->comm[c] = '?';
++			report->holder_count++;
++		}
++		spin_unlock_irq(&report->lock);
++		/*
++		 * The file goes with the minor's directory when the DRM device is
++		 * unplugged. Stopping returns before that and waits for a
++		 * notification under way, so none is made once the file may go.
++		 */
++		mutex_lock(&report->notify_lock);
++		if (report->kdev)
++			sysfs_notify(&report->kdev->kobj, NULL,
++				     MEMORY_REPORT_FILE);
++		mutex_unlock(&report->notify_lock);
++	}
++
++	spin_lock_irq(&report->lock);
++	report->in_flight = false;
++	again = report->wanted && !report->stopping;
++	spin_unlock_irq(&report->lock);
++	if (again)
++		schedule_work(&report->work);
++}
++
++static struct virtio_gpu_device *memory_report_device(struct device *kdev)
++{
++	struct drm_minor *minor = dev_get_drvdata(kdev);
++
++	return minor->dev->dev_private;
++}
++
++static ssize_t gpu_memory_report_show(struct device *kdev,
++				      struct device_attribute *attr, char *buf)
++{
++	struct virtio_gpu_memory_report *report =
++		&memory_report_device(kdev)->memory_report;
++	struct virtio_gpu_memory_holder holders[VIRTIO_GPU_UML_MAX_HOLDERS];
++	u64 seq, stored_ns, budget, used, held, refusals;
++	u32 state, generation, count, i;
++	bool armed;
++	ssize_t len;
++
++	spin_lock_irq(&report->lock);
++	seq = report->seq;
++	stored_ns = report->stored_ns;
++	budget = report->budget_bytes;
++	used = report->used_bytes;
++	held = report->context_bytes;
++	refusals = report->refusals;
++	state = report->state;
++	generation = report->generation;
++	armed = report->armed;
++	count = report->holder_count;
++	memcpy(holders, report->holders, count * sizeof(holders[0]));
++	spin_unlock_irq(&report->lock);
++
++	len = sysfs_emit(buf,
++		"seq=%llu age_ms=%llu state=%u refused=%llu budget=%llu used=%llu held=%llu armed=%u generation=%u\n",
++		seq,
++		seq ? div_u64(ktime_get_boottime_ns() - stored_ns, NSEC_PER_MSEC) : 0,
++		state, refusals, budget, used, held, armed, generation);
++	for (i = 0; i < count; i++)
++		len += sysfs_emit_at(buf, len, "%u %llu %u %u %s\n",
++				     holders[i].pid, holders[i].bytes,
++				     holders[i].idle_ms, holders[i].contexts,
++				     holders[i].comm);
++	return len;
++}
++
++/* "arm <min_bytes> <min_idle_ms>", "refresh" or "disarm". */
++static ssize_t gpu_memory_report_store(struct device *kdev,
++				       struct device_attribute *attr,
++				       const char *buf, size_t count)
++{
++	struct virtio_gpu_device *vgdev = memory_report_device(kdev);
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++	char line[64], *cursor, *word;
++	u64 min_bytes = 0;
++	u32 min_idle_ms = 0;
++
++	if (count >= sizeof(line))
++		return -EINVAL;
++	memcpy(line, buf, count);
++	line[count] = '\0';
++	cursor = strim(line);
++	word = strsep(&cursor, " \t");
++	if (!word)
++		return -EINVAL;
++
++	if (!strcmp(word, "arm")) {
++		char *bytes = strsep(&cursor, " \t");
++		char *idle = strsep(&cursor, " \t");
++
++		if (!bytes || !idle || cursor || kstrtou64(bytes, 10, &min_bytes) ||
++		    kstrtou32(idle, 10, &min_idle_ms))
++			return -EINVAL;
++		spin_lock_irq(&report->lock);
++		report->armed = true;
++		report->min_bytes = min_bytes;
++		report->min_idle_ms = min_idle_ms;
++		spin_unlock_irq(&report->lock);
++	} else if (!strcmp(word, "disarm") && !cursor) {
++		spin_lock_irq(&report->lock);
++		report->armed = false;
++		spin_unlock_irq(&report->lock);
++	} else if (strcmp(word, "refresh") || cursor) {
++		return -EINVAL;
++	}
++	virtio_gpu_memory_report_want(vgdev);
++	return count;
++}
++
++/* Root only: it names other processes' graphics memory. */
++static DEVICE_ATTR(gpu_memory_report, 0600, gpu_memory_report_show,
++		   gpu_memory_report_store);
++
++int virtio_gpu_memory_report_register(struct virtio_gpu_device *vgdev)
++{
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++	struct device *kdev;
++	int ret;
++
++	if (!vgdev->has_uml_memory_report || !vgdev->ddev->primary)
++		return 0;
++	kdev = vgdev->ddev->primary->kdev;
++	ret = device_create_file(kdev, &dev_attr_gpu_memory_report);
++	if (ret) {
++		DRM_ERROR("cannot create %s: %d\n", MEMORY_REPORT_FILE, ret);
++		return ret;
++	}
++	mutex_lock(&report->notify_lock);
++	report->kdev = kdev;
++	mutex_unlock(&report->notify_lock);
++	return 0;
++}
++
++/*
++ * Stops the report before the DRM device is unplugged, which removes the file
++ * with the minor's directory: no query is queued and no notification is made
++ * from here on. The file is never removed by name, since by the time a driver
++ * removal runs after a shutdown the directory is already gone.
++ */
++void virtio_gpu_memory_report_stop(struct virtio_gpu_device *vgdev)
++{
++	struct virtio_gpu_memory_report *report = &vgdev->memory_report;
++
++	if (!vgdev->has_uml_memory_report)
++		return;
++	spin_lock_irq(&report->lock);
++	report->stopping = true;
++	spin_unlock_irq(&report->lock);
++	mutex_lock(&report->notify_lock);
++	report->kdev = NULL;
++	mutex_unlock(&report->notify_lock);
++}
++
++/* Waits for the work item; the reply callback queues no more. */
++void virtio_gpu_memory_report_flush(struct virtio_gpu_device *vgdev)
++{
++	if (vgdev->has_uml_memory_report)
++		cancel_work_sync(&vgdev->memory_report.work);
++}
+diff --git a/drivers/gpu/drm/virtio/virtgpu_uml.h b/drivers/gpu/drm/virtio/virtgpu_uml.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a11b4bd33a730311364e3ec107dfc480028fa80
+--- /dev/null
++++ b/drivers/gpu/drm/virtio/virtgpu_uml.h
+@@ -0,0 +1,118 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Private Virtio-GPU memory-report extension.
++ *
++ * The host GPU gives a guest a fixed device-memory budget that the guest's own
++ * memory accounting cannot see. This extension lets the host tell the guest
++ * kernel how much of the budget is in use and which guest processes hold it.
++ * It is negotiated with VIRTIO_GPU_F_UML_MEMORY_REPORT and used by the guest
++ * kernel alone: Mesa and libdrm never see it.
++ *
++ * Bit 23 is the last device-specific feature bit (24 to 40 belong to the
++ * transports), and upstream's virtio_gpu.h uses 0 to 4. Command 0x0f00 and
++ * response 0x11f0 lie in no range upstream's header uses: its commands are
++ * 0x0100, 0x0200 and 0x0300 plus a few, its successes 0x1100 plus a few.
++ *
++ * The device raises the event with the display event's mechanism (events_read
++ * in the configuration space, cleared through events_clear) only after a
++ * GET_MEMORY with the SUBSCRIBE flag, and a GET_MEMORY without the flag ends
++ * the subscription. A reply is built from the host's counters when the command
++ * runs; it never waits for the renderer.
++ */
++#ifndef VIRTGPU_UML_H
++#define VIRTGPU_UML_H
++
++#ifdef __KERNEL__
++#include <linux/types.h>
++#include <linux/virtio_gpu.h>
++#else
++#include <stdint.h>
++typedef uint8_t __u8;
++typedef uint32_t __le32;
++typedef uint64_t __le64;
++struct virtio_gpu_ctrl_hdr {
++	__le32 type;
++	__le32 flags;
++	__le64 fence_id;
++	__le32 ctx_id;
++	__u8 ring_idx;
++	__u8 padding[3];
++} __attribute__((packed));
++#endif
++
++#define VIRTIO_GPU_F_UML_MEMORY_REPORT 23
++
++/* events_read bit 1; VIRTIO_GPU_EVENT_DISPLAY is bit 0. */
++#define VIRTIO_GPU_EVENT_UML_MEMORY (1 << 1)
++
++#define VIRTIO_GPU_CMD_UML_GET_MEMORY 0x0f00
++#define VIRTIO_GPU_RESP_OK_UML_MEMORY 0x11f0
++
++/* GET_MEMORY flags. */
++/* Raise VIRTIO_GPU_EVENT_UML_MEMORY when the pool's state changes. */
++#define VIRTIO_GPU_UML_MEMORY_SUBSCRIBE (1 << 0)
++/*
++ * A reclaimer in the guest (Android's lmkd) acts on the reports, so a host
++ * that has its own reclaimer stands down while this is set. Set per query: a
++ * query without it, and a new connection, clear it.
++ */
++#define VIRTIO_GPU_UML_MEMORY_GUEST_RECLAIMS (1 << 1)
++
++/* Reply state bits. */
++/* Graphics memory use is near the budget and has been for a while. */
++#define VIRTIO_GPU_UML_STATE_PRESSURE (1 << 0)
++/* An allocation was refused since the previous GET_MEMORY. */
++#define VIRTIO_GPU_UML_STATE_REFUSED (1 << 1)
++
++/* The most holders a reply lists. */
++#define VIRTIO_GPU_UML_MAX_HOLDERS 16
++/* TASK_COMM_LEN, including the terminating NUL. */
++#define VIRTIO_GPU_UML_COMM_LEN 16
++
++/*
++ * The holders listed are the guest processes that hold at least min_bytes of
++ * the device memory and have been idle (no command and no retired fence of
++ * any of their contexts) for at least min_idle_ms, the largest first, at most
++ * max_holders of them (and no more than fit the reply buffer the guest gave).
++ */
++struct virtio_gpu_uml_get_memory {
++	struct virtio_gpu_ctrl_hdr hdr;
++	__le32 flags;
++	__le32 max_holders;
++	__le32 min_idle_ms;
++	__le32 padding;
++	__le64 min_bytes;
++};
++
++struct virtio_gpu_uml_memory_holder {
++	__le64 bytes;
++	/* The guest process (thread group ID in the initial PID namespace). */
++	__le32 pid;
++	/* How many of its Virtio-GPU contexts there are. */
++	__le32 contexts;
++	/* Saturates at 0xffffffff. */
++	__le32 idle_ms;
++	/* The process's command name, NUL-terminated. */
++	char comm[VIRTIO_GPU_UML_COMM_LEN];
++	__le32 padding;
++};
++
++struct virtio_gpu_uml_memory {
++	struct virtio_gpu_ctrl_hdr hdr; /* type VIRTIO_GPU_RESP_OK_UML_MEMORY */
++	/* The budget B, and 0 when the host has none. */
++	__le64 budget_bytes;
++	/* What the host GPU holds against it, caches the drivers keep included. */
++	__le64 used_bytes;
++	/* What the guest's contexts hold of it. */
++	__le64 context_bytes;
++	/* Allocations refused since the display was made. */
++	__le64 refusals;
++	__le32 state;
++	/* How many events the host has raised in this connection. */
++	__le32 generation;
++	__le32 holder_count;
++	__le32 padding;
++	struct virtio_gpu_uml_memory_holder holders[];
++};
++
++#endif /* VIRTGPU_UML_H */
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+index 9cbb91f9f7f9ff15e5f6f5014611e8d6dab02e31..36de960cb1ba8f34e8075d9984a83022cc362fe5 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -1019,6 +1019,34 @@ int virtio_gpu_cmd_get_capset_info(struct virtio_gpu_device *vgdev, int idx)
+ 	return 0;
+ }
+ 
++int virtio_gpu_cmd_uml_get_memory(struct virtio_gpu_device *vgdev, u32 flags,
++				  u32 min_idle_ms, u64 min_bytes)
++{
++	struct virtio_gpu_uml_get_memory *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++	size_t resp_size = sizeof(struct virtio_gpu_uml_memory) +
++		VIRTIO_GPU_UML_MAX_HOLDERS *
++		sizeof(struct virtio_gpu_uml_memory_holder);
++	void *resp_buf;
++
++	resp_buf = kzalloc(resp_size, GFP_KERNEL);
++	if (!resp_buf)
++		return -ENOMEM;
++
++	cmd_p = virtio_gpu_alloc_cmd_resp
++		(vgdev, &virtio_gpu_memory_report_reply, &vbuf,
++		 sizeof(*cmd_p), resp_size, resp_buf);
++	memset(cmd_p, 0, sizeof(*cmd_p));
++
++	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_UML_GET_MEMORY);
++	cmd_p->flags = cpu_to_le32(flags);
++	cmd_p->max_holders = cpu_to_le32(VIRTIO_GPU_UML_MAX_HOLDERS);
++	cmd_p->min_idle_ms = cpu_to_le32(min_idle_ms);
++	cmd_p->min_bytes = cpu_to_le64(min_bytes);
++	/* A refused queue frees the buffer and never calls the callback. */
++	return virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
++}
++
+ int virtio_gpu_cmd_get_capset(struct virtio_gpu_device *vgdev,
+ 			      int idx, int version,
+ 			      struct virtio_gpu_drv_cap_cache **cache_p)

@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 14:11:49 +0900
+Subject: [PATCH] kosmickrisp: offer only the texture capabilities the Metal
+ device has
+
+The format table names the BC/S3TC, RGTC and BPTC pixel formats because
+Metal defines their MTLPixelFormat values, and it names every pixel format
+Metal can filter. Every Apple silicon Mac accepts a texture in a compressed
+format and filters 32-bit float textures, so nothing had to ask whether
+the device does. An Apple GPU on iOS does neither.
+
+MTLDevice.supportsBCTextureCompression is false there, and Metal answers a
+descriptor naming such a format by aborting the process from
+-[MTLTextureDescriptorInternal validateWithDevice:] rather than failing the
+call, so the driver cannot recover from having offered one. On an iPad
+mini 6 running iPadOS 27 this aborted during startup, before any
+application draws: virglrenderer's vrend_check_texture_storage() probes
+glTexStorage2D for each format it means to expose, Zink asks for the BC1
+image the driver said it supported, kk_image_layout_init() hands Metal the
+descriptor, and the process dies with "MTLTextureDescriptor has invalid
+pixelFormat (130)". Report the three compressed layouts as unsupported
+there, and answer the textureCompressionBC feature from the same device
+query, so the feature and the format properties cannot disagree;
+dEQP-VK.api.info.format_properties.compressed_formats reports such a
+disagreement directly. Nothing else in the stack keys on the feature
+rather than the format: the driver has no BC decode or emulation path,
+Venus forwards the host driver's feature set verbatim, and Zink gates S3TC
+on format properties.
+
+Filtering a 32-bit float texture is likewise a device capability rather
+than a format property. An Apple GPU on iOS samples such a texture and
+ignores the filter, so a linear sample returns the nearest texel, and with
+SAMPLED_IMAGE_FILTER_LINEAR advertised every interpolated result was
+silently wrong: on an A15, 32 of the first 92,573 released Vulkan CTS
+cases failed with "Result image is incorrect", every one of them a linear
+blit, mipmap generation or mipmapped sample of r32_sfloat, r32g32_sfloat,
+r32g32b32a32_sfloat or d32_sfloat_s8_uint. Ask the device with
+supports32BitFloatFiltering and withhold the linear and minmax filter bits
+when it says no. A caller then takes the nearest-only path that any format
+without the bit already takes, and the cases report NotSupported instead
+of producing wrong images.
+
+A Mac reports both capabilities, so nothing changes there.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/bridge/mtl_device.h         |  6 ++++
+ src/kosmickrisp/bridge/mtl_device.m         | 18 ++++++++++
+ src/kosmickrisp/vulkan/kk_image.c           | 38 ++++++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_physical_device.c | 13 +++++--
+ src/kosmickrisp/vulkan/kk_physical_device.h |  2 ++
+ 5 files changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/bridge/mtl_device.h b/src/kosmickrisp/bridge/mtl_device.h
+index ec90ac4c60e8aee938c607ef80844a31a38e0253..1f0205ff6561c91238dc385b7687ad18462cd118 100644
+--- a/src/kosmickrisp/bridge/mtl_device.h
++++ b/src/kosmickrisp/bridge/mtl_device.h
+@@ -30,6 +30,12 @@ void mtl_device_get_architecture_name(mtl_device *dev, char buffer[256]);
+ uint32_t mtl_device_get_gpu_apple_family(mtl_device *dev);
+ uint64_t mtl_device_get_registry_id(mtl_device *dev);
+ bool mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count);
++/* Whether the device can sample BC/S3TC, RGTC and BPTC compressed
++ * textures. Apple GPUs on iOS do not. */
++bool mtl_device_supports_bc_texture_compression(mtl_device *dev);
++/* Whether the device filters 32-bit float textures. An Apple GPU on iOS
++ * samples them but ignores the filter. */
++bool mtl_device_supports_32bit_float_filtering(mtl_device *dev);
+ struct mtl_size mtl_device_max_threads_per_threadgroup(mtl_device *dev);
+ uint32_t mtl_device_max_threadgroup_memory_length(mtl_device *dev);
+ uint64_t mtl_device_max_buffer_length(mtl_device *dev);
+diff --git a/src/kosmickrisp/bridge/mtl_device.m b/src/kosmickrisp/bridge/mtl_device.m
+index 7ccf20bbd91e086443efbabfe385ee6f39deda30..52a8e8ca5473abf30bc63e7d5a91db4bcdf8a67c 100644
+--- a/src/kosmickrisp/bridge/mtl_device.m
++++ b/src/kosmickrisp/bridge/mtl_device.m
+@@ -123,6 +123,24 @@
+    }
+ }
+ 
++bool
++mtl_device_supports_bc_texture_compression(mtl_device *dev)
++{
++   @autoreleasepool {
++      id<MTLDevice> device = (id<MTLDevice>)dev;
++      return [device supportsBCTextureCompression];
++   }
++}
++
++bool
++mtl_device_supports_32bit_float_filtering(mtl_device *dev)
++{
++   @autoreleasepool {
++      id<MTLDevice> device = (id<MTLDevice>)dev;
++      return [device supports32BitFloatFiltering];
++   }
++}
++
+ struct mtl_size
+ mtl_device_max_threads_per_threadgroup(mtl_device *dev)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 18f693770298aff83c38df9b0ab94a4b7008bc5b..f027da8882b151ee9b8560673e6ef5dfbebcb7ad 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -37,6 +37,19 @@ static void kk_image_report_address_binding(struct kk_device *dev,
+ 
+ #include <vulkan/vulkan_metal.h>
+ 
++static bool
++kk_format_has_32bit_float_channel(enum pipe_format p_format)
++{
++   const struct util_format_description *desc =
++      util_format_description(p_format);
++   for (unsigned channel = 0; channel < desc->nr_channels; ++channel) {
++      if (desc->channel[channel].type == UTIL_FORMAT_TYPE_FLOAT &&
++          desc->channel[channel].size == 32)
++         return true;
++   }
++   return false;
++}
++
+ static VkFormatFeatureFlags2
+ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+                                    VkFormat vk_format, VkImageTiling tiling,
+@@ -73,11 +86,34 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+    if (va_format == NULL)
+       return 0;
+ 
++   /* The format table names the BC/S3TC, RGTC and BPTC pixel formats because
++    * Metal defines them, but only a device that reports BC support accepts a
++    * texture in one: an Apple GPU on iOS does not, and Metal answers such a
++    * descriptor by aborting the process rather than failing the call. Report
++    * the layouts it cannot carry as unsupported so nothing above builds an
++    * image Metal will refuse. */
++   if (!pdev->info.supports_bc_compression) {
++      const enum util_format_layout layout =
++         util_format_description(p_format)->layout;
++      if (layout == UTIL_FORMAT_LAYOUT_S3TC ||
++          layout == UTIL_FORMAT_LAYOUT_RGTC ||
++          layout == UTIL_FORMAT_LAYOUT_BPTC)
++         return 0;
++   }
++
+    // Textures can at least be sampled
+    features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
+    features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+ 
+-   if (va_format->filter) {
++   /* The format table names every pixel format Metal can filter, but a device
++    * only filters 32-bit float textures when it says it does: an Apple GPU on
++    * iOS samples them and ignores the filter, so a linear sample returns the
++    * nearest texel and every interpolated result is wrong. Report what the
++    * device can do, so a caller takes the nearest-only path a format without
++    * the bit already has. */
++   if (va_format->filter &&
++       (pdev->info.supports_32bit_float_filtering ||
++        !kk_format_has_32bit_float_channel(p_format))) {
+       features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+       features |=
+          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT; // TODO_KOSMICKRISP
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 52114fe03f98bd24c4e8d18760f8275cacf293d7..b8132353702e9af3ae4020679ba71755bef6e825 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -223,6 +223,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+ 
+ static void
+ kk_get_device_features(
++   const struct kk_physical_device *pdev,
+    const struct vk_device_extension_table *supported_extensions,
+    struct vk_features *features)
+ {
+@@ -264,7 +265,11 @@ kk_get_device_features(
+       .shaderUniformBufferArrayDynamicIndexing = true,
+       .tessellationShader = true,
+       .textureCompressionASTC_LDR = true,
+-      .textureCompressionBC = true,
++      /* Only a device that reports BC support accepts a texture in a BC/RGTC/
++       * BPTC pixel format; an Apple GPU on iOS does not. kk_get_image_format_
++       * features() already reports those formats as unsupported there, so the
++       * feature has to answer from the same place or the two disagree. */
++      .textureCompressionBC = pdev->info.supports_bc_compression,
+       .textureCompressionETC2 = true,
+       .vertexPipelineStoresAndAtomics = true,
+ 
+@@ -1147,6 +1152,10 @@ get_metal_limits(struct kk_physical_device *pdev)
+       mtl_device_max_buffer_length(pdev->mtl_dev_handle);
+    pdev->info.gpu_apple_family =
+       mtl_device_get_gpu_apple_family(pdev->mtl_dev_handle);
++   pdev->info.supports_bc_compression =
++      mtl_device_supports_bc_texture_compression(pdev->mtl_dev_handle);
++   pdev->info.supports_32bit_float_filtering =
++      mtl_device_supports_32bit_float_filtering(pdev->mtl_dev_handle);
+ 
+    pdev->supported_sample_counts = VK_SAMPLE_COUNT_1_BIT;
+    for (uint32_t sample_count = VK_SAMPLE_COUNT_2_BIT;
+@@ -1188,7 +1197,7 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+    kk_get_device_extensions(instance, &supported_extensions);
+ 
+    struct vk_features supported_features;
+-   kk_get_device_features(&supported_extensions, &supported_features);
++   kk_get_device_features(pdev, &supported_extensions, &supported_features);
+ 
+    struct vk_properties properties;
+    kk_get_device_properties(pdev, instance, &properties);
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.h b/src/kosmickrisp/vulkan/kk_physical_device.h
+index aeca5fa731f2ba5ea00fbe504d0d3baee7dc73fd..135850ac3f92676d765825272047218a46e29a14 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.h
++++ b/src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -40,6 +40,8 @@ struct kk_device_info {
+    uint32_t max_workgroup_invocations;
+    uint32_t max_compute_shared_memory_size;
+    uint32_t gpu_apple_family;
++   bool supports_bc_compression;
++   bool supports_32bit_float_filtering;
+    uint64_t max_buffer_size;
+ };
+ 

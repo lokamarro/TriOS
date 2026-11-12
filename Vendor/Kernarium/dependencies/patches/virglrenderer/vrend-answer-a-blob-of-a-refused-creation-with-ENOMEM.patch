@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:43:42 +0900
+Subject: [PATCH] vrend: answer a blob of a refused creation with ENOMEM
+
+A guest that makes a resource inside a command buffer sends
+PIPE_RESOURCE_CREATE with a blob id and then CREATE_BLOB naming it.
+When the host has no memory for the resource, vrend abandons the
+rest of the buffer and the guest never sees the creation fail; the
+blob it asks for next named an id vrend had no resource for, which
+get_blob answered with EINVAL, the answer for a request the guest got
+wrong.
+
+vrend now remembers the blob ids of the pipe resources it refused for
+want of memory, the newest sixteen of each context. A blob lookup that
+finds no resource consults them: the id of a refusal is answered
+with ENOMEM, once, and any other id with EINVAL as before.
+vrend_get_blob_pipe() takes the error it reports.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/vrend/vrend_decode.c   |  6 ++++--
+ src/vrend/vrend_renderer.c | 41 ++++++++++++++++++++++++++++++++++++--
+ src/vrend/vrend_renderer.h |  6 +++++-
+ 3 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index 1f7f600bc93226e680184e1217639c7ad01e4153..e54ae0b8ec4bce5e305e12edbf238ae044cdb265 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1735,11 +1735,13 @@ static int vrend_decode_ctx_get_blob(struct virgl_context *ctx,
+    TRACE_FUNC();
+    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+ 
++   int error = EINVAL;
++
+    blob->type = VIRGL_RESOURCE_FD_INVALID;
+    /* this transfers ownership and blob_id is no longer valid */
+-   blob->u.pipe_resource = vrend_get_blob_pipe(dctx->grctx, blob_id);
++   blob->u.pipe_resource = vrend_get_blob_pipe(dctx->grctx, blob_id, &error);
+    if (!blob->u.pipe_resource)
+-      return -EINVAL;
++      return -error;
+ 
+    blob->map_info = vrend_renderer_resource_get_map_info(blob->u.pipe_resource);
+    return 0;
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 99f48550e72fca7e63fd20d891dbfa1a814b33b5..192cb0495564b3b722fa38f0fa6b413e5f40301b 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -899,6 +899,8 @@ struct vrend_untyped_resource {
+    struct list_head head;
+ };
+ 
++#define VREND_REFUSED_BLOB_IDS 16
++
+ struct vrend_context {
+    char debug_name[64];
+ 
+@@ -945,6 +947,15 @@ struct vrend_context {
+    struct list_head untyped_resources;
+    struct virgl_resource *untyped_resource_cache;
+ 
++   /*
++    * Blob ids of pipe resources the host had no memory to create. A guest
++    * that submits PIPE_RESOURCE_CREATE and then CREATE_BLOB for the id
++    * learns of the refusal only when the blob lookup answers ENOMEM for an
++    * id with no resource. The newest ids replace the oldest.
++    */
++   uint32_t refused_blob_ids[VREND_REFUSED_BLOB_IDS];
++   unsigned refused_blob_count;
++
+    struct vrend_shader_cfg shader_cfg;
+ 
+    unsigned debug_flags;
+@@ -15257,15 +15268,25 @@ int vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob
+    struct vrend_resource *res;
+    int error;
+    res = (struct vrend_resource *)vrend_renderer_resource_create(args, NULL, &error);
+-   if (!res)
++   if (!res) {
++      if (error == ENOMEM) {
++         if (ctx->refused_blob_count == VREND_REFUSED_BLOB_IDS) {
++            memmove(ctx->refused_blob_ids, ctx->refused_blob_ids + 1,
++                    (VREND_REFUSED_BLOB_IDS - 1) * sizeof(ctx->refused_blob_ids[0]));
++            ctx->refused_blob_count--;
++         }
++         ctx->refused_blob_ids[ctx->refused_blob_count++] = blob_id;
++      }
+       return error;
++   }
+ 
+    res->blob_id = blob_id;
+    list_addtail(&res->head, &ctx->vrend_resources);
+    return 0;
+ }
+ 
+-struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id)
++struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id,
++                                          int *error)
+ {
+    uint32_t id = (uint32_t)blob_id;
+ 
+@@ -15279,6 +15300,22 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
+       return &res->base;
+    }
+ 
++   /* No resource: either the id is unknown, or the host refused to create
++    * the resource for want of memory, which the guest must be able to tell
++    * apart. The id is forgotten once the guest has been told.
++    */
++   *error = EINVAL;
++   for (unsigned i = 0; i < ctx->refused_blob_count; i++) {
++      if (ctx->refused_blob_ids[i] != id)
++         continue;
++
++      memmove(ctx->refused_blob_ids + i, ctx->refused_blob_ids + i + 1,
++              (ctx->refused_blob_count - i - 1) * sizeof(ctx->refused_blob_ids[0]));
++      ctx->refused_blob_count--;
++      *error = ENOMEM;
++      break;
++   }
++
+    return NULL;
+ }
+ 
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 133569a3b0c733d625226afc6f803c89a5a4daa5..81ffe90bea4519848ac979aa2e9faa2e546b9639 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -708,7 +708,11 @@ int
+ vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
+                                     const struct vrend_renderer_resource_create_args *args);
+ 
+-struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id);
++/* Takes the pipe resource the guest created with PIPE_RESOURCE_CREATE for the
++ * blob id. Without one, *error is ENOMEM if the host refused to create it for
++ * want of memory (once per refusal), and EINVAL for an id it never saw. */
++struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id,
++                                          int *error);
+ 
+ int
+ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,

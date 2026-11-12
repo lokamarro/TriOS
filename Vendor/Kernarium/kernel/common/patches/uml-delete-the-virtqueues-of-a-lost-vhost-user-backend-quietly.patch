@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:28:46 +0900
+Subject: [PATCH] uml: delete the virtqueues of a lost vhost-user backend
+ quietly
+
+A lost backend retires its device: the connection-broken work breaks the
+virtio device and unregisters it, and its driver's removal deletes the
+virtqueues. vu_del_vqs() then sent SET_VRING_ENABLE for every queue and
+a GET_FEATURES round trip to the backend that had gone, and warned once
+for each message that failed, so every lost backend still printed a
+warning per queue and one more.
+
+Disabling the rings and the round trip after it only make a live backend
+stop using them before they are freed. A backend that has gone uses
+nothing and can be told nothing, so vu_del_vqs() now sends it nothing,
+and warns only when a message fails to a backend that has not gone.
+
+vhost_user_check_reset() records the loss on the device, whether or not
+the device is still registered. A send that fails because the peer has
+gone, and a read that fails that way, are its loss too, as a read of end
+of file already is. Socket errors are host errno values, so
+os_error_is_disconnect() names them in the host layer.
+---
+ arch/um/drivers/virtio_uml.c | 37 ++++++++++++++++++++++++++++++------
+ arch/um/include/shared/os.h  |  1 +
+ arch/um/os-Darwin/file.c     |  6 ++++++
+ 3 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index 8facd5d0bf72554b6b73bc76716222f1d338c7de..186d3bab01d71da414c7f2bff4217fe1be488190 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -70,6 +70,9 @@ struct virtio_uml_device {
+ 	u8 has_shmem_region:1;
+ 	u8 req_fd_gone:1;
+ 
++	/* Set once the backend has gone; it is never cleared. */
++	bool backend_gone;
++
+ 	/* Recorded under req_lock, taken and cleared by vu_req_interrupt() */
+ 	bool config_changed_irq;
+ 	uint64_t vq_irq_vq_map;
+@@ -129,10 +132,11 @@ static int full_read(int fd, void *buf, int len, bool abortable)
+ 		}
+ 	} while (len && (rc > 0 || rc == -EINTR || (!abortable && rc == -EAGAIN)));
+ 
++	/* A peer that closed its end, or has gone, has disconnected. */
++	if (rc == 0 || (rc < 0 && os_error_is_disconnect(rc)))
++		return -ECONNRESET;
+ 	if (rc < 0)
+ 		return rc;
+-	if (rc == 0)
+-		return -ECONNRESET;
+ 	return 0;
+ }
+ 
+@@ -181,6 +185,8 @@ static void vhost_user_check_reset(struct virtio_uml_device *vu_dev,
+ 	if (rc != -ECONNRESET)
+ 		return;
+ 
++	WRITE_ONCE(vu_dev->backend_gone, true);
++
+ 	if (!vu_dev->registered)
+ 		return;
+ 
+@@ -376,8 +382,14 @@ static int vhost_user_send(struct virtio_uml_device *vu_dev,
+ 
+ 	raw_spin_lock_irqsave(&vu_dev->sock_lock, flags);
+ 	rc = full_sendmsg_fds(vu_dev->sock, msg, size, fds, num_fds);
+-	if (rc < 0)
++	if (rc < 0) {
++		/* Sending to a backend that has gone is how its loss shows. */
++		if (os_error_is_disconnect(rc)) {
++			rc = -ECONNRESET;
++			vhost_user_check_reset(vu_dev, rc);
++		}
+ 		goto out;
++	}
+ 
+ 	if (request_ack) {
+ 		uint64_t status;
+@@ -1250,13 +1262,26 @@ static void vu_del_vqs(struct virtio_device *vdev)
+ 	struct virtio_uml_device *vu_dev = to_virtio_uml_device(vdev);
+ 	struct virtqueue *vq, *n;
+ 	u64 features;
++	int rc;
+ 
++	/*
++	 * Disabling the rings, and the round trip after it, stop a live backend
++	 * from using them before they are freed. A backend that has gone uses
++	 * nothing and can be told nothing, so losing it is no error here.
++	 */
+ 	/* Note: reverse order as a workaround to a decoding bug in snabb */
+-	list_for_each_entry_reverse(vq, &vdev->vqs, list)
+-		WARN_ON(vhost_user_set_vring_enable(vu_dev, vq->index, false));
++	list_for_each_entry_reverse(vq, &vdev->vqs, list) {
++		if (READ_ONCE(vu_dev->backend_gone))
++			break;
++		rc = vhost_user_set_vring_enable(vu_dev, vq->index, false);
++		WARN_ON(rc && !READ_ONCE(vu_dev->backend_gone));
++	}
+ 
+ 	/* Ensure previous messages have been processed */
+-	WARN_ON(vhost_user_get_features(vu_dev, &features));
++	if (!READ_ONCE(vu_dev->backend_gone)) {
++		rc = vhost_user_get_features(vu_dev, &features);
++		WARN_ON(rc && !READ_ONCE(vu_dev->backend_gone));
++	}
+ 
+ 	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
+ 		vu_del_vq(vq);
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 2dde638d10d910fcc9a9110793c36f5c29495e66..8ebb9e59271b2cca93efb75d62f25cf744a2fd7a 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -150,6 +150,7 @@ extern int os_open_file(const char *file, struct openflags flags, int mode);
+ extern int os_read_file(int fd, void *buf, int len);
+ extern int os_write_file(int fd, const void *buf, int count);
+ extern int os_error_is_would_block(int error);
++extern int os_error_is_disconnect(int error);
+ extern int os_sync_file(int fd);
+ extern int os_file_size(const char *file, unsigned long long *size_out);
+ extern int os_pread_file(int fd, void *buf, int len, unsigned long long offset);
+diff --git a/arch/um/os-Darwin/file.c b/arch/um/os-Darwin/file.c
+index 4e03a2424252b6cf64aa8cb97850a8a144455a66..2af88421f7a2d6d47b0462532f0ed7417af4b178 100644
+--- a/arch/um/os-Darwin/file.c
++++ b/arch/um/os-Darwin/file.c
+@@ -209,6 +209,12 @@ int os_error_is_would_block(int error)
+ 	return error == -EAGAIN || error == -EWOULDBLOCK;
+ }
+ 
++/* Whether a socket's error means its peer has gone, in host errno values. */
++int os_error_is_disconnect(int error)
++{
++	return error == -EPIPE || error == -ECONNRESET || error == -ENOTCONN;
++}
++
+ int os_pread_file(int fd, void *buffer, int length,
+ 		  unsigned long long offset)
+ {

@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Rosenberg <drosen@google.com>
+Date: Fri, 22 Apr 2016 00:00:48 -0700
+Subject: [PATCH] fuse: add support for d_canonical_path
+
+Allows FUSE to report to inotify that it is acting as a layered
+filesystem. The userspace component returns a string representing the
+location of the underlying file, and the kernel resolves it, in the
+daemon's context, while it writes the reply. A daemon that cannot give
+the location may fail the request, which lets it refuse an inotify
+watch, and one that answers ENOSYS is not asked again.
+
+Rolled in fix from
+cad4f67e5b5b("ANDROID: fuse: Allocate zeroed memory for canonical path")
+
+Signed-off-by: Daniel Rosenberg <drosen@google.com>
+Signed-off-by: Alessio Balsini <balsini@google.com>
+(cherry picked from commit 31c46931f12a of the Android common kernel
+android17-6.18, with the error handling of cdbf344d3522 by Paul
+Lawrence, which combines it with the fixes for the ENOSYS cases)
+[Adapted to 6.18.54: the code is keyed on the new
+CONFIG_FUSE_CANONICAL_PATH, which selects CONFIG_DCACHE_CANONICAL_PATH,
+and FUSE-BPF does not exist here. A daemon without the operation now
+makes d_canonical_path return -ENOSYS, the value its two callers take
+as "keep the dentry's own path", where the Android kernel returned that
+path and so notified it twice for an open. The reply is not trusted to
+be non-empty: the page is zeroed, and an empty reply is an empty path.]
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ fs/fuse/Kconfig           | 18 +++++++++++++++
+ fs/fuse/args.h            |  5 ++++
+ fs/fuse/dev.c             | 14 ++++++++++++
+ fs/fuse/dir.c             | 48 +++++++++++++++++++++++++++++++++++++++
+ fs/fuse/fuse_i.h          |  5 ++++
+ include/uapi/linux/fuse.h |  3 +++
+ 6 files changed, 93 insertions(+)
+
+diff --git a/fs/fuse/Kconfig b/fs/fuse/Kconfig
+index 3a4ae632c94aa8b6f57f8a3dd08fe70f1573c846..23572fcafdd16a176ccf8bc659fe32b9b744e185 100644
+--- a/fs/fuse/Kconfig
++++ b/fs/fuse/Kconfig
+@@ -65,6 +65,24 @@ config FUSE_PASSTHROUGH
+ 
+ 	  If you want to allow passthrough operations, answer Y.
+ 
++config FUSE_CANONICAL_PATH
++	bool "FUSE canonical paths for inotify"
++	depends on FUSE_FS
++	depends on INOTIFY_USER
++	select DCACHE_CANONICAL_PATH
++	help
++	  This lets a FUSE server that implements FUSE_CANONICAL_PATH tell
++	  the kernel which file of another filesystem a FUSE file stands for.
++	  inotify then watches that file instead of the FUSE one, and so sees
++	  the changes made to it outside the FUSE mount, and an open of the
++	  FUSE file is reported to the watchers of that file as well.
++
++	  Android's MediaProvider serves shared storage this way, and its apps
++	  rely on it for FileObserver. A server without the operation is asked
++	  once.
++
++	  Say N unless the guest is Android.
++
+ config FUSE_IO_URING
+ 	bool "FUSE communication over io-uring"
+ 	default y
+diff --git a/fs/fuse/args.h b/fs/fuse/args.h
+index ecfe51a192af0becae2abed3b14672c312230151..d6a1143f293425b24c9ed4cc0f9fda13413fc043 100644
+--- a/fs/fuse/args.h
++++ b/fs/fuse/args.h
+@@ -6,6 +6,7 @@
+ #include <linux/types.h>
+ 
+ struct fuse_mount;
++struct path;
+ 
+ /** One input argument of a request */
+ struct fuse_in_arg {
+@@ -47,6 +48,10 @@ struct fuse_args {
+ 	void (*end)(struct fuse_args *args, int error);
+ 	/* Used for kvec iter backed by vmalloc address */
+ 	void *vmap_base;
++#ifdef CONFIG_FUSE_CANONICAL_PATH
++	/* Path the reply to FUSE_CANONICAL_PATH resolves to */
++	struct path *canonical_path;
++#endif
+ };
+ 
+ /** FUSE folio descriptor */
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index 7c884532d9e736df7f715b749b157a7c8180d39f..18eabade80a9a8178ebeeb000d8c02312f2836ce 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -24,6 +24,7 @@
+ #include <linux/splice.h>
+ #include <linux/sched.h>
+ #include <linux/seq_file.h>
++#include <linux/namei.h>
+ 
+ #include "fuse_trace.h"
+ 
+@@ -2285,6 +2286,19 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 		err = fuse_copy_out_args(cs, req->args, nbytes);
+ 	fuse_copy_finish(cs);
+ 
++#ifdef CONFIG_FUSE_CANONICAL_PATH
++	if (!err && req->in.h.opcode == FUSE_CANONICAL_PATH && !oh.error) {
++		char *path = (char *)req->args->out_args[0].value;
++		unsigned int size = req->args->out_args[0].size;
++
++		/* The buffer is zeroed, so an empty reply is an empty path */
++		if (size)
++			path[size - 1] = 0;
++		req->out.h.error =
++			kern_path(path, 0, req->args->canonical_path);
++	}
++#endif
++
+ 	spin_lock(&fpq->lock);
+ 	clear_bit(FR_LOCKED, &req->flags);
+ 	if (!fpq->connected)
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index a013fad843b2cdbb55827ca1de07f78b2a9ddccc..e0862f66770e82367085b55e504b23710a9c594d 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -340,12 +340,60 @@ static struct vfsmount *fuse_dentry_automount(struct path *path)
+ 	return mnt;
+ }
+ 
++#ifdef CONFIG_FUSE_CANONICAL_PATH
++/*
++ * Get the canonical path. Since we must translate to a path, this must be done
++ * in the context of the userspace daemon, however, the userspace daemon cannot
++ * look up paths on its own. Instead, we handle the lookup as a special case
++ * inside of the write request.
++ *
++ * -ENOSYS means the daemon has no canonical path to report, and the caller
++ * keeps the dentry's own path.
++ */
++static int fuse_dentry_canonical_path(const struct path *path,
++				      struct path *canonical_path)
++{
++	struct inode *inode = d_inode(path->dentry);
++	struct fuse_mount *fm = get_fuse_mount_super(path->mnt->mnt_sb);
++	FUSE_ARGS(args);
++	char *path_name;
++	int err;
++
++	if (fm->fc->no_dentry_canonical_path)
++		return -ENOSYS;
++
++	path_name = (char *)get_zeroed_page(GFP_KERNEL);
++	if (!path_name)
++		return -ENOMEM;
++
++	args.opcode = FUSE_CANONICAL_PATH;
++	args.nodeid = get_node_id(inode);
++	args.in_numargs = 0;
++	args.out_numargs = 1;
++	args.out_args[0].size = PATH_MAX;
++	args.out_args[0].value = path_name;
++	args.canonical_path = canonical_path;
++	args.out_argvar = 1;
++
++	err = fuse_simple_request(fm, &args);
++	free_page((unsigned long)path_name);
++	if (err > 0)
++		return 0;
++	if (err == -ENOSYS)
++		fm->fc->no_dentry_canonical_path = 1;
++	return err;
++}
++#endif
++
+ const struct dentry_operations fuse_dentry_operations = {
+ 	.d_revalidate	= fuse_dentry_revalidate,
+ 	.d_delete	= fuse_dentry_delete,
+ 	.d_init		= fuse_dentry_init,
+ 	.d_release	= fuse_dentry_release,
+ 	.d_automount	= fuse_dentry_automount,
++#ifdef CONFIG_FUSE_CANONICAL_PATH
++	.d_canonical_path = fuse_dentry_canonical_path,
++#endif
+ };
+ 
+ int fuse_valid_type(int m)
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 7d26159af4059ad598f1ddd2907c59585c3267b6..56e0019ca7b492e4830c7776b595d67fd022498d 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -845,6 +845,11 @@ struct fuse_conn {
+ 	/* Is statx not implemented by fs? */
+ 	unsigned int no_statx:1;
+ 
++#ifdef CONFIG_FUSE_CANONICAL_PATH
++	/* Is d_canonical_path not implemented by fs? */
++	unsigned int no_dentry_canonical_path:1;
++#endif
++
+ 	/** Passthrough support for read/write IO */
+ 	unsigned int passthrough:1;
+ 
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index c13e1f9a2f12bd39f535188cb5466688eba42263..f16ec1aee7516462917b280d2fda462266d30dbe 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -664,6 +664,9 @@ enum fuse_opcode {
+ 	FUSE_STATX		= 52,
+ 	FUSE_COPY_FILE_RANGE_64	= 53,
+ 
++	/* Android: the path of the file a FUSE file wraps, for inotify */
++	FUSE_CANONICAL_PATH	= 2016,
++
+ 	/* CUSE specific operations */
+ 	CUSE_INIT		= 4096,
+ 

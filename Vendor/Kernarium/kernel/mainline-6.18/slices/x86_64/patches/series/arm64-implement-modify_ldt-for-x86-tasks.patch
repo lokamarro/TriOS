@@ -1,0 +1,439 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:14:53 +0900
+Subject: [PATCH] arm64: implement modify_ldt for x86 tasks
+
+x86 tasks of the x86-64 userspace slice get an LDT, which modify_ldt()
+reads and writes as an x86-64 kernel does: function 0 reads the
+entries in use, zero-filled to the byte count; 2 gives 128 zero bytes;
+1 and 0x11 write one entry in the old and the new mode, with Linux's
+checks and fill_ldt()'s descriptor; anything else is ENOSYS, and the
+result is an int, zero-extended in RAX. A fork child gets a copy, and
+execve starts without one. Wine's i386 NtSetLdtEntries() is a user.
+
+This kernel refuses 16-bit segments, as an x86-64 kernel built
+without CONFIG_X86_16BIT does: the Darwin host runs no 16-bit code.
+
+The host's engines read the table while the mm's tasks run (bridge
+ABI 20): every guest entry hands its address over in the guest
+registers' fp. The table holds all 8192 descriptors from the first
+write on, a write changes one descriptor with a single 8-byte store,
+and the table is freed only with the mm. An empty slot answers every
+lookup as an index past Linux's LDT limit does, so the host needs no
+entry count.
+
+The breakpoint event's #NP, which a selector load of a segment that is
+not present raises, reaches the task as SIGBUS with SI_KERNEL and the
+selector in the error code, as on x86 Linux.
+---
+ arch/arm64/um/Makefile             |   2 +-
+ arch/arm64/um/ldt.c                | 191 +++++++++++++++++++++++++++++
+ arch/arm64/um/x86_32.h             |  17 +++
+ arch/arm64/um/x86_32_syscalls.c    |  13 --
+ arch/um/include/asm/mm_hooks.h     |   6 +
+ arch/um/include/asm/mmu.h          |  10 ++
+ arch/um/include/shared/kern_util.h |   1 +
+ arch/um/kernel/skas/mmu_darwin.c   |  11 ++
+ arch/um/os-Darwin/skas/process.c   |  19 ++-
+ 9 files changed, 251 insertions(+), 19 deletions(-)
+ create mode 100644 arch/arm64/um/ldt.c
+
+diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
+index cc95273be0999519bc1fd89160ddbf39772dbc74..0f28e2f9b1be156b6d873587861c1bf1627c9986 100644
+--- a/arch/arm64/um/Makefile
++++ b/arch/arm64/um/Makefile
+@@ -8,7 +8,7 @@ obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
+ obj-$(CONFIG_UML_ARM64_AARCH32) += aarch32.o aarch32_pages.o \
+ 	armv8_deprecated.o ptrace32.o signal32.o sys32.o sys_compat.o
+ obj-$(CONFIG_COMPAT) += x86_32_syscalls.o
+-obj-$(CONFIG_UML_X86_64_USERSPACE_ONLY) += x86_syscall_tables.o
++obj-$(CONFIG_UML_X86_64_USERSPACE_ONLY) += ldt.o x86_syscall_tables.o
+ 
+ x86-syscalltbl := $(srctree)/scripts/syscalltbl.sh
+ x86-syscall-32 := $(srctree)/arch/x86/entry/syscalls/syscall_32.tbl
+diff --git a/arch/arm64/um/ldt.c b/arch/arm64/um/ldt.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4eda41e0416698b81be7c6df6d04c537406d019
+--- /dev/null
++++ b/arch/arm64/um/ldt.c
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * The x86 LDT of an x86-64 userspace slice task's mm, which modify_ldt()
++ * edits as an x86-64 kernel does.  The Darwin host's engines read the table
++ * while the mm's tasks run: the guest registers' fp carries its address at
++ * every entry (bridge ABI 20).  So the table holds all 8192 descriptors from
++ * the first write on, a write changes one descriptor with a single 8-byte
++ * store, and the table goes only with the mm.  An empty slot answers every
++ * lookup as an index beyond Linux's LDT limit does, so the host needs no
++ * entry count; only modify_ldt()'s read keeps one.
++ *
++ * This kernel refuses 16-bit segments, as an x86-64 kernel built without
++ * CONFIG_X86_16BIT does: the host runs no 16-bit code.
++ */
++
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <asm/mm_hooks.h>
++#include <kern_util.h>
++#include "x86_32.h"
++
++enum {
++	UML_X86_LDT_ENTRIES = 8192,
++	UML_X86_LDT_SIZE = UML_X86_LDT_ENTRIES * sizeof(u64),
++	/* What read_default_ldt() gives on x86-64: 128 zero bytes. */
++	UML_X86_LDT_DEFAULT_SIZE = 128,
++};
++
++/* LDT_empty(): the descriptor of no segment, which clears an entry. */
++static bool uml_x86_ldt_empty(const struct uml_x86_32_user_desc *info)
++{
++	return info->base_addr == 0 && info->limit == 0 &&
++		info->contents == 0 && info->read_exec_only == 1 &&
++		info->seg_32bit == 0 && info->limit_in_pages == 0 &&
++		info->seg_not_present == 1 && info->useable == 0;
++}
++
++/* fill_ldt(): accessed, DPL 3, never a long-mode code segment. */
++static u64 uml_x86_ldt_descriptor(const struct uml_x86_32_user_desc *info,
++				  bool oldmode)
++{
++	u64 base = info->base_addr;
++	u64 limit = info->limit;
++	u64 type = ((info->read_exec_only ^ 1ULL) << 1) |
++		((u64)info->contents << 2) | 1;
++
++	return (limit & 0xffff) | ((base & 0xffffff) << 16) |
++		(type << 40) | (1ULL << 44) | (3ULL << 45) |
++		((u64)(info->seg_not_present ^ 1) << 47) |
++		(((limit >> 16) & 0xf) << 48) |
++		((u64)(oldmode ? 0 : info->useable) << 52) |
++		((u64)info->seg_32bit << 54) |
++		((u64)info->limit_in_pages << 55) |
++		((base >> 24) << 56);
++}
++
++static int uml_x86_read_ldt(void __user *ptr, unsigned long bytecount)
++{
++	struct mm_struct *mm = current->mm;
++	unsigned long size;
++	int result;
++
++	mmap_read_lock(mm);
++	if (mm->context.x86_ldt == NULL) {
++		result = 0;
++		goto out;
++	}
++	if (bytecount > UML_X86_LDT_SIZE)
++		bytecount = UML_X86_LDT_SIZE;
++	size = min_t(unsigned long, bytecount,
++		     mm->context.x86_ldt_entries * sizeof(u64));
++	if (copy_to_user(ptr, mm->context.x86_ldt, size) ||
++	    clear_user(ptr + size, bytecount - size)) {
++		result = -EFAULT;
++		goto out;
++	}
++	result = bytecount;
++out:
++	mmap_read_unlock(mm);
++	return result;
++}
++
++static int uml_x86_read_default_ldt(void __user *ptr, unsigned long bytecount)
++{
++	if (bytecount > UML_X86_LDT_DEFAULT_SIZE)
++		bytecount = UML_X86_LDT_DEFAULT_SIZE;
++	if (clear_user(ptr, bytecount))
++		return -EFAULT;
++	return bytecount;
++}
++
++static int uml_x86_write_ldt(void __user *ptr, unsigned long bytecount,
++			     bool oldmode)
++{
++	struct mm_struct *mm = current->mm;
++	struct uml_x86_32_user_desc info;
++	u64 descriptor = 0;
++	u64 *table;
++
++	if (bytecount != sizeof(info))
++		return -EINVAL;
++	if (copy_from_user(&info, ptr, sizeof(info)))
++		return -EFAULT;
++	if (info.entry_number >= UML_X86_LDT_ENTRIES)
++		return -EINVAL;
++	if (info.contents == 3 && (oldmode || !info.seg_not_present))
++		return -EINVAL;
++	if (!(oldmode && !info.base_addr && !info.limit) &&
++	    !uml_x86_ldt_empty(&info)) {
++		if (!info.seg_32bit)
++			return -EINVAL;
++		descriptor = uml_x86_ldt_descriptor(&info, oldmode);
++	}
++
++	if (mmap_write_lock_killable(mm))
++		return -EINTR;
++	table = mm->context.x86_ldt;
++	if (table == NULL) {
++		table = kzalloc(UML_X86_LDT_SIZE, GFP_KERNEL_ACCOUNT);
++		if (table == NULL) {
++			mmap_write_unlock(mm);
++			return -ENOMEM;
++		}
++		/* A task of the mm that enters the guest after this sees the
++		 * zeroed table before its address. */
++		smp_store_release(&mm->context.x86_ldt, table);
++	}
++	WRITE_ONCE(table[info.entry_number], descriptor);
++	mm->context.x86_ldt_entries = max(mm->context.x86_ldt_entries,
++					  info.entry_number + 1);
++	mmap_write_unlock(mm);
++	return 0;
++}
++
++SYSCALL_DEFINE3(modify_ldt, int, func, void __user *, ptr,
++		unsigned long, bytecount)
++{
++	int result = -ENOSYS;
++
++	switch (func) {
++	case 0:
++		result = uml_x86_read_ldt(ptr, bytecount);
++		break;
++	case 1:
++		result = uml_x86_write_ldt(ptr, bytecount, true);
++		break;
++	case 2:
++		result = uml_x86_read_default_ldt(ptr, bytecount);
++		break;
++	case 0x11:
++		result = uml_x86_write_ldt(ptr, bytecount, false);
++		break;
++	}
++	/* modify_ldt() returns an int, which x86-64 Linux hands back
++	 * zero-extended in RAX. */
++	return (unsigned int)result;
++}
++
++unsigned long current_x86_ldt(void)
++{
++	struct mm_struct *mm = current->mm;
++
++	return mm == NULL ? 0 :
++		(unsigned long)smp_load_acquire(&mm->context.x86_ldt);
++}
++
++/* Called with both mms' mmap_lock held for writing. */
++int uml_x86_ldt_dup(struct mm_struct *oldmm, struct mm_struct *mm)
++{
++	u64 *table;
++
++	if (oldmm->context.x86_ldt == NULL)
++		return 0;
++	table = kmemdup(oldmm->context.x86_ldt, UML_X86_LDT_SIZE,
++			GFP_KERNEL_ACCOUNT);
++	if (table == NULL)
++		return -ENOMEM;
++	mm->context.x86_ldt = table;
++	mm->context.x86_ldt_entries = oldmm->context.x86_ldt_entries;
++	return 0;
++}
++
++void uml_x86_ldt_free(struct mm_struct *mm)
++{
++	kfree(mm->context.x86_ldt);
++	mm->context.x86_ldt = NULL;
++	mm->context.x86_ldt_entries = 0;
++}
+diff --git a/arch/arm64/um/x86_32.h b/arch/arm64/um/x86_32.h
+index 76a56e3ed77af00063dc201bd461565318be63b8..5fd66e09ae77f23741aa5ef124c93e1f9b64026c 100644
+--- a/arch/arm64/um/x86_32.h
++++ b/arch/arm64/um/x86_32.h
+@@ -2,8 +2,25 @@
+ #ifndef __UM_ARM64_X86_32_H
+ #define __UM_ARM64_X86_32_H
+ 
++#include <linux/types.h>
++
+ struct task_struct;
+ 
++/* struct user_desc of set_thread_area() and modify_ldt(); x86-64's has the
++ * lm bit next, which a descriptor from user space never sets. */
++struct uml_x86_32_user_desc {
++	u32 entry_number;
++	u32 base_addr;
++	u32 limit;
++	u32 seg_32bit : 1;
++	u32 contents : 2;
++	u32 read_exec_only : 1;
++	u32 limit_in_pages : 1;
++	u32 seg_not_present : 1;
++	u32 useable : 1;
++	u32 reserved : 25;
++};
++
+ int uml_x86_32_set_task_tls(struct task_struct *task, unsigned long descriptor);
+ 
+ #endif
+diff --git a/arch/arm64/um/x86_32_syscalls.c b/arch/arm64/um/x86_32_syscalls.c
+index e2b7a3efea0cfccde4ed0f388fee7b46ed540455..bf9d9d8a789afb0e9718d9f6b0482a031147b546 100644
+--- a/arch/arm64/um/x86_32_syscalls.c
++++ b/arch/arm64/um/x86_32_syscalls.c
+@@ -31,19 +31,6 @@ enum {
+ 	UML_X86_32_TLS_ENTRIES = 3,
+ };
+ 
+-struct uml_x86_32_user_desc {
+-	u32 entry_number;
+-	u32 base_addr;
+-	u32 limit;
+-	u32 seg_32bit : 1;
+-	u32 contents : 2;
+-	u32 read_exec_only : 1;
+-	u32 limit_in_pages : 1;
+-	u32 seg_not_present : 1;
+-	u32 useable : 1;
+-	u32 reserved : 25;
+-};
+-
+ /* The guest registers carry one descriptor per compat_tls pair. */
+ static_assert(sizeof(struct uml_x86_32_user_desc) ==
+ 	sizeof(((struct uml_pt_regs *)0)->compat_tls[0]));
+diff --git a/arch/um/include/asm/mm_hooks.h b/arch/um/include/asm/mm_hooks.h
+index 2427d23ff06b608042a4b2eec8c8b4438a19a56a..3552cbdf6de90e19c7659f0ea8662cae83ffda3a 100644
+--- a/arch/um/include/asm/mm_hooks.h
++++ b/arch/um/include/asm/mm_hooks.h
+@@ -6,6 +6,12 @@
+ struct mm_struct;
+ struct vm_area_struct;
+ 
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++/* arch/arm64/um/ldt.c: a fork child gets a copy of its parent's LDT. */
++int uml_x86_ldt_dup(struct mm_struct *oldmm, struct mm_struct *mm);
++void uml_x86_ldt_free(struct mm_struct *mm);
++#endif
++
+ #ifdef CONFIG_UML_DARWIN_MM_SHARED
+ int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm);
+ #else
+diff --git a/arch/um/include/asm/mmu.h b/arch/um/include/asm/mmu.h
+index fdc3e28675372640fbebb31155b25a035b021209..a7d76b1c5499420064308406731c8e40e14fef3e 100644
+--- a/arch/um/include/asm/mmu.h
++++ b/arch/um/include/asm/mmu.h
+@@ -30,6 +30,16 @@ typedef struct mm_context {
+ #ifdef CONFIG_COMPAT
+ 	/* Where the signal-return trampolines of a 32-bit task are mapped. */
+ 	unsigned long compat_sigpage;
++#endif
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	/*
++	 * The x86 LDT of the mm's tasks, all 8192 descriptors from the first
++	 * modify_ldt() write on, or NULL; arch/arm64/um/ldt.c.  The Darwin
++	 * host reads it while the tasks run, so it changes one descriptor at
++	 * a time and is freed only with the mm.
++	 */
++	u64 *x86_ldt;
++	unsigned int x86_ldt_entries;
+ #endif
+ 	struct mutex turnstile;
+ 
+diff --git a/arch/um/include/shared/kern_util.h b/arch/um/include/shared/kern_util.h
+index 4f94a043ff6518da1eb331931e677e96f2ebe5bb..26cd771730004f8ca702a6a4fa48e9830a33bc09 100644
+--- a/arch/um/include/shared/kern_util.h
++++ b/arch/um/include/shared/kern_util.h
+@@ -69,6 +69,7 @@ extern void do_uml_exitcalls(void);
+ extern int __uml_cant_sleep(void);
+ extern int get_current_pid(void);
+ extern int current_is_x86_32_userspace(void);
++extern unsigned long current_x86_ldt(void);
+ extern int copy_from_user_proc(void *to, void *from, int size);
+ extern char *uml_strdup(const char *string);
+ int uml_need_resched(void);
+diff --git a/arch/um/kernel/skas/mmu_darwin.c b/arch/um/kernel/skas/mmu_darwin.c
+index 7a70e528b66dd95c7102ff2f8bc335907c18c985..2a704fcdc2dc64f45e6d1fbe8e47da133e3e9c16 100644
+--- a/arch/um/kernel/skas/mmu_darwin.c
++++ b/arch/um/kernel/skas/mmu_darwin.c
+@@ -119,7 +119,11 @@ int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm)
+ {
+ 	if (READ_ONCE(oldmm->context.darwin_maps_shared) && maps_shared(mm))
+ 		WRITE_ONCE(mm->context.darwin_maps_shared, 1);
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	return uml_x86_ldt_dup(oldmm, mm);
++#else
+ 	return 0;
++#endif
+ }
+ #endif
+ 
+@@ -151,6 +155,10 @@ int init_new_context(struct task_struct *task, struct mm_struct *mm)
+ #ifdef CONFIG_UML_DARWIN_MM_SHARED
+ 	mm->context.darwin_maps_shared = 0;
+ 	atomic_set(&mm->context.darwin_ring_pins, 0);
++#endif
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	mm->context.x86_ldt = NULL;
++	mm->context.x86_ldt_entries = 0;
+ #endif
+ 	id->stack = 0;
+ 	id->sock = -1;
+@@ -170,4 +178,7 @@ void destroy_context(struct mm_struct *mm)
+ 		      id->darwin_generation);
+ 	id->darwin_context = NULL;
+ 	id->pid = -1;
++#ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
++	uml_x86_ldt_free(mm);
++#endif
+ }
+diff --git a/arch/um/os-Darwin/skas/process.c b/arch/um/os-Darwin/skas/process.c
+index 9eb94479273d2bc898a29169a51c6b7ac7e60dd1..c28617c6798bad815dd135c1001c71af4a6b2518 100644
+--- a/arch/um/os-Darwin/skas/process.c
++++ b/arch/um/os-Darwin/skas/process.c
+@@ -96,6 +96,7 @@ _Static_assert(UML_ARM64_SME_P_OFFSET(64, 3) ==
+ /* Linux's ILL_ILLOPN, which Darwin's signal.h numbers 4, for x86 #UD. */
+ #define DARWIN_GUEST_ILL_ILLOPN 2
+ #define DARWIN_GUEST_X86_TRAP_UD 6
++#define DARWIN_GUEST_X86_TRAP_NP 11
+ #define DARWIN_GUEST_X86_TRAP_SS 12
+ #define DARWIN_GUEST_X86_TRAP_MF 16
+ #define DARWIN_GUEST_X86_TRAP_XM 19
+@@ -477,6 +478,8 @@ void userspace(struct uml_pt_regs *registers)
+ #ifdef CONFIG_UML_X86_64_USERSPACE_ONLY
+ 		upt_x86_32_set_task_mode(registers,
+ 					 current_is_x86_32_userspace());
++		/* Bridge ABI 20: the host reads the mm's LDT from here. */
++		UPT_FP(registers) = current_x86_ldt();
+ #endif
+ 		guest_tls = current_tls();
+ 		/* Snapshot before polling so an IPI racing with the poll remains
+@@ -779,17 +782,23 @@ void userspace(struct uml_pt_regs *registers)
+ 			} else if (registers->faultinfo.trap_no == 4 ||
+ 				   registers->faultinfo.trap_no == 5 ||
+ 				   registers->faultinfo.trap_no ==
++				   DARWIN_GUEST_X86_TRAP_NP ||
++				   registers->faultinfo.trap_no ==
+ 				   DARWIN_GUEST_X86_TRAP_SS ||
+ 				   registers->faultinfo.trap_no == 13) {
+-				/* #OF from INTO or INT 4, #BR from BOUND, #SS from a
+-				 * non-canonical stack address, and a #GP such as RDTSC
++				/* #OF from INTO or INT 4, #BR from BOUND, #NP and
++				 * #SS from a segment that is not present or a stack
++				 * access outside its segment, and a #GP such as RDTSC
+ 				 * under PR_TSC_SIGSEGV reach native userspace with
+ 				 * Linux SI_KERNEL, a name Darwin's signal.h does not
+-				 * define, and no fault address: #SS as SIGBUS and the
+-				 * rest as SIGSEGV.  The host's error code stays, as
+-				 * the selector index a #GP from INT n names. */
++				 * define, and no fault address: #NP and #SS as
++				 * SIGBUS and the rest as SIGSEGV.  The host's error
++				 * code stays, as the selector a segment fault or a
++				 * #GP from INT n names. */
+ 				registers->faultinfo.cr2 = 0;
+ 				signal_info.si_signo =
++					registers->faultinfo.trap_no ==
++					DARWIN_GUEST_X86_TRAP_NP ||
+ 					registers->faultinfo.trap_no ==
+ 					DARWIN_GUEST_X86_TRAP_SS ?
+ 					DARWIN_GUEST_SIGBUS : SIGSEGV;

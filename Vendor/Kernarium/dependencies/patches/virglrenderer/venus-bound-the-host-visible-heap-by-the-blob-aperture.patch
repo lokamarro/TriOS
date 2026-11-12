@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 11:53:41 +0900
+Subject: [PATCH] venus: bound the host-visible heap by the blob aperture
+
+A Venus guest reaches host-visible memory only through the fixed blob
+aperture the transport publishes, never through its own pages. The guest
+was nevertheless shown the host's whole system-memory heap for that type,
+so nothing told it how much of that memory it could ever have mapped at
+once.
+
+A guest sizes its largest host-visible mapping from the heap it is shown.
+The conformance suite does exactly that, taking up to a quarter of the
+heap, and the aperture cannot place such a mapping: the guest's blob
+allocator keeps the previous mapping resident until the host has retired
+it, so the live demand is several times the mapping, and the request fails
+at vkMapMemory with VK_ERROR_OUT_OF_DEVICE_MEMORY -- a session-ending
+error, after the allocation the guest could have coped with succeeded.
+
+Give the synthesized host-visible type its own heap, sized by the aperture
+the host states through virgl_renderer_set_host_visible_aperture_size(),
+which is the same split a discrete GPU makes between its VRAM and the
+visible window into it. A host that states no aperture keeps the single
+heap it has today. Memory budgets the host reports are indexed by its own
+heaps, so they are mapped onto the guest's heaps and bounded by them.
+---
+ src/venus/vkr_physical_device.c | 69 +++++++++++++++++++++++++++++++++
+ src/venus/vkr_physical_device.h |  3 ++
+ src/venus/vkr_renderer.c        | 20 ++++++++++
+ src/venus/vkr_renderer.h        |  6 +++
+ src/virglrenderer.c             | 14 +++++++
+ src/virglrenderer.h             | 14 +++++++
+ 6 files changed, 126 insertions(+)
+
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 06136a73e756b584d2f3963e0b974e51fd06233b..f449011fc7037b8dcc12394128f7b5b8ddf5f19a 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -177,6 +177,8 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+ 
+    for (uint32_t i = 0; i < physical_dev->memory_properties.memoryTypeCount; i++)
+       physical_dev->memory_type_guest_to_host[i] = i;
++   for (uint32_t i = 0; i < physical_dev->memory_properties.memoryHeapCount; i++)
++      physical_dev->memory_heap_guest_to_host[i] = i;
+ 
+    /* VK_EXT_external_memory_host imports anonymous guest memory as a native
+     * buffer.  Some unified-memory drivers expose a single host-visible,
+@@ -206,6 +208,35 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+          physical_dev->memory_type_guest_to_host[1] = 0;
+          physical_dev->host_visible_memory_type_bits = 1u << 1;
+          physical_dev->separate_external_host_memory = true;
++
++         /* The guest reaches this type through a fixed blob aperture rather
++          * than through its own pages, so the heap the guest is shown has to
++          * describe the aperture and not the host's system memory. A guest
++          * that sizes its largest host-visible mapping from the heap -- the
++          * conformance suite does, at up to a quarter of it -- otherwise asks
++          * for a mapping the aperture can never place, and it fails with
++          * VK_ERROR_OUT_OF_DEVICE_MEMORY instead of the allocation failing
++          * where the guest could have coped. The split is the same one a
++          * discrete GPU makes between its VRAM and the visible window into
++          * it.
++          */
++         const uint64_t aperture =
++            vkr_renderer_get_host_visible_aperture_size();
++         VkPhysicalDeviceMemoryProperties *props =
++            &physical_dev->memory_properties;
++         const uint32_t host_heap_index = device_type->heapIndex;
++         if (aperture && props->memoryHeapCount < VK_MAX_MEMORY_HEAPS &&
++             aperture < props->memoryHeaps[host_heap_index].size) {
++            const uint32_t heap_index = props->memoryHeapCount++;
++            props->memoryHeaps[heap_index] = (VkMemoryHeap){
++               .size = aperture,
++               .flags = props->memoryHeaps[host_heap_index].flags,
++            };
++            physical_dev->memory_heap_guest_to_host[heap_index] =
++               host_heap_index;
++            host_visible_type->heapIndex = heap_index;
++            physical_dev->bounded_host_visible_heap = true;
++         }
+       }
+    }
+ 
+@@ -814,6 +845,42 @@ vkr_dispatch_vkGetPhysicalDeviceQueueFamilyProperties2(
+                                                args->pQueueFamilyProperties);
+ }
+ 
++/* A budget the host reported is indexed by its own heaps. Where the guest sees
++ * an extra heap that names the blob aperture, that heap's budget and usage are
++ * the host heap's, bounded by the aperture the guest was promised.
++ */
++static void
++vkr_physical_device_map_memory_budget(
++   const struct vkr_physical_device *physical_dev, void *pnext)
++{
++   if (!physical_dev->bounded_host_visible_heap)
++      return;
++
++   VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget = vkr_find_struct(
++      pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT);
++   if (!budget)
++      return;
++
++   const VkPhysicalDeviceMemoryProperties *props =
++      &physical_dev->memory_properties;
++   VkDeviceSize heap_budget[VK_MAX_MEMORY_HEAPS];
++   VkDeviceSize heap_usage[VK_MAX_MEMORY_HEAPS];
++   memcpy(heap_budget, budget->heapBudget, sizeof(heap_budget));
++   memcpy(heap_usage, budget->heapUsage, sizeof(heap_usage));
++
++   for (uint32_t i = 0; i < props->memoryHeapCount; i++) {
++      const uint32_t host_index = physical_dev->memory_heap_guest_to_host[i];
++      const VkDeviceSize size = props->memoryHeaps[i].size;
++      budget->heapBudget[i] =
++         MIN2(heap_budget[host_index], size);
++      budget->heapUsage[i] = MIN2(heap_usage[host_index], size);
++   }
++   for (uint32_t i = props->memoryHeapCount; i < VK_MAX_MEMORY_HEAPS; i++) {
++      budget->heapBudget[i] = 0;
++      budget->heapUsage[i] = 0;
++   }
++}
++
+ static void
+ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
+    UNUSED struct vn_dispatch_context *dispatch,
+@@ -827,6 +894,8 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
+       vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
+       vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
+                                              args->pMemoryProperties);
++      vkr_physical_device_map_memory_budget(physical_dev,
++                                            args->pMemoryProperties->pNext);
+    }
+ 
+    /* The base properties are invariant and can include renderer-provided
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index 1d3ef2f190b2b5ba9cf456d869799a453b88b0e2..0b101fb6fae1859e44108b9c8f3ccadfdd549160 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -36,8 +36,11 @@ struct vkr_physical_device {
+    VkPhysicalDeviceMemoryProperties host_memory_properties;
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    uint8_t memory_type_guest_to_host[VK_MAX_MEMORY_TYPES];
++   uint8_t memory_heap_guest_to_host[VK_MAX_MEMORY_HEAPS];
+    uint32_t host_visible_memory_type_bits;
+    bool separate_external_host_memory;
++   /* set when the host-visible type was given its own aperture-sized heap */
++   bool bounded_host_visible_heap;
+    VkPhysicalDeviceIDProperties id_properties;
+    bool is_dma_buf_fd_export_supported;
+    bool is_opaque_fd_export_supported;
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 52ef342cb4163b313e4c6f2af67dd11a60d58d91..47ef6c053c8c70e1e1a04ed2f1e246e6ad48f48f 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -16,10 +16,30 @@ struct vkr_renderer_state {
+ 
+    /* track the vkr_context */
+    struct list_head contexts;
++
++   /* how much host-visible blob memory the transport can keep mapped into the
++    * guest at once, or zero when it has no such bound
++    */
++   uint64_t host_visible_aperture_size;
+ };
+ 
+ struct vkr_renderer_state vkr_state;
+ 
++/* Set before vkr_renderer_init and left alone by vkr_renderer_fini: the
++ * transport's aperture is a property of the host, not of one renderer run.
++ */
++void
++vkr_renderer_set_host_visible_aperture_size(uint64_t size)
++{
++   vkr_state.host_visible_aperture_size = size;
++}
++
++uint64_t
++vkr_renderer_get_host_visible_aperture_size(void)
++{
++   return vkr_state.host_visible_aperture_size;
++}
++
+ size_t
+ vkr_get_capset(void *capset, uint32_t flags)
+ {
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index be3ae04605efc75cddf2bde5b8254cd8160d312d..71fa65494fef44c0d66e1f5d9116e6e4806de9ee 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -29,6 +29,12 @@ struct vkr_renderer_callbacks {
+ size_t
+ vkr_get_capset(void *capset, uint32_t flags);
+ 
++void
++vkr_renderer_set_host_visible_aperture_size(uint64_t size);
++
++uint64_t
++vkr_renderer_get_host_visible_aperture_size(void);
++
+ bool
+ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs);
+ 
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index adacb9a0e19775b56ba0a4a3ab7d44759f866ef2..ca3112d47446e92822fe248dac57e3741aac4a42 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -46,6 +46,9 @@
+ #endif
+ 
+ #include "vkr_allocator.h"
++#ifdef ENABLE_VENUS
++#include "vkr_renderer.h"
++#endif
+ #include "drm_renderer.h"
+ #include "proxy/proxy_renderer.h"
+ #include "virgl_protocol.h"
+@@ -1658,6 +1661,17 @@ virgl_renderer_release_handle_for_scanout(enum virgl_renderer_native_handle_type
+ #endif
+ }
+ 
++void
++virgl_renderer_set_host_visible_aperture_size(uint64_t size)
++{
++   TRACE_FUNC();
++#ifdef ENABLE_VENUS
++   vkr_renderer_set_host_visible_aperture_size(size);
++#else
++   (void)size;
++#endif
++}
++
+ int
+ virgl_renderer_export_fence(uint64_t client_fence_id, int *fd)
+ {
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index d524ce473cdf1376cd9b47e7a79e45d8bb533294..1b14cb00936cade3c1541248722de5c0a0356424 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -566,6 +566,20 @@ VIRGL_EXPORT void
+ virgl_renderer_release_handle_for_scanout(enum virgl_renderer_native_handle_type type,
+                                           virgl_renderer_native_handle handle);
+ 
++/**
++ * State how much host-visible blob memory the transport can keep mapped into
++ * the guest at once, in bytes, or zero when the transport has no such bound.
++ *
++ * A Venus guest sizes its largest host-visible mapping from the memory heap it
++ * is shown. Where the guest reaches host-visible memory through a fixed
++ * aperture rather than through its own pages, that heap has to describe the
++ * aperture, or the guest asks for a mapping the transport can never place.
++ * Call this before `virgl_renderer_init`; it takes effect for every physical
++ * device enumerated afterwards.
++ */
++VIRGL_EXPORT void
++virgl_renderer_set_host_visible_aperture_size(uint64_t size);
++
+ /* vtest semi-private APIs: */
+ VIRGL_EXPORT int virgl_renderer_attach_fence(int ctx_id, int fence_fd);
+ VIRGL_EXPORT int virgl_renderer_get_fence_fd(uint64_t fence_id);

@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:16:32 +0900
+Subject: [PATCH] ALSA: virtio: start a substream afresh after a system suspend
+
+The ALSA core prepares a suspended substream again from the start of its
+buffer: it resets hw_ptr and appl_ptr after ops->prepare(), and the driver
+resets its indirect PCM state. Two pieces of state from before the suspend
+survived.
+
+The suspended branch of virtsnd_pcm_prepare() kept vss->hw_ptr, the
+buffer position where the substream had stopped. The first pointer call
+after the restart counted that position as played, so the core position
+jumped ahead and the indirect state took the queued periods for that
+much less than they were. The transfer then wrote into periods still
+queued, which complete with more than one period's length: from then on
+each completion moved the position by two or three periods. A playback
+stream suspended one period into its buffer played at twice its rate
+(7/3 and 3 times two and three periods in), the data written into the
+queued periods never reached the device, and the device itself kept
+completing one period of real time after another. The fast phase lasted
+until two completions reached one pointer call, whose modulo-buffer
+count then lost a buffer and left the stream with fewer periods queued.
+Restart hw_ptr in both branches.
+
+Only a substream the core was running is suspended through the trigger,
+which stops it, and the synchronization that follows releases it on the
+device. A substream that was prepared, paused or in an xrun is only
+marked suspended in the core: its stream stays on the device, stopped or
+prepared and with the periods already written to it, while the driver
+neither marks it suspended nor forgets its messages. The suspend of the
+virtio device that follows does not reset it, and the driver's freeze
+does not run: virtio_uml only disables the rings, and the back-end then
+resets a device that holds requests and keeps the streams of one that
+does not. A paused stream met a reset device that refused the release of
+a stream it did not know, at the next prepare and, for good, at the next
+open; a stopped stream whose queue had drained met a device that kept it
+and refused its prepare and its parameters.
+
+Release the stream of such a substream on the device from a driver
+suspend callback, while the control queue still works, and mark the
+substream for reconfiguration. The device then holds no request when its
+rings are disabled, whatever the back-end does with the device, and the
+next prepare, or the next open, sets the parameters again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ sound/virtio/virtio_card.c    | 23 +++++++++++++++
+ sound/virtio/virtio_pcm.h     |  7 +++--
+ sound/virtio/virtio_pcm_ops.c | 54 ++++++++++++++++++++++++++++++++++-
+ 3 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/sound/virtio/virtio_card.c b/sound/virtio/virtio_card.c
+index a3e69a460b85faf09447b5343d9e9c137cadac21..56e3f49621ad1e9eacb84a2a41c6396db8096179 100644
+--- a/sound/virtio/virtio_card.c
++++ b/sound/virtio/virtio_card.c
+@@ -368,6 +368,28 @@ static void virtsnd_remove(struct virtio_device *vdev)
+ 	kfree(snd->event_msgs);
+ }
+ 
++/**
++ * virtsnd_suspend() - Release the streams that a system suspend leaves on the
++ *                     device.
++ * @dev: Device of the VirtIO sound device.
++ *
++ * Context: Process context.
++ * Return: 0.
++ */
++static int virtsnd_suspend(struct device *dev)
++{
++	struct virtio_device *vdev = dev_to_virtio(dev);
++	struct virtio_snd *snd = vdev->priv;
++	unsigned int i;
++
++	for (i = 0; i < snd->nsubstreams; ++i)
++		virtsnd_pcm_suspend(&snd->substreams[i]);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(virtsnd_pm_ops, virtsnd_suspend, NULL);
++
+ #ifdef CONFIG_PM_SLEEP
+ /**
+  * virtsnd_freeze() - Suspend device.
+@@ -431,6 +453,7 @@ static unsigned int features[] = {
+ 
+ static struct virtio_driver virtsnd_driver = {
+ 	.driver.name = KBUILD_MODNAME,
++	.driver.pm = pm_sleep_ptr(&virtsnd_pm_ops),
+ 	.id_table = id_table,
+ 	.feature_table = features,
+ 	.feature_table_size = ARRAY_SIZE(features),
+diff --git a/sound/virtio/virtio_pcm.h b/sound/virtio/virtio_pcm.h
+index 0f3a433175e49a27e50ab8897329b765406a3958..fff17cfe7d169099a5049068a2ade322b6604842 100644
+--- a/sound/virtio/virtio_pcm.h
++++ b/sound/virtio/virtio_pcm.h
+@@ -33,8 +33,9 @@ struct virtio_pcm_msg;
+  * @xfer_xrun: Data underflow/overflow state (0 - no xrun, 1 - xrun).
+  * @stopped: True if the substream is stopped and must be released on the device
+  *           side.
+- * @suspended: True if the substream is suspended and must be reconfigured on
+- *             the device side at resume.
++ * @suspended: True if the substream was released on the device side by a
++ *             system suspend since it was last prepared, so that it must be
++ *             reconfigured on the device side at its next prepare.
+  * @msgs: Allocated I/O messages.
+  * @nmsgs: Number of allocated I/O messages.
+  * @msg_last_enqueued: Index of the last I/O message added to the virtqueue.
+@@ -126,4 +127,6 @@ int virtsnd_pcm_msg_send(struct virtio_pcm_substream *vss, unsigned long offset,
+ 
+ unsigned int virtsnd_pcm_msg_pending_num(struct virtio_pcm_substream *vss);
+ 
++void virtsnd_pcm_suspend(struct virtio_pcm_substream *vss);
++
+ #endif /* VIRTIO_SND_PCM_H */
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 1091100a4c982b90e6a682e8a6e2548217b1012a..9f5646c752dbbdfb7fd7fb08c91be5bb9a79526b 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -282,7 +282,6 @@ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ 		}
+ 
+ 		vss->buffer_bytes = snd_pcm_lib_buffer_bytes(substream);
+-		vss->hw_ptr = 0;
+ 	} else {
+ 		struct snd_pcm_runtime *runtime = substream->runtime;
+ 		unsigned int buffer_bytes = snd_pcm_lib_buffer_bytes(substream);
+@@ -296,6 +295,14 @@ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ 			return rc;
+ 	}
+ 
++	/*
++	 * The ALSA core restarts the substream at the beginning of the buffer
++	 * after a prepare, and so does the indirect PCM state below. The
++	 * position of the first I/O message must restart there too, also on
++	 * resume: the position the substream had when it was suspended points
++	 * into the middle of the restarted buffer.
++	 */
++	vss->hw_ptr = 0;
+ 	vss->xfer_xrun = false;
+ 	vss->suspended = false;
+ 	vss->msg_count = 0;
+@@ -430,6 +437,51 @@ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ 	return 0;
+ }
+ 
++/**
++ * virtsnd_pcm_suspend() - Release the stream of a substream on the device side
++ *                         before a system suspend.
++ * @vss: VirtIO PCM substream.
++ *
++ * The ALSA core stops a running substream through its trigger and then
++ * synchronizes it, which releases it on the device and marks it suspended. A
++ * substream that was prepared, paused or in an xrun is only marked suspended
++ * in the core: its stream stays on the device, stopped or prepared and with
++ * the periods already written to it, while the driver neither marks it
++ * suspended nor forgets those messages. The suspend of the virtio device
++ * that follows does not reset it: the back-end resets a device whose rings
++ * are disabled when it holds requests, and keeps its streams otherwise. The
++ * restarted substream then met either a device that did not know its stream
++ * and refused to release it, or a stopped stream that refused its parameters
++ * and its prepare, and could not be recovered, nor, for a paused one, opened
++ * again.
++ *
++ * Release the stream while the control queue still works. The device then
++ * holds no request when its rings are disabled, whatever the back-end does
++ * with the device, and the next prepare, or the next open, configures the
++ * stream again.
++ *
++ * Context: Process context. Takes and releases the VirtIO substream spinlock.
++ */
++void virtsnd_pcm_suspend(struct virtio_pcm_substream *vss)
++{
++	struct snd_pcm_runtime *runtime = vss->substream->runtime;
++
++	if (!runtime || runtime->state != SNDRV_PCM_STATE_SUSPENDED ||
++	    vss->suspended)
++		return;
++
++	vss->stopped = true;
++	if (virtsnd_pcm_sync_stop(vss->substream))
++		dev_warn(&vss->snd->vdev->dev,
++			 "SID %u: failed to release the stream for the suspend\n",
++			 vss->sid);
++
++	scoped_guard(spinlock_irqsave, &vss->lock)
++		vss->msg_count = 0;
++	vss->stopped = false;
++	vss->suspended = true;
++}
++
+ /**
+  * virtsnd_pcm_pb_pointer() - Get the current hardware position for the PCM
+  *                         substream for playback.

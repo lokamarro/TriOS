@@ -1,0 +1,1006 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 02:18:00 +0900
+Subject: [PATCH] kosmickrisp: derive alpha to coverage without a colour
+ attachment
+
+Metal derives alpha to coverage from the alpha of colour attachment 0, so a
+pipeline whose fragment shader Location 0 output reaches no attachment leaves
+it nothing to read: a subpass with no colour attachment at all, or one whose
+first attachment is VK_ATTACHMENT_UNUSED, where the Location 0 store is
+dropped because Metal must not expose an output for an absent attachment.
+Metal then rasterizes those draws fully covered, and Vulkan's rule that the
+coverage follows the Location 0 alpha, gating the colour writes of the other
+attachments and the depth and stencil writes of the subpass, is lost.
+
+Compute the coverage in the fragment shader for exactly those pipelines and
+turn Metal's own alpha to coverage off for them. The dither mask keeps the
+number of set bits proportional to the alpha and produces one mask per alpha,
+and its low 2, 4, 8 and 16 bits are each a valid mask, so a single value
+serves every sample count. It is folded into the shader's sample mask output,
+which Metal intersects with the rasterized coverage before the depth and
+stencil tests. The lowering runs before the undeclared outputs are dropped, so
+it still sees the alpha, and after sample shading lowering, so the coverage it
+masks is already the sample being shaded.
+
+Add a KosmicKrisp test that renders both shapes: a draw whose first colour
+attachment is unused, read back from the attachment that is used, and a draw
+with no colour attachment, read back through a second draw whose depth test
+only passes where the first left the cleared depth.
+---
+ .../compiler/msl_nir_lower_common.c           |  88 +++
+ src/kosmickrisp/compiler/nir_to_msl.h         |   1 +
+ src/kosmickrisp/vulkan/kk_shader.c            |  52 +-
+ src/kosmickrisp/vulkan/meson.build            |  14 +
+ .../tests/alpha_to_coverage_shaders/a2c.vert  |  10 +
+ .../alpha_to_coverage_shaders/a2c.vert.h      |  57 ++
+ .../alpha_to_coverage_shaders/a2c_alpha.frag  |  11 +
+ .../a2c_alpha.frag.h                          |  34 ++
+ .../alpha_to_coverage_shaders/a2c_red.frag    |   6 +
+ .../alpha_to_coverage_shaders/a2c_red.frag.h  |  19 +
+ .../alpha_to_coverage_shaders/generate.sh     |   7 +
+ .../test_alpha_to_coverage_no_attachment.cpp  | 542 ++++++++++++++++++
+ 12 files changed, 832 insertions(+), 9 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag.h
+ create mode 100755 src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/generate.sh
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_alpha_to_coverage_no_attachment.cpp
+
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_common.c b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+index 2c837a01f80e43657c37bbd3fb2535bc8d9a674a..d3b0aaff248a874ebd48f71c5981b1b5d15bfa50 100644
+--- a/src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -189,6 +189,94 @@ msl_lower_static_sample_mask(nir_shader *nir, uint32_t sample_mask)
+    return true;
+ }
+ 
++/* Coverage from an alpha value, with a number of set bits proportional to the
++ * alpha and one mask per alpha.  The low 2, 4, 8 or 16 bits are each a valid
++ * mask on their own, so the same value serves every sample count Metal
++ * rasterizes with.
++ */
++static nir_def *
++build_alpha_coverage_mask(nir_builder *b, nir_def *alpha)
++{
++   nir_def *m = nir_f2i32(b, nir_fmul_imm(b, nir_fsat(b, alpha), 16.0));
++
++   nir_def *part_a = nir_iand_imm(
++      b, nir_ushr(b, nir_imm_int(b, 0xfea80), nir_iand_imm(b, m, ~3)), 0xf);
++   nir_def *part_b = nir_iand_imm(b, m, 2);
++   nir_def *part_c = nir_iand_imm(b, m, 1);
++
++   return nir_ior(b, nir_imul_imm(b, part_a, 0x1111),
++                  nir_ior(b, nir_imul_imm(b, part_b, 0x0808),
++                          nir_imul_imm(b, part_c, 0x0100)));
++}
++
++bool
++msl_lower_alpha_to_coverage(nir_shader *nir)
++{
++   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
++
++   /* Fragment outputs have been sunk into the final block, so both stores are
++    * unique and both operands dominate the end of the shader. */
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   nir_intrinsic_instr *color_store = NULL;
++   nir_intrinsic_instr *mask_store = NULL;
++
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++
++         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++         if (intrin->intrinsic != nir_intrinsic_store_output)
++            continue;
++
++         const nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
++         if (io.location == FRAG_RESULT_SAMPLE_MASK) {
++            mask_store = intrin;
++         } else if (io.location == FRAG_RESULT_DATA0 ||
++                    io.location == FRAG_RESULT_COLOR) {
++            const unsigned written = nir_intrinsic_write_mask(intrin)
++                                     << nir_intrinsic_component(intrin);
++            if (written & BITFIELD_BIT(3))
++               color_store = intrin;
++         }
++      }
++   }
++
++   /* Without an alpha there is nothing to derive coverage from; Vulkan leaves
++    * the fragment fully covered. */
++   if (color_store == NULL)
++      return false;
++
++   nir_builder b = nir_builder_at(nir_after_impl(impl));
++
++   const unsigned component = nir_intrinsic_component(color_store);
++   assert(component <= 3u);
++   nir_def *alpha = nir_channel(&b, color_store->src[0].ssa, 3u - component);
++   nir_def *coverage = build_alpha_coverage_mask(&b, alpha);
++
++   nir_def *sample_mask;
++   if (mask_store != NULL) {
++      sample_mask = mask_store->src[0].ssa;
++      nir_instr_remove(&mask_store->instr);
++   } else {
++      sample_mask = nir_load_sample_mask_in(&b);
++      BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);
++   }
++
++   struct nir_io_semantics io_semantics = {
++      .location = FRAG_RESULT_SAMPLE_MASK,
++      .num_slots = 1u,
++   };
++   nir_store_output(&b, nir_iand(&b, sample_mask, coverage), nir_imm_int(&b, 0u),
++                    .base = 0u, .range = 1u, .write_mask = 0x1, .component = 0u,
++                    .src_type = nir_type_uint32, .io_semantics = io_semantics);
++   nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
++
++   nir_progress(true, impl, nir_metadata_control_flow);
++
++   return true;
++}
++
+ bool
+ msl_ensure_depth_write(nir_shader *nir)
+ {
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.h b/src/kosmickrisp/compiler/nir_to_msl.h
+index 803ee64b6e6203315855cf4085832738b18553af..a983cade8d4598b19e33fcfd514040df93b4ceb6 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.h
++++ b/src/kosmickrisp/compiler/nir_to_msl.h
+@@ -70,6 +70,7 @@ bool msl_nir_fs_remove_depth_write(nir_builder *b, nir_intrinsic_instr *intrin,
+ bool msl_lower_textures(nir_shader *s);
+ 
+ bool msl_lower_static_sample_mask(nir_shader *nir, uint32_t sample_mask);
++bool msl_lower_alpha_to_coverage(nir_shader *nir);
+ bool msl_ensure_depth_write(nir_shader *nir);
+ bool msl_ensure_vertex_position_output(nir_shader *nir);
+ bool msl_ensure_vertex_point_size_output(nir_shader *nir);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index ff1f36fb770cde1d4508dceec05b49e05ce94b04..f04574b19f162d29a290723989b6feb4207e0f99 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -546,6 +546,30 @@ kk_get_logical_color_att_index(const struct vk_graphics_pipeline_state *state,
+    return (state->cal) ? state->cal->color_map[i] : i;
+ }
+ 
++/* Metal derives alpha to coverage from the alpha of colour attachment 0, so it
++ * has nothing to read when the fragment shader's Location 0 output reaches no
++ * attachment: a subpass with no colour attachment at all, or one whose first
++ * attachment is VK_ATTACHMENT_UNUSED.  Vulkan still requires the coverage to
++ * follow that output's alpha, which then gates the depth and stencil writes,
++ * so those pipelines compute the coverage in the shader instead.
++ */
++static bool
++kk_alpha_to_coverage_is_emulated(const struct vk_graphics_pipeline_state *state)
++{
++   if (state == NULL || state->ms == NULL || state->rp == NULL ||
++       !state->ms->alpha_to_coverage_enable)
++      return false;
++
++   for (uint32_t i = 0; i < state->rp->color_attachment_count; ++i) {
++      if (state->rp->color_attachment_formats[i] == VK_FORMAT_UNDEFINED)
++         continue;
++      if (kk_get_logical_color_att_index(state, i) == 0)
++         return false;
++   }
++
++   return true;
++}
++
+ static bool
+ kk_nir_remove_undeclared_fs_output(nir_builder *b,
+                                    nir_intrinsic_instr *intrin, void *data)
+@@ -724,14 +748,6 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+             const struct vk_graphics_pipeline_state *state, bool writes_depth,
+             bool pipeline_statistics)
+ {
+-   /* Metal pipelines must not expose fragment outputs for attachments that
+-    * were not declared by the Vulkan pipeline.  In particular, an extra
+-    * attachment supplied by VkRenderingInfo must still get its render-pass
+-    * load/store operations without becoming a shader output. */
+-   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+-            kk_nir_remove_undeclared_fs_output, nir_metadata_control_flow,
+-            (void *)state);
+-
+    nir->info.fs.uses_sample_shading |=
+       state->ms && state->ms->sample_shading_enable;
+ 
+@@ -742,6 +758,20 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+    if (nir->info.fs.uses_sample_shading)
+       NIR_PASS(_, nir, msl_nir_lower_sample_shading);
+ 
++   /* Emulated alpha to coverage consumes the Location 0 alpha, so it runs
++    * before the output that carries it is dropped below.  Sample shading has
++    * already narrowed the incoming coverage to the sample being shaded. */
++   if (kk_alpha_to_coverage_is_emulated(state))
++      NIR_PASS(_, nir, msl_lower_alpha_to_coverage);
++
++   /* Metal pipelines must not expose fragment outputs for attachments that
++    * were not declared by the Vulkan pipeline.  In particular, an extra
++    * attachment supplied by VkRenderingInfo must still get its render-pass
++    * load/store operations without becoming a shader output. */
++   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
++            kk_nir_remove_undeclared_fs_output, nir_metadata_control_flow,
++            (void *)state);
++
+    if (state->cb)
+       kk_lower_fs_blend(nir, state);
+ 
+@@ -3610,7 +3640,11 @@ gather_graphics_pipeline_create_info(
+    if (info->vs.has_ms) {
+       const struct vk_multisample_state *ms = state->ms;
+       info->vs.sample_count = ms->rasterization_samples;
+-      info->vs.has_alpha_to_coverage_enabled = ms->alpha_to_coverage_enable;
++      /* Metal's own alpha to coverage would read an attachment that carries
++       * neither the shader's Location 0 output nor a defined alpha, so the
++       * emulated pipelines keep it off and mask the coverage in the shader. */
++      info->vs.has_alpha_to_coverage_enabled =
++         ms->alpha_to_coverage_enable && !kk_alpha_to_coverage_is_emulated(state);
+       info->vs.has_alpha_to_one_enabled = ms->alpha_to_one_enable;
+    }
+ 
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 3113d5fbad3c41824f223378264b2d4fab2eacd2..1bcd4a3b6c3a0f2eaf03458f0b97397f387a0bac 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -368,6 +368,20 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_alpha_to_coverage_no_attachment',
++      executable(
++        'test_kosmickrisp_alpha_to_coverage_no_attachment',
++        files('tests/test_alpha_to_coverage_no_attachment.cpp'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++        override_options : ['cpp_std=c++20'],
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 120,
++    )
+     test(
+       'kosmickrisp_point_clip_volume',
+       executable(
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..168e8f0b20d16446c16623a842515d9252dfab43
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert
+@@ -0,0 +1,10 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++vec2 positions[3] = vec2[](
++    vec2(-1.0, -1.0),
++    vec2(-1.0, 3.0),
++    vec2(3.0, -1.0)
++);
++void main (void) {
++    gl_Position = vec4(positions[gl_VertexIndex % 3], 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert.h b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a588d424a5aa66c2c956314a0ac6ebdc452b730c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c.vert.h
+@@ -0,0 +1,57 @@
++{0x07230203,0x00010600,0x000d000b,0x0000002c,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x00000018,0x0000001c,0x00030047,
++0x00000016,0x00000002,0x00050048,0x00000016,
++0x00000000,0x0000000b,0x00000000,0x00050048,
++0x00000016,0x00000001,0x0000000b,0x00000001,
++0x00050048,0x00000016,0x00000002,0x0000000b,
++0x00000003,0x00050048,0x00000016,0x00000003,
++0x0000000b,0x00000004,0x00040047,0x0000001c,
++0x0000000b,0x0000002a,0x00020013,0x00000002,
++0x00030021,0x00000003,0x00000002,0x00030016,
++0x00000006,0x00000020,0x00040017,0x00000007,
++0x00000006,0x00000002,0x00040015,0x00000008,
++0x00000020,0x00000000,0x0004002b,0x00000008,
++0x00000009,0x00000003,0x0004001c,0x0000000a,
++0x00000007,0x00000009,0x0004002b,0x00000006,
++0x0000000d,0xbf800000,0x0005002c,0x00000007,
++0x0000000e,0x0000000d,0x0000000d,0x0004002b,
++0x00000006,0x0000000f,0x40400000,0x0005002c,
++0x00000007,0x00000010,0x0000000d,0x0000000f,
++0x0005002c,0x00000007,0x00000011,0x0000000f,
++0x0000000d,0x0006002c,0x0000000a,0x00000012,
++0x0000000e,0x00000010,0x00000011,0x00040017,
++0x00000013,0x00000006,0x00000004,0x0004002b,
++0x00000008,0x00000014,0x00000001,0x0004001c,
++0x00000015,0x00000006,0x00000014,0x0006001e,
++0x00000016,0x00000013,0x00000006,0x00000015,
++0x00000015,0x00040020,0x00000017,0x00000003,
++0x00000016,0x0004003b,0x00000017,0x00000018,
++0x00000003,0x00040015,0x00000019,0x00000020,
++0x00000001,0x0004002b,0x00000019,0x0000001a,
++0x00000000,0x00040020,0x0000001b,0x00000001,
++0x00000019,0x0004003b,0x0000001b,0x0000001c,
++0x00000001,0x0004002b,0x00000019,0x0000001e,
++0x00000003,0x0004002b,0x00000006,0x00000023,
++0x00000000,0x0004002b,0x00000006,0x00000024,
++0x3f800000,0x00040020,0x00000028,0x00000003,
++0x00000013,0x00040020,0x0000002a,0x00000007,
++0x0000000a,0x00040020,0x0000002b,0x00000007,
++0x00000007,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x0004003b,0x0000002a,0x0000000c,0x00000007,
++0x0003003e,0x0000000c,0x00000012,0x0004003d,
++0x00000019,0x0000001d,0x0000001c,0x0005008b,
++0x00000019,0x0000001f,0x0000001d,0x0000001e,
++0x00050041,0x0000002b,0x00000021,0x0000000c,
++0x0000001f,0x0004003d,0x00000007,0x00000022,
++0x00000021,0x00050051,0x00000006,0x00000025,
++0x00000022,0x00000000,0x00050051,0x00000006,
++0x00000026,0x00000022,0x00000001,0x00070050,
++0x00000013,0x00000027,0x00000025,0x00000026,
++0x00000023,0x00000024,0x00050041,0x00000028,
++0x00000029,0x00000018,0x0000001a,0x0003003e,
++0x00000029,0x00000027,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f95caa9f29d2a80105ec72fa802a91c71afd3f5
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag
+@@ -0,0 +1,11 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (push_constant, std430) uniform PushConstantBlock { float alpha; } pc;
++/* Location 0 carries only the coverage alpha; the colour is written to the
++ * attached Location 1. */
++layout (location=0) out vec4 coverageAlpha;
++layout (location=1) out vec4 attachedColor;
++void main (void) {
++    coverageAlpha = vec4(0.0, 0.0, 0.0, pc.alpha);
++    attachedColor = vec4(1.0, 0.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag.h b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f9d78df6cb159c761bd5b94f7d52eca04520f10
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_alpha.frag.h
+@@ -0,0 +1,34 @@
++{0x07230203,0x00010600,0x000d000b,0x00000017,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x0000000d,0x00000014,
++0x00030010,0x00000004,0x00000007,0x00040047,
++0x00000009,0x0000001e,0x00000000,0x00030047,
++0x0000000b,0x00000002,0x00050048,0x0000000b,
++0x00000000,0x00000023,0x00000000,0x00040047,
++0x00000014,0x0000001e,0x00000001,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000004,0x00040020,
++0x00000008,0x00000003,0x00000007,0x0004003b,
++0x00000008,0x00000009,0x00000003,0x0004002b,
++0x00000006,0x0000000a,0x00000000,0x0003001e,
++0x0000000b,0x00000006,0x00040020,0x0000000c,
++0x00000009,0x0000000b,0x0004003b,0x0000000c,
++0x0000000d,0x00000009,0x00040015,0x0000000e,
++0x00000020,0x00000001,0x0004002b,0x0000000e,
++0x0000000f,0x00000000,0x00040020,0x00000010,
++0x00000009,0x00000006,0x0004003b,0x00000008,
++0x00000014,0x00000003,0x0004002b,0x00000006,
++0x00000015,0x3f800000,0x0007002c,0x00000007,
++0x00000016,0x00000015,0x0000000a,0x0000000a,
++0x00000015,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x00050041,0x00000010,0x00000011,0x0000000d,
++0x0000000f,0x0004003d,0x00000006,0x00000012,
++0x00000011,0x00070050,0x00000007,0x00000013,
++0x0000000a,0x0000000a,0x0000000a,0x00000012,
++0x0003003e,0x00000009,0x00000013,0x0003003e,
++0x00000014,0x00000016,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..82b393b2f8546e0997d835caf417459e4b17aebf
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag
+@@ -0,0 +1,6 @@
++#version 460
++/* SPDX-License-Identifier: MIT */
++layout (location=0) out vec4 outColor;
++void main (void) {
++    outColor = vec4(1.0, 0.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag.h b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4124a153eda634126dd3dc61162bb8c50c79894c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/a2c_red.frag.h
+@@ -0,0 +1,19 @@
++{0x07230203,0x00010600,0x000d000b,0x0000000d,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x00000009,0x00030010,0x00000004,
++0x00000007,0x00040047,0x00000009,0x0000001e,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00030016,0x00000006,
++0x00000020,0x00040017,0x00000007,0x00000006,
++0x00000004,0x00040020,0x00000008,0x00000003,
++0x00000007,0x0004003b,0x00000008,0x00000009,
++0x00000003,0x0004002b,0x00000006,0x0000000a,
++0x3f800000,0x0004002b,0x00000006,0x0000000b,
++0x00000000,0x0007002c,0x00000007,0x0000000c,
++0x0000000a,0x0000000b,0x0000000b,0x0000000a,
++0x00050036,0x00000002,0x00000004,0x00000000,
++0x00000003,0x000200f8,0x00000005,0x0003003e,
++0x00000009,0x0000000c,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/generate.sh b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/generate.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..d7595e1807b652af9d7c9e5c926d1ee2e7c0f339
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/alpha_to_coverage_shaders/generate.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++cd -- "$(dirname -- "$0")"
++for shader in a2c.vert a2c_alpha.frag a2c_red.frag; do
++   glslc -O --target-env=vulkan1.3 -mfmt=c "$shader" -o "$shader.h"
++done
+diff --git a/src/kosmickrisp/vulkan/tests/test_alpha_to_coverage_no_attachment.cpp b/src/kosmickrisp/vulkan/tests/test_alpha_to_coverage_no_attachment.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebdfed33ce4a020438e3da4a795ff64b88fdf6bb
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_alpha_to_coverage_no_attachment.cpp
+@@ -0,0 +1,542 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Alpha to coverage derives the coverage from the fragment shader's Location 0
++ * alpha even when that output reaches no colour attachment.  Both shapes the
++ * conformance suite renders are covered here: a subpass whose first colour
++ * attachment is unused, and a subpass with no colour attachment at all, where
++ * the coverage is only observable through the depth writes it gates.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++
++static void require(bool ok, const char *operation, VkResult value = VK_SUCCESS)
++{
++   if (!ok) {
++      std::fprintf(stderr, "%s: %d\n", operation, value);
++      std::exit(1);
++   }
++}
++
++template <typename T> static T load(VkInstance instance, const char *name)
++{
++   auto function = reinterpret_cast<T>(vkGetInstanceProcAddr(instance, name));
++   require(function != nullptr, name);
++   return function;
++}
++
++#define LOAD_I(name) auto name = load<PFN_##name>(instance, #name)
++#define LOAD_D(name)                                                             \
++   auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
++   require(name != nullptr, #name)
++
++static const uint32_t vertex_spirv[] =
++#include "alpha_to_coverage_shaders/a2c.vert.h"
++;
++static const uint32_t alpha_fragment_spirv[] =
++#include "alpha_to_coverage_shaders/a2c_alpha.frag.h"
++;
++static const uint32_t red_fragment_spirv[] =
++#include "alpha_to_coverage_shaders/a2c_red.frag.h"
++;
++
++int main()
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++   app.pApplicationName = "alpha-to-coverage-no-attachment";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++   instance_info.pApplicationInfo = &app;
++   auto result = vkCreateInstance(&instance_info, nullptr, &instance);
++   require(result == VK_SUCCESS, "create instance", result);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceProperties);
++   LOAD_I(vkGetPhysicalDeviceQueueFamilyProperties);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t physical_count = 0;
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, nullptr);
++   require(result == VK_SUCCESS && physical_count, "physical device count", result);
++   std::vector<VkPhysicalDevice> physicals(physical_count);
++   result = vkEnumeratePhysicalDevices(instance, &physical_count, physicals.data());
++   require(result == VK_SUCCESS, "physical devices", result);
++
++   constexpr uint32_t extent = 32;
++   constexpr VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_4_BIT;
++   constexpr VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
++   constexpr VkFormat depth_format = VK_FORMAT_D32_SFLOAT;
++
++   for (VkPhysicalDevice physical : physicals) {
++      VkPhysicalDeviceProperties properties{};
++      vkGetPhysicalDeviceProperties(physical, &properties);
++      require((properties.limits.framebufferColorSampleCounts & samples) &&
++                 (properties.limits.framebufferDepthSampleCounts & samples),
++              "four sample framebuffers");
++
++      uint32_t queue_count = 0;
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(queue_count);
++      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, queues.data());
++      uint32_t queue = 0;
++      while (queue < queue_count && !(queues[queue].queueFlags & VK_QUEUE_GRAPHICS_BIT))
++         ++queue;
++      require(queue < queue_count, "graphics queue");
++      float priority = 1.0f;
++      VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++      queue_info.queueFamilyIndex = queue;
++      queue_info.queueCount = 1;
++      queue_info.pQueuePriorities = &priority;
++      VkPhysicalDeviceVulkan13Features features13{
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++      features13.dynamicRendering = VK_TRUE;
++      VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++      device_info.pNext = &features13;
++      device_info.queueCreateInfoCount = 1;
++      device_info.pQueueCreateInfos = &queue_info;
++      VkDevice device = VK_NULL_HANDLE;
++      result = vkCreateDevice(physical, &device_info, nullptr, &device);
++      require(result == VK_SUCCESS, "create device", result);
++      LOAD_D(vkDestroyDevice);
++      LOAD_D(vkCreateShaderModule);
++      LOAD_D(vkDestroyShaderModule);
++      LOAD_D(vkCreatePipelineLayout);
++      LOAD_D(vkDestroyPipelineLayout);
++      LOAD_D(vkCreateGraphicsPipelines);
++      LOAD_D(vkDestroyPipeline);
++      LOAD_D(vkCreateCommandPool);
++      LOAD_D(vkDestroyCommandPool);
++      LOAD_D(vkResetCommandPool);
++      LOAD_D(vkAllocateCommandBuffers);
++      LOAD_D(vkBeginCommandBuffer);
++      LOAD_D(vkEndCommandBuffer);
++      LOAD_D(vkCmdBeginRendering);
++      LOAD_D(vkCmdEndRendering);
++      LOAD_D(vkCmdBindPipeline);
++      LOAD_D(vkCmdPushConstants);
++      LOAD_D(vkCmdDraw);
++      LOAD_D(vkGetDeviceQueue);
++      LOAD_D(vkQueueSubmit);
++      LOAD_D(vkCreateFence);
++      LOAD_D(vkDestroyFence);
++      LOAD_D(vkWaitForFences);
++      LOAD_D(vkCreateImage);
++      LOAD_D(vkDestroyImage);
++      LOAD_D(vkCreateImageView);
++      LOAD_D(vkDestroyImageView);
++      LOAD_D(vkGetImageMemoryRequirements);
++      LOAD_D(vkCreateBuffer);
++      LOAD_D(vkDestroyBuffer);
++      LOAD_D(vkGetBufferMemoryRequirements);
++      LOAD_D(vkAllocateMemory);
++      LOAD_D(vkFreeMemory);
++      LOAD_D(vkBindImageMemory);
++      LOAD_D(vkBindBufferMemory);
++      LOAD_D(vkMapMemory);
++      LOAD_D(vkCmdPipelineBarrier);
++      LOAD_D(vkCmdCopyImageToBuffer);
++      VkQueue device_queue = VK_NULL_HANDLE;
++      vkGetDeviceQueue(device, queue, 0, &device_queue);
++
++      VkPhysicalDeviceMemoryProperties memory_properties{};
++      vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++      auto pick_memory = [&](uint32_t bits, VkMemoryPropertyFlags flags) {
++         uint32_t type = 0;
++         while (type < memory_properties.memoryTypeCount &&
++                (!(bits & (1u << type)) ||
++                 (memory_properties.memoryTypes[type].propertyFlags & flags) != flags))
++            ++type;
++         require(type < memory_properties.memoryTypeCount, "memory type");
++         return type;
++      };
++
++      struct Attachment {
++         VkImage image = VK_NULL_HANDLE;
++         VkImageView view = VK_NULL_HANDLE;
++         VkDeviceMemory memory = VK_NULL_HANDLE;
++      };
++      auto make_attachment = [&](VkFormat format, VkSampleCountFlagBits count,
++                                 VkImageUsageFlags usage,
++                                 VkImageAspectFlags aspect) {
++         Attachment attachment;
++         VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++         image_info.imageType = VK_IMAGE_TYPE_2D;
++         image_info.format = format;
++         image_info.extent = {extent, extent, 1};
++         image_info.mipLevels = 1;
++         image_info.arrayLayers = 1;
++         image_info.samples = count;
++         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++         image_info.usage = usage;
++         result = vkCreateImage(device, &image_info, nullptr, &attachment.image);
++         require(result == VK_SUCCESS, "create image", result);
++         VkMemoryRequirements requirements{};
++         vkGetImageMemoryRequirements(device, attachment.image, &requirements);
++         VkMemoryAllocateInfo memory_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++         memory_info.allocationSize = requirements.size;
++         memory_info.memoryTypeIndex = pick_memory(requirements.memoryTypeBits, 0);
++         result = vkAllocateMemory(device, &memory_info, nullptr, &attachment.memory);
++         require(result == VK_SUCCESS, "allocate image", result);
++         result = vkBindImageMemory(device, attachment.image, attachment.memory, 0);
++         require(result == VK_SUCCESS, "bind image", result);
++         VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++         view_info.image = attachment.image;
++         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++         view_info.format = format;
++         view_info.subresourceRange = {aspect, 0, 1, 0, 1};
++         result = vkCreateImageView(device, &view_info, nullptr, &attachment.view);
++         require(result == VK_SUCCESS, "create view", result);
++         return attachment;
++      };
++
++      const Attachment color = make_attachment(
++         color_format, samples, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++         VK_IMAGE_ASPECT_COLOR_BIT);
++      const Attachment resolve = make_attachment(
++         color_format, VK_SAMPLE_COUNT_1_BIT,
++         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++         VK_IMAGE_ASPECT_COLOR_BIT);
++      const Attachment depth = make_attachment(
++         depth_format, samples, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
++         VK_IMAGE_ASPECT_DEPTH_BIT);
++
++      const VkDeviceSize readback_size = VkDeviceSize(extent) * extent * 4;
++      VkBufferCreateInfo readback_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++      readback_info.size = readback_size;
++      readback_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      VkBuffer readback = VK_NULL_HANDLE;
++      result = vkCreateBuffer(device, &readback_info, nullptr, &readback);
++      require(result == VK_SUCCESS, "create readback buffer", result);
++      VkMemoryRequirements readback_requirements{};
++      vkGetBufferMemoryRequirements(device, readback, &readback_requirements);
++      VkMemoryAllocateInfo readback_memory_info{
++         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++      readback_memory_info.allocationSize = readback_requirements.size;
++      readback_memory_info.memoryTypeIndex =
++         pick_memory(readback_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++      result = vkAllocateMemory(device, &readback_memory_info, nullptr,
++                                &readback_memory);
++      require(result == VK_SUCCESS, "allocate readback memory", result);
++      result = vkBindBufferMemory(device, readback, readback_memory, 0);
++      require(result == VK_SUCCESS, "bind readback buffer", result);
++      void *readback_data = nullptr;
++      result = vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0,
++                           &readback_data);
++      require(result == VK_SUCCESS, "map readback buffer", result);
++
++      const VkPushConstantRange push_range{VK_SHADER_STAGE_FRAGMENT_BIT, 0,
++                                           sizeof(float)};
++      VkPipelineLayoutCreateInfo layout_info{
++         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++      layout_info.pushConstantRangeCount = 1;
++      layout_info.pPushConstantRanges = &push_range;
++      VkPipelineLayout layout = VK_NULL_HANDLE;
++      result = vkCreatePipelineLayout(device, &layout_info, nullptr, &layout);
++      require(result == VK_SUCCESS, "create layout", result);
++
++      VkShaderModule modules[3] = {};
++      const uint32_t *sources[3] = {vertex_spirv, alpha_fragment_spirv,
++                                    red_fragment_spirv};
++      const size_t sizes[3] = {sizeof(vertex_spirv), sizeof(alpha_fragment_spirv),
++                               sizeof(red_fragment_spirv)};
++      for (unsigned i = 0; i < 3; ++i) {
++         VkShaderModuleCreateInfo module_info{
++            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++         module_info.codeSize = sizes[i];
++         module_info.pCode = sources[i];
++         result = vkCreateShaderModule(device, &module_info, nullptr, &modules[i]);
++         require(result == VK_SUCCESS, "create module", result);
++      }
++
++      const VkViewport viewport{0.0f, 0.0f, float(extent), float(extent), 0.0f,
++                                1.0f};
++      const VkRect2D scissor{{0, 0}, {extent, extent}};
++
++      /* Every pipeline draws the same full screen triangle at depth zero. */
++      auto make_pipeline = [&](VkShaderModule fragment,
++                               const VkFormat *color_formats,
++                               uint32_t color_format_count, bool has_depth,
++                               bool depth_write, bool alpha_to_coverage) {
++         VkPipelineShaderStageCreateInfo stages[2]{};
++         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++         stages[0].module = modules[0];
++         stages[0].pName = "main";
++         stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++         stages[1].module = fragment;
++         stages[1].pName = "main";
++
++         VkPipelineVertexInputStateCreateInfo vi{
++            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++         VkPipelineInputAssemblyStateCreateInfo ia{
++            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++         ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++         VkPipelineViewportStateCreateInfo vp{
++            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++         vp.viewportCount = 1;
++         vp.pViewports = &viewport;
++         vp.scissorCount = 1;
++         vp.pScissors = &scissor;
++         VkPipelineRasterizationStateCreateInfo rs{
++            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++         rs.polygonMode = VK_POLYGON_MODE_FILL;
++         rs.cullMode = VK_CULL_MODE_NONE;
++         rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++         rs.lineWidth = 1.0f;
++         VkPipelineMultisampleStateCreateInfo ms{
++            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++         ms.rasterizationSamples = samples;
++         ms.alphaToCoverageEnable = alpha_to_coverage ? VK_TRUE : VK_FALSE;
++         VkPipelineDepthStencilStateCreateInfo ds{
++            VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++         ds.depthTestEnable = has_depth ? VK_TRUE : VK_FALSE;
++         ds.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
++         ds.depthCompareOp = VK_COMPARE_OP_LESS;
++         VkPipelineColorBlendAttachmentState blend_attachments[2]{};
++         for (VkPipelineColorBlendAttachmentState &attachment : blend_attachments)
++            attachment.colorWriteMask = 0xf;
++         VkPipelineColorBlendStateCreateInfo blend{
++            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++         blend.attachmentCount = color_format_count;
++         blend.pAttachments = blend_attachments;
++         VkPipelineRenderingCreateInfo rendering{
++            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++         rendering.colorAttachmentCount = color_format_count;
++         rendering.pColorAttachmentFormats = color_formats;
++         rendering.depthAttachmentFormat =
++            has_depth ? depth_format : VK_FORMAT_UNDEFINED;
++         VkGraphicsPipelineCreateInfo pipeline_info{
++            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++         pipeline_info.pNext = &rendering;
++         pipeline_info.stageCount = 2;
++         pipeline_info.pStages = stages;
++         pipeline_info.pVertexInputState = &vi;
++         pipeline_info.pInputAssemblyState = &ia;
++         pipeline_info.pViewportState = &vp;
++         pipeline_info.pRasterizationState = &rs;
++         pipeline_info.pMultisampleState = &ms;
++         pipeline_info.pDepthStencilState = &ds;
++         pipeline_info.pColorBlendState = &blend;
++         pipeline_info.layout = layout;
++         VkPipeline pipeline = VK_NULL_HANDLE;
++         result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                            &pipeline_info, nullptr, &pipeline);
++         require(result == VK_SUCCESS, "create pipeline", result);
++         return pipeline;
++      };
++
++      const VkFormat unused_formats[2] = {VK_FORMAT_UNDEFINED, color_format};
++      const VkFormat single_format[1] = {color_format};
++      /* The first colour attachment is unused; the shader's Location 0 alpha
++       * still has to drive the coverage of the attached Location 1. */
++      VkPipeline unused_pipeline =
++         make_pipeline(modules[1], unused_formats, 2, false, false, true);
++      /* No colour attachment at all: the coverage is only visible in the depth
++       * writes it gates. */
++      VkPipeline depth_only_pipeline =
++         make_pipeline(modules[1], nullptr, 0, true, true, true);
++      /* The probe that reports whether the depth-only draw wrote depth. */
++      VkPipeline depth_probe_pipeline =
++         make_pipeline(modules[2], single_format, 1, true, false, false);
++
++      VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++      pool_info.queueFamilyIndex = queue;
++      VkCommandPool pool = VK_NULL_HANDLE;
++      result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
++      require(result == VK_SUCCESS, "create command pool", result);
++      VkCommandBufferAllocateInfo allocate{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++      allocate.commandPool = pool;
++      allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++      allocate.commandBufferCount = 1;
++      VkCommandBuffer command = VK_NULL_HANDLE;
++      result = vkAllocateCommandBuffers(device, &allocate, &command);
++      require(result == VK_SUCCESS, "allocate command", result);
++
++      VkRenderingAttachmentInfo resolved_color{
++         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++      resolved_color.imageView = color.view;
++      resolved_color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      resolved_color.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
++      resolved_color.resolveImageView = resolve.view;
++      resolved_color.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      resolved_color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++      resolved_color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      resolved_color.clearValue.color.float32[3] = 1.0f;
++
++      /* Renders one case and returns the red channel every resolved pixel
++       * agreed on, or -1 when the image is not uniform. */
++      auto render = [&](bool depth_only, float alpha) {
++         result = vkResetCommandPool(device, pool, 0);
++         require(result == VK_SUCCESS, "reset command pool", result);
++         VkCommandBufferBeginInfo begin{
++            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++         result = vkBeginCommandBuffer(command, &begin);
++         require(result == VK_SUCCESS, "begin command", result);
++
++         VkRenderingAttachmentInfo unused{
++            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++         VkRenderingAttachmentInfo colors[2] = {unused, resolved_color};
++         VkRenderingAttachmentInfo depth_attachment{
++            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++         depth_attachment.imageView = depth.view;
++         depth_attachment.imageLayout =
++            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++         depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++         depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++         depth_attachment.clearValue.depthStencil.depth = 1.0f;
++
++         VkRenderingInfo render_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++         render_info.renderArea = scissor;
++         render_info.layerCount = 1;
++         if (depth_only) {
++            render_info.colorAttachmentCount = 0;
++            render_info.pDepthAttachment = &depth_attachment;
++         } else {
++            render_info.colorAttachmentCount = 2;
++            render_info.pColorAttachments = colors;
++         }
++         vkCmdBeginRendering(command, &render_info);
++         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                           depth_only ? depth_only_pipeline : unused_pipeline);
++         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
++                            sizeof(alpha), &alpha);
++         vkCmdDraw(command, 3, 1, 0, 0);
++         vkCmdEndRendering(command);
++
++         if (depth_only) {
++            VkMemoryBarrier depth_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++            depth_barrier.srcAccessMask =
++               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++            depth_barrier.dstAccessMask =
++               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
++            vkCmdPipelineBarrier(command,
++                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0,
++                                 1, &depth_barrier, 0, nullptr, 0, nullptr);
++
++            /* Draw the same triangle at the same depth with the depth test
++             * kept.  It only reaches the colour attachment where the first
++             * draw left the cleared depth, that is, where coverage was zero. */
++            depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++            depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++            VkRenderingInfo probe_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++            probe_info.renderArea = scissor;
++            probe_info.layerCount = 1;
++            probe_info.colorAttachmentCount = 1;
++            probe_info.pColorAttachments = &resolved_color;
++            probe_info.pDepthAttachment = &depth_attachment;
++            vkCmdBeginRendering(command, &probe_info);
++            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                              depth_probe_pipeline);
++            vkCmdDraw(command, 3, 1, 0, 0);
++            vkCmdEndRendering(command);
++         }
++
++         VkImageMemoryBarrier to_source{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++         to_source.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++         to_source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++         to_source.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++         to_source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++         to_source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++         to_source.image = resolve.image;
++         to_source.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++         vkCmdPipelineBarrier(command,
++                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                              nullptr, 1, &to_source);
++         VkBufferImageCopy region{};
++         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++         region.imageExtent = {extent, extent, 1};
++         vkCmdCopyImageToBuffer(command, resolve.image,
++                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                                1, &region);
++         result = vkEndCommandBuffer(command);
++         require(result == VK_SUCCESS, "end command", result);
++
++         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++         VkFence fence = VK_NULL_HANDLE;
++         result = vkCreateFence(device, &fence_info, nullptr, &fence);
++         require(result == VK_SUCCESS, "create fence", result);
++         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++         submit.commandBufferCount = 1;
++         submit.pCommandBuffers = &command;
++         result = vkQueueSubmit(device_queue, 1, &submit, fence);
++         require(result == VK_SUCCESS, "submit command", result);
++         result = vkWaitForFences(device, 1, &fence, VK_TRUE, 20000000000ull);
++         require(result == VK_SUCCESS, "draw retired", result);
++         vkDestroyFence(device, fence, nullptr);
++
++         const auto *pixels = static_cast<const uint8_t *>(readback_data);
++         int red = pixels[0];
++         for (VkDeviceSize p = 0; p < readback_size; p += 4) {
++            if (int(pixels[p]) != red)
++               return -1;
++         }
++         return red;
++      };
++
++      struct Case {
++         const char *name;
++         bool depth_only;
++         float alpha;
++         int expected;
++      };
++      /* Zero coverage keeps the unused-attachment draw off the attached colour
++       * and keeps the depth-only draw off the depth buffer, which is what lets
++       * the probe through. */
++      const Case cases[] = {
++         {"unused_attachment alpha 1.0", false, 1.0f, 255},
++         {"unused_attachment alpha 0.0", false, 0.0f, 0},
++         {"no_color_attachment alpha 1.0", true, 1.0f, 0},
++         {"no_color_attachment alpha 0.0", true, 0.0f, 255},
++      };
++      bool failed = false;
++      for (const Case &test : cases) {
++         const int red = render(test.depth_only, test.alpha);
++         std::printf("%s: red %d, expected %d\n", test.name, red, test.expected);
++         if (red != test.expected)
++            failed = true;
++      }
++      require(!failed, "alpha to coverage without a colour attachment");
++      std::printf("alpha to coverage gates every uncovered sample\n");
++
++      vkDestroyCommandPool(device, pool, nullptr);
++      vkDestroyPipeline(device, unused_pipeline, nullptr);
++      vkDestroyPipeline(device, depth_only_pipeline, nullptr);
++      vkDestroyPipeline(device, depth_probe_pipeline, nullptr);
++      for (VkShaderModule module : modules)
++         vkDestroyShaderModule(device, module, nullptr);
++      vkDestroyPipelineLayout(device, layout, nullptr);
++      vkDestroyBuffer(device, readback, nullptr);
++      vkFreeMemory(device, readback_memory, nullptr);
++      for (const Attachment &attachment : {color, resolve, depth}) {
++         vkDestroyImageView(device, attachment.view, nullptr);
++         vkDestroyImage(device, attachment.image, nullptr);
++         vkFreeMemory(device, attachment.memory, nullptr);
++      }
++      vkDestroyDevice(device, nullptr);
++   }
++   vkDestroyInstance(instance, nullptr);
++   return 0;
++}

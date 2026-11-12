@@ -1,0 +1,546 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 18:25:09 +0900
+Subject: [PATCH] kosmickrisp: export native Metal textures
+
+VK_EXT_metal_objects lets code that shares objects with Metal ask for the
+Metal object behind a Vulkan one; Zink's GL interop asks it for an image's
+texture. vkExportMetalObjectsEXT returns nothing, so a caller can only tell
+what it got from the outputs it passed in, and every export structure in the
+chain is answered. A device gives its MTLDevice, device memory its MTLBuffer,
+an image the texture of the plane asked for, an image view its sampled
+texture, a buffer view its texel-buffer texture and a timeline semaphore its
+MTLSharedEvent. The rest have no Metal object to give and come back NULL: the
+queue runs on an MTL4CommandQueue, which is not the MTLCommandQueue the
+structure names, no image is backed by an IOSurface, a VkEvent has no shared
+event, and a binary semaphore counts internal points on its event that a
+caller could not interpret.
+
+A test chains one of each export structure, every output holding a value the
+caller left there, and checks that none keeps it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_image.c             | 111 ++++++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   1 +
+ src/kosmickrisp/vulkan/meson.build            |  13 +
+ .../vulkan/tests/test_metal_objects_export.c  | 332 ++++++++++++++++++
+ 4 files changed, 457 insertions(+)
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_metal_objects_export.c
+
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 5b4dd8f4ace41a608daece1a4d2f7cc564ae9867..28b4b063976cb6dda3f946326915bea04910c913 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -7,11 +7,14 @@
+ 
+ #include "kk_image.h"
+ 
++#include "kk_buffer_view.h"
+ #include "kk_device.h"
+ #include "kk_device_memory.h"
+ #include "kk_entrypoints.h"
+ #include "kk_format.h"
++#include "kk_image_view.h"
+ #include "kk_physical_device.h"
++#include "kk_sync.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+@@ -19,8 +22,11 @@
+ #include "vk_enum_defines.h"
+ #include "vk_enum_to_str.h"
+ #include "vk_format.h"
++#include "vk_semaphore.h"
+ #include "wsi_common_private.h"
+ 
++#include <vulkan/vulkan_metal.h>
++
+ static VkFormatFeatureFlags2
+ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+                                    VkFormat vk_format, VkImageTiling tiling,
+@@ -982,6 +988,111 @@ kk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
+    return first_error_or_success;
+ }
+ 
++#ifdef VK_USE_PLATFORM_METAL_EXT
++static uint8_t
++kk_export_plane(VkImageAspectFlagBits aspect)
++{
++   switch (aspect) {
++   case VK_IMAGE_ASPECT_PLANE_1_BIT:
++      return 1u;
++   case VK_IMAGE_ASPECT_PLANE_2_BIT:
++      return 2u;
++   default:
++      return 0u;
++   }
++}
++
++static MTLTexture_id
++kk_export_metal_texture(const VkExportMetalTextureInfoEXT *info)
++{
++   const uint8_t plane = kk_export_plane(info->plane);
++
++   if (info->image != VK_NULL_HANDLE) {
++      VK_FROM_HANDLE(kk_image, image, info->image);
++      return plane < image->plane_count ? image->planes[plane].mtl_handle
++                                        : NULL;
++   }
++   if (info->imageView != VK_NULL_HANDLE) {
++      VK_FROM_HANDLE(kk_image_view, view, info->imageView);
++      return plane < view->plane_count ? view->planes[plane].mtl_handle_sampled
++                                       : NULL;
++   }
++   if (info->bufferView != VK_NULL_HANDLE) {
++      VK_FROM_HANDLE(kk_buffer_view, view, info->bufferView);
++      return view->mtl_texel_buffer_handle;
++   }
++   return NULL;
++}
++
++/* A timeline semaphore's payload is a Metal shared event whose values are the
++ * semaphore's own. A binary semaphore counts internal points on its event,
++ * which a caller could not interpret, so it has nothing to export. */
++static MTLSharedEvent_id
++kk_export_metal_shared_event(const VkExportMetalSharedEventInfoEXT *info)
++{
++   if (info->semaphore == VK_NULL_HANDLE)
++      return NULL;
++
++   VK_FROM_HANDLE(vk_semaphore, semaphore, info->semaphore);
++   struct vk_sync *sync = vk_semaphore_get_active_sync(semaphore);
++   if (sync->type != &kk_sync_type)
++      return NULL;
++
++   return container_of(sync, struct kk_sync_timeline, base)->mtl_handle;
++}
++
++/* Every structure the extension defines gets an answer, so a caller never
++ * reads back whatever it had left in an output. The queue runs on an
++ * MTL4CommandQueue, which is not the MTLCommandQueue the structure asks for,
++ * no image is backed by an IOSurface, and a VkEvent has no shared event, so
++ * those answers are NULL. */
++VKAPI_ATTR void VKAPI_CALL
++kk_ExportMetalObjectsEXT(VkDevice _device,
++                         VkExportMetalObjectsInfoEXT *pMetalObjectsInfo)
++{
++   VK_FROM_HANDLE(kk_device, dev, _device);
++
++   vk_foreach_struct(metal_object, (void *)pMetalObjectsInfo->pNext) {
++      switch (metal_object->sType) {
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT: {
++         VkExportMetalDeviceInfoEXT *info = (void *)metal_object;
++         info->mtlDevice = (MTLDevice_id)dev->mtl_handle;
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT: {
++         VkExportMetalCommandQueueInfoEXT *info = (void *)metal_object;
++         info->mtlCommandQueue = NULL;
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_BUFFER_INFO_EXT: {
++         VkExportMetalBufferInfoEXT *info = (void *)metal_object;
++         VK_FROM_HANDLE(kk_device_memory, mem, info->memory);
++         info->mtlBuffer =
++            mem != NULL ? (MTLBuffer_id)mem->bo->map : (MTLBuffer_id)NULL;
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT: {
++         VkExportMetalTextureInfoEXT *info = (void *)metal_object;
++         info->mtlTexture = kk_export_metal_texture(info);
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_IO_SURFACE_INFO_EXT: {
++         VkExportMetalIOSurfaceInfoEXT *info = (void *)metal_object;
++         info->ioSurface = NULL;
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT: {
++         VkExportMetalSharedEventInfoEXT *info = (void *)metal_object;
++         info->mtlSharedEvent = kk_export_metal_shared_event(info);
++         break;
++      }
++      default:
++         break;
++      }
++   }
++}
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_GetImageOpaqueCaptureDescriptorDataEXT(
+    VkDevice _device, const VkImageCaptureDescriptorDataInfoEXT *pInfo,
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 7e68db80f88b6530d6d7b56716baab10eb517220..89de07801dbc3b00614c023a1005ff2e8883ff71 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -170,6 +170,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_metal = true,
+       .EXT_external_memory_host = true,
++      .EXT_metal_objects = true,
+       .EXT_hdr_metadata = true,
+       .EXT_image_2d_view_of_3d = true,
+       .EXT_load_store_op_none = true,
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index c13f5698af8d11e46cb1b8739344b333df829c44..aab37eeb4cf713018e942c533477c0eb81029eec 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -231,5 +231,18 @@ if with_tests
+       env : ['MESA_SHADER_CACHE_DISABLE=true'],
+       timeout : 120,
+     )
++    test(
++      'kosmickrisp_metal_objects_export',
++      executable(
++        'test_kosmickrisp_metal_objects_export',
++        files('tests/test_metal_objects_export.c'),
++        include_directories : kk_test_include_directories,
++        dependencies : [idep_vulkan_runtime_headers],
++        link_with : libvulkan_kosmickrisp,
++      ),
++      suite : ['kosmickrisp'],
++      env : ['MESA_SHADER_CACHE_DISABLE=true'],
++      timeout : 60,
++    )
+   endif
+ endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_metal_objects_export.c b/src/kosmickrisp/vulkan/tests/test_metal_objects_export.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..35dddcf57203b0ad8274d09ed71ae3254f798f76
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_metal_objects_export.c
+@@ -0,0 +1,332 @@
++/* SPDX-License-Identifier: MIT */
++
++/* vkExportMetalObjectsEXT returns void, so a caller can only tell what it got
++ * from the outputs it passed in. Every export structure the extension defines
++ * must therefore come back answered: the Metal object the driver has, or NULL
++ * where it has none, never whatever the caller had left there. */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan_core.h>
++#include <vulkan/vulkan_metal.h>
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++extern PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance, const char *);
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
++#define LOAD_I(name) PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); CHECK(name)
++#define LOAD_D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name); CHECK(name)
++
++/* What a caller left in every output before the export. */
++#define LEFT_OVER ((void *)(uintptr_t)0x5a5a5a5a5a50)
++
++static uint32_t
++find_memory(const VkPhysicalDeviceMemoryProperties *properties, uint32_t bits,
++            VkMemoryPropertyFlags want)
++{
++   for (uint32_t type = 0u; type < properties->memoryTypeCount; type++) {
++      if ((bits & (1u << type)) &&
++          (properties->memoryTypes[type].propertyFlags & want) == want)
++         return type;
++   }
++   CHECK(!"no memory type");
++   return 0u;
++}
++
++int
++main(void)
++{
++   VkInstance instance = VK_NULL_HANDLE;
++   LOAD_I(vkCreateInstance);
++   VkExportMetalObjectCreateInfoEXT export_queue = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_COMMAND_QUEUE_BIT_EXT,
++   };
++   VkExportMetalObjectCreateInfoEXT export_device = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .pNext = &export_queue,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_DEVICE_BIT_EXT,
++   };
++   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++                            .apiVersion = VK_API_VERSION_1_3};
++   VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pNext = &export_device,
++      .pApplicationInfo = &app,
++   };
++   CHECK(vkCreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
++   LOAD_I(vkDestroyInstance);
++   LOAD_I(vkEnumeratePhysicalDevices);
++   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
++   LOAD_I(vkCreateDevice);
++   LOAD_I(vkGetDeviceProcAddr);
++   uint32_t count = 1;
++   VkPhysicalDevice physical = VK_NULL_HANDLE;
++   VkResult enumerated =
++      vkEnumeratePhysicalDevices(instance, &count, &physical);
++   CHECK((enumerated == VK_SUCCESS || enumerated == VK_INCOMPLETE) && count);
++   VkPhysicalDeviceMemoryProperties memory_properties;
++   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   VkPhysicalDeviceVulkan12Features features = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++      .timelineSemaphore = VK_TRUE,
++   };
++   const char *extensions[] = {VK_EXT_METAL_OBJECTS_EXTENSION_NAME};
++   VkDeviceCreateInfo device_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .pNext = &features,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = 1,
++      .ppEnabledExtensionNames = extensions,
++   };
++   VkDevice device = VK_NULL_HANDLE;
++   CHECK(vkCreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
++   LOAD_D(vkDestroyDevice);
++   LOAD_D(vkGetDeviceQueue);
++   LOAD_D(vkExportMetalObjectsEXT);
++   LOAD_D(vkAllocateMemory);
++   LOAD_D(vkFreeMemory);
++   LOAD_D(vkCreateBuffer);
++   LOAD_D(vkDestroyBuffer);
++   LOAD_D(vkGetBufferMemoryRequirements);
++   LOAD_D(vkBindBufferMemory);
++   LOAD_D(vkCreateBufferView);
++   LOAD_D(vkDestroyBufferView);
++   LOAD_D(vkCreateImage);
++   LOAD_D(vkDestroyImage);
++   LOAD_D(vkGetImageMemoryRequirements);
++   LOAD_D(vkBindImageMemory);
++   LOAD_D(vkCreateImageView);
++   LOAD_D(vkDestroyImageView);
++   LOAD_D(vkCreateSemaphore);
++   LOAD_D(vkDestroySemaphore);
++   LOAD_D(vkCreateEvent);
++   LOAD_D(vkDestroyEvent);
++   VkQueue queue = VK_NULL_HANDLE;
++   vkGetDeviceQueue(device, 0, 0, &queue);
++
++   VkExportMetalObjectCreateInfoEXT export_buffer = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT,
++   };
++   VkExportMetalObjectCreateInfoEXT export_texture = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
++   };
++   VkExportMetalObjectCreateInfoEXT export_surface = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .pNext = &export_texture,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_IOSURFACE_BIT_EXT,
++   };
++   VkExportMetalObjectCreateInfoEXT export_event = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
++      .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_SHARED_EVENT_BIT_EXT,
++   };
++
++   /* A texel buffer and its view. */
++   VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = 4096,
++      .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
++   };
++   VkBuffer buffer = VK_NULL_HANDLE;
++   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
++   VkMemoryRequirements buffer_requirements;
++   vkGetBufferMemoryRequirements(device, buffer, &buffer_requirements);
++   VkMemoryAllocateInfo buffer_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &export_buffer,
++      .allocationSize = buffer_requirements.size,
++      .memoryTypeIndex =
++         find_memory(&memory_properties, buffer_requirements.memoryTypeBits, 0),
++   };
++   VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &buffer_allocate, NULL, &buffer_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindBufferMemory(device, buffer, buffer_memory, 0) == VK_SUCCESS);
++   VkBufferViewCreateInfo buffer_view_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
++      .pNext = &export_texture,
++      .buffer = buffer,
++      .format = VK_FORMAT_R32_UINT,
++      .range = VK_WHOLE_SIZE,
++   };
++   VkBufferView buffer_view = VK_NULL_HANDLE;
++   CHECK(vkCreateBufferView(device, &buffer_view_info, NULL, &buffer_view) ==
++         VK_SUCCESS);
++
++   /* A sampled image and its view. */
++   VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &export_surface,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = {64, 64, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
++   };
++   VkImage image = VK_NULL_HANDLE;
++   CHECK(vkCreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
++   VkMemoryRequirements image_requirements;
++   vkGetImageMemoryRequirements(device, image, &image_requirements);
++   VkMemoryAllocateInfo image_allocate = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = image_requirements.size,
++      .memoryTypeIndex =
++         find_memory(&memory_properties, image_requirements.memoryTypeBits,
++                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++   };
++   VkDeviceMemory image_memory = VK_NULL_HANDLE;
++   CHECK(vkAllocateMemory(device, &image_allocate, NULL, &image_memory) ==
++         VK_SUCCESS);
++   CHECK(vkBindImageMemory(device, image, image_memory, 0) == VK_SUCCESS);
++   VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .pNext = &export_texture,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   VkImageView view = VK_NULL_HANDLE;
++   CHECK(vkCreateImageView(device, &view_info, NULL, &view) == VK_SUCCESS);
++
++   /* A timeline semaphore and an event. */
++   VkSemaphoreTypeCreateInfo timeline_type = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++      .pNext = &export_event,
++      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++   };
++   VkSemaphoreCreateInfo semaphore_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++      .pNext = &timeline_type,
++   };
++   VkSemaphore semaphore = VK_NULL_HANDLE;
++   CHECK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore) ==
++         VK_SUCCESS);
++   VkEventCreateInfo event_info = {
++      .sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO,
++      .pNext = &export_event,
++   };
++   VkEvent event = VK_NULL_HANDLE;
++   CHECK(vkCreateEvent(device, &event_info, NULL, &event) == VK_SUCCESS);
++
++   /* One of each export structure, every output left over from the caller. */
++   VkExportMetalSharedEventInfoEXT event_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT,
++      .event = event,
++      .mtlSharedEvent = LEFT_OVER,
++   };
++   VkExportMetalSharedEventInfoEXT semaphore_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT,
++      .pNext = &event_export,
++      .semaphore = semaphore,
++      .mtlSharedEvent = LEFT_OVER,
++   };
++   VkExportMetalIOSurfaceInfoEXT surface_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_IO_SURFACE_INFO_EXT,
++      .pNext = &semaphore_export,
++      .image = image,
++      .ioSurface = LEFT_OVER,
++   };
++   VkExportMetalTextureInfoEXT buffer_view_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
++      .pNext = &surface_export,
++      .bufferView = buffer_view,
++      .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
++      .mtlTexture = LEFT_OVER,
++   };
++   VkExportMetalTextureInfoEXT view_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
++      .pNext = &buffer_view_export,
++      .imageView = view,
++      .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
++      .mtlTexture = LEFT_OVER,
++   };
++   VkExportMetalTextureInfoEXT image_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
++      .pNext = &view_export,
++      .image = image,
++      .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
++      .mtlTexture = LEFT_OVER,
++   };
++   VkExportMetalBufferInfoEXT buffer_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_BUFFER_INFO_EXT,
++      .pNext = &image_export,
++      .memory = buffer_memory,
++      .mtlBuffer = LEFT_OVER,
++   };
++   VkExportMetalCommandQueueInfoEXT queue_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT,
++      .pNext = &buffer_export,
++      .queue = queue,
++      .mtlCommandQueue = LEFT_OVER,
++   };
++   VkExportMetalDeviceInfoEXT device_export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
++      .pNext = &queue_export,
++      .mtlDevice = LEFT_OVER,
++   };
++   VkExportMetalObjectsInfoEXT objects = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
++      .pNext = &device_export,
++   };
++   vkExportMetalObjectsEXT(device, &objects);
++
++   fprintf(stderr,
++           "device %p queue %p buffer %p image %p view %p buffer view %p "
++           "surface %p semaphore %p event %p\n",
++           (void *)device_export.mtlDevice,
++           (void *)queue_export.mtlCommandQueue,
++           (void *)buffer_export.mtlBuffer, (void *)image_export.mtlTexture,
++           (void *)view_export.mtlTexture,
++           (void *)buffer_view_export.mtlTexture,
++           (void *)surface_export.ioSurface,
++           (void *)semaphore_export.mtlSharedEvent,
++           (void *)event_export.mtlSharedEvent);
++
++   /* The objects the driver has. */
++   CHECK(device_export.mtlDevice != NULL &&
++         (void *)device_export.mtlDevice != LEFT_OVER);
++   CHECK(buffer_export.mtlBuffer != NULL &&
++         (void *)buffer_export.mtlBuffer != LEFT_OVER);
++   CHECK(image_export.mtlTexture != NULL &&
++         (void *)image_export.mtlTexture != LEFT_OVER);
++   CHECK(view_export.mtlTexture != NULL &&
++         (void *)view_export.mtlTexture != LEFT_OVER);
++   CHECK(buffer_view_export.mtlTexture != NULL &&
++         (void *)buffer_view_export.mtlTexture != LEFT_OVER);
++   CHECK(semaphore_export.mtlSharedEvent != NULL &&
++         (void *)semaphore_export.mtlSharedEvent != LEFT_OVER);
++   /* The ones it has not: its queue is not an MTLCommandQueue, no image is
++    * an IOSurface and an event has no shared event. */
++   CHECK(queue_export.mtlCommandQueue == NULL);
++   CHECK(surface_export.ioSurface == NULL);
++   CHECK(event_export.mtlSharedEvent == NULL);
++
++   vkDestroyEvent(device, event, NULL);
++   vkDestroySemaphore(device, semaphore, NULL);
++   vkDestroyImageView(device, view, NULL);
++   vkDestroyImage(device, image, NULL);
++   vkFreeMemory(device, image_memory, NULL);
++   vkDestroyBufferView(device, buffer_view, NULL);
++   vkDestroyBuffer(device, buffer, NULL);
++   vkFreeMemory(device, buffer_memory, NULL);
++   vkDestroyDevice(device, NULL);
++   vkDestroyInstance(instance, NULL);
++   printf("every Metal export is answered\n");
++   return 0;
++}

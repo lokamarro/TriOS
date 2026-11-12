@@ -1,0 +1,179 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# A disposable session on an image that does not configure one itself. The
+# per-run /init installs this file at /usr/local/libexec/uml-session with its
+# parameters at /etc/uml-session.env and switches root into it; it prepares
+# what the parameters ask for and replaces itself, as PID 1, with the entry,
+# or runs a workload entry and powers the guest off after it. The assignments
+# below and the parameter loop are the /etc/uml-session.env keys and their
+# defaults. It runs under the image's own shell, so any failure is reported
+# and ends the run.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+fail()
+{
+	echo "UML_SESSION_ERROR:$*"
+	exit 1
+}
+
+entry=/bin/sh
+resolver=image
+container_state=image
+runtime_mounts=0
+network=image
+workspace=tmpfs
+swap=
+cgroup=
+
+parameters=/etc/uml-session.env
+if [ -f "$parameters" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		''|'#'*) continue ;;
+		*=*) ;;
+		*) fail "malformed $parameters line: $line" ;;
+		esac
+		value=${line#*=}
+		case "${line%%=*}" in
+		UML_SESSION_ENTRY) entry=$value ;;
+		UML_SESSION_RESOLVER) resolver=$value ;;
+		UML_SESSION_CONTAINER_STATE) container_state=$value ;;
+		UML_SESSION_RUNTIME_MOUNTS) runtime_mounts=$value ;;
+		UML_SESSION_NETWORK) network=$value ;;
+		UML_SESSION_WORKSPACE) workspace=$value ;;
+		UML_SESSION_SWAP) swap=$value ;;
+		UML_SESSION_CGROUP) cgroup=$value ;;
+		*) fail "unknown $parameters parameter: ${line%%=*}" ;;
+		esac
+	done < "$parameters"
+fi
+workload=0
+case "$entry" in
+/bin/sh) ;;
+/*)
+	[ -x "$entry" ] || fail "the workload is not executable: $entry"
+	workload=1
+	;;
+systemd)
+	for candidate in /lib/systemd/systemd /usr/lib/systemd/systemd; do
+		if [ -x "$candidate" ]; then
+			entry=$candidate
+			break
+		fi
+	done
+	[ "$entry" != systemd ] || fail "the image has no systemd"
+	;;
+*) fail "unsupported entry: $entry" ;;
+esac
+case "$resolver" in image|user-network) ;; *) fail "unsupported resolver: $resolver" ;; esac
+case "$container_state" in image|tmpfs) ;; *) fail "unsupported container state: $container_state" ;; esac
+case "$runtime_mounts" in 0|1) ;; *) fail "UML_SESSION_RUNTIME_MOUNTS must be 0 or 1" ;; esac
+case "$network" in image|user-network) ;; *) fail "unsupported network: $network" ;; esac
+case "$workspace" in tmpfs|ext2) ;; *) fail "unsupported workspace: $workspace" ;; esac
+case "$swap" in ''|/dev/*) ;; *) fail "UML_SESSION_SWAP must name a device" ;; esac
+case "$cgroup" in
+''|v2-nsdelegate) ;;
+v1:*[!a-z0-9_,]*|v1:) fail "unsupported cgroup v1 controller: ${cgroup#v1:}" ;;
+v1:*) ;;
+*) fail "unsupported cgroup: $cgroup" ;;
+esac
+if [ "$workload" = 0 ] && [ "$entry" != /bin/sh ]; then
+	# systemd mounts these itself and owns the network and the workspace.
+	[ "$runtime_mounts" = 0 ] && [ "$network" = image ] && \
+		[ "$workspace" = tmpfs ] && [ -z "$swap$cgroup" ] || \
+		fail "runtime mounts, network, workspace, swap and cgroups need a shell or workload entry"
+fi
+
+# The SLiRP user network's own resolver answers, but the public ones keep
+# working when a guest service restarts it.
+if [ "$resolver" = user-network ]; then
+	rm -f /etc/resolv.conf && printf '%s\n' \
+		'# Darwin UML user-mode network' \
+		'nameserver 1.1.1.1' \
+		'nameserver 8.8.8.8' \
+		'nameserver 10.0.2.3' \
+		'options timeout:1 attempts:3 rotate' > /etc/resolv.conf || \
+		fail "cannot write the resolver configuration"
+fi
+
+# Container images and layers stay out of the overlay's upper layer.
+if [ "$container_state" = tmpfs ]; then
+	for directory in /var/lib/docker /var/lib/containerd; do
+		mkdir -p "$directory" && \
+			mount -t tmpfs -o mode=0711,nosuid,nodev tmpfs "$directory" || \
+			fail "cannot mount $directory"
+	done
+fi
+
+# What an init would otherwise provide for a shell: POSIX shared memory,
+# ptys, security modules' files and shared mount propagation, which
+# unshare(1) relies on.
+if [ "$runtime_mounts" = 1 ]; then
+	mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run && \
+		mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp && \
+		mkdir -p /dev/shm /dev/pts && \
+		mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm && \
+		mount -t devpts -o gid=5,mode=620,ptmxmode=000 devpts /dev/pts && \
+		mount -t securityfs securityfs /sys/kernel/security && \
+		mount --make-rshared / || fail "cannot mount the runtime filesystems"
+fi
+
+# The SLiRP provider's fixed lease; the kernel has no IP autoconfiguration.
+if [ "$network" = user-network ]; then
+	ip link set lo up || fail "cannot bring up lo"
+	if ip link show eth0 >/dev/null 2>&1; then
+		ip link set eth0 up && \
+			ip addr add 10.0.2.15/24 dev eth0 && \
+			ip route add default via 10.0.2.2 || \
+			fail "cannot configure eth0"
+	fi
+fi
+
+# LTP's disposable ext2 workspace, backed by memory like the tmpfs default.
+if [ "$workspace" = ext2 ]; then
+	image=/run/uml-ltp-workspace.ext2
+	dd if=/dev/zero of="$image" bs=1M count=0 seek=512 2>/dev/null && \
+		loop=$(losetup -f) && losetup "$loop" "$image" || \
+		fail "cannot attach the ext2 workspace"
+	if command -v mkfs.ext2 >/dev/null 2>&1; then
+		mkfs.ext2 -q "$loop"
+	else
+		mke2fs -q -t ext2 "$loop"
+	fi || fail "cannot format the ext2 workspace"
+	mount -t ext2 -o noatime "$loop" /tmp && chmod 1777 /tmp || \
+		fail "cannot mount the ext2 workspace"
+fi
+
+if [ -n "$swap" ]; then
+	mkswap "$swap" >/dev/null && swapon "$swap" || fail "cannot enable swap on $swap"
+fi
+
+case "$cgroup" in
+v2-nsdelegate)
+	mkdir -p /sys/fs/cgroup && \
+		mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup || \
+		fail "cannot mount the cgroup v2 hierarchy"
+	;;
+v1:*)
+	controller=${cgroup#v1:}
+	mount -t tmpfs -o mode=755 cgroup-root /sys/fs/cgroup && \
+		mkdir -p "/sys/fs/cgroup/$controller" && \
+		mount -t cgroup -o "$controller" "$controller" \
+			"/sys/fs/cgroup/$controller" || \
+		fail "cannot mount the cgroup v1 $controller hierarchy"
+	;;
+esac
+
+echo "UML_SESSION_READY:$entry"
+[ "$workload" = 1 ] || exec "$entry"
+
+# PID 1 may not exit, so the session outlives the workload and powers the
+# guest off once its status is on the console.
+"$entry"
+status=$?
+echo "UML_SESSION_EXIT:$status"
+sync
+poweroff -f
+fail "cannot power off"

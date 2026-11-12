@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 19:28:45 +0900
+Subject: [PATCH] vulkan: preserve trailing bytes when lowering whole-size
+ fills
+
+vkCmdFillBuffer with VK_WHOLE_SIZE fills complete uint32 words and leaves any trailing one to three bytes untouched. Round only that resolved range with a 64-bit mask, and skip dispatch when it contains no full word. Explicit sizes and generic device address ranges retain their existing semantics.
+
+Add a dispatch-level regression test linked to the production command-buffer object. Cover tail residues, offsets, sub-word no-ops, aligned explicit ranges, and logical ranges larger than 4 GiB.
+---
+ src/vulkan/runtime/meson.build                |  16 +++
+ .../runtime/tests/test_vk_cmd_fill_buffer.c   | 104 ++++++++++++++++++
+ src/vulkan/runtime/vk_command_buffer.c        |   8 +-
+ 3 files changed, 127 insertions(+), 1 deletion(-)
+ create mode 100644 src/vulkan/runtime/tests/test_vk_cmd_fill_buffer.c
+
+diff --git a/src/vulkan/runtime/meson.build b/src/vulkan/runtime/meson.build
+index e5d720d165e519fd851d4a96f903aa43539a76e0..ce7b910591d66c7ec377b57eec1b799eaaff4250 100644
+--- a/src/vulkan/runtime/meson.build
++++ b/src/vulkan/runtime/meson.build
+@@ -332,3 +332,19 @@ idep_vulkan_runtime = declare_dependency(
+     idep_vulkan_runtime_body,
+   ]
+ )
++
++if with_tests and (host_machine.system() == 'darwin' or ld_args_gc_sections.length() > 0)
++  # Exercise the real lowering object without unrelated driver entrypoints.
++  test(
++    'vk_cmd_fill_buffer',
++    executable(
++      'test_vk_cmd_fill_buffer',
++      files('tests/test_vk_cmd_fill_buffer.c'),
++      include_directories : [inc_include, inc_src],
++      dependencies : vulkan_lite_runtime_deps,
++      objects : libvulkan_lite_runtime.extract_objects('vk_command_buffer.c'),
++      link_args : host_machine.system() == 'darwin' ? ['-Wl,-dead_strip'] : ld_args_gc_sections,
++    ),
++    suite : ['vulkan'],
++  )
++endif
+diff --git a/src/vulkan/runtime/tests/test_vk_cmd_fill_buffer.c b/src/vulkan/runtime/tests/test_vk_cmd_fill_buffer.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd936e1dc57ceca840502fc5303f95b91e86a448
+--- /dev/null
++++ b/src/vulkan/runtime/tests/test_vk_cmd_fill_buffer.c
+@@ -0,0 +1,104 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "vulkan/runtime/vk_buffer.h"
++#include "vulkan/runtime/vk_command_buffer.h"
++#include "vulkan/runtime/vk_common_entrypoints.h"
++#include "vulkan/runtime/vk_device.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition) do { \
++   if (!(condition)) { \
++      fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition); \
++      abort(); \
++   } \
++} while (0)
++
++struct test_command_buffer {
++   struct vk_command_buffer vk;
++   uint32_t call_count;
++   VkDeviceAddressRangeKHR range;
++   VkAddressCommandFlagsKHR flags;
++   uint32_t data;
++};
++
++static VKAPI_ATTR void VKAPI_CALL
++capture_fill(VkCommandBuffer command_buffer,
++             const VkDeviceAddressRangeKHR *range,
++             VkAddressCommandFlagsKHR flags, uint32_t data)
++{
++   struct test_command_buffer *cmd =
++      (struct test_command_buffer *)vk_command_buffer_from_handle(command_buffer);
++   cmd->call_count++;
++   cmd->range = *range;
++   cmd->flags = flags;
++   cmd->data = data;
++}
++
++static void
++check_fill(struct vk_device *device, VkDeviceSize buffer_size,
++           VkDeviceSize offset, VkDeviceSize size, VkDeviceSize expected_size)
++{
++   struct test_command_buffer cmd = {
++      .vk.base.type = VK_OBJECT_TYPE_COMMAND_BUFFER,
++      .vk.base.device = device,
++   };
++   struct vk_buffer buffer = {
++      .base.type = VK_OBJECT_TYPE_BUFFER,
++      .base.device = device,
++      .size = buffer_size,
++      .device_address = UINT64_C(0x123400000000),
++      .address_flags = VK_ADDRESS_COMMAND_FULLY_BOUND_BIT_KHR |
++                       VK_ADDRESS_COMMAND_STORAGE_BUFFER_USAGE_BIT_KHR,
++   };
++   const uint32_t data = 0x76543210;
++
++   vk_common_CmdFillBuffer(vk_command_buffer_to_handle(&cmd.vk),
++                           vk_buffer_to_handle(&buffer), offset, size, data);
++
++   CHECK(cmd.call_count == (expected_size > 0 ? 1 : 0));
++   if (expected_size > 0) {
++      CHECK(cmd.range.address == buffer.device_address + offset);
++      CHECK(cmd.range.size == expected_size);
++      CHECK(cmd.flags == buffer.address_flags);
++      CHECK(cmd.data == data);
++   }
++
++   /* The shared range helper must retain the byte range for other commands. */
++   const VkDeviceAddressRangeKHR range =
++      vk_device_address_range(&buffer, offset, VK_WHOLE_SIZE);
++   CHECK(range.address == buffer.device_address + offset);
++   CHECK(range.size == buffer_size - offset);
++}
++
++int
++main(void)
++{
++   struct vk_device device = {
++      .dispatch_table.CmdFillMemoryKHR = capture_fill,
++   };
++
++   for (uint32_t tail = 0; tail < 4; tail++) {
++      check_fill(&device, 64 + tail, 0, VK_WHOLE_SIZE, 64);
++      check_fill(&device, 64 + tail, 12, VK_WHOLE_SIZE, 52);
++      check_fill(&device, 64 + tail, 60, VK_WHOLE_SIZE, 4);
++
++      /* Only metadata is large: the test never allocates a multi-GiB buffer. */
++      check_fill(&device, UINT64_C(0x100000010) + tail, 8,
++                 VK_WHOLE_SIZE, UINT64_C(0x100000008));
++   }
++
++   for (uint32_t remaining = 1; remaining < 4; remaining++) {
++      check_fill(&device, remaining, 0, VK_WHOLE_SIZE, 0);
++      check_fill(&device, 12 + remaining, 12, VK_WHOLE_SIZE, 0);
++   }
++
++   /* Explicit valid ranges are forwarded unchanged, even with a buffer tail. */
++   check_fill(&device, 67, 0, 64, 64);
++   check_fill(&device, 67, 12, 4, 4);
++   check_fill(&device, UINT64_C(0x100000010), 8,
++              UINT64_C(0x100000004), UINT64_C(0x100000004));
++
++   return 0;
++}
+diff --git a/src/vulkan/runtime/vk_command_buffer.c b/src/vulkan/runtime/vk_command_buffer.c
+index f23ad4b0211a5ec7b1d1076af568c68249861c7d..3ce8d414b2d045f9b0051ee3b5c3f397e346e2f2 100644
+--- a/src/vulkan/runtime/vk_command_buffer.c
++++ b/src/vulkan/runtime/vk_command_buffer.c
+@@ -935,8 +935,14 @@ vk_common_CmdFillBuffer(
+ 
+    const struct vk_device_dispatch_table *disp =
+       &cmd_buffer->base.device->dispatch_table;
+-   const VkDeviceAddressRangeKHR addr_range =
++   VkDeviceAddressRangeKHR addr_range =
+       vk_device_address_range(buffer, dstOffset, size);
++   if (size == VK_WHOLE_SIZE) {
++      /* FillBuffer leaves any incomplete trailing word untouched. */
++      addr_range.size &= ~UINT64_C(3);
++      if (addr_range.size == 0)
++         return;
++   }
+    disp->CmdFillMemoryKHR(commandBuffer, &addr_range,
+                           buffer->address_flags, data);
+ }
